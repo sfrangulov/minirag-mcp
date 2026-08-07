@@ -135,7 +135,9 @@ def create_app(
     def ingest_url(url: str, source: str | None = None, title: str | None = None) -> dict:
         """Fetch an http(s) URL, convert it to Markdown, and index it.
 
-        Only http and https schemes are accepted. This is the one tool that
+        Only http and https schemes are accepted, and the host must not be a
+        private or local address (loopback, link-local, private, reserved) —
+        set ALLOW_PRIVATE_URLS=1 to lift that. This is the one tool that
         reaches the network — every other tool works purely against local
         files and the local index. source defaults to the URL itself; pass
         one to control the index key or to update a previously ingested URL.

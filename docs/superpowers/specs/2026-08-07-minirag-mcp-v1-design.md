@@ -205,7 +205,9 @@ chunks (delete by source + add).
 **Ingest (data):** `text`/`markdown` pass through; `html` → markitdown
 HtmlConverter → same pipeline. Re-using a `source` id replaces its chunks.
 
-**Ingest (url):** scheme check (`http`/`https` only) → markitdown
+**Ingest (url):** URL check (scheme `http`/`https`, and a host that is not and
+does not resolve to a loopback/link-local/private/reserved/unspecified
+address) → markitdown
 `convert_url` (network fetch; special converters for YouTube/Wikipedia/RSS
 apply automatically) → same pipeline. `source` defaults to the URL string;
 re-ingesting the same source replaces its chunks.
@@ -283,6 +285,14 @@ test corpus; they are internal (not env-configurable) in v1.
 - `ingest_url` accepts only `http`/`https` schemes. `file:` and `data:` URIs
   are rejected — markitdown's `convert_uri` would otherwise read arbitrary
   local files, bypassing the document-root boundary.
+- `ingest_url` also rejects a host that is, or resolves to, a
+  loopback/link-local/private/reserved/unspecified address: the URL is usually
+  chosen by an LLM that may be acting on text from an indexed document, which
+  makes an unrestricted host a prompt-injection path to cloud metadata and to
+  internal services. Every resolved address is checked, not just the first;
+  resolution is bounded by a short timeout and a resolution failure is a fetch
+  error, not a security verdict. `ALLOW_PRIVATE_URLS=1` opts out of the host
+  rule only.
 - No other network I/O: only `ingest_url` (explicit) and the one-time model
   download by fastembed.
 - Single local user; no auth (parity). One writer per `DB_PATH`; concurrent

@@ -1,12 +1,15 @@
-"""Shared fixtures: deterministic fake embedder (no model download)."""
+"""Shared fixtures: deterministic fake embedder (no model download), offline DNS."""
 
 from __future__ import annotations
 
 import hashlib
 import math
+import socket
 from collections.abc import Sequence
 
 import pytest
+
+PUBLIC_IP = "93.184.216.34"
 
 
 class FakeEmbedder:
@@ -31,3 +34,18 @@ class FakeEmbedder:
 @pytest.fixture
 def fake_embedder() -> FakeEmbedder:
     return FakeEmbedder()
+
+
+@pytest.fixture
+def public_dns(monkeypatch):
+    """Resolve every hostname to one fixed public address, without a resolver.
+
+    ingest_url validates the host before fetching, so a test that ingests a URL
+    would otherwise depend on a working resolver and on what a real name happens
+    to resolve to today.
+    """
+
+    def fake(host, port, *args, **kwargs):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (PUBLIC_IP, port or 80))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake)

@@ -100,7 +100,7 @@ async def test_ingest_file_outside_root_is_tool_error(app):
             await c.call_tool("ingest_file", {"filePath": "/etc/passwd"})
 
 
-async def test_ingest_data_and_url(app, monkeypatch):
+async def test_ingest_data_and_url(app, monkeypatch, public_dns):
     import minirag_mcp.ingest.pipeline as pmod
     from minirag_mcp.ingest.parser import ParsedDoc
 

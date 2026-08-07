@@ -89,7 +89,7 @@ def test_sync_and_read_neighbors(corpus, capsys):
     assert json.loads(capsys.readouterr().out)["chunks"]
 
 
-def test_ingest_url_mocked(corpus, capsys, monkeypatch):
+def test_ingest_url_mocked(corpus, capsys, monkeypatch, public_dns):
     import minirag_mcp.ingest.pipeline as pmod
     from minirag_mcp.ingest.parser import ParsedDoc
 

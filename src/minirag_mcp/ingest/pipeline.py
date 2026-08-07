@@ -17,7 +17,7 @@ from minirag_mcp.ingest.parser import (
     parse_file,
     parse_html,
 )
-from minirag_mcp.security import check_url_scheme
+from minirag_mcp.security import check_url
 from minirag_mcp.store import ChunkRecord, Store
 
 MAX_CHUNK_CHARS = 1500
@@ -172,7 +172,7 @@ class Pipeline:
     def ingest_url(
         self, url: str, source: str | None = None, title: str | None = None
     ) -> IngestResult:
-        check_url_scheme(url)
+        check_url(url, allow_private=self.config.allow_private_urls)
         doc = parse_url(url)
         explicit = title.strip() if title and title.strip() else None
         # A titleless page is titled after its URL, which is an address, not a title.

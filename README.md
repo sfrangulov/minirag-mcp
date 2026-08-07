@@ -133,7 +133,9 @@ Two more ways to get content in without a file on disk:
 - **`ingest_url`** — the server fetches an `http`/`https` URL itself via
   `markitdown`'s `convert_url` (YouTube, Wikipedia, and RSS get
   format-specific handling automatically). This is the one tool that reaches
-  the network.
+  the network. Private and local hosts are refused unless
+  `ALLOW_PRIVATE_URLS` says otherwise — see
+  [Security and Operation](#security-and-operation).
 
 ## MCP Tools
 
@@ -356,6 +358,7 @@ merges with them.
 | `RAG_GROUPING` | unset | See [Search Tuning](#search-tuning). |
 | `RAG_MAX_DISTANCE` | unset | See [Search Tuning](#search-tuning). |
 | `RAG_MAX_FILES` | unset | See [Search Tuning](#search-tuning). |
+| `ALLOW_PRIVATE_URLS` | unset (off) | Let `ingest_url` fetch hosts that resolve to loopback, link-local, private, reserved, or unspecified addresses. Off by default — see [Security and Operation](#security-and-operation). Accepts `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off`; anything else is a configuration error. |
 
 ## Security and Operation
 
@@ -383,6 +386,20 @@ merges with them.
 - `ingest_url` accepts only `http`/`https` URLs. `file:` and `data:` schemes
   are rejected — `markitdown`'s `convert_uri` would otherwise read arbitrary
   local files, bypassing the document-root boundary entirely.
+- `ingest_url` also checks the **host**, not just the scheme: a host that is,
+  or resolves to, a loopback, link-local, private, reserved, or unspecified
+  address is refused. That covers cloud instance metadata
+  (`http://169.254.169.254/latest/meta-data/`), services bound to localhost
+  (`http://localhost:8080/admin`), and anything on the LAN. The URL is usually
+  chosen by an LLM which may be acting on text from an already-indexed
+  document, so without this an attacker-authored document is a
+  prompt-injection path into your network. A name is rejected if **any** of
+  its addresses is blocked, and the error names the host and the reason. A
+  host that simply fails to resolve is reported as a fetch error, not a
+  security refusal.
+  Set `ALLOW_PRIVATE_URLS=1` to turn the host check off — for a server you
+  point at an internal wiki on purpose. It changes nothing else: `file:` and
+  `data:` are still rejected.
 - No other network I/O happens: only an explicit `ingest_url` call and the
   one-time embedding-model download ever leave the machine.
 - Single local user, no authentication. One writer per `DB_PATH` at a time
@@ -414,6 +431,12 @@ and retry.
 **"... exceeds MAX_FILE_SIZE" / "file too large".**
 The file is bigger than the 100 MB default limit. Raise it:
 `export MAX_FILE_SIZE=209715200` (200 MB), or exclude the file.
+
+**"Refusing to fetch from host ...".**
+`ingest_url` was pointed at a host that is, or resolves to, a private or local
+address. If that is deliberate — an internal wiki, a service on this machine —
+set `ALLOW_PRIVATE_URLS=1`. If it is not, treat the URL as untrusted: it may
+have come from a document in the index rather than from you.
 
 **"Path outside configured document roots".**
 The path (or what a symlink resolves to) isn't inside any configured root.

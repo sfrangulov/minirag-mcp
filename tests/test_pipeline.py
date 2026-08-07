@@ -104,6 +104,25 @@ def test_ingest_url_scheme_rejected(pipe):
         p.ingest_url("file:///etc/passwd")
 
 
+def test_ingest_url_refuses_cloud_metadata(pipe):
+    """The URL is usually picked by an LLM reading an indexed document — an
+    unrestricted host turns that into an SSRF path."""
+    p, _, _ = pipe
+    with pytest.raises(SecurityError, match="ALLOW_PRIVATE_URLS"):
+        p.ingest_url("http://169.254.169.254/latest/meta-data/")
+
+
+def test_allow_private_urls_config_reaches_ingest_url(tmp_path, fake_embedder, monkeypatch):
+    import minirag_mcp.ingest.pipeline as mod
+    from minirag_mcp.ingest.parser import ParsedDoc
+
+    monkeypatch.setattr(mod, "parse_url", lambda u: ParsedDoc("# W\n\nWiki body.", "W"))
+    cfg = load_config({"BASE_DIR": str(tmp_path), "ALLOW_PRIVATE_URLS": "1"}, cwd=tmp_path)
+    store = Store(tmp_path / "db-private", dim=fake_embedder.dim)
+    res = Pipeline(store, fake_embedder, cfg).ingest_url("http://192.168.1.10/wiki")
+    assert res.source == "http://192.168.1.10/wiki"
+
+
 def test_title_line_seeded_into_first_chunk_only(pipe):
     """The title must reach the embedding of chunk 0, so semantic search sees the
     filename too — but it must not be repeated in every chunk."""
@@ -183,7 +202,7 @@ def test_html_data_without_a_title_is_not_seeded_with_the_fallback(pipe):
     assert "# Untitled" not in text and "# page-1" not in text
 
 
-def test_url_title_is_seeded_only_when_the_page_has_one(pipe, monkeypatch):
+def test_url_title_is_seeded_only_when_the_page_has_one(pipe, monkeypatch, public_dns):
     """A raw URL is an address, not a title — "# https://example.com/a/b?x=1&y=2" in the
     embedded text buys nothing and costs relevance."""
     import minirag_mcp.ingest.pipeline as mod
@@ -209,7 +228,7 @@ def test_url_title_is_seeded_only_when_the_page_has_one(pipe, monkeypatch):
     assert store.all_chunks(url)[0].text.startswith("# Remote Page\n\n")
 
 
-def test_explicit_url_title_is_seeded_even_for_a_titleless_page(pipe, monkeypatch):
+def test_explicit_url_title_is_seeded_even_for_a_titleless_page(pipe, monkeypatch, public_dns):
     import minirag_mcp.ingest.pipeline as mod
     from minirag_mcp.ingest.parser import ParsedDoc
 
@@ -224,7 +243,7 @@ def test_explicit_url_title_is_seeded_even_for_a_titleless_page(pipe, monkeypatc
     assert store.all_chunks(url)[0].text.startswith("# Storage Policy\n\n")
 
 
-def test_ingest_url_mocked(pipe, monkeypatch):
+def test_ingest_url_mocked(pipe, monkeypatch, public_dns):
     import minirag_mcp.ingest.pipeline as mod
     from minirag_mcp.ingest.parser import ParsedDoc
 
