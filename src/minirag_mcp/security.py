@@ -50,12 +50,28 @@ def resolve_in_roots(
 def _blocked_kind(ip: IPAddress) -> str | None:
     """Name why `ip` must not be fetched from, or None if it is fetchable.
 
-    An IPv4-mapped IPv6 address (`::ffff:127.0.0.1`) needs no unwrapping here: every
-    property below already reads through the wrapper to the IPv4 address it carries,
-    identically on 3.11.13, 3.12.11, 3.13.6 and 3.14.6. An interpreter that did not
-    would fail closed, since `::ffff:0:0/96` is itself listed private — and
-    test_ipv4_mapped_addresses_are_judged_by_the_address_they_carry says so out loud.
+    An IPv4-mapped IPv6 address (`::ffff:127.0.0.1`) is judged by the IPv4 address it
+    carries, unwrapped here rather than left to the properties below. Recent stdlibs
+    do delegate through `ipv4_mapped` — but that arrived as a mid-series backport,
+    landing in two waves, so how much of it an interpreter has depends on the *patch*
+    release, not on 3.11-vs-3.12-vs-3.13. Measured on the interpreters themselves:
+
+        3.11.9, 3.11.10, 3.12.3   no property delegates
+        3.12.4, 3.12.6            is_loopback does; is_link_local, is_unspecified and
+                                  is_reserved still do not
+        3.11.11+, 3.12.8+, 3.13+  all of them do
+
+    Relying on the stdlib therefore makes the verdict a function of the patch version,
+    and on the older ones it is wrong twice over — CI caught both. `::ffff:127.0.0.1`
+    degrades to "private" instead of "loopback": still blocked, only less precise. But
+    a mapped *public* address such as `::ffff:93.184.216.34` reads as reserved (it sits
+    in IPv6 `::/8`) and gets refused outright — a legitimate URL silently rejected, and
+    the reason this unwrap is load-bearing rather than cosmetic. `requires-python` is
+    >=3.11, which admits every one of those patch releases.
     """
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        ip = mapped
     return next((kind for kind, attr in _BLOCKED_KINDS if getattr(ip, attr)), None)
 
 

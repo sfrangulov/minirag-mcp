@@ -125,17 +125,18 @@ def test_blocked_address_literal_rejected(host, reason):
 
 
 def test_ipv4_mapped_addresses_are_judged_by_the_address_they_carry():
-    """`::ffff:x.x.x.x` must get whatever verdict `x.x.x.x` gets — blocked when the
-    IPv4 address is blocked, and *fetchable* when it is not.
+    """`::ffff:x.x.x.x` must get whatever verdict `x.x.x.x` gets — blocked, for the
+    same stated reason, when the IPv4 address is blocked, and *fetchable* when it is
+    not.
 
-    The second half is the load-bearing one, and it is why this test exists rather
-    than an unwrap in `_blocked_kind`. Every property the check reads already looks
-    through the wrapper (verified identical on 3.11.13, 3.12.11, 3.13.6 and 3.14.6),
-    so no unwrapping of our own is needed. On an interpreter that stopped doing so, a
-    mapped public address would land inside `::ffff:0:0/96` — listed private — and be
-    refused: fail-closed, but wrong, and this assertion is what would catch it.
+    Both halves pin the explicit `ipv4_mapped` unwrap in `_blocked_kind`, because the
+    stdlib's own delegation through the wrapper arrived as a mid-series backport and
+    holds only on newer patch releases of 3.11/3.12. Drop the unwrap and this test
+    fails on 3.11.9, 3.11.10, 3.12.3, 3.12.4 and 3.12.6 — all of which `requires-python
+    >=3.11` admits — because a mapped public address reads reserved there and is
+    refused. That is the damaging direction: a legitimate URL silently rejected.
     """
-    check_url(f"http://[::ffff:{PUBLIC_IP}]/p")  # no raise
+    check_url(f"http://[::ffff:{PUBLIC_IP}]/p")  # no raise: public stays fetchable
     with pytest.raises(SecurityError, match="loopback"):
         check_url("http://[::ffff:127.0.0.1]/p")
 
