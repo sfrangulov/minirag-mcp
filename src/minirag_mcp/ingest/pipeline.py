@@ -23,6 +23,21 @@ MAX_CHUNK_CHARS = 1500
 DATA_FORMATS = ("text", "markdown", "html")
 
 
+def _seed_title(text: str, title: str) -> str:
+    """Put the title in front of the first chunk's text, once.
+
+    Keyword search reads the title column directly, but the vector side only ever
+    sees chunk text — so without this a filename-derived title would be invisible to
+    semantic search. Applied after chunking (it can never move a chunk boundary) and
+    before embedding (the vector reflects it). A document that already opens with its
+    own title line is left alone, which is also what keeps re-ingest idempotent.
+    """
+    line = f"# {title}"
+    if not title.strip() or text == line or text.startswith(f"{line}\n"):
+        return text
+    return f"{line}\n\n{text}"
+
+
 class UnsupportedFormatError(Exception):
     pass
 
@@ -80,6 +95,7 @@ class Pipeline:
         )
         if not texts:
             raise EmptyDocumentError(f"No text content extracted from {source}")
+        texts[0] = _seed_title(texts[0], title)
         vectors = self.embedder.embed_documents(texts)
         now = datetime.now(UTC).isoformat()
         records = [

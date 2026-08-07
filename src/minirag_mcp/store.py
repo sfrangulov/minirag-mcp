@@ -12,6 +12,9 @@ import pyarrow as pa
 from lancedb.index import FTS
 
 TABLE = "chunks"
+# Columns carrying BM25 indexes. `title` is indexed because for many document sets the
+# filename is where the document code and subject live, and nowhere else.
+FTS_COLUMNS = ("text", "title")
 _LIST_LIMIT = 2**31 - 1  # LanceDB scalar queries default to limit 10 — always set explicitly
 RRF_K = 60  # standard RRF damping constant
 GAP_FACTOR = 2.0  # relevance_cutoff boundary must exceed mean gap by this factor
@@ -146,9 +149,23 @@ class Store:
                 ]
             )
             self._table = self._db.create_table(TABLE, schema=schema)
-            self._table.create_index("text", config=FTS())
+            self._ensure_fts_indices()
         else:
             self._check_dim(db_path, dim)
+            self._ensure_fts_indices()
+
+    def _ensure_fts_indices(self) -> None:
+        """Create any FTS index the table is missing.
+
+        Creating an FTS index on an empty table is supported (verified against
+        lancedb 0.36), so a fresh table gets both here. Running this on open as well
+        means an index built by an older version — `text` only — gains `title` search
+        without a re-ingest of the corpus.
+        """
+        indexed = {col for idx in self._table.list_indices() for col in idx.columns}
+        for column in FTS_COLUMNS:
+            if column not in indexed:
+                self._table.create_index(column, config=FTS())
 
     def _check_dim(self, db_path: Path, dim: int) -> None:
         """Fail early and clearly when an existing index has a different vector width.
@@ -312,7 +329,9 @@ class Store:
             ordered = vrows
         else:
             try:
-                fq = self._table.search(query_text, query_type="fts").limit(fetch)
+                fq = self._table.search(
+                    query_text, query_type="fts", fts_columns=list(FTS_COLUMNS)
+                ).limit(fetch)
                 if clause:
                     fq = fq.where(clause)
                 fts_rows = fq.to_list()

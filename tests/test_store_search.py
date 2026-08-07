@@ -195,6 +195,68 @@ def test_max_distance_drops_hits_without_a_distance(hybrid_store):
     assert all(r.distance is not None and r.distance <= 0.5 for r in got)
 
 
+# --- keyword search covers the title column too ---------------------------------------
+
+
+TITLED_SRC = "/И-112_ЗПС_Хранение ТМЗ на складах.md"
+
+
+@pytest.fixture
+def titled_store(tmp_path):
+    """A row whose distinguishing term lives ONLY in its title — the real-corpus case:
+    the document code and subject are in the filename, never in the body text.
+
+    Its vector is FARAWAY, so it can never enter the vector fetch window (see the note
+    above): if search finds it at all, keyword ranking is what found it.
+    """
+    s = Store(tmp_path / "titled-db", dim=8)
+    s.replace_source(
+        TITLED_SRC,
+        [
+            ChunkRecord(
+                id=f"{TITLED_SRC}#0",
+                source=TITLED_SRC,
+                source_type="file",
+                title="И-112 ЗПС Хранение ТМЗ на складах",
+                chunk_index=0,
+                text="Общие положения. Ответственный за приёмку назначается приказом.",
+                vector=FARAWAY(0),
+                file_hash="h",
+                mtime=1.0,
+                ingested_at="2026-08-07T00:00:00+00:00",
+            )
+        ],
+    )
+    s.replace_source(
+        "/filler.md",
+        [rec("/filler.md", i, f"sprocket filler body {i}", V(1.0 - i * 0.0005)) for i in range(50)],
+    )
+    return s
+
+
+def test_titled_row_is_unreachable_by_vector_search_alone(titled_store):
+    """Guard for the fixture: without this the tests below would prove nothing."""
+    got = titled_store.search("ТМЗ", V(1.0), top_k=12, hybrid_weight=0.0)
+    assert all(r.source != TITLED_SRC for r in got)
+
+
+def test_title_only_term_is_found_at_default_hybrid_weight(titled_store):
+    """Regression: FTS covered only `text`, so filenames/titles were unsearchable."""
+    got = titled_store.search("ТМЗ", V(1.0), top_k=12, hybrid_weight=0.6)
+    assert [r.source for r in got].count(TITLED_SRC) == 1, "title-only term must be retrievable"
+
+
+def test_text_only_term_still_found_when_title_is_indexed(titled_store):
+    got = titled_store.search("приёмку", V(1.0), top_k=12, hybrid_weight=0.6)
+    assert [r.source for r in got].count(TITLED_SRC) == 1
+
+
+def test_the_rare_term_really_is_absent_from_the_text_column(titled_store):
+    """Guard: prove the term is in the title only, not merely a substring of the body."""
+    rows = titled_store._table.search("ТМЗ", query_type="fts", fts_columns=["text"]).to_list()
+    assert rows == []
+
+
 def test_fts_failure_degrades_to_vector_ranking(store, monkeypatch):
     """LanceDB tolerates malformed FTS syntax, so inject a real failure to cover the except."""
     real_search = store._table.search

@@ -22,6 +22,10 @@ built on [fastmcp](https://github.com/jlowin/fastmcp),
   ranking (LanceDB BM25 full-text search) by weighted Reciprocal Rank Fusion,
   so exact identifiers and error codes surface alongside semantically similar
   passages.
+- **Filenames are searchable** — keyword search covers document titles as well
+  as body text, and an informative filename becomes the document's title. In
+  many real document sets the filename is the only place the document code and
+  subject appear at all. See [Titles and filenames](#titles-and-filenames).
 - **Multilingual by default** — the default embedding model covers 50+
   languages, so English and Russian corpora both work out of the box.
 - **12 file formats** ingested via `markitdown` (PDF, DOCX, PPTX, XLSX,
@@ -220,6 +224,31 @@ only looking at each side's ranking.
 - `1.0` — pure keyword ranking (BM25 order wins ties completely).
 - `0.6` (default) — leans slightly toward exact-term matches while still
   benefiting from semantic recall.
+
+<a id="titles-and-filenames"></a>
+**Titles and filenames.** The BM25 side indexes the `title` column as well as
+the chunk text, so a query matching a document's title finds it even when the
+term never appears in the body. For files the title is chosen as: converter
+metadata (only formats like HTML and EPUB carry it) → the **filename stem**,
+when it is informative → the first `# H1` → the stem. A stem counts as
+informative unless it is shorter than 4 characters, purely numeric, or a
+generic name (`untitled`, `document`, `doc`, `index`, `readme`, `new`, `copy`,
+`scan`, `image`); underscores become spaces and the rest is kept as-is, so
+`И-112_ЗПС_Хранение ТМЗ.docx` gives the title `И-112 ЗПС Хранение ТМЗ`.
+
+The filename outranks the H1 because office documents typically open with
+boilerplate ("1. Общие положения") that is identical across a whole document
+set, while the filename names the document. The title is also prepended as a
+`# Title` line to the first chunk's text before embedding, so it reaches
+semantic search too — later chunks are untouched, and chunk boundaries, ids
+and counts are unaffected.
+
+Both are ingest-time decisions: **already-indexed files keep the title they
+were ingested with until they are re-ingested.** `sync` will not do it for
+you — it treats a file whose content hash is unchanged as already ingested —
+so use `ingest_file` per file, or `delete_file` and re-sync. Keyword search
+over the `title` column, by contrast, needs no re-ingest: an index built by an
+earlier version gains the title index the next time it is opened.
 
 <a id="hits-without-a-distance"></a>
 **Hits without a distance.** The vector side only fetches a bounded window of

@@ -104,6 +104,55 @@ def test_ingest_url_scheme_rejected(pipe):
         p.ingest_url("file:///etc/passwd")
 
 
+def test_title_line_seeded_into_first_chunk_only(pipe):
+    """The title must reach the embedding of chunk 0, so semantic search sees the
+    filename too — but it must not be repeated in every chunk."""
+    p, store, root = pipe
+    f = root / "И-112_ЗПС_Хранение ТМЗ на складах.md"
+    f.write_text("# 1. Общие положения\n\n" + "Абзац про хранение. " * 200, encoding="utf-8")
+    res = p.ingest_file(f)
+    assert res.title == "И-112 ЗПС Хранение ТМЗ на складах"
+    chunks = store.all_chunks(str(f))
+    assert len(chunks) > 1, "need several chunks to prove the prefix is chunk-0 only"
+    assert chunks[0].text.startswith(f"# {res.title}\n\n")
+    assert all(not c.text.startswith(f"# {res.title}") for c in chunks[1:])
+
+
+def test_title_line_is_not_doubled_on_reingest(pipe):
+    p, store, root = pipe
+    f = root / "И-112_ЗПС_Хранение ТМЗ на складах.md"
+    f.write_text("# 1. Общие положения\n\n" + "Абзац про хранение. " * 200, encoding="utf-8")
+    res = p.ingest_file(f)
+    first = store.all_chunks(str(f))[0].text
+    assert first.startswith(f"# {res.title}\n\n")
+    p.ingest_file(f)
+    again = store.all_chunks(str(f))[0].text
+    assert again == first
+    assert again.count(f"# {res.title}") == 1
+
+
+def test_title_line_not_added_when_the_chunk_already_starts_with_it(pipe):
+    p, store, _ = pipe
+    res = p.ingest_data("# MD Title\n\nBody here, long enough to keep.", source="n", fmt="markdown")
+    assert res.title == "MD Title"
+    text = store.all_chunks("n")[0].text
+    assert text.startswith("# MD Title\n\n") and text.count("# MD Title") == 1
+
+
+def test_title_seeding_does_not_change_chunk_ids_or_count(pipe):
+    """The prefix is applied after chunking, so boundaries and ids must be untouched."""
+    p, store, root = pipe
+    body = "# 1. Общие положения\n\n" + "Абзац про хранение. " * 200
+    named = root / "И-112_ЗПС_Хранение ТМЗ на складах.md"
+    named.write_text(body, encoding="utf-8")
+    generic = root / "doc.md"
+    generic.write_text(body, encoding="utf-8")
+    assert p.ingest_file(named).chunk_count == p.ingest_file(generic).chunk_count
+    assert [c.chunk_index for c in store.all_chunks(str(named))] == [
+        c.chunk_index for c in store.all_chunks(str(generic))
+    ]
+
+
 def test_ingest_url_mocked(pipe, monkeypatch):
     import minirag_mcp.ingest.pipeline as mod
     from minirag_mcp.ingest.parser import ParsedDoc

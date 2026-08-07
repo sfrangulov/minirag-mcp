@@ -111,6 +111,29 @@ def test_reopening_with_the_same_dim_is_fine(tmp_path):
     assert Store(tmp_path / "db", dim=8).chunk_count() == 1
 
 
+def _fts_columns(store) -> set[str]:
+    return {c for idx in store._table.list_indices() for c in idx.columns}
+
+
+def test_new_table_indexes_both_text_and_title(store):
+    assert _fts_columns(store) == {"text", "title"}
+
+
+def test_reopening_an_older_index_adds_the_missing_title_index(tmp_path):
+    """A DB written before titles were searchable must gain the index on open —
+    without that, existing users would need a full re-ingest to search filenames."""
+    s1 = Store(tmp_path / "db", dim=8)
+    s1._table.drop_index("title_idx")  # simulate a table created by the older version
+    assert _fts_columns(s1) == {"text"}
+    s1.replace_source("/a.md", [rec("/a.md", 0, "alpha", title="Sputnik Handbook")])
+
+    s2 = Store(tmp_path / "db", dim=8)
+    assert _fts_columns(s2) == {"text", "title"}
+    assert s2.chunk_count() == 1  # the upgrade did not disturb the data
+    rows = s2._table.search("Sputnik", query_type="fts", fts_columns=["title"]).to_list()
+    assert [r["id"] for r in rows] == ["/a.md#0"]
+
+
 def test_scope_prefix_with_like_wildcards_not_overmatching(store):
     for src in ("/docs_api/f1.md", "/docsXapi/f2.md", "/100%done/f4.md", "/100Xdone/f5.md"):
         store.replace_source(src, [rec(src, 0, "x")])
