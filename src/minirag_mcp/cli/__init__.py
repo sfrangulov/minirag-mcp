@@ -12,8 +12,8 @@ from cyclopts import App, Parameter
 
 from minirag_mcp import __version__
 from minirag_mcp.config import Config, ConfigError, load_config
-from minirag_mcp.embedder import Embedder
-from minirag_mcp.ingest.pipeline import Pipeline
+from minirag_mcp.embedder import Embedder, UnknownModelError
+from minirag_mcp.ingest.pipeline import IngestResult, Pipeline
 from minirag_mcp.ingest.scanner import compute_states, scan_roots
 from minirag_mcp.security import SecurityError, resolve_in_roots
 from minirag_mcp.store import SearchResult, Store
@@ -22,6 +22,21 @@ from minirag_mcp.sync import run_sync
 app = App(name="minirag-mcp", version=__version__)
 
 JsonFlag = Annotated[bool, Parameter(name="--json", help="Machine-readable JSON output")]
+BaseDirOpt = Annotated[
+    list[str] | None,
+    Parameter(name="--base-dir", help="Document root; repeatable. Overrides BASE_DIR/BASE_DIRS."),
+]
+DbPathOpt = Annotated[
+    str | None, Parameter(name="--db-path", help="Index directory. Overrides DB_PATH.")
+]
+CacheDirOpt = Annotated[
+    str | None,
+    Parameter(name="--cache-dir", help="Embedding model cache. Overrides CACHE_DIR."),
+]
+ModelNameOpt = Annotated[
+    str | None,
+    Parameter(name="--model-name", help="fastembed model id. Overrides MODEL_NAME."),
+]
 
 
 def _make_embedder(cfg: Config) -> Embedder:
@@ -53,6 +68,9 @@ def _load(
     except ConfigError as e:
         _fail(str(e))
         raise AssertionError from e  # unreachable
+    except UnknownModelError as e:
+        _fail(f"{e} — see fastembed's supported models")
+        raise AssertionError from e  # unreachable
 
 
 def _emit(payload: dict, as_json: bool, human: str) -> None:
@@ -67,30 +85,46 @@ def _result_line(r: SearchResult) -> str:
 def ingest(
     paths: list[str],
     *,
-    base_dir: list[str] | None = None,
-    db_path: str | None = None,
-    cache_dir: str | None = None,
-    model_name: str | None = None,
+    base_dir: BaseDirOpt = None,
+    db_path: DbPathOpt = None,
+    cache_dir: CacheDirOpt = None,
+    model_name: ModelNameOpt = None,
     json: JsonFlag = False,
 ):
     """Ingest files or directories (recursive)."""
     cfg, store, pipeline = _load(base_dir, db_path, cache_dir, model_name)
     files: list[Path] = []
+    seen: set[Path] = set()
     try:
         for raw in paths:
             p = resolve_in_roots(raw, cfg.roots, require_absolute=False)
-            if p.is_dir():
-                files.extend(e.path for e in scan_roots([p]))
-            else:
-                files.append(p)
-        done = [pipeline.ingest_file(f) for f in files]
-    except Exception as e:  # SecurityError, pipeline errors, parser errors
+            candidates = [e.path for e in scan_roots([p])] if p.is_dir() else [p]
+            for c in candidates:
+                resolved = c.resolve()
+                if resolved not in seen:
+                    seen.add(resolved)
+                    files.append(c)
+    except Exception as e:  # SecurityError or a scan-time filesystem error
         _fail(str(e))
+    done: list[IngestResult] = []
+    failures: list[dict] = []
+    for f in files:
+        try:
+            done.append(pipeline.ingest_file(f))
+        except Exception as e:  # per-file failures never abort the batch
+            failures.append({"source": str(f), "error": str(e)})
     payload = {
-        "ingested": [{"source": r.source, "chunkCount": r.chunk_count} for r in done]
+        "ingested": [{"source": r.source, "chunkCount": r.chunk_count} for r in done],
+        "failed": failures,
     }
-    human = f"ingested {len(done)} file(s):\n" + "\n".join(f"  {r.source}" for r in done)
+    human = "\n".join(
+        [f"ingested {len(done)} file(s):"] + [f"  {r.source}" for r in done]
+    )
     _emit(payload, json, human)
+    for fail in failures:
+        print(f"warn: {fail['source']}: {fail['error']}", file=sys.stderr)
+    if failures:
+        raise SystemExit(1)
 
 
 @app.command(name="ingest-url")
@@ -99,10 +133,10 @@ def ingest_url(
     *,
     source: str | None = None,
     title: str | None = None,
-    base_dir: list[str] | None = None,
-    db_path: str | None = None,
-    cache_dir: str | None = None,
-    model_name: str | None = None,
+    base_dir: BaseDirOpt = None,
+    db_path: DbPathOpt = None,
+    cache_dir: CacheDirOpt = None,
+    model_name: ModelNameOpt = None,
     json: JsonFlag = False,
 ):
     """Fetch an http(s) URL and index it."""
@@ -121,10 +155,10 @@ def ingest_url(
 def sync(
     path: str | None = None,
     *,
-    base_dir: list[str] | None = None,
-    db_path: str | None = None,
-    cache_dir: str | None = None,
-    model_name: str | None = None,
+    base_dir: BaseDirOpt = None,
+    db_path: DbPathOpt = None,
+    cache_dir: CacheDirOpt = None,
+    model_name: ModelNameOpt = None,
     json: JsonFlag = False,
 ):
     """Reconcile the index with the document roots (synchronous)."""
@@ -152,10 +186,10 @@ def query(
     *,
     scope: list[str] | None = None,
     top_k: int = 8,
-    base_dir: list[str] | None = None,
-    db_path: str | None = None,
-    cache_dir: str | None = None,
-    model_name: str | None = None,
+    base_dir: BaseDirOpt = None,
+    db_path: DbPathOpt = None,
+    cache_dir: CacheDirOpt = None,
+    model_name: ModelNameOpt = None,
     json: JsonFlag = False,
 ):
     """Hybrid search over the index."""
@@ -183,10 +217,10 @@ def read_neighbors(
     chunk_index: int,
     before: int = 1,
     after: int = 1,
-    base_dir: list[str] | None = None,
-    db_path: str | None = None,
-    cache_dir: str | None = None,
-    model_name: str | None = None,
+    base_dir: BaseDirOpt = None,
+    db_path: DbPathOpt = None,
+    cache_dir: CacheDirOpt = None,
+    model_name: ModelNameOpt = None,
     json: JsonFlag = False,
 ):
     """Read chunks around a given chunk index."""
@@ -210,10 +244,10 @@ def read(
     path: str | None = None,
     *,
     source: str | None = None,
-    base_dir: list[str] | None = None,
-    db_path: str | None = None,
-    cache_dir: str | None = None,
-    model_name: str | None = None,
+    base_dir: BaseDirOpt = None,
+    db_path: DbPathOpt = None,
+    cache_dir: CacheDirOpt = None,
+    model_name: ModelNameOpt = None,
     json: JsonFlag = False,
 ):
     """Print a source's full indexed content (all chunks, as Markdown)."""
@@ -230,8 +264,12 @@ def read(
     chunks = store.all_chunks(key)
     if not chunks:
         _fail(f"source not found in index: {key}")
+    info = store.get_source(key)
     text = "\n\n".join(ch.text for ch in chunks)
-    payload = {"source": key, "chunkCount": len(chunks), "text": text}
+    payload = {
+        "source": key, "sourceType": info.source_type, "title": info.title,
+        "chunkCount": len(chunks), "text": text,
+    }
     _emit(payload, json, text)
 
 
@@ -239,10 +277,10 @@ def read(
 def list_cmd(
     *,
     scope: list[str] | None = None,
-    base_dir: list[str] | None = None,
-    db_path: str | None = None,
-    cache_dir: str | None = None,
-    model_name: str | None = None,
+    base_dir: BaseDirOpt = None,
+    db_path: DbPathOpt = None,
+    cache_dir: CacheDirOpt = None,
+    model_name: ModelNameOpt = None,
     json: JsonFlag = False,
 ):
     """List files on disk with ingestion state, plus indexed data/url sources."""
@@ -266,10 +304,10 @@ def list_cmd(
 @app.command
 def status(
     *,
-    base_dir: list[str] | None = None,
-    db_path: str | None = None,
-    cache_dir: str | None = None,
-    model_name: str | None = None,
+    base_dir: BaseDirOpt = None,
+    db_path: DbPathOpt = None,
+    cache_dir: CacheDirOpt = None,
+    model_name: ModelNameOpt = None,
     json: JsonFlag = False,
 ):
     """Show index and configuration status."""
@@ -279,6 +317,7 @@ def status(
         "roots": [str(r) for r in cfg.roots],
         "dbPath": str(cfg.db_path),
         "model": cfg.model_name,
+        "hybridWeight": cfg.hybrid_weight,
         "chunkCount": store.chunk_count(),
         "sourceCount": store.source_count(),
     }
@@ -291,10 +330,10 @@ def delete(
     path: str | None = None,
     *,
     source: str | None = None,
-    base_dir: list[str] | None = None,
-    db_path: str | None = None,
-    cache_dir: str | None = None,
-    model_name: str | None = None,
+    base_dir: BaseDirOpt = None,
+    db_path: DbPathOpt = None,
+    cache_dir: CacheDirOpt = None,
+    model_name: ModelNameOpt = None,
     json: JsonFlag = False,
 ):
     """Delete an indexed file (by path) or data/url item (by --source)."""

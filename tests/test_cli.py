@@ -4,6 +4,10 @@ import pytest
 
 import minirag_mcp.cli as cli
 
+# Captured at import time, before the autouse fixture below ever patches
+# cli._make_embedder — lets tests that need the real factory restore it.
+_REAL_MAKE_EMBEDDER = cli._make_embedder
+
 
 @pytest.fixture(autouse=True)
 def fake_model(monkeypatch, fake_embedder):
@@ -96,3 +100,41 @@ def test_env_used_when_no_flags(corpus, capsys, monkeypatch):
     monkeypatch.setenv("BASE_DIR", str(corpus))
     run(["ingest", str(corpus)])
     assert "2" in capsys.readouterr().out
+
+
+def test_unknown_model_name_is_clean_error(corpus, capsys, monkeypatch):
+    monkeypatch.setattr(cli, "_make_embedder", _REAL_MAKE_EMBEDDER)  # use the real factory
+    with pytest.raises(SystemExit) as exc:
+        run(["status", "--base-dir", str(corpus), "--model-name", "totally-bogus-model"])
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "totally-bogus-model" in err and "Traceback" not in err
+
+
+def test_ingest_partial_failure_reports_both(corpus, capsys):
+    bad = corpus / "bad.xyz"
+    bad.write_text("unsupported")
+    with pytest.raises(SystemExit) as exc:
+        run(["ingest", str(corpus / "a.md"), str(bad), "--base-dir", str(corpus), "--json"])
+    assert exc.value.code == 1
+    out = capsys.readouterr()
+    payload = json.loads(out.out)
+    assert [i["source"] for i in payload["ingested"]] == [str(corpus / "a.md")]
+    assert payload["failed"] and "bad.xyz" in payload["failed"][0]["source"]
+
+
+def test_ingest_dedupes_overlapping_arguments(corpus, capsys):
+    run(["ingest", str(corpus), str(corpus / "sub"), "--base-dir", str(corpus), "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    sources = [i["source"] for i in payload["ingested"]]
+    assert len(sources) == len(set(sources)) == 2
+
+
+def test_status_and_read_match_server_fields(corpus, capsys):
+    run(["ingest", str(corpus / "a.md"), "--base-dir", str(corpus)])
+    capsys.readouterr()
+    run(["status", "--base-dir", str(corpus), "--json"])
+    assert "hybridWeight" in json.loads(capsys.readouterr().out)
+    run(["read", str(corpus / "a.md"), "--base-dir", str(corpus), "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert {"source", "sourceType", "title", "chunkCount", "text"} <= set(payload)
