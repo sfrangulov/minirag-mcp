@@ -12,6 +12,9 @@ dependencies = [
     "markitdown[pdf,docx,pptx,xlsx]>=0.1.7",
     "cyclopts>=4.0",
     "platformdirs>=4.0",
+    # markitdown already pulls this in, but we import it directly: the URL fetch runs
+    # through a requests session we build and guard ourselves.
+    "requests>=2.32",
 ]
 
 [project.scripts]

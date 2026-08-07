@@ -1,6 +1,7 @@
 import pytest
 
 from minirag_mcp.config import load_config
+from minirag_mcp.ingest.parser import ParserError
 from minirag_mcp.ingest.pipeline import (
     EmptyDocumentError,
     FileTooLargeError,
@@ -112,11 +113,23 @@ def test_ingest_url_refuses_cloud_metadata(pipe):
         p.ingest_url("http://169.254.169.254/latest/meta-data/")
 
 
+def test_a_redirect_to_cloud_metadata_indexes_nothing(pipe, redirect_server):
+    """End to end: the URL the caller gives passes the check, the response redirects
+    to instance metadata, and the index stays empty. Checking only the supplied URL
+    would have put the metadata response in it."""
+    p, store, _ = pipe
+    url = redirect_server.url("/redirect-to-metadata")
+    with pytest.raises(ParserError, match="169.254.169.254"):
+        p.ingest_url(url)
+    assert store.chunk_count() == 0
+    assert store.get_source(url) is None
+
+
 def test_allow_private_urls_config_reaches_ingest_url(tmp_path, fake_embedder, monkeypatch):
     import minirag_mcp.ingest.pipeline as mod
     from minirag_mcp.ingest.parser import ParsedDoc
 
-    monkeypatch.setattr(mod, "parse_url", lambda u: ParsedDoc("# W\n\nWiki body.", "W"))
+    monkeypatch.setattr(mod, "parse_url", lambda u, **kw: ParsedDoc("# W\n\nWiki body.", "W"))
     cfg = load_config({"BASE_DIR": str(tmp_path), "ALLOW_PRIVATE_URLS": "1"}, cwd=tmp_path)
     store = Store(tmp_path / "db-private", dim=fake_embedder.dim)
     res = Pipeline(store, fake_embedder, cfg).ingest_url("http://192.168.1.10/wiki")
@@ -214,7 +227,7 @@ def test_url_title_is_seeded_only_when_the_page_has_one(pipe, monkeypatch, publi
     monkeypatch.setattr(
         mod,
         "parse_url",
-        lambda u: ParsedDoc(markdown="Fetched body text.", title=u, has_title=False),
+        lambda u, **kw: ParsedDoc(markdown="Fetched body text.", title=u, has_title=False),
     )
     p.ingest_url(url)
     assert store.all_chunks(url)[0].text == "Fetched body text."
@@ -222,7 +235,7 @@ def test_url_title_is_seeded_only_when_the_page_has_one(pipe, monkeypatch, publi
     monkeypatch.setattr(
         mod,
         "parse_url",
-        lambda u: ParsedDoc(markdown="Fetched body text.", title="Remote Page", has_title=True),
+        lambda u, **kw: ParsedDoc("Fetched body text.", title="Remote Page", has_title=True),
     )
     p.ingest_url(url)
     assert store.all_chunks(url)[0].text.startswith("# Remote Page\n\n")
@@ -237,7 +250,7 @@ def test_explicit_url_title_is_seeded_even_for_a_titleless_page(pipe, monkeypatc
     monkeypatch.setattr(
         mod,
         "parse_url",
-        lambda u: ParsedDoc(markdown="Fetched body text.", title=u, has_title=False),
+        lambda u, **kw: ParsedDoc(markdown="Fetched body text.", title=u, has_title=False),
     )
     p.ingest_url(url, title="Storage Policy")
     assert store.all_chunks(url)[0].text.startswith("# Storage Policy\n\n")
@@ -251,7 +264,7 @@ def test_ingest_url_mocked(pipe, monkeypatch, public_dns):
     monkeypatch.setattr(
         mod,
         "parse_url",
-        lambda url: ParsedDoc(markdown="# Remote\n\nFetched body.", title="Remote"),
+        lambda url, **kw: ParsedDoc(markdown="# Remote\n\nFetched body.", title="Remote"),
     )
     res = p.ingest_url("https://example.com/docs")
     assert res.source == "https://example.com/docs"

@@ -67,8 +67,8 @@ def file_sha256(path: Path) -> str:
 
 
 # module-level alias so tests can monkeypatch minirag_mcp.ingest.pipeline.parse_url
-def parse_url(url: str):
-    return _parser.parse_url(url)
+def parse_url(url: str, *, allow_private: bool = False):
+    return _parser.parse_url(url, allow_private=allow_private)
 
 
 class Pipeline:
@@ -189,8 +189,11 @@ class Pipeline:
     def ingest_url(
         self, url: str, source: str | None = None, title: str | None = None
     ) -> IngestResult:
+        # Checked here so a URL the caller supplied is refused before any request is
+        # made; the same rule is re-applied per redirect hop inside parse_url, which
+        # is the only place that can see where a fetch actually ends up.
         check_url(url, allow_private=self.config.allow_private_urls)
-        doc = parse_url(url)
+        doc = parse_url(url, allow_private=self.config.allow_private_urls)
         explicit = title.strip() if title and title.strip() else None
         # A titleless page is titled after its URL, which is an address, not a title.
         real_title = explicit or (doc.title if doc.has_title else None)

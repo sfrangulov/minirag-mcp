@@ -1192,6 +1192,7 @@ dependencies = [
     { name = "lancedb" },
     { name = "markitdown", extra = ["docx", "pdf", "pptx", "xlsx"] },
     { name = "platformdirs" },
+    { name = "requests" },
 ]
 
 [package.dev-dependencies]
@@ -1209,6 +1210,7 @@ requires-dist = [
     { name = "lancedb", specifier = ">=0.36" },
     { name = "markitdown", extras = ["pdf", "docx", "pptx", "xlsx"], specifier = ">=0.1.7" },
     { name = "platformdirs", specifier = ">=4.0" },
+    { name = "requests", specifier = ">=2.32" },
 ]
 
 [package.metadata.requires-dev]

@@ -1,6 +1,8 @@
 import pytest
 
+from conftest import SECRET_BODY
 from minirag_mcp.ingest.parser import (
+    MAX_REDIRECTS,
     SUPPORTED_EXTENSIONS,
     ParsedDoc,
     ParserError,
@@ -10,6 +12,7 @@ from minirag_mcp.ingest.parser import (
     extract_title,
     parse_file,
     parse_html,
+    parse_url,
     strip_data_uri_images,
 )
 
@@ -268,6 +271,61 @@ def test_a_document_that_is_only_a_placeholder_keeps_it():
     md = f"![]({PNG})"
     assert strip_data_uri_images(md) == md
     assert strip_data_uri_images("") == ""
+
+
+# --- the host rule survives a redirect (SSRF) ----------------------------------------
+
+
+def test_redirect_to_cloud_metadata_is_refused(redirect_server):
+    """The bypass this guard exists for: an allowed public host answering
+    `302 -> http://<metadata>/`. Checking only the URL the caller supplied leaves the
+    hop unexamined, and the metadata response reaches the converter."""
+    with pytest.raises(ParserError) as exc:
+        parse_url(redirect_server.url("/redirect-to-metadata"))
+    msg = str(exc.value)
+    assert "metadata.test" in msg  # names the blocked host
+    assert "169.254.169.254" in msg and "link-local" in msg  # and why
+    assert "redirected" in msg  # and that a redirect, not the given URL, was refused
+    assert "ALLOW_PRIVATE_URLS" in msg  # and the way out
+    # The strongest evidence: the request was never made. The stand-in metadata
+    # endpoint is this same server, so a followed redirect would show up here.
+    assert redirect_server.hits == [f"public.test:{redirect_server.port}/redirect-to-metadata"]
+
+
+def test_the_refused_redirect_target_really_would_have_been_served(redirect_server):
+    """Turning the host rule off fetches exactly what the refusal withheld — so the
+    refusal is doing work, and the guard reads the setting in force at call time
+    rather than whatever the cached converter was first built with."""
+    url = redirect_server.url("/redirect-to-metadata")
+    with pytest.raises(ParserError):
+        parse_url(url)
+    assert SECRET_BODY in parse_url(url, allow_private=True).markdown
+
+
+def test_a_blocked_url_asked_for_directly_is_not_reported_as_a_redirect(redirect_server):
+    """The same guard covers the first request, and the refusal says what happened —
+    the caller asked for this host, nothing redirected them to it."""
+    with pytest.raises(ParserError) as exc:
+        parse_url(redirect_server.url("/latest/meta-data/", host="metadata.test"))
+    msg = str(exc.value)
+    assert "metadata.test" in msg and "link-local" in msg
+    assert "redirected" not in msg
+    assert redirect_server.hits == []  # refused before the socket was opened
+
+
+def test_a_redirect_chain_across_public_hosts_is_followed(redirect_server):
+    """The guard refuses blocked hops, not redirects."""
+    doc = parse_url(redirect_server.url("/chain/3"))
+    assert "PUBLIC-BODY" in doc.markdown
+    assert doc.title == "Public Page"
+
+
+def test_redirects_are_capped(redirect_server):
+    """requests would follow 30. Each hop is another chance to reach somewhere the
+    guard has to refuse, and no document needs that many."""
+    assert MAX_REDIRECTS == 5
+    with pytest.raises(ParserError, match=f"Exceeded {MAX_REDIRECTS} redirects"):
+        parse_url(redirect_server.url(f"/chain/{MAX_REDIRECTS + 4}"))
 
 
 def test_every_entry_point_strips_placeholders(tmp_path):

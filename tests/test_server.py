@@ -105,7 +105,7 @@ async def test_ingest_data_and_url(app, monkeypatch, public_dns):
     import minirag_mcp.ingest.pipeline as pmod
     from minirag_mcp.ingest.parser import ParsedDoc
 
-    monkeypatch.setattr(pmod, "parse_url", lambda url: ParsedDoc("# R\n\nRemote body.", "R"))
+    monkeypatch.setattr(pmod, "parse_url", lambda url, **kw: ParsedDoc("# R\n\nRemote body.", "R"))
     mcp, _ = app
     async with Client(mcp) as c:
         r = (

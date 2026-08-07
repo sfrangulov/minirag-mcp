@@ -412,9 +412,17 @@ merges with them.
   its addresses is blocked, and the error names the host and the reason. A
   host that simply fails to resolve is reported as a fetch error, not a
   security refusal.
-  Set `ALLOW_PRIVATE_URLS=1` to turn the host check off — for a server you
-  point at an internal wiki on purpose. It changes nothing else: `file:` and
-  `data:` are still rejected.
+- The host check runs again on **every redirect hop**, not just on the URL you
+  supplied. Checking only the given URL leaves the fetch itself open: a
+  permitted public host answering `302 -> http://169.254.169.254/` would have
+  had its redirect followed and the metadata response indexed. The check sits
+  in the HTTP transport, which sees each hop, and the chain is capped at 5
+  redirects (`requests` would follow 30). A refusal names the blocked host and
+  says the fetch was redirected there.
+- Set `ALLOW_PRIVATE_URLS=1` to turn the host check off — for a server you
+  point at an internal wiki on purpose. It applies to redirect hops as well as
+  to the URL you supply, and changes nothing else: `file:` and `data:` are
+  still rejected.
 - No other network I/O happens: only an explicit `ingest_url` call and the
   one-time embedding-model download ever leave the machine.
 - Single local user, no authentication. One writer per `DB_PATH` at a time

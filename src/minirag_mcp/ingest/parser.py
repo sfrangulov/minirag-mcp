@@ -8,7 +8,11 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
+import requests
 from markitdown import MarkItDown
+from requests.adapters import HTTPAdapter
+
+from minirag_mcp.security import SecurityError, check_url
 
 SUPPORTED_EXTENSIONS = frozenset(
     {
@@ -115,11 +119,31 @@ _SEPARATORS_RE = re.compile(r"[\s_\-.]+")
 _SPACE_RE = re.compile(r"\s+")
 _MIN_INFORMATIVE_STEM = 4
 
-_converter: MarkItDown | None = None
+# The header markitdown puts on its own session; kept when we supply ours instead.
+_ACCEPT_HEADER = "text/markdown, text/html;q=0.9, text/plain;q=0.8, */*;q=0.1"
+# requests defaults to 30 redirects. Every hop is a fresh chance for a redirect to
+# land somewhere the guard has to refuse, and no document needs more than a handful.
+MAX_REDIRECTS = 5
+
+_converters: dict[bool, MarkItDown] = {}
 
 
 class ParserError(Exception):
     pass
+
+
+class BlockedFetchError(SecurityError):
+    """A URL the transport guard refused — the first request or any redirect hop.
+
+    Carries the URL that was actually blocked, which is what lets `parse_url` say
+    whether the refusal happened on the URL the caller asked for or on a redirect
+    target it was sent to.
+    """
+
+    def __init__(self, url: str, reason: str) -> None:
+        super().__init__(f"{reason} (blocked URL: {url})")
+        self.url = url
+        self.reason = reason
 
 
 @dataclass(frozen=True)
@@ -132,11 +156,54 @@ class ParsedDoc:
     has_title: bool = True
 
 
-def _md() -> MarkItDown:
-    global _converter
-    if _converter is None:
-        _converter = MarkItDown(enable_plugins=False)
-    return _converter
+class _GuardedHTTPAdapter(HTTPAdapter):
+    """A transport that re-runs the URL check on every request it is handed.
+
+    Validating only the URL the caller supplied leaves the fetch itself unguarded: a
+    permitted public host answering `302 -> http://169.254.169.254/` would have its
+    redirect followed, and cloud-metadata content would reach the index. requests
+    calls `send()` once per hop, so a check here necessarily sees every redirect
+    target as well as the original URL.
+    """
+
+    def __init__(self, *, allow_private: bool, **kwargs) -> None:
+        self._allow_private = allow_private
+        super().__init__(**kwargs)
+
+    def send(self, request, **kwargs):
+        try:
+            check_url(request.url, allow_private=self._allow_private)
+        except SecurityError as e:
+            raise BlockedFetchError(request.url, str(e)) from e
+        return super().send(request, **kwargs)
+
+
+def _guarded_session(allow_private: bool) -> requests.Session:
+    session = requests.Session()
+    session.headers.update({"Accept": _ACCEPT_HEADER})
+    adapter = _GuardedHTTPAdapter(allow_private=allow_private)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    session.max_redirects = MAX_REDIRECTS
+    return session
+
+
+def _md(allow_private: bool = False) -> MarkItDown:
+    """The converter, cached per host-rule setting.
+
+    The guard is baked into the instance's session, so one cached converter would
+    freeze whichever `allow_private` was in force when it was first built. Keying the
+    cache on the flag keeps the answer current; the flag is a bool, so at most two
+    converters ever exist. Callers that never fetch (files, HTML strings) take the
+    default instance — its session is unused.
+    """
+    converter = _converters.get(allow_private)
+    if converter is None:
+        converter = MarkItDown(
+            enable_plugins=False, requests_session=_guarded_session(allow_private)
+        )
+        _converters[allow_private] = converter
+    return converter
 
 
 def _lines_with_fence_state(markdown: str) -> Iterator[tuple[str, bool]]:
@@ -322,9 +389,23 @@ def parse_html(html: str, title: str | None = None) -> ParsedDoc:
     return ParsedDoc(markdown=markdown, title=found or "Untitled", has_title=found is not None)
 
 
-def parse_url(url: str) -> ParsedDoc:
+def parse_url(url: str, *, allow_private: bool = False) -> ParsedDoc:
+    """Fetch and convert a URL, with the host rule enforced on every redirect hop.
+
+    `allow_private` is the caller's current ALLOW_PRIVATE_URLS setting; it selects the
+    converter whose session carries the matching guard.
+    """
     try:
-        result = _md().convert_url(url)
+        result = _md(allow_private).convert_url(url)
+    except BlockedFetchError as e:
+        # The refusal must reach the user as a refusal, naming the host that was
+        # blocked and — when it was not the URL they asked for — the redirect.
+        if e.url != url:
+            raise ParserError(
+                f"Refused to fetch {url}: it redirected to {e.url}, which this server "
+                f"must not fetch. {e.reason}"
+            ) from e
+        raise ParserError(e.reason) from e
     except Exception as e:
         raise ParserError(f"Failed to fetch/convert {url}: {e}") from e
     markdown = _converted_markdown(result)

@@ -94,7 +94,7 @@ def test_ingest_url_mocked(corpus, capsys, monkeypatch, public_dns):
     import minirag_mcp.ingest.pipeline as pmod
     from minirag_mcp.ingest.parser import ParsedDoc
 
-    monkeypatch.setattr(pmod, "parse_url", lambda url: ParsedDoc("# R\n\nRemote body.", "R"))
+    monkeypatch.setattr(pmod, "parse_url", lambda url, **kw: ParsedDoc("# R\n\nRemote body.", "R"))
     run(["ingest-url", "https://example.com/p", "--base-dir", str(corpus)])
     assert "example.com" in capsys.readouterr().out
 
