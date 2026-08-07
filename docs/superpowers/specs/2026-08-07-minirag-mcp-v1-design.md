@@ -212,7 +212,9 @@ GIL during embedding). The thread: recursive scan of roots (or the one path) →
 extension whitelist → sha256 diff against the index → ingest new/changed,
 delete vanished → update job counts `{scanned, ingested, skipped, deleted,
 failed}` and per-file errors. `sync_status` reads the in-memory record.
-Starting a new sync while one is running is rejected.
+Starting a new sync while one is running is rejected. Sources of type
+`data`/`url` are never touched by sync — they are not files under the roots
+and persist until deleted explicitly via `delete_file`.
 
 Scanner whitelist: `.md .markdown .txt .pdf .docx .pptx .xlsx .html .htm .csv
 .epub .ipynb`. Hidden entries (dot-prefixed) and `node_modules`,
