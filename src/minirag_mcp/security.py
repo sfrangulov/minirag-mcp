@@ -103,9 +103,16 @@ def check_url(url: str, *, allow_private: bool = False) -> None:
     metadata (169.254.169.254) and to internal services (localhost:8080/admin).
 
     A host given as an address literal is judged as written; a name is resolved and
-    rejected if **any** of its addresses is blocked, since the fetch would pick one of
+    rejected if **any** of its addresses is blocked, since the fetch could use any of
     them. Resolution failure raises URLResolutionError, not SecurityError — a name that
     does not resolve is a broken fetch, not an attack.
+
+    What this does not stop: the resolution here is the guard's own, and requests
+    resolves the name again when it connects. A short-TTL name can therefore answer
+    public to this check and private to the fetch. Closing that means pinning the
+    validated address at the socket layer, which this server does not do — so the rule
+    stops accidental and injection-driven access to obvious internal targets, not an
+    attacker who controls DNS for the name being ingested.
 
     `allow_private` (ALLOW_PRIVATE_URLS) turns the host rule off for a user who
     deliberately indexes an internal wiki. It also skips resolution: with no verdict

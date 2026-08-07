@@ -191,7 +191,7 @@ class Pipeline:
     ) -> IngestResult:
         # Checked here so a URL the caller supplied is refused before any request is
         # made; the same rule is re-applied per redirect hop inside parse_url, which
-        # is the only place that can see where a fetch actually ends up.
+        # is the only place that sees where a fetch is redirected to.
         check_url(url, allow_private=self.config.allow_private_urls)
         doc = parse_url(url, allow_private=self.config.allow_private_urls)
         explicit = title.strip() if title and title.strip() else None

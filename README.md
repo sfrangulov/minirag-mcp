@@ -423,6 +423,14 @@ merges with them.
   point at an internal wiki on purpose. It applies to redirect hops as well as
   to the URL you supply, and changes nothing else: `file:` and `data:` are
   still rejected.
+- **Known gap: DNS rebinding.** The check resolves the host itself, and then
+  `requests` resolves it again when it opens the connection — two independent
+  lookups, so a name with a short TTL can answer with a public address for the
+  check and a private one for the fetch. Closing that means pinning the
+  validated address at the socket layer, which this server does not do. Read
+  the host rule accordingly: it stops accidental and injection-driven access to
+  obvious internal targets, and it is not a defence against an attacker who
+  controls DNS for a name you ask the server to ingest.
 - No other network I/O happens: only an explicit `ingest_url` call and the
   one-time embedding-model download ever leave the machine.
 - Single local user, no authentication. One writer per `DB_PATH` at a time
@@ -455,11 +463,13 @@ and retry.
 The file is bigger than the 100 MB default limit. Raise it:
 `export MAX_FILE_SIZE=209715200` (200 MB), or exclude the file.
 
-**"Refusing to fetch from host ...".**
-`ingest_url` was pointed at a host that is, or resolves to, a private or local
-address. If that is deliberate — an internal wiki, a service on this machine —
-set `ALLOW_PRIVATE_URLS=1`. If it is not, treat the URL as untrusted: it may
-have come from a document in the index rather than from you.
+**"Refusing to fetch from host ..." / "... it redirected to ...".**
+`ingest_url` was pointed at — or redirected to — a host that is, or resolves
+to, a private or local address. If that is deliberate — an internal wiki, a
+service on this machine — set `ALLOW_PRIVATE_URLS=1`. If it is not, treat the
+URL as untrusted: it may have come from a document in the index rather than
+from you. A refusal that names a host you never typed means the page you asked
+for redirected there.
 
 **"Path outside configured document roots".**
 The path (or what a symlink resolves to) isn't inside any configured root.
