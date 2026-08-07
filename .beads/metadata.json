@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "minirag_mcp",
+  "project_id": "63ac12e8-3430-4cc6-b5ce-7ee2fce2135f"
+}
