@@ -14,7 +14,8 @@ SUPPORTED_EXTENSIONS = frozenset(
      ".html", ".htm", ".csv", ".epub", ".ipynb"}
 )
 
-_H1_RE = re.compile(r"^#\s+(.+?)\s*$", re.MULTILINE)
+_H1_RE = re.compile(r"^#\s+(.+?)\s*$")
+_FENCE_RE = re.compile(r"^(```+|~~~+)")
 
 _converter: MarkItDown | None = None
 
@@ -36,12 +37,33 @@ def _md() -> MarkItDown:
     return _converter
 
 
+def _first_h1(markdown: str) -> str | None:
+    """First ATX H1 outside fenced code blocks.
+
+    A `# ` line inside a fence is code (a shell or Python comment), not a title.
+    """
+    fence: str | None = None
+    for line in markdown.split("\n"):
+        stripped = line.lstrip()
+        if fence is None:
+            match = _FENCE_RE.match(stripped)
+            if match:
+                fence = match.group(1)
+                continue
+            heading = _H1_RE.match(line)
+            if heading:
+                return heading.group(1).strip()
+        elif stripped.startswith(fence[0] * len(fence)):
+            fence = None
+    return None
+
+
 def extract_title(markdown: str, explicit: str | None, fallback: str) -> str:
     if explicit and explicit.strip():
         return explicit.strip()
-    m = _H1_RE.search(markdown)
-    if m:
-        return m.group(1)
+    h1 = _first_h1(markdown)
+    if h1:
+        return h1
     return fallback
 
 

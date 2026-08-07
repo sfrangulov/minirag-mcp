@@ -64,3 +64,18 @@ def test_parse_file_invalid_pdf(tmp_path):
     # Verify it gracefully falls back to treating it as plain text
     assert "not a real pdf" in doc.markdown
     assert doc.title == "broken"
+
+
+def test_h1_inside_code_fence_is_not_a_title():
+    md = "```\n# This is inside a code fence\n```\n\nActual body"
+    assert extract_title(md, None, "fallback") == "fallback"
+
+
+def test_real_h1_after_fenced_fake_wins():
+    md = "```\n# Fenced Fake Title\n```\n\n# Real Title\n\nBody"
+    assert extract_title(md, None, "fallback") == "Real Title"
+
+
+def test_h1_after_tilde_fence():
+    md = "~~~\n# fake\n~~~\n\n# Real\n\nBody"
+    assert extract_title(md, None, "fallback") == "Real"
