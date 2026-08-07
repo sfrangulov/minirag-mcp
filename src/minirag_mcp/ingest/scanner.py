@@ -30,7 +30,17 @@ class SyncDiff:
 
 
 def scan_roots(roots: Sequence[Path]) -> list[ScanEntry]:
+    """Recursively scan roots for files with whitelisted extensions.
+
+    Skips hidden directories (dot-prefixed) and SKIP_DIRS. Prunes directory traversal
+    for SKIP_DIRS and hidden dirs, but includes symlinked files with whitelisted extensions.
+    Symlinked directories are not traversed (os.walk followlinks=False avoids cycles).
+    Overlapping roots are tolerated: each file is reported once (deduplicated by path).
+
+    Returns entries sorted by path.
+    """
     entries: list[ScanEntry] = []
+    seen: set[Path] = set()
     for root in roots:
         for dirpath, dirnames, filenames in os.walk(root):
             dirnames[:] = sorted(
@@ -42,6 +52,11 @@ def scan_roots(roots: Sequence[Path]) -> list[ScanEntry]:
                 p = Path(dirpath) / name
                 if p.suffix.lower() not in SUPPORTED_EXTENSIONS:
                     continue
+                # Dedupe by resolved path to handle overlapping roots
+                resolved = p.resolve()
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
                 st = p.stat()
                 entries.append(ScanEntry(path=p, size=st.st_size, mtime=st.st_mtime))
     entries.sort(key=lambda e: e.path)
@@ -62,6 +77,22 @@ def compute_diff(
     max_file_size: int,
     scope: Path | None = None,
 ) -> SyncDiff:
+    """Compute sync diff: files to ingest, delete, and unchanged status.
+
+    Uses mtime fast-path: if mtime matches, file is considered unchanged without hashing.
+    This is a deliberate trade-off — equal mtime is trusted, so an mtime-preserving restore
+    (cp -p, rsync -a, git checkout) may leave a stale index entry. Re-sync will detect and
+    update it only if mtime differs (then hash is compared).
+
+    Args:
+        entries: Scanned disk files.
+        indexed: Files currently in the index (SourceInfo from Store).
+        max_file_size: Files larger than this are marked oversized (not ingested).
+        scope: If provided, limit processing to files under this path.
+
+    Returns:
+        SyncDiff with to_ingest, to_delete, unchanged, and oversized lists.
+    """
     indexed_files = {
         s.source: s for s in indexed if s.source_type == "file" and _in_scope(s.source, scope)
     }
@@ -102,7 +133,21 @@ class FileState:
 
 
 def compute_states(entries: list[ScanEntry], indexed: list[SourceInfo]) -> list[FileState]:
-    by_source = {s.source: s for s in indexed}
+    """Compute file states: ingested, stale, or not_ingested for disk files + data/url sources.
+
+    States for disk files (source_type="file"):
+    - "ingested": mtime matches indexed record, or content hash matches (file unchanged).
+    - "stale": mtime differs AND hash differs (file changed on disk).
+    - "not_ingested": file not in index.
+
+    Uses mtime fast-path: if mtime matches, no hash is computed. Equal mtime is trusted,
+    so mtime-preserving restores (cp -p, rsync -a, git checkout) may mark changed files
+    as ingested. Re-sync will detect and correct if mtime changes.
+
+    Indexed data/url sources are appended as "ingested" and never filtered.
+    Results sorted by source path.
+    """
+    by_source = {s.source: s for s in indexed if s.source_type == "file"}
     states: list[FileState] = []
     for e in entries:
         prior = by_source.get(str(e.path))

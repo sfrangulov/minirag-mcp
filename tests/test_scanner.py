@@ -99,3 +99,23 @@ def test_compute_states(tmp_path):
     assert states[str(b)] == "stale"
     assert states[str(c)] == "not_ingested"
     assert states["note-1"] == "ingested" and states["https://x.io/p"] == "ingested"
+
+
+def test_compute_states_ignores_data_source_colliding_with_file_path(tmp_path):
+    from minirag_mcp.ingest.scanner import compute_states
+
+    f = tmp_path / "a.md"
+    f.write_text("on disk, never ingested")
+    entries = scan_roots([tmp_path])
+    indexed = [info(str(f), source_type="data", file_hash="unrelated", mtime=-1.0)]
+    states = compute_states(entries, indexed)
+    disk_rows = [s for s in states if s.source_type == "file"]
+    assert [s.state for s in disk_rows] == ["not_ingested"]
+
+
+def test_scan_roots_dedupes_overlapping_roots(tmp_path):
+    inner = tmp_path / "inner"
+    inner.mkdir()
+    (inner / "i.md").write_text("x")
+    entries = scan_roots([tmp_path, inner])
+    assert [e.path for e in entries] == [inner / "i.md"]
