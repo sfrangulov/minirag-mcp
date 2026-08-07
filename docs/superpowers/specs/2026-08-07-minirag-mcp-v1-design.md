@@ -19,9 +19,10 @@ Differences from the reference:
   readability layer: markitdown's HtmlConverter converts the whole `<body>`
   without boilerplate removal — accepted trade-off (user decision 2026-08-07);
   revisit with a readability pass only if index noise hurts in practice.
-- **`ingest_url` tool** (not in the reference): the server fetches a page
-  itself via markitdown's `convert_url` — YouTube/Wikipedia/RSS get special
-  handling for free.
+- **Two tools beyond parity**: `ingest_url` — the server fetches a page
+  itself via markitdown's `convert_url` (YouTube/Wikipedia/RSS get special
+  handling for free); `read_file` — return a source's full indexed Markdown
+  (chunks joined in order; original file bytes are not stored).
 - **Multilingual embedding model by default** (Russian + English corpora work
   out of the box).
 - **Smarter default storage**: index lives next to the documents, model cache
@@ -33,7 +34,7 @@ All documentation, tool descriptions, and code are in English.
 ## Goals
 
 1. Tool-for-tool parity with the reference's 9 MCP tools and CLI commands,
-   plus `ingest_url` (10 tools total).
+   plus `ingest_url` and `read_file` (11 tools total).
 2. Same environment-variable contract (names) where applicable; defaults
    deviate deliberately for `DB_PATH`/`CACHE_DIR` (see Configuration).
 3. Local-first: file/data ingestion and search never touch the network after
@@ -108,7 +109,7 @@ src/minirag_mcp/
 Each module is independently testable; `server.py` and `cli/` share the same
 core (`pipeline`, `store`, `embedder`) and contain no business logic.
 
-## MCP tools (10 = 9 parity + ingest_url)
+## MCP tools (11 = 9 parity + ingest_url + read_file)
 
 | Tool | Input | Output |
 |---|---|---|
@@ -117,9 +118,10 @@ core (`pipeline`, `store`, `embedder`) and contain no business logic.
 | `ingest_file` | `filePath` (absolute, inside a root) | `{source, chunkCount, title}` — re-ingest replaces chunks |
 | `ingest_data` | `data`, `source` (stable id), `format: text\|markdown\|html`, `title?` | same; html goes through markitdown HtmlConverter |
 | `ingest_url` | `url` (http/https only), `source?` (default: the URL), `title?` | fetch + convert via markitdown `convert_url`; re-ingest replaces |
-| `query_documents` | `query`, `topK?` (default 8), `scope?` (absolute path prefix or list) | results: `{text, source, title, chunkIndex, score}` |
+| `query_documents` | `query`, `topK?` (default 8), `scope?` (absolute path prefix or list) | `results`: `{text, source, title, chunkIndex, score}`; plus `sources`: distinct matched sources in rank order with `{source, title, hits}` |
 | `read_chunk_neighbors` | `chunkIndex` + `filePath` or `source`, `before?`, `after?` | surrounding chunks in order |
-| `list_files` | `scope?` | supported files under roots + ingestion state (ingested / not ingested / stale) + `ingest_data` sources |
+| `read_file` | `filePath` or `source` | the source's full indexed Markdown: `{source, sourceType, title, chunkCount, text}` (chunks joined in order) |
+| `list_files` | `scope?` | files on disk under roots with state `ingested` \| `not_ingested` \| `stale` (hash/mtime mismatch), plus indexed `data`/`url` sources |
 | `delete_file` | `filePath` or `source` | removes all chunks for that source |
 | `status` | — | config summary, model, chunk/source counts, index health; **works even when config is invalid** and explains the error |
 
@@ -135,6 +137,7 @@ minirag-mcp sync [path]            # synchronous, progress to stderr
 minirag-mcp ingest-url <url> [--source S]
 minirag-mcp query "..." [--scope P]...
 minirag-mcp read-neighbors (--file-path P | --source S) --chunk-index N
+minirag-mcp read <path> | --source <id>
 minirag-mcp list
 minirag-mcp status
 minirag-mcp delete <path> | --source <id>
@@ -230,6 +233,15 @@ optional `RAG_MAX_FILES` → optional `scope` prefix filter on `source`.
 **Neighbors:** fetch by `source` + `chunk_index` range `[i−before, i+after]`
 (defaults: `before=1`, `after=1`), ordered.
 
+**Read (full source):** all chunks of a source in `chunk_index` order, joined
+with a blank line. This is the indexed Markdown reconstruction, not the
+original file bytes.
+
+**List:** scan roots (recursive, whitelist) and join with the index: state is
+`ingested` (hash or mtime matches), `stale` (both differ), or `not_ingested`
+(absent from the index); indexed `data`/`url` sources are appended as
+`ingested`.
+
 ## Chunking
 
 Two-stage, operating on Markdown (the universal intermediate):
@@ -283,6 +295,6 @@ test corpus; they are internal (not env-configurable) in v1.
 - **Integration (slow marker, real model, cached locally):** full
   ingest → query on a tmpdir corpus (RU + EN, one PDF/DOCX fixture, code-block
   markdown), hybrid ranking sanity (exact identifier query finds its chunk).
-- **E2E:** fastmcp in-memory client exercising all 10 tools over the MCP
+- **E2E:** fastmcp in-memory client exercising all 11 tools over the MCP
   protocol (`ingest_url` with a mocked fetch — tests stay offline); CLI smoke
   via runner (ingest → query → delete; flag-over-env precedence).

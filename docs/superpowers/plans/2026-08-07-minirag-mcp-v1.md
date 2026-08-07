@@ -1070,7 +1070,7 @@ git commit -m "feat: lazy fastembed wrapper with registry dim lookup"
   - `@dataclass(frozen=True) ChunkRecord(id: str, source: str, source_type: str, title: str, chunk_index: int, text: str, vector: list[float], file_hash: str, mtime: float, ingested_at: str)`
   - `@dataclass(frozen=True) SearchResult(text: str, source: str, title: str, chunk_index: int, score: float, distance: float | None)`
   - `@dataclass(frozen=True) SourceInfo(source: str, source_type: str, title: str, chunk_count: int, file_hash: str, mtime: float)`
-  - `class Store` with `__init__(db_path: Path, dim: int)` (creates dir/table/FTS index idempotently), `replace_source(source, records: Sequence[ChunkRecord]) -> None`, `delete_source(source) -> int`, `neighbors(source, chunk_index, before=1, after=1) -> list[SearchResult]` (score=0.0, distance=None), `list_sources(scopes: tuple[str, ...] = ()) -> list[SourceInfo]` (sorted by source), `get_source(source) -> SourceInfo | None`, `chunk_count() -> int`, `source_count() -> int`
+  - `class Store` with `__init__(db_path: Path, dim: int)` (creates dir/table/FTS index idempotently), `replace_source(source, records: Sequence[ChunkRecord]) -> None`, `delete_source(source) -> int`, `neighbors(source, chunk_index, before=1, after=1) -> list[SearchResult]` (score=0.0, distance=None), `all_chunks(source) -> list[SearchResult]` (every chunk of the source in `chunk_index` order), `list_sources(scopes: tuple[str, ...] = ()) -> list[SourceInfo]` (sorted by source), `get_source(source) -> SourceInfo | None`, `chunk_count() -> int`, `source_count() -> int`
   - Module helpers: `_sql_str(s: str) -> str` (escape `'` → `''`), `_scope_clause(scopes) -> str | None` (`source LIKE 'p%' OR ...`)
 
 - [ ] **Step 1: Write the failing tests**
@@ -1138,6 +1138,13 @@ def test_neighbors_window_and_order(store):
     assert [g.chunk_index for g in got] == [13, 14, 15, 16, 17]  # >10 rows must survive default limits
     edge = store.neighbors("/a.md", 0, before=3, after=1)
     assert [g.chunk_index for g in edge] == [0, 1]
+
+
+def test_all_chunks_full_order(store):
+    store.replace_source("/a.md", [rec("/a.md", i, f"chunk {i}") for i in range(25)])
+    got = store.all_chunks("/a.md")
+    assert [g.chunk_index for g in got] == list(range(25))  # all rows, ordered
+    assert store.all_chunks("/missing.md") == []
 
 
 def test_list_sources_scopes_and_many_rows(store):
@@ -1273,6 +1280,18 @@ class Store:
     def neighbors(self, source: str, chunk_index: int, before: int = 1, after: int = 1) -> list[SearchResult]:
         lo, hi = max(0, chunk_index - before), chunk_index + after
         clause = f"source = '{_sql_str(source)}' AND chunk_index >= {lo} AND chunk_index <= {hi}"
+        rows = self._table.search().where(clause).limit(_LIST_LIMIT).to_list()
+        rows.sort(key=lambda r: r["chunk_index"])
+        return [
+            SearchResult(
+                text=r["text"], source=r["source"], title=r["title"],
+                chunk_index=r["chunk_index"], score=0.0, distance=None,
+            )
+            for r in rows
+        ]
+
+    def all_chunks(self, source: str) -> list[SearchResult]:
+        clause = f"source = '{_sql_str(source)}'"
         rows = self._table.search().where(clause).limit(_LIST_LIMIT).to_list()
         rows.sort(key=lambda r: r["chunk_index"])
         return [
@@ -2021,6 +2040,8 @@ git commit -m "feat: ingest pipeline for files, data, and URLs"
   - `scan_roots(roots: Sequence[Path]) -> list[ScanEntry]` — recursive, whitelist extensions, prunes hidden dirs (dot-prefixed) and `SKIP_DIRS`, skips hidden files, sorted by path
   - `@dataclass(frozen=True) SyncDiff(to_ingest: list[Path], to_delete: list[str], unchanged: list[Path], oversized: list[Path])`
   - `compute_diff(entries: list[ScanEntry], indexed: list[SourceInfo], *, max_file_size: int, scope: Path | None = None) -> SyncDiff` — mtime fast-path (equal mtime ⇒ unchanged, no hashing), else sha256 compare; `to_delete` = indexed `file`-type sources under scope that are not on disk; `data`/`url` sources never appear.
+  - `@dataclass(frozen=True) FileState(source: str, source_type: str, title: str, state: str, chunk_count: int)` — `state` ∈ `ingested | not_ingested | stale`
+  - `compute_states(entries: list[ScanEntry], indexed: list[SourceInfo]) -> list[FileState]` — one entry per file on disk (`ingested` when hash or mtime matches, `stale` when both differ, `not_ingested` when absent from the index; `title=""`/`chunk_count=0` for not-ingested), then every indexed `data`/`url` source appended as `ingested`, sorted by source.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2104,6 +2125,29 @@ def test_diff_scope_limits_both_sides(tmp_path):
     diff = compute_diff(entries, indexed, max_file_size=10**9, scope=tmp_path / "in")
     assert diff.to_ingest == [fin]
     assert diff.to_delete == []  # out/gone.md is outside scope: not touched
+
+
+def test_compute_states(tmp_path):
+    from minirag_mcp.ingest.scanner import compute_states
+
+    a = tmp_path / "a.md"
+    a.write_text("ingested content")
+    b = tmp_path / "b.md"
+    b.write_text("changed on disk")
+    c = tmp_path / "c.md"
+    c.write_text("never ingested")
+    entries = scan_roots([tmp_path])
+    indexed = [
+        info(str(a), file_hash=file_sha256(a), mtime=a.stat().st_mtime),
+        info(str(b), file_hash="old-hash", mtime=-1.0),
+        info("note-1", source_type="data"),
+        info("https://x.io/p", source_type="url"),
+    ]
+    states = {s.source: s.state for s in compute_states(entries, indexed)}
+    assert states[str(a)] == "ingested"
+    assert states[str(b)] == "stale"
+    assert states[str(c)] == "not_ingested"
+    assert states["note-1"] == "ingested" and states["https://x.io/p"] == "ingested"
 ```
 
 - [ ] **Step 2: Run to verify failure**
@@ -2207,6 +2251,33 @@ def compute_diff(
         to_ingest=to_ingest, to_delete=sorted(to_delete),
         unchanged=unchanged, oversized=oversized,
     )
+
+
+@dataclass(frozen=True)
+class FileState:
+    source: str
+    source_type: str
+    title: str
+    state: str  # "ingested" | "not_ingested" | "stale"
+    chunk_count: int
+
+
+def compute_states(entries: list[ScanEntry], indexed: list[SourceInfo]) -> list[FileState]:
+    by_source = {s.source: s for s in indexed}
+    states: list[FileState] = []
+    for e in entries:
+        prior = by_source.get(str(e.path))
+        if prior is None:
+            states.append(FileState(str(e.path), "file", "", "not_ingested", 0))
+        elif prior.mtime == e.mtime or prior.file_hash == file_sha256(e.path):
+            states.append(FileState(str(e.path), "file", prior.title, "ingested", prior.chunk_count))
+        else:
+            states.append(FileState(str(e.path), "file", prior.title, "stale", prior.chunk_count))
+    for s in indexed:
+        if s.source_type in ("data", "url"):
+            states.append(FileState(s.source, s.source_type, s.title, "ingested", s.chunk_count))
+    states.sort(key=lambda s: s.source)
+    return states
 ```
 
 - [ ] **Step 4: Run to verify pass**
@@ -2499,7 +2570,7 @@ git commit -m "feat: sync engine with single background job manager"
 
 ---
 
-### Task 13: server.py + __main__.py — 10 MCP tools
+### Task 13: server.py + __main__.py — 11 MCP tools
 
 **Files:**
 - Create: `src/minirag_mcp/server.py`, `src/minirag_mcp/__main__.py`, `tests/test_server.py`
@@ -2510,7 +2581,7 @@ git commit -m "feat: sync engine with single background job manager"
   - `create_app(config: Config | None, *, config_error: str | None = None, embedder=None) -> FastMCP` — builds the FastMCP app; `embedder=None` means a real `Embedder(config.model_name, config.cache_dir)`; heavy objects (store/embedder/pipeline/sync manager) are built lazily on first tool call so the server starts instantly and `status` works without touching the model
   - `run_server() -> None` — loads config from `os.environ` (capturing `ConfigError` into degraded mode) and calls `mcp.run()` (stdio)
   - `main() -> None` in `__main__.py`: `sys.argv[1:]` empty → `run_server()`, else CLI app (Task 14 wires it; until then `main` imports lazily so this task stays testable)
-  - Tool names and parameter names (parity): `sync_start(path=None)`, `sync_status(jobId)`, `ingest_file(filePath)`, `ingest_data(data, source, format="text", title=None)`, `ingest_url(url, source=None, title=None)`, `query_documents(query, topK=8, scope=None)`, `read_chunk_neighbors(chunkIndex, filePath=None, source=None, before=1, after=1)`, `list_files(scope=None)`, `delete_file(filePath=None, source=None)`, `status()`
+  - Tool names and parameter names (parity + extras): `sync_start(path=None)`, `sync_status(jobId)`, `ingest_file(filePath)`, `ingest_data(data, source, format="text", title=None)`, `ingest_url(url, source=None, title=None)`, `query_documents(query, topK=8, scope=None)` → `{results, sources}` where `sources` = distinct matched sources in rank order `{source, title, hits}`, `read_chunk_neighbors(chunkIndex, filePath=None, source=None, before=1, after=1)`, `read_file(filePath=None, source=None)` → `{source, sourceType, title, chunkCount, text}` (chunks joined with a blank line), `list_files(scope=None)` → files on disk with `state` `ingested|not_ingested|stale` plus data/url sources (uses `scan_roots` + `compute_states`), `delete_file(filePath=None, source=None)`, `status()`
   - All domain exceptions (`SecurityError`, `ConfigError`, pipeline errors, `ParserError`, `SyncBusyError`, `KeyError`, `UnknownModelError`, `EmptyDocumentError`, ...) surface as `ToolError` with the original message.
 
 - [ ] **Step 1: Write the failing tests**
@@ -2541,13 +2612,14 @@ def app(tmp_path, fake_embedder):
     return create_app(cfg, embedder=fake_embedder), root
 
 
-async def test_all_ten_tools_listed(app):
+async def test_all_eleven_tools_listed(app):
     mcp, _ = app
     async with Client(mcp) as c:
         names = {t.name for t in await c.list_tools()}
     assert names == {
         "sync_start", "sync_status", "ingest_file", "ingest_data", "ingest_url",
-        "query_documents", "read_chunk_neighbors", "list_files", "delete_file", "status",
+        "query_documents", "read_chunk_neighbors", "read_file", "list_files",
+        "delete_file", "status",
     }
 
 
@@ -2565,6 +2637,9 @@ async def test_sync_then_query_then_neighbors(app):
         assert res["results"], "expected at least one search result"
         top = res["results"][0]
         assert {"text", "source", "title", "chunkIndex", "score"} <= set(top)
+        assert res["sources"], "expected aggregated sources"
+        assert {"source", "title", "hits"} <= set(res["sources"][0])
+        assert res["sources"][0]["source"] == top["source"]  # rank order preserved
 
         nb = (await c.call_tool(
             "read_chunk_neighbors",
@@ -2573,17 +2648,29 @@ async def test_sync_then_query_then_neighbors(app):
         assert nb["chunks"]
 
 
-async def test_ingest_file_and_delete(app):
+async def test_ingest_file_read_list_delete(app):
     mcp, root = app
     f = root / "new.md"
     f.write_text("# New\n\nFresh content body that is long enough to index.")
     async with Client(mcp) as c:
         r = (await c.call_tool("ingest_file", {"filePath": str(f)})).data
         assert r["source"] == str(f) and r["chunkCount"] >= 1
+
+        full = (await c.call_tool("read_file", {"filePath": str(f)})).data
+        assert full["source"] == str(f) and full["sourceType"] == "file"
+        assert "Fresh content body" in full["text"]
+        assert full["chunkCount"] == r["chunkCount"]
+
         listed = (await c.call_tool("list_files", {})).data
-        assert any(x["source"] == str(f) for x in listed["files"])
+        by_source = {x["source"]: x for x in listed["files"]}
+        assert by_source[str(f)]["state"] == "ingested"
+        # auth.md/err.md exist on disk but were not ingested in this test's client session
+        assert any(x["state"] == "not_ingested" for x in listed["files"])
+
         d = (await c.call_tool("delete_file", {"filePath": str(f)})).data
         assert d["deletedChunks"] >= 1
+        with pytest.raises(Exception, match="not"):
+            await c.call_tool("read_file", {"filePath": str(f)})
 
 
 async def test_ingest_file_outside_root_is_tool_error(app):
@@ -2653,6 +2740,7 @@ from minirag_mcp import __version__
 from minirag_mcp.config import Config, ConfigError, load_config
 from minirag_mcp.embedder import Embedder
 from minirag_mcp.ingest.pipeline import Pipeline
+from minirag_mcp.ingest.scanner import compute_states, scan_roots
 from minirag_mcp.security import resolve_in_roots
 from minirag_mcp.store import SearchResult, Store
 from minirag_mcp.sync import SyncManager
@@ -2771,7 +2859,11 @@ def create_app(
             max_distance=c.config.max_distance, grouping=c.config.grouping,
             max_files=c.config.max_files,
         )
-        return {"results": [_result_dict(r) for r in results]}
+        sources: dict[str, dict] = {}
+        for r in results:  # rank order: first hit of a source fixes its position
+            agg = sources.setdefault(r.source, {"source": r.source, "title": r.title, "hits": 0})
+            agg["hits"] += 1
+        return {"results": [_result_dict(r) for r in results], "sources": list(sources.values())}
 
     @mcp.tool
     @guard
@@ -2795,16 +2887,45 @@ def create_app(
 
     @mcp.tool
     @guard
+    def read_file(filePath: str | None = None, source: str | None = None) -> dict:
+        """Read a source's full indexed content (all chunks in order, as Markdown)."""
+        c = ctx()
+        if filePath is not None:
+            key = str(resolve_in_roots(filePath, c.config.roots))
+        elif source is not None:
+            key = source
+        else:
+            raise ToolError("Provide filePath or source")
+        chunks = c.store.all_chunks(key)
+        if not chunks:
+            raise ToolError(f"Source not found in index: {key}")
+        info = c.store.get_source(key)
+        return {
+            "source": key,
+            "sourceType": info.source_type,
+            "title": info.title,
+            "chunkCount": len(chunks),
+            "text": "\n\n".join(ch.text for ch in chunks),
+        }
+
+    @mcp.tool
+    @guard
     def list_files(scope: str | list[str] | None = None) -> dict:
-        """List indexed sources (files, data items, URLs) with their state."""
-        infos = ctx().store.list_sources(scopes=_scopes(scope))
+        """List files on disk (with ingestion state) and indexed data/url sources."""
+        c = ctx()
+        scopes = _scopes(scope)
+        entries = scan_roots(c.config.roots)
+        if scopes:
+            entries = [e for e in entries if any(str(e.path).startswith(p) for p in scopes)]
+        indexed = c.store.list_sources(scopes=scopes)
+        states = compute_states(entries, indexed)
         return {
             "files": [
                 {
-                    "source": i.source, "sourceType": i.source_type, "title": i.title,
-                    "chunkCount": i.chunk_count,
+                    "source": s.source, "sourceType": s.source_type, "title": s.title,
+                    "state": s.state, "chunkCount": s.chunk_count,
                 }
-                for i in infos
+                for s in states
             ]
         }
 
@@ -2904,7 +3025,7 @@ git commit -m "feat: FastMCP server with 10 tools and degraded-config mode"
 
 **Interfaces:**
 - Consumes: everything above.
-- Produces: cyclopts `app` with subcommands `ingest`, `ingest-url`, `sync`, `query`, `read-neighbors`, `list`, `status`, `delete`. Shared option quartet on every command: `--base-dir` (repeatable), `--db-path`, `--cache-dir`, `--model-name` (flags beat env; note: flags come AFTER the subcommand — documented deviation from the reference's global-flags-first style). `--json` (`Annotated[bool, Parameter(name="--json")]`) switches to JSON output. Human output → stdout; errors → stderr + `SystemExit(1)`. CLI paths may be relative (resolved against cwd, `require_absolute=False`).
+- Produces: cyclopts `app` with subcommands `ingest`, `ingest-url`, `sync`, `query`, `read-neighbors`, `read`, `list`, `status`, `delete`. `read` prints a source's full indexed Markdown; `list` shows disk files with `ingested|not_ingested|stale` state plus data/url sources (same `compute_states` join as the server). Shared option quartet on every command: `--base-dir` (repeatable), `--db-path`, `--cache-dir`, `--model-name` (flags beat env; note: flags come AFTER the subcommand — documented deviation from the reference's global-flags-first style). `--json` (`Annotated[bool, Parameter(name="--json")]`) switches to JSON output. Human output → stdout; errors → stderr + `SystemExit(1)`. CLI paths may be relative (resolved against cwd, `require_absolute=False`).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2954,7 +3075,7 @@ def test_list_and_status_and_delete(corpus, capsys):
     capsys.readouterr()
     run(["list", "--base-dir", str(corpus), "--json"])
     files = json.loads(capsys.readouterr().out)["files"]
-    assert len(files) == 2
+    assert len(files) == 2 and all(f["state"] == "ingested" for f in files)
 
     run(["status", "--base-dir", str(corpus), "--json"])
     st = json.loads(capsys.readouterr().out)
@@ -2963,7 +3084,17 @@ def test_list_and_status_and_delete(corpus, capsys):
     run(["delete", str(corpus / "a.md"), "--base-dir", str(corpus)])
     capsys.readouterr()
     run(["list", "--base-dir", str(corpus), "--json"])
-    assert len(json.loads(capsys.readouterr().out)["files"]) == 1
+    files = json.loads(capsys.readouterr().out)["files"]
+    by_source = {f["source"]: f["state"] for f in files}
+    assert by_source[str(corpus / "a.md")] == "not_ingested"  # still on disk, gone from index
+
+
+def test_read_full_source(corpus, capsys):
+    run(["ingest", str(corpus / "a.md"), "--base-dir", str(corpus)])
+    capsys.readouterr()
+    run(["read", str(corpus / "a.md"), "--base-dir", str(corpus), "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert "Alpha body" in payload["text"] and payload["chunkCount"] >= 1
 
 
 def test_sync_and_read_neighbors(corpus, capsys):
@@ -3025,7 +3156,7 @@ from minirag_mcp import __version__
 from minirag_mcp.config import Config, ConfigError, load_config
 from minirag_mcp.embedder import Embedder
 from minirag_mcp.ingest.pipeline import Pipeline
-from minirag_mcp.ingest.scanner import scan_roots
+from minirag_mcp.ingest.scanner import compute_states, scan_roots
 from minirag_mcp.security import SecurityError, resolve_in_roots
 from minirag_mcp.store import SearchResult, Store
 from minirag_mcp.sync import run_sync
@@ -3215,6 +3346,36 @@ def read_neighbors(
     _emit(payload, json, "\n\n".join(f"[{r.chunk_index}] {r.text}" for r in chunks) or "no chunks")
 
 
+@app.command
+def read(
+    path: str | None = None,
+    *,
+    source: str | None = None,
+    base_dir: list[str] | None = None,
+    db_path: str | None = None,
+    cache_dir: str | None = None,
+    model_name: str | None = None,
+    json: JsonFlag = False,
+):
+    """Print a source's full indexed content (all chunks, as Markdown)."""
+    cfg, store, _ = _load(base_dir, db_path, cache_dir, model_name)
+    if path is not None:
+        try:
+            key = str(resolve_in_roots(path, cfg.roots, require_absolute=False))
+        except SecurityError as e:
+            _fail(str(e))
+    elif source is not None:
+        key = source
+    else:
+        _fail("provide a path or --source")
+    chunks = store.all_chunks(key)
+    if not chunks:
+        _fail(f"source not found in index: {key}")
+    text = "\n\n".join(ch.text for ch in chunks)
+    payload = {"source": key, "chunkCount": len(chunks), "text": text}
+    _emit(payload, json, text)
+
+
 @app.command(name="list")
 def list_cmd(
     *,
@@ -3225,17 +3386,22 @@ def list_cmd(
     model_name: str | None = None,
     json: JsonFlag = False,
 ):
-    """List indexed sources."""
-    _, store, _ = _load(base_dir, db_path, cache_dir, model_name)
-    infos = store.list_sources(scopes=tuple(scope or ()))
+    """List files on disk with ingestion state, plus indexed data/url sources."""
+    cfg, store, _ = _load(base_dir, db_path, cache_dir, model_name)
+    scopes = tuple(scope or ())
+    entries = scan_roots(cfg.roots)
+    if scopes:
+        entries = [e for e in entries if any(str(e.path).startswith(p) for p in scopes)]
+    states = compute_states(entries, store.list_sources(scopes=scopes))
     payload = {
         "files": [
-            {"source": i.source, "sourceType": i.source_type, "title": i.title,
-             "chunkCount": i.chunk_count}
-            for i in infos
+            {"source": s.source, "sourceType": s.source_type, "title": s.title,
+             "state": s.state, "chunkCount": s.chunk_count}
+            for s in states
         ]
     }
-    _emit(payload, json, "\n".join(f"{i.source} ({i.chunk_count} chunks)" for i in infos) or "index is empty")
+    human = "\n".join(f"[{s.state}] {s.source} ({s.chunk_count} chunks)" for s in states)
+    _emit(payload, json, human or "no files found")
 
 
 @app.command
@@ -3315,7 +3481,7 @@ git commit -m "feat: cyclopts CLI over the shared core"
 - Modify: `docs/superpowers/specs/2026-08-07-minirag-mcp-v1-design.md` (CLI flags line)
 
 **Interfaces:**
-- Produces: English README covering: what it is (local-first RAG MCP server), quick start (`claude mcp add minirag --scope user --env BASE_DIR=/abs/path -- uvx minirag-mcp`, plus Cursor/Codex JSON snippets), the 10 tools table, CLI examples, configuration table (all env vars + defaults, incl. the DB-next-to-docs and global-model-cache defaults), search tuning (`RAG_HYBRID_WEIGHT` etc.), security notes (roots boundary, symlink rejection, http/https-only `ingest_url`, single writer per DB_PATH, network promise: only `ingest_url` and the one-time model download touch the network), troubleshooting (model download, "No results found" → ingest first, changing MODEL_NAME → re-ingest).
+- Produces: English README covering: what it is (local-first RAG MCP server), quick start (`claude mcp add minirag --scope user --env BASE_DIR=/abs/path -- uvx minirag-mcp`, plus Cursor/Codex JSON snippets), the 11 tools table, CLI examples, configuration table (all env vars + defaults, incl. the DB-next-to-docs and global-model-cache defaults), search tuning (`RAG_HYBRID_WEIGHT` etc.), security notes (roots boundary, symlink rejection, http/https-only `ingest_url`, single writer per DB_PATH, network promise: only `ingest_url` and the one-time model download touch the network), troubleshooting (model download, "No results found" → ingest first, changing MODEL_NAME → re-ingest).
 
 - [ ] **Step 1: Write README.md** — follow the reference README's structure (Features / Quick Start / Supported Content / MCP Tools / CLI / Search Tuning / Configuration / Security and Operation / Troubleshooting), adapted to this stack. State explicitly: model is `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` (~220 MB, 50+ languages), downloads on first use to the platformdirs cache; index lives at `<first root>/.minirag/lancedb` by default.
 
@@ -3368,6 +3534,6 @@ bd close minirag-mcp-cuz --reason "v1 implemented per plan"
 
 ## Self-review notes (done at plan time)
 
-- **Spec coverage:** 10 tools → Task 13; CLI 8 commands → Task 14; env contract + deviations → Task 2; chunking (structural+semantic, atomic code fences, CHUNK_MIN_LENGTH) → Tasks 4–5; hybrid + RAG_* filters → Task 8; recursive scan/whitelist/skip dirs + sha256 diff → Task 11; sync semantics (single job, data/url untouched) → Tasks 11–12; security (roots, symlink, absolute-only MCP paths, URL schemes) → Tasks 3, 10, 13; degraded status → Task 13; README → Task 15; slow real-model test → Tasks 6, 16.
+- **Spec coverage:** 11 tools (incl. `read_file`, disk-state `list_files`, `sources` aggregation in query responses) → Task 13; CLI 9 commands (incl. `read`) → Task 14; env contract + deviations → Task 2; chunking (structural+semantic, atomic code fences, CHUNK_MIN_LENGTH) → Tasks 4–5; hybrid + RAG_* filters → Task 8; recursive scan/whitelist/skip dirs + sha256 diff → Task 11; sync semantics (single job, data/url untouched) → Tasks 11–12; security (roots, symlink, absolute-only MCP paths, URL schemes) → Tasks 3, 10, 13; degraded status → Task 13; README → Task 15; slow real-model test → Tasks 6, 16.
 - **Deliberate deviations locked in:** CLI flags after subcommand (spec updated in Task 15); `chunkIndex`-style camelCase only at the MCP/CLI boundary, snake_case internally.
 - **Known risks accepted:** FTS coverage of freshly added rows (probe-verified; `optimize()` fallback documented in Task 8); `.select()` on scalar search (fallback documented in Task 7); pytest-asyncio collection mode (fallback documented in Task 13).
