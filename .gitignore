@@ -12,3 +12,6 @@ build/
 # minirag-mcp runtime artifacts
 lancedb/
 models/
+
+# macOS
+.DS_Store
