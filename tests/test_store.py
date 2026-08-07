@@ -1,3 +1,5 @@
+import os
+
 import pytest
 
 from minirag_mcp.store import ChunkRecord, DimensionMismatchError, Store
@@ -132,6 +134,58 @@ def test_reopening_an_older_index_adds_the_missing_title_index(tmp_path):
     assert s2.chunk_count() == 1  # the upgrade did not disturb the data
     rows = s2._table.search("Sputnik", query_type="fts", fts_columns=["title"]).to_list()
     assert [r["id"] for r in rows] == ["/a.md#0"]
+
+
+def _chmod_tree(root, dir_mode: int, file_mode: int) -> None:
+    for path, dirs, files in os.walk(root, topdown=False):
+        for name in files:
+            os.chmod(os.path.join(path, name), file_mode)
+        for name in dirs:
+            os.chmod(os.path.join(path, name), dir_mode)
+    os.chmod(root, dir_mode)
+
+
+def test_opening_a_read_only_database_serves_reads(tmp_path):
+    """Reading a database must never require write access — the title-index upgrade is
+    an opportunistic extra, not a precondition for opening."""
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("root bypasses file permissions")
+    db = tmp_path / "db"
+    s1 = Store(db, dim=8)
+    s1._table.drop_index("title_idx")  # a table written by the older version
+    s1.replace_source("/a.md", [rec("/a.md", 0, "alpha body", title="Sputnik Handbook")])
+
+    _chmod_tree(db, 0o555, 0o444)
+    try:
+        with pytest.warns(RuntimeWarning, match="title"):
+            s2 = Store(db, dim=8)
+        assert s2.missing_fts_indices == ("title",)
+        assert s2.chunk_count() == 1
+        got = s2.search("alpha", [0.1] * 8, top_k=5, hybrid_weight=0.6)
+        assert [r.source for r in got] == ["/a.md"]
+    finally:
+        _chmod_tree(db, 0o755, 0o644)
+
+
+def test_index_creation_failure_does_not_propagate(tmp_path, monkeypatch):
+    """Concurrent opens of a not-yet-upgraded database race on the same index write;
+    the loser gets a commit conflict and must still hand back a usable Store."""
+    db = tmp_path / "db"
+    s1 = Store(db, dim=8)
+    s1._table.drop_index("title_idx")
+    s1.replace_source("/a.md", [rec("/a.md", 0, "alpha body", title="Sputnik Handbook")])
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("Retryable commit conflict for version 65")
+
+    monkeypatch.setattr(type(s1._table), "create_index", boom)
+    with pytest.warns(RuntimeWarning, match="title"):
+        s2 = Store(db, dim=8)
+    assert s2.missing_fts_indices == ("title",)
+    assert _fts_columns(s2) == {"text"}
+    monkeypatch.undo()
+    got = s2.search("alpha", [0.1] * 8, top_k=5, hybrid_weight=0.6)
+    assert [r.source for r in got] == ["/a.md"]
 
 
 def test_scope_prefix_with_like_wildcards_not_overmatching(store):

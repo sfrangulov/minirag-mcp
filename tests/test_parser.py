@@ -4,7 +4,9 @@ from minirag_mcp.ingest.parser import (
     SUPPORTED_EXTENSIONS,
     ParsedDoc,
     ParserError,
+    _is_boilerplate_heading,
     _is_informative_stem,
+    _strip_extension_suffix,
     extract_title,
     parse_file,
     parse_html,
@@ -127,8 +129,100 @@ def test_is_informative_stem():
     assert not _is_informative_stem("2026-08-07")  # numeric once separators drop out
     assert not _is_informative_stem("Untitled")
     assert not _is_informative_stem("DOCUMENT")  # case-insensitive
-    assert not _is_informative_stem("read_me")  # separators ignored
     assert not _is_informative_stem("   ")
+
+
+# Names a camera, a scanner, an office suite or a file manager hands out — they say
+# nothing about the document and must never be mistaken for a deliberate name.
+MACHINE_ISSUED_STEMS = [
+    "Untitled-1",
+    "New Document",
+    "Copy of Report",
+    "scan_001",
+    "IMG_20260807_123456",
+    "Копия документа (2)",
+    "Document1",
+    "DSC00042",
+]
+
+
+@pytest.mark.parametrize("stem", MACHINE_ISSUED_STEMS)
+def test_machine_issued_stems_are_not_informative(stem):
+    assert not _is_informative_stem(stem)
+
+
+@pytest.mark.parametrize("stem", MACHINE_ISSUED_STEMS)
+def test_machine_issued_stem_never_displaces_a_real_h1(tmp_path, stem):
+    f = tmp_path / f"{stem}.md"
+    f.write_text("# Real Document Heading\n\nBody.\n", encoding="utf-8")
+    assert parse_file(f).title == "Real Document Heading"
+
+
+@pytest.mark.parametrize(
+    "name", ["notes.md", "intro.md", "CHANGELOG.md", "0001-use-lancedb.md", "guide.txt"]
+)
+def test_a_real_h1_outranks_the_filename(tmp_path, name):
+    """A heading the author wrote is a better title than the file's name, whatever the
+    name looks like — the filename only steps in when the heading is boilerplate."""
+    f = tmp_path / name
+    f.write_text("# Real Document Heading\n\nBody.\n", encoding="utf-8")
+    assert parse_file(f).title == "Real Document Heading"
+
+
+@pytest.mark.parametrize(
+    "heading",
+    ["**1. Общие положения**", "1. Общие положения", "Лист изменений", "IV. Introduction"],
+)
+def test_boilerplate_h1_yields_to_the_filename(tmp_path, heading):
+    """The measured corpus problem: 76 documents titled "1 Общие положения" and 69
+    titled "Лист изменений" — the section name is shared, the filename is not."""
+    f = tmp_path / "И-112_ЗПС_Хранение ТМЗ на складах.md"
+    f.write_text(f"# {heading}\n\nТекст документа.\n", encoding="utf-8")
+    assert parse_file(f).title == "И-112 ЗПС Хранение ТМЗ на складах"
+
+
+def test_boilerplate_h1_with_a_generic_filename_still_wins_over_nothing(tmp_path):
+    f = tmp_path / "doc.md"
+    f.write_text("# Общие положения\n\nТекст.\n", encoding="utf-8")
+    assert parse_file(f).title == "Общие положения"
+
+
+def test_is_boilerplate_heading():
+    assert _is_boilerplate_heading("Общие положения")
+    assert _is_boilerplate_heading("1.2.3 Общие положения")
+    assert _is_boilerplate_heading("**Лист изменений**")
+    assert _is_boilerplate_heading("  2) TABLE OF CONTENTS  ")
+    assert _is_boilerplate_heading("III. Revision history")
+    # whole-heading match only: a real title that merely mentions the words stays
+    assert not _is_boilerplate_heading("Общие положения о премировании работников")
+    assert not _is_boilerplate_heading("Introduction to LanceDB indexing")
+    assert not _is_boilerplate_heading("И-112 ЗПС Хранение ТМЗ")
+
+
+def test_image_only_h1_is_not_a_title(tmp_path):
+    """markitdown renders a heading holding only a picture as an image placeholder;
+    it names nothing, so the filename must win (5 documents in the measured corpus)."""
+    f = tmp_path / "D-493 Передача данных.md"
+    f.write_text("# ![](data:image/x-emf;base64...)\n\nТекст.\n", encoding="utf-8")
+    assert parse_file(f).title == "D-493 Передача данных"
+
+
+def test_leftover_extension_is_not_part_of_the_title(tmp_path):
+    """`report.pdf.pdf` has the stem `report.pdf`; the extension is not part of a title."""
+    assert _strip_extension_suffix("report.pdf") == "report"
+    assert _strip_extension_suffix("И-112.DOCX") == "И-112"
+    assert _strip_extension_suffix("v1.2 plan") == "v1.2 plan"  # not an extension
+    f = tmp_path / "report.txt.txt"
+    f.write_text("plain body without a heading", encoding="utf-8")
+    assert parse_file(f).title == "report"
+
+
+def test_a_name_that_only_contains_a_generic_word_stays_informative():
+    """The rule rejects names made entirely of generic tokens, not every name that
+    happens to use one — otherwise real titles would be thrown away."""
+    assert _is_informative_stem("Document Management Policy")
+    assert _is_informative_stem("Scanner maintenance log")
+    assert _is_informative_stem("И-112_ЗПС_Хранение ТМЗ")
 
 
 def test_stem_normalisation_keeps_meaningful_punctuation(tmp_path):

@@ -153,6 +153,77 @@ def test_title_seeding_does_not_change_chunk_ids_or_count(pipe):
     ]
 
 
+def test_no_title_seeded_when_a_data_source_has_no_title(pipe):
+    """The source id identifies the document, it does not describe it: injecting it into
+    the embedded text is non-semantic noise in the very vector seeding exists to help."""
+    p, store, _ = pipe
+    body = "plain body about storage, long enough to keep."
+    res = p.ingest_data(body, source="notes-2026")
+    assert res.title == "notes-2026"
+    assert store.all_chunks("notes-2026")[0].text == body
+
+
+def test_explicit_data_title_is_seeded(pipe):
+    p, store, _ = pipe
+    p.ingest_data("plain body, long enough to keep.", source="notes-2026", title="Storage Policy")
+    assert store.all_chunks("notes-2026")[0].text.startswith("# Storage Policy\n\n")
+
+
+def test_html_data_without_a_title_is_not_seeded_with_the_fallback(pipe):
+    p, store, _ = pipe
+    res = p.ingest_data(
+        "<html><body><p>Body text long enough to keep around.</p></body></html>",
+        source="page-1",
+        fmt="html",
+    )
+    # the source id stands in, as it does for the other data formats — but only as
+    # metadata; it must not reach the embedded text
+    assert res.title == "page-1"
+    text = store.all_chunks("page-1")[0].text
+    assert "# Untitled" not in text and "# page-1" not in text
+
+
+def test_url_title_is_seeded_only_when_the_page_has_one(pipe, monkeypatch):
+    """A raw URL is an address, not a title — "# https://example.com/a/b?x=1&y=2" in the
+    embedded text buys nothing and costs relevance."""
+    import minirag_mcp.ingest.pipeline as mod
+    from minirag_mcp.ingest.parser import ParsedDoc
+
+    p, store, _ = pipe
+    url = "https://example.com/a/b?x=1&y=2"
+    # what parse_url returns for a titleless page: the URL as a stand-in title
+    monkeypatch.setattr(
+        mod,
+        "parse_url",
+        lambda u: ParsedDoc(markdown="Fetched body text.", title=u, has_title=False),
+    )
+    p.ingest_url(url)
+    assert store.all_chunks(url)[0].text == "Fetched body text."
+
+    monkeypatch.setattr(
+        mod,
+        "parse_url",
+        lambda u: ParsedDoc(markdown="Fetched body text.", title="Remote Page", has_title=True),
+    )
+    p.ingest_url(url)
+    assert store.all_chunks(url)[0].text.startswith("# Remote Page\n\n")
+
+
+def test_explicit_url_title_is_seeded_even_for_a_titleless_page(pipe, monkeypatch):
+    import minirag_mcp.ingest.pipeline as mod
+    from minirag_mcp.ingest.parser import ParsedDoc
+
+    p, store, _ = pipe
+    url = "https://example.com/a/b"
+    monkeypatch.setattr(
+        mod,
+        "parse_url",
+        lambda u: ParsedDoc(markdown="Fetched body text.", title=u, has_title=False),
+    )
+    p.ingest_url(url, title="Storage Policy")
+    assert store.all_chunks(url)[0].text.startswith("# Storage Policy\n\n")
+
+
 def test_ingest_url_mocked(pipe, monkeypatch):
     import minirag_mcp.ingest.pipeline as mod
     from minirag_mcp.ingest.parser import ParsedDoc

@@ -13,6 +13,7 @@ from minirag_mcp.config import Config
 from minirag_mcp.ingest import parser as _parser
 from minirag_mcp.ingest.parser import (
     SUPPORTED_EXTENSIONS,
+    find_title,
     parse_file,
     parse_html,
 )
@@ -83,9 +84,17 @@ class Pipeline:
         source: str,
         source_type: str,
         title: str,
+        seed_title: bool,
         file_hash: str = "",
         mtime: float = 0.0,
     ) -> IngestResult:
+        """Chunk, embed and store, replacing whatever `source` held before.
+
+        `seed_title` says whether `title` is a real title and may therefore be written
+        into chunk 0's text. Only the caller knows: a data source with no title of its
+        own is titled after its source id, and a titleless page after its URL — neither
+        belongs in the embedded text.
+        """
         blocks = split_markdown(markdown, max_chars=MAX_CHUNK_CHARS)
         texts = merge_blocks(
             blocks,
@@ -95,7 +104,8 @@ class Pipeline:
         )
         if not texts:
             raise EmptyDocumentError(f"No text content extracted from {source}")
-        texts[0] = _seed_title(texts[0], title)
+        if seed_title:
+            texts[0] = _seed_title(texts[0], title)
         vectors = self.embedder.embed_documents(texts)
         now = datetime.now(UTC).isoformat()
         records = [
@@ -133,6 +143,8 @@ class Pipeline:
             source=str(path),
             source_type="file",
             title=doc.title,
+            # a file's title is always a real one: metadata, a heading, or its name
+            seed_title=True,
             file_hash=file_sha256(path),
             mtime=path.stat().st_mtime,
         )
@@ -144,20 +156,31 @@ class Pipeline:
             raise UnsupportedFormatError(f"format must be one of {DATA_FORMATS}, got {fmt!r}")
         if fmt == "html":
             doc = parse_html(data, title=title)
-            markdown, final_title = doc.markdown, doc.title
+            markdown, real_title = doc.markdown, doc.title if doc.has_title else None
         else:
             markdown = data
-            from minirag_mcp.ingest.parser import extract_title
-
-            final_title = extract_title(markdown, title, source)
-        return self._chunk_and_store(markdown, source=source, source_type="data", title=final_title)
+            real_title = find_title(markdown, title)
+        # Without a title of its own the source id stands in, and an id is not a title.
+        return self._chunk_and_store(
+            markdown,
+            source=source,
+            source_type="data",
+            title=real_title or source,
+            seed_title=real_title is not None,
+        )
 
     def ingest_url(
         self, url: str, source: str | None = None, title: str | None = None
     ) -> IngestResult:
         check_url_scheme(url)
         doc = parse_url(url)
-        final_title = title.strip() if title and title.strip() else doc.title
+        explicit = title.strip() if title and title.strip() else None
+        # A titleless page is titled after its URL, which is an address, not a title.
+        real_title = explicit or (doc.title if doc.has_title else None)
         return self._chunk_and_store(
-            doc.markdown, source=source or url, source_type="url", title=final_title
+            doc.markdown,
+            source=source or url,
+            source_type="url",
+            title=real_title or doc.title,
+            seed_title=real_title is not None,
         )

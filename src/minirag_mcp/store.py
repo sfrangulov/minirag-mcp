@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import statistics
+import warnings
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -131,6 +132,8 @@ class Store:
         db_path.mkdir(parents=True, exist_ok=True)
         self._db = lancedb.connect(str(db_path))
         self.dim = dim
+        # FTS columns this instance could not index (see _ensure_fts_indices)
+        self.missing_fts_indices: tuple[str, ...] = ()
         try:
             self._table = self._db.open_table(TABLE)
         except Exception:
@@ -149,23 +152,50 @@ class Store:
                 ]
             )
             self._table = self._db.create_table(TABLE, schema=schema)
-            self._ensure_fts_indices()
+            self._ensure_fts_indices(db_path)
         else:
             self._check_dim(db_path, dim)
-            self._ensure_fts_indices()
+            self._ensure_fts_indices(db_path)
 
-    def _ensure_fts_indices(self) -> None:
-        """Create any FTS index the table is missing.
+    def _ensure_fts_indices(self, db_path: Path) -> None:
+        """Create any FTS index the table is missing — best effort, never fatal.
 
         Creating an FTS index on an empty table is supported (verified against
         lancedb 0.36), so a fresh table gets both here. Running this on open as well
         means an index built by an older version — `text` only — gains `title` search
         without a re-ingest of the corpus.
+
+        That upgrade is a write, and opening a database must not require write access:
+        a read-only copy would raise "Permission denied", and two processes opening the
+        same un-upgraded database race on the same commit ("Retryable commit conflict").
+        Both are stepped over with a warning. Searching `fts_columns=["text", "title"]`
+        against a table that only has the `text` index works — LanceDB searches the
+        indexes it has — so the only cost is that titles stay out of keyword results.
+
+        Warnings go through `warnings.warn`, never `print`: stdout is the MCP stdio
+        channel and anything written there corrupts the protocol.
         """
-        indexed = {col for idx in self._table.list_indices() for col in idx.columns}
+        try:
+            indexed = {col for idx in self._table.list_indices() for col in idx.columns}
+        except Exception:  # unreadable index manifest: treat every column as missing
+            indexed = set()
+        missing: list[str] = []
         for column in FTS_COLUMNS:
-            if column not in indexed:
+            if column in indexed:
+                continue
+            try:
                 self._table.create_index(column, config=FTS())
+            except Exception as e:
+                missing.append(column)
+                warnings.warn(
+                    f"Could not create the BM25 index on the {column!r} column of the index "
+                    f"at {db_path}: {e}. Search still works, but {column} content is not "
+                    f"keyword-searchable until the index exists — reopen the database with "
+                    f"write access (and no concurrent writer) to retry.",
+                    RuntimeWarning,
+                    stacklevel=3,
+                )
+        self.missing_fts_indices = tuple(missing)
 
     def _check_dim(self, db_path: Path, dim: int) -> None:
         """Fail early and clearly when an existing index has a different vector width.

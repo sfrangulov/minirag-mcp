@@ -23,9 +23,10 @@ built on [fastmcp](https://github.com/jlowin/fastmcp),
   so exact identifiers and error codes surface alongside semantically similar
   passages.
 - **Filenames are searchable** — keyword search covers document titles as well
-  as body text, and an informative filename becomes the document's title. In
-  many real document sets the filename is the only place the document code and
-  subject appear at all. See [Titles and filenames](#titles-and-filenames).
+  as body text, and an informative filename becomes the document's title when
+  the document's own heading is boilerplate. In many real document sets the
+  filename is the only place the document code and subject appear at all.
+  See [Titles and filenames](#titles-and-filenames).
 - **Multilingual by default** — the default embedding model covers 50+
   languages, so English and Russian corpora both work out of the box.
 - **12 file formats** ingested via `markitdown` (PDF, DOCX, PPTX, XLSX,
@@ -229,26 +230,41 @@ only looking at each side's ranking.
 **Titles and filenames.** The BM25 side indexes the `title` column as well as
 the chunk text, so a query matching a document's title finds it even when the
 term never appears in the body. For files the title is chosen as: converter
-metadata (only formats like HTML and EPUB carry it) → the **filename stem**,
-when it is informative → the first `# H1` → the stem. A stem counts as
-informative unless it is shorter than 4 characters, purely numeric, or a
-generic name (`untitled`, `document`, `doc`, `index`, `readme`, `new`, `copy`,
-`scan`, `image`); underscores become spaces and the rest is kept as-is, so
-`И-112_ЗПС_Хранение ТМЗ.docx` gives the title `И-112 ЗПС Хранение ТМЗ`.
+metadata (only formats like HTML and EPUB carry it) → the first `# H1`, unless
+it is **boilerplate** → the **filename stem**, when it is informative → the
+first `# H1` → the stem.
 
-The filename outranks the H1 because office documents typically open with
-boilerplate ("1. Общие положения") that is identical across a whole document
-set, while the filename names the document. The title is also prepended as a
-`# Title` line to the first chunk's text before embedding, so it reaches
-semantic search too — later chunks are untouched, and chunk boundaries, ids
-and counts are unaffected.
+A heading the author wrote is the best title available, so it wins by default.
+It steps aside when it names a section rather than the document — office
+document sets share their opening section ("1. Общие положения", "Лист
+изменений", "Introduction", "Table of contents"), so that heading is identical
+across the whole set — or when it holds no words at all, as a heading that is
+only a picture does. Then the filename takes over: a stem is informative
+unless it is shorter than 4 characters or, once pure-digit tokens are dropped,
+consists only of generic words (`untitled`, `document`, `new`, `copy`, `scan`,
+`img`, `dsc`, `screenshot`, `копия`, `документ`, …). That rejects the names
+machines hand out — `Untitled-1`, `IMG_20260807_123456`, `Копия документа
+(2)` — while keeping real names that merely contain such a word. Underscores
+become spaces and the rest is kept as-is, so `И-112_ЗПС_Хранение ТМЗ.docx`
+gives the title `И-112 ЗПС Хранение ТМЗ`.
+
+The title is also prepended as a `# Title` line to the first chunk's text
+before embedding, so it reaches semantic search too — later chunks are
+untouched, and chunk boundaries, ids and counts are unaffected. Data and URL
+sources are seeded only when they have a title of their own (given explicitly
+or found in the content): a source id or a bare URL identifies a document
+without describing it, and injecting it would only add noise to the vector.
 
 Both are ingest-time decisions: **already-indexed files keep the title they
 were ingested with until they are re-ingested.** `sync` will not do it for
 you — it treats a file whose content hash is unchanged as already ingested —
 so use `ingest_file` per file, or `delete_file` and re-sync. Keyword search
 over the `title` column, by contrast, needs no re-ingest: an index built by an
-earlier version gains the title index the next time it is opened.
+earlier version gains the title index the next time it is opened. That upgrade
+is best-effort — a read-only index directory, or a second process racing for
+the same commit, leaves the index as it was and warns instead of failing, so
+the database still opens and still searches (titles simply stay out of keyword
+results until an index can be built).
 
 <a id="hits-without-a-distance"></a>
 **Hits without a distance.** The vector side only fetches a bounded window of
