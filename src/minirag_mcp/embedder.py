@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -10,6 +11,16 @@ from fastembed import TextEmbedding
 
 class UnknownModelError(Exception):
     pass
+
+
+def _unit(vector: list[float]) -> list[float]:
+    """Scale to unit length so LanceDB's L2 ranking matches cosine similarity.
+
+    sentence-transformers paraphrase-* models are trained for cosine; for unit
+    vectors ‖a-b‖² = 2 - 2·cos, so L2 order and cosine order coincide.
+    """
+    norm = math.sqrt(sum(x * x for x in vector))
+    return [x / norm for x in vector] if norm else list(vector)
 
 
 class Embedder:
@@ -42,7 +53,7 @@ class Embedder:
     def embed_documents(self, texts: Sequence[str]) -> list[list[float]]:
         if not texts:
             return []
-        return [[float(x) for x in v] for v in self._load().embed(list(texts))]
+        return [_unit([float(x) for x in v]) for v in self._load().embed(list(texts))]
 
     def embed_query(self, text: str) -> list[float]:
-        return [[float(x) for x in v] for v in self._load().query_embed([text])][0]
+        return [_unit([float(x) for x in v]) for v in self._load().query_embed([text])][0]

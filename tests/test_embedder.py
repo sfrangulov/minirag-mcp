@@ -1,7 +1,9 @@
+import math
+
 import pytest
 
 from minirag_mcp.config import DEFAULT_MODEL
-from minirag_mcp.embedder import Embedder, UnknownModelError
+from minirag_mcp.embedder import Embedder, UnknownModelError, _unit
 
 
 def test_dim_from_registry_without_download(tmp_path):
@@ -24,3 +26,14 @@ def test_lazy_no_model_instantiation_on_init(tmp_path, monkeypatch):
 
     monkeypatch.setattr(mod, "TextEmbedding", boom)
     Embedder(DEFAULT_MODEL, cache_dir=tmp_path)  # must not raise
+
+
+def test_unit_scales_to_norm_one():
+    scaled = _unit([3.0, 4.0])
+    norm = math.sqrt(sum(x * x for x in scaled))
+    assert math.isclose(norm, 1.0, abs_tol=1e-9)
+    assert scaled == pytest.approx([0.6, 0.8])
+
+
+def test_unit_leaves_zero_vector_alone():
+    assert _unit([0.0, 0.0, 0.0]) == [0.0, 0.0, 0.0]
