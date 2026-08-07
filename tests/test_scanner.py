@@ -1,0 +1,101 @@
+from pathlib import Path
+
+from minirag_mcp.ingest.pipeline import file_sha256
+from minirag_mcp.ingest.scanner import ScanEntry, compute_diff, scan_roots
+from minirag_mcp.store import SourceInfo
+
+
+def info(source, *, source_type="file", file_hash="", mtime=0.0):
+    return SourceInfo(source=source, source_type=source_type, title="T",
+                      chunk_count=1, file_hash=file_hash, mtime=mtime)
+
+
+def make_tree(root: Path):
+    (root / "sub" / "deep").mkdir(parents=True)
+    (root / "a.md").write_text("a")
+    (root / "sub" / "b.txt").write_text("b")
+    (root / "sub" / "deep" / "c.pdf").write_bytes(b"%PDF-fake")
+    (root / "skip.py").write_text("nope")            # not whitelisted
+    (root / ".hidden.md").write_text("hidden file")   # hidden file
+    (root / ".git").mkdir()
+    (root / ".git" / "x.md").write_text("in hidden dir")
+    (root / "node_modules").mkdir()
+    (root / "node_modules" / "y.md").write_text("in skip dir")
+
+
+def test_scan_recursive_whitelist_and_skips(tmp_path):
+    make_tree(tmp_path)
+    entries = scan_roots([tmp_path])
+    names = [e.path.relative_to(tmp_path).as_posix() for e in entries]
+    assert names == ["a.md", "sub/b.txt", "sub/deep/c.pdf"]
+    assert all(isinstance(e, ScanEntry) and e.size > 0 for e in entries)
+
+
+def test_diff_new_changed_unchanged_deleted(tmp_path):
+    make_tree(tmp_path)
+    entries = scan_roots([tmp_path])
+    a = tmp_path / "a.md"
+    b = tmp_path / "sub" / "b.txt"
+    indexed = [
+        info(str(a), file_hash=file_sha256(a), mtime=a.stat().st_mtime),  # unchanged (mtime match)
+        info(str(b), file_hash="stale-hash", mtime=-1.0),                  # changed (hash differs)
+        info(str(tmp_path / "gone.md")),                                    # deleted from disk
+        info("https://x.io/p", source_type="url"),                          # never deleted by sync
+        info("note-1", source_type="data"),                                 # never deleted by sync
+    ]
+    diff = compute_diff(entries, indexed, max_file_size=10**9)
+    assert diff.unchanged == [a]
+    assert b in diff.to_ingest and (tmp_path / "sub" / "deep" / "c.pdf") in diff.to_ingest
+    assert diff.to_delete == [str(tmp_path / "gone.md")]
+
+
+def test_diff_mtime_differs_but_hash_same_is_unchanged(tmp_path):
+    f = tmp_path / "a.md"
+    f.write_text("stable content")
+    entries = [ScanEntry(path=f, size=f.stat().st_size, mtime=999.0)]
+    indexed = [info(str(f), file_hash=file_sha256(f), mtime=1.0)]
+    diff = compute_diff(entries, indexed, max_file_size=10**9)
+    assert diff.unchanged == [f] and diff.to_ingest == []
+
+
+def test_diff_oversized(tmp_path):
+    f = tmp_path / "big.md"
+    f.write_text("0123456789ABCDEF")
+    entries = scan_roots([tmp_path])
+    diff = compute_diff(entries, [], max_file_size=4)
+    assert diff.oversized == [f] and diff.to_ingest == []
+
+
+def test_diff_scope_limits_both_sides(tmp_path):
+    (tmp_path / "in").mkdir()
+    (tmp_path / "out").mkdir()
+    fin = tmp_path / "in" / "f.md"
+    fin.write_text("x")
+    entries = scan_roots([tmp_path])
+    indexed = [info(str(tmp_path / "out" / "gone.md"))]
+    diff = compute_diff(entries, indexed, max_file_size=10**9, scope=tmp_path / "in")
+    assert diff.to_ingest == [fin]
+    assert diff.to_delete == []  # out/gone.md is outside scope: not touched
+
+
+def test_compute_states(tmp_path):
+    from minirag_mcp.ingest.scanner import compute_states
+
+    a = tmp_path / "a.md"
+    a.write_text("ingested content")
+    b = tmp_path / "b.md"
+    b.write_text("changed on disk")
+    c = tmp_path / "c.md"
+    c.write_text("never ingested")
+    entries = scan_roots([tmp_path])
+    indexed = [
+        info(str(a), file_hash=file_sha256(a), mtime=a.stat().st_mtime),
+        info(str(b), file_hash="old-hash", mtime=-1.0),
+        info("note-1", source_type="data"),
+        info("https://x.io/p", source_type="url"),
+    ]
+    states = {s.source: s.state for s in compute_states(entries, indexed)}
+    assert states[str(a)] == "ingested"
+    assert states[str(b)] == "stale"
+    assert states[str(c)] == "not_ingested"
+    assert states["note-1"] == "ingested" and states["https://x.io/p"] == "ingested"
