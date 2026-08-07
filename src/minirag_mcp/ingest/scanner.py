@@ -9,6 +9,7 @@ from pathlib import Path
 
 from minirag_mcp.ingest.parser import SUPPORTED_EXTENSIONS
 from minirag_mcp.ingest.pipeline import file_sha256
+from minirag_mcp.scope import is_under
 from minirag_mcp.store import SourceInfo
 
 SKIP_DIRS = frozenset({"node_modules", "__pycache__", ".venv", "venv"})
@@ -87,10 +88,15 @@ def scan_roots(roots: Sequence[Path]) -> list[ScanEntry]:
 
 
 def _in_scope(path_str: str, scope: Path | None) -> bool:
+    """Whether `path_str` is the scope path itself or sits under it.
+
+    Both sides go through `Path` first, so a non-canonical spelling ("/a//b") is
+    compared in its normalised form; the containment rule itself is `scope.is_under`,
+    the same one the store's SQL filter and `list_files` apply.
+    """
     if scope is None:
         return True
-    p = Path(path_str)
-    return p == scope or scope in p.parents
+    return is_under(str(Path(path_str)), str(scope))
 
 
 def compute_diff(

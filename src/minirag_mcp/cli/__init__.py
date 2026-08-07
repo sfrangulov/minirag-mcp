@@ -16,6 +16,7 @@ from minirag_mcp.embedder import Embedder, UnknownModelError
 from minirag_mcp.ingest.pipeline import IngestResult, Pipeline
 from minirag_mcp.ingest.scanner import compute_states, scan_roots
 from minirag_mcp.results import aggregate_sources, result_dict
+from minirag_mcp.scope import is_under
 from minirag_mcp.security import SecurityError, resolve_in_roots
 from minirag_mcp.store import DimensionMismatchError, SearchResult, Store
 from minirag_mcp.sync import run_sync
@@ -319,7 +320,7 @@ def list_cmd(
     scopes = tuple(scope or ())
     entries = scan_roots(cfg.roots)
     if scopes:
-        entries = [e for e in entries if any(str(e.path).startswith(p) for p in scopes)]
+        entries = [e for e in entries if any(is_under(str(e.path), p) for p in scopes)]
     states = compute_states(entries, store.list_sources(scopes=scopes))
     payload = {
         "files": [

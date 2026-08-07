@@ -98,6 +98,18 @@ def test_ingest_url_mocked(corpus, capsys, monkeypatch):
     assert "example.com" in capsys.readouterr().out
 
 
+def test_list_scope_stops_at_a_path_component_boundary(tmp_path, capsys):
+    (tmp_path / "proj").mkdir()
+    (tmp_path / "project-secret").mkdir()
+    (tmp_path / "proj" / "a.md").write_text("# A\n\nProject body long enough to index.")
+    (tmp_path / "project-secret" / "b.md").write_text("# B\n\nSecret body long enough to index.")
+    run(["ingest", str(tmp_path / "project-secret"), "--base-dir", str(tmp_path)])
+    capsys.readouterr()
+    run(["list", "--base-dir", str(tmp_path), "--scope", str(tmp_path / "proj"), "--json"])
+    files = json.loads(capsys.readouterr().out)["files"]
+    assert [f["source"] for f in files] == [str(tmp_path / "proj" / "a.md")]
+
+
 def test_error_exits_nonzero(corpus, capsys):
     with pytest.raises(SystemExit) as exc:
         run(["delete", str(corpus / "never-ingested.md"), "--base-dir", str(corpus)])

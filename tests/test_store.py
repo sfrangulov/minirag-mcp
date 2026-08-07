@@ -188,6 +188,27 @@ def test_index_creation_failure_does_not_propagate(tmp_path, monkeypatch):
     assert [r.source for r in got] == ["/a.md"]
 
 
+def test_scope_stops_at_a_path_component_boundary(store):
+    for src in ("/data/proj/f.md", "/data/project-secret/f.md"):
+        store.replace_source(src, [rec(src, 0, "x")])
+    assert [s.source for s in store.list_sources(scopes=("/data/proj",))] == ["/data/proj/f.md"]
+    # a trailing separator names the same scope
+    assert [s.source for s in store.list_sources(scopes=("/data/proj/",))] == ["/data/proj/f.md"]
+
+
+def test_scope_matches_the_scoped_source_itself(store):
+    store.replace_source("/data/proj", [rec("/data/proj", 0, "x")])
+    store.replace_source("/data/project-secret", [rec("/data/project-secret", 0, "x")])
+    assert [s.source for s in store.list_sources(scopes=("/data/proj",))] == ["/data/proj"]
+
+
+def test_url_scope_stops_at_a_path_component_boundary(store):
+    for src in ("https://example.com/docs/page", "https://example.com/docs-private/page"):
+        store.replace_source(src, [rec(src, 0, "x", source_type="url")])
+    scoped = store.list_sources(scopes=("https://example.com/docs",))
+    assert [s.source for s in scoped] == ["https://example.com/docs/page"]
+
+
 def test_scope_prefix_with_like_wildcards_not_overmatching(store):
     for src in ("/docs_api/f1.md", "/docsXapi/f2.md", "/100%done/f4.md", "/100Xdone/f5.md"):
         store.replace_source(src, [rec(src, 0, "x")])

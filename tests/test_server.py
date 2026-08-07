@@ -120,6 +120,21 @@ async def test_ingest_data_and_url(app, monkeypatch):
             await c.call_tool("ingest_url", {"url": "file:///etc/passwd"})
 
 
+async def test_list_files_scope_stops_at_a_path_component_boundary(tmp_path, fake_embedder):
+    """A scope of .../proj must not list .../project-secret, on disk or in the index."""
+    root = tmp_path / "docs"
+    (root / "proj").mkdir(parents=True)
+    (root / "project-secret").mkdir()
+    (root / "proj" / "a.md").write_text("# A\n\nProject body long enough to index.")
+    (root / "project-secret" / "b.md").write_text("# B\n\nSecret body long enough to index.")
+    cfg = load_config({"BASE_DIR": str(root)}, cwd=root)
+    mcp = create_app(cfg, embedder=fake_embedder)
+    async with Client(mcp) as c:
+        await c.call_tool("ingest_file", {"filePath": str(root / "project-secret" / "b.md")})
+        listed = (await c.call_tool("list_files", {"scope": str(root / "proj")})).data
+    assert [f["source"] for f in listed["files"]] == [str(root / "proj" / "a.md")]
+
+
 async def test_status_reports_counts(app):
     mcp, root = app
     async with Client(mcp) as c:

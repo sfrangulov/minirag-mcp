@@ -12,6 +12,8 @@ import lancedb
 import pyarrow as pa
 from lancedb.index import FTS
 
+from minirag_mcp.scope import sql_clause, sql_str
+
 TABLE = "chunks"
 # Columns carrying BM25 indexes. `title` is indexed because for many document sets the
 # filename is where the document code and subject live, and nowhere else.
@@ -53,16 +55,6 @@ class SourceInfo:
     chunk_count: int
     file_hash: str
     mtime: float
-
-
-def _sql_str(s: str) -> str:
-    return s.replace("'", "''")
-
-
-def _scope_clause(scopes: tuple[str, ...]) -> str | None:
-    if not scopes:
-        return None
-    return " OR ".join(f"starts_with(source, '{_sql_str(p)}')" for p in scopes)
 
 
 _META_COLS = ["source", "source_type", "title", "chunk_index", "file_hash", "mtime"]
@@ -216,12 +208,12 @@ class Store:
         )
 
     def replace_source(self, source: str, records: Sequence[ChunkRecord]) -> None:
-        self._table.delete(f"source = '{_sql_str(source)}'")
+        self._table.delete(f"source = '{sql_str(source)}'")
         if records:
             self._table.add([asdict(r) for r in records])
 
     def delete_source(self, source: str) -> int:
-        clause = f"source = '{_sql_str(source)}'"
+        clause = f"source = '{sql_str(source)}'"
         before = len(self._table.search().where(clause).select(["id"]).limit(_LIST_LIMIT).to_list())
         if before:
             self._table.delete(clause)
@@ -231,7 +223,7 @@ class Store:
         self, source: str, chunk_index: int, before: int = 1, after: int = 1
     ) -> list[SearchResult]:
         lo, hi = max(0, chunk_index - before), chunk_index + after
-        clause = f"source = '{_sql_str(source)}' AND chunk_index >= {lo} AND chunk_index <= {hi}"
+        clause = f"source = '{sql_str(source)}' AND chunk_index >= {lo} AND chunk_index <= {hi}"
         rows = self._table.search().where(clause).limit(_LIST_LIMIT).to_list()
         rows.sort(key=lambda r: r["chunk_index"])
         return [
@@ -247,7 +239,7 @@ class Store:
         ]
 
     def all_chunks(self, source: str) -> list[SearchResult]:
-        clause = f"source = '{_sql_str(source)}'"
+        clause = f"source = '{sql_str(source)}'"
         rows = self._table.search().where(clause).limit(_LIST_LIMIT).to_list()
         rows.sort(key=lambda r: r["chunk_index"])
         return [
@@ -264,7 +256,7 @@ class Store:
 
     def _iter_meta(self, scopes: tuple[str, ...] = ()) -> list[dict]:
         q = self._table.search().select(_META_COLS)
-        clause = _scope_clause(scopes)
+        clause = sql_clause(scopes)
         if clause:
             q = q.where(clause)
         return q.limit(_LIST_LIMIT).to_list()
@@ -290,7 +282,7 @@ class Store:
     def get_source(self, source: str) -> SourceInfo | None:
         rows = (
             self._table.search()
-            .where(f"source = '{_sql_str(source)}'")
+            .where(f"source = '{sql_str(source)}'")
             .select(_META_COLS)
             .limit(_LIST_LIMIT)
             .to_list()
@@ -344,7 +336,7 @@ class Store:
         list is truncated to `top_k` last.
         """
         fetch = max(top_k * 4, 50)
-        clause = _scope_clause(scopes)
+        clause = sql_clause(scopes)
 
         vq = self._table.search(query_vector).limit(fetch)
         if clause:

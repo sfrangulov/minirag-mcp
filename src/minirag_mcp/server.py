@@ -16,6 +16,7 @@ from minirag_mcp.embedder import Embedder
 from minirag_mcp.ingest.pipeline import Pipeline
 from minirag_mcp.ingest.scanner import compute_states, scan_roots
 from minirag_mcp.results import aggregate_sources, result_dict
+from minirag_mcp.scope import is_under
 from minirag_mcp.security import resolve_in_roots
 from minirag_mcp.store import Store
 from minirag_mcp.sync import SyncManager
@@ -248,7 +249,7 @@ def create_app(
         scopes = _scopes(scope)
         entries = scan_roots(c.config.roots)
         if scopes:
-            entries = [e for e in entries if any(str(e.path).startswith(p) for p in scopes)]
+            entries = [e for e in entries if any(is_under(str(e.path), p) for p in scopes)]
         indexed = c.store.list_sources(scopes=scopes)
         states = compute_states(entries, indexed)
         return {

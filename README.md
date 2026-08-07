@@ -373,6 +373,12 @@ merges with them.
   inside a root are followed and indexed as normal, under the link's path.
 - MCP tool file paths must be absolute. The CLI accepts relative paths and
   resolves them against the current directory.
+- `scope` (on `query_documents` and `list_files`, and `--scope` on the CLI)
+  narrows results to a path **and everything under it**. Matching stops at a
+  path separator, so `/docs/proj` covers `/docs/proj/notes.md` but never
+  `/docs/project-secret/notes.md`. The same rule covers data and url source
+  ids, with `/` as the separator: a scope of `https://example.com/docs` matches
+  `https://example.com/docs/page` and not `https://example.com/docs-private`.
 - `MAX_FILE_SIZE` is enforced before a file is parsed.
 - `ingest_url` accepts only `http`/`https` URLs. `file:` and `data:` schemes
   are rejected — `markitdown`'s `convert_uri` would otherwise read arbitrary
