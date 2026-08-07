@@ -92,3 +92,30 @@ def test_unknown_job_id(env):
     mgr = SyncManager(pipeline, store, cfg)
     with pytest.raises(KeyError):
         mgr.status("nope")
+
+
+def test_run_sync_scope_is_resolved(env):
+    cfg, store, pipeline, root = env
+    seed(root)
+    # A non-canonical path spelling must still match (root/./sub is the same dir).
+    scope = root / "." / "sub"
+    counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size, scope=scope)
+    assert counts["ingested"] == 1 and errors == []
+    assert store.get_source(str((root / "sub" / "b.md").resolve())) is not None
+
+
+def test_run_sync_scope_single_file(env):
+    cfg, store, pipeline, root = env
+    seed(root)
+    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size, scope=root / "a.md")
+    assert counts["ingested"] == 1
+
+
+def test_finished_at_set_when_state_terminal(env):
+    cfg, store, pipeline, root = env
+    seed(root)
+    mgr = SyncManager(pipeline, store, cfg)
+    job_id = mgr.start()
+    mgr.wait()
+    job = mgr.status(job_id)
+    assert job.state in ("succeeded", "failed") and job.finished_at is not None

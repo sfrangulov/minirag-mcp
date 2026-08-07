@@ -61,6 +61,17 @@ def run_sync(
     scope: Path | None = None,
     on_event: Callable[[str], None] | None = None,
 ) -> tuple[dict[str, int], list[dict]]:
+    """Scan `roots`, diff against the store, ingest/delete accordingly.
+
+    `scope`, if given, is resolved to its canonical form (`Path.resolve()`)
+    before use, matching `Config.roots` (which are always resolved). Without
+    this, a non-canonical scope (e.g. an unresolved `/tmp` on macOS, where
+    the real path is `/private/tmp`) silently matches zero files: the diff
+    comes back empty, the job "succeeds" with all-zero counts, and no error
+    is ever raised.
+    """
+    scope = scope.resolve() if scope is not None else None
+
     def emit(msg: str) -> None:
         if on_event:
             on_event(msg)
@@ -116,18 +127,21 @@ class SyncManager:
 
         def work() -> None:
             job.state = "running"
+            # Invariant: finished_at is stamped before state flips to a terminal
+            # value, so a poller never observes a terminal state with finished_at
+            # still None.
             try:
                 counts, errors = run_sync(
                     self._pipeline, self._store, self._config.roots,
                     self._config.max_file_size, scope=scope,
                 )
                 job.counts, job.errors = counts, errors
+                job.finished_at = _now()
                 job.state = "succeeded"
             except Exception as e:  # catastrophic failure (scan error, DB down, ...)
                 job.error = str(e)
-                job.state = "failed"
-            finally:
                 job.finished_at = _now()
+                job.state = "failed"
 
         self._thread = threading.Thread(target=work, name="minirag-sync", daemon=True)
         self._thread.start()
@@ -140,5 +154,14 @@ class SyncManager:
         return job
 
     def wait(self, timeout: float = 30.0) -> None:
+        """Block until the current worker thread finishes (test/CLI helper).
+
+        Reads `self._thread` without synchronization, so this is only safe
+        when called after `start()` has returned in the same calling thread
+        (the ordinary test/CLI usage: `start()` then `wait()`). It is not a
+        general-purpose "block until done" API for arbitrary concurrent
+        callers — a `wait()` racing a concurrent `start()` may see a stale
+        or `None` `self._thread` and return without waiting for the new job.
+        """
         if self._thread is not None:
             self._thread.join(timeout)
