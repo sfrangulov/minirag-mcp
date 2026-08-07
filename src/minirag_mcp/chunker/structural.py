@@ -64,12 +64,17 @@ def split_markdown(markdown: str, *, max_chars: int = 1500) -> list[Block]:
         fence = _FENCE_RE.match(line.lstrip())
         if fence:
             flush_para()
-            marker = fence.group(1)[0] * 3
+            open_seq = fence.group(1)
             code = [line]
             i += 1
             while i < len(lines):
                 code.append(lines[i])
-                if lines[i].lstrip().startswith(marker):
+                lstripped = lines[i].lstrip()
+                if (
+                    lstripped.startswith(open_seq[0])
+                    and len(lstripped) - len(lstripped.lstrip(open_seq[0]))
+                    >= len(open_seq)
+                ):
                     break
                 i += 1
             if pending_heading is not None:
@@ -80,8 +85,9 @@ def split_markdown(markdown: str, *, max_chars: int = 1500) -> list[Block]:
         elif _HEADING_RE.match(line):
             flush_para()
             if pending_heading is not None:
-                blocks.append(Block(text=pending_heading, is_code=False))
-            pending_heading = line.strip()
+                pending_heading = pending_heading + "\n\n" + line.strip()
+            else:
+                pending_heading = line.strip()
         elif line.strip() == "":
             flush_para()
         else:

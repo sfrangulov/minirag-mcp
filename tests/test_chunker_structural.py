@@ -54,3 +54,20 @@ def test_long_paragraph_split_at_whitespace():
     assert all(len(b.text) <= 200 for b in blocks)
     joined = " ".join(b.text for b in blocks)
     assert joined.split() == md.split()  # no words lost
+
+
+def test_longer_fence_not_closed_by_shorter_inner_fence():
+    md = "````\nouter\n```\ninner\n```\nend\n````"
+    blocks = split_markdown(md)
+    assert len(blocks) == 1 and blocks[0].is_code
+
+
+def test_consecutive_headings_glue_together():
+    blocks = split_markdown("# A\n## B\n### C\nBody text.")
+    assert len(blocks) == 1
+    assert blocks[0].text == "# A\n\n## B\n\n### C\n\nBody text."
+
+
+def test_trailing_consecutive_headings_one_block():
+    blocks = split_markdown("Body.\n\n# A\n## B")
+    assert blocks[-1].text == "# A\n\n## B"
