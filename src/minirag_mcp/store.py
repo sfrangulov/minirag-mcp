@@ -162,8 +162,12 @@ class Store:
         rows.sort(key=lambda r: r["chunk_index"])
         return [
             SearchResult(
-                text=r["text"], source=r["source"], title=r["title"],
-                chunk_index=r["chunk_index"], score=0.0, distance=None,
+                text=r["text"],
+                source=r["source"],
+                title=r["title"],
+                chunk_index=r["chunk_index"],
+                score=0.0,
+                distance=None,
             )
             for r in rows
         ]
@@ -174,8 +178,12 @@ class Store:
         rows.sort(key=lambda r: r["chunk_index"])
         return [
             SearchResult(
-                text=r["text"], source=r["source"], title=r["title"],
-                chunk_index=r["chunk_index"], score=0.0, distance=None,
+                text=r["text"],
+                source=r["source"],
+                title=r["title"],
+                chunk_index=r["chunk_index"],
+                score=0.0,
+                distance=None,
             )
             for r in rows
         ]
@@ -195,8 +203,12 @@ class Store:
             counts[row["source"]] = counts.get(row["source"], 0) + 1
         return [
             SourceInfo(
-                source=src, source_type=row["source_type"], title=row["title"],
-                chunk_count=counts[src], file_hash=row["file_hash"], mtime=row["mtime"],
+                source=src,
+                source_type=row["source_type"],
+                title=row["title"],
+                chunk_count=counts[src],
+                file_hash=row["file_hash"],
+                mtime=row["mtime"],
             )
             for src, row in sorted(by_source.items())
         ]
@@ -213,8 +225,12 @@ class Store:
             return None
         r = rows[0]
         return SourceInfo(
-            source=r["source"], source_type=r["source_type"], title=r["title"],
-            chunk_count=len(rows), file_hash=r["file_hash"], mtime=r["mtime"],
+            source=r["source"],
+            source_type=r["source_type"],
+            title=r["title"],
+            chunk_count=len(rows),
+            file_hash=r["file_hash"],
+            mtime=r["mtime"],
         )
 
     def chunk_count(self) -> int:
@@ -281,13 +297,19 @@ class Store:
                 score = 1.0 / (1.0 + distance) if distance is not None else 0.0
             results.append(
                 SearchResult(
-                    text=r["text"], source=r["source"], title=r["title"],
-                    chunk_index=r["chunk_index"], score=float(score), distance=distance,
+                    text=r["text"],
+                    source=r["source"],
+                    title=r["title"],
+                    chunk_index=r["chunk_index"],
+                    score=float(score),
+                    distance=distance,
                 )
             )
 
-        if grouping in ("similar", "related") and results and all(
-            r.distance is not None for r in results
+        if (
+            grouping in ("similar", "related")
+            and results
+            and all(r.distance is not None for r in results)
         ):
             cut = relevance_cutoff([r.distance for r in results], grouping)
             results = results[:cut]

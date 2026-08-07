@@ -52,6 +52,7 @@ def test_parse_html_explicit_title_wins():
 def test_parse_file_failure_wrapped():
     # Test that ParserError is raised for non-existent files
     from pathlib import Path
+
     with pytest.raises(ParserError):
         parse_file(Path("/nonexistent/file.pdf"))
 

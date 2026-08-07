@@ -62,13 +62,21 @@ class Pipeline:
         self.config = config
 
     def _chunk_and_store(
-        self, markdown: str, *, source: str, source_type: str, title: str,
-        file_hash: str = "", mtime: float = 0.0,
+        self,
+        markdown: str,
+        *,
+        source: str,
+        source_type: str,
+        title: str,
+        file_hash: str = "",
+        mtime: float = 0.0,
     ) -> IngestResult:
         blocks = split_markdown(markdown, max_chars=MAX_CHUNK_CHARS)
         texts = merge_blocks(
-            blocks, self.embedder.embed_documents,
-            max_chars=MAX_CHUNK_CHARS, min_length=self.config.chunk_min_length,
+            blocks,
+            self.embedder.embed_documents,
+            max_chars=MAX_CHUNK_CHARS,
+            min_length=self.config.chunk_min_length,
         )
         if not texts:
             raise EmptyDocumentError(f"No text content extracted from {source}")
@@ -76,8 +84,15 @@ class Pipeline:
         now = datetime.now(UTC).isoformat()
         records = [
             ChunkRecord(
-                id=f"{source}#{i}", source=source, source_type=source_type, title=title,
-                chunk_index=i, text=text, vector=vec, file_hash=file_hash, mtime=mtime,
+                id=f"{source}#{i}",
+                source=source,
+                source_type=source_type,
+                title=title,
+                chunk_index=i,
+                text=text,
+                vector=vec,
+                file_hash=file_hash,
+                mtime=mtime,
                 ingested_at=now,
             )
             for i, (text, vec) in enumerate(zip(texts, vectors, strict=True))
@@ -98,8 +113,12 @@ class Pipeline:
             )
         doc = parse_file(path)
         return self._chunk_and_store(
-            doc.markdown, source=str(path), source_type="file", title=doc.title,
-            file_hash=file_sha256(path), mtime=path.stat().st_mtime,
+            doc.markdown,
+            source=str(path),
+            source_type="file",
+            title=doc.title,
+            file_hash=file_sha256(path),
+            mtime=path.stat().st_mtime,
         )
 
     def ingest_data(

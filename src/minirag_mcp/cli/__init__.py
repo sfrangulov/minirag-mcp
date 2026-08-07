@@ -117,9 +117,7 @@ def ingest(
         "ingested": [{"source": r.source, "chunkCount": r.chunk_count} for r in done],
         "failed": failures,
     }
-    human = "\n".join(
-        [f"ingested {len(done)} file(s):"] + [f"  {r.source}" for r in done]
-    )
+    human = "\n".join([f"ingested {len(done)} file(s):"] + [f"  {r.source}" for r in done])
     _emit(payload, json, human)
     for fail in failures:
         print(f"warn: {fail['source']}: {fail['error']}", file=sys.stderr)
@@ -147,7 +145,8 @@ def ingest_url(
         _fail(str(e))
     _emit(
         {"source": r.source, "chunkCount": r.chunk_count, "title": r.title},
-        json, f"ingested {r.source} ({r.chunk_count} chunks)",
+        json,
+        f"ingested {r.source} ({r.chunk_count} chunks)",
     )
 
 
@@ -170,7 +169,11 @@ def sync(
         except SecurityError as e:
             _fail(str(e))
     counts, errors = run_sync(
-        pipeline, store, cfg.roots, cfg.max_file_size, scope=scope,
+        pipeline,
+        store,
+        cfg.roots,
+        cfg.max_file_size,
+        scope=scope,
         on_event=lambda m: print(m, file=sys.stderr),
     )
     human = ", ".join(f"{k}: {v}" for k, v in counts.items())
@@ -195,14 +198,25 @@ def query(
     """Hybrid search over the index."""
     cfg, store, pipeline = _load(base_dir, db_path, cache_dir, model_name)
     results = store.search(
-        text, pipeline.embedder.embed_query(text),
-        top_k=top_k, hybrid_weight=cfg.hybrid_weight, scopes=tuple(scope or ()),
-        max_distance=cfg.max_distance, grouping=cfg.grouping, max_files=cfg.max_files,
+        text,
+        pipeline.embedder.embed_query(text),
+        top_k=top_k,
+        hybrid_weight=cfg.hybrid_weight,
+        scopes=tuple(scope or ()),
+        max_distance=cfg.max_distance,
+        grouping=cfg.grouping,
+        max_files=cfg.max_files,
     )
     payload = {
         "results": [
-            {"text": r.text, "source": r.source, "title": r.title,
-             "chunkIndex": r.chunk_index, "score": r.score, "distance": r.distance}
+            {
+                "text": r.text,
+                "source": r.source,
+                "title": r.title,
+                "chunkIndex": r.chunk_index,
+                "score": r.score,
+                "distance": r.distance,
+            }
             for r in results
         ]
     }
@@ -267,8 +281,11 @@ def read(
     info = store.get_source(key)
     text = "\n\n".join(ch.text for ch in chunks)
     payload = {
-        "source": key, "sourceType": info.source_type, "title": info.title,
-        "chunkCount": len(chunks), "text": text,
+        "source": key,
+        "sourceType": info.source_type,
+        "title": info.title,
+        "chunkCount": len(chunks),
+        "text": text,
     }
     _emit(payload, json, text)
 
@@ -292,8 +309,13 @@ def list_cmd(
     states = compute_states(entries, store.list_sources(scopes=scopes))
     payload = {
         "files": [
-            {"source": s.source, "sourceType": s.source_type, "title": s.title,
-             "state": s.state, "chunkCount": s.chunk_count}
+            {
+                "source": s.source,
+                "sourceType": s.source_type,
+                "title": s.title,
+                "state": s.state,
+                "chunkCount": s.chunk_count,
+            }
             for s in states
         ]
     }

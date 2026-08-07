@@ -5,9 +5,16 @@ from minirag_mcp.store import ChunkRecord, Store
 
 def rec(source, i, text, vec=None, source_type="file", title="T"):
     return ChunkRecord(
-        id=f"{source}#{i}", source=source, source_type=source_type, title=title,
-        chunk_index=i, text=text, vector=vec or [0.1 * (i + 1)] * 8,
-        file_hash="h", mtime=1.0, ingested_at="2026-08-07T00:00:00+00:00",
+        id=f"{source}#{i}",
+        source=source,
+        source_type=source_type,
+        title=title,
+        chunk_index=i,
+        text=text,
+        vector=vec or [0.1 * (i + 1)] * 8,
+        file_hash="h",
+        mtime=1.0,
+        ingested_at="2026-08-07T00:00:00+00:00",
     )
 
 

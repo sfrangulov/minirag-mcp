@@ -132,8 +132,11 @@ class SyncManager:
             # still None.
             try:
                 counts, errors = run_sync(
-                    self._pipeline, self._store, self._config.roots,
-                    self._config.max_file_size, scope=scope,
+                    self._pipeline,
+                    self._store,
+                    self._config.roots,
+                    self._config.max_file_size,
+                    scope=scope,
                 )
                 job.counts, job.errors = counts, errors
                 job.finished_at = _now()

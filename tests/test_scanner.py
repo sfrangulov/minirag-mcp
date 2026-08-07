@@ -6,8 +6,14 @@ from minirag_mcp.store import SourceInfo
 
 
 def info(source, *, source_type="file", file_hash="", mtime=0.0):
-    return SourceInfo(source=source, source_type=source_type, title="T",
-                      chunk_count=1, file_hash=file_hash, mtime=mtime)
+    return SourceInfo(
+        source=source,
+        source_type=source_type,
+        title="T",
+        chunk_count=1,
+        file_hash=file_hash,
+        mtime=mtime,
+    )
 
 
 def make_tree(root: Path):
@@ -15,8 +21,8 @@ def make_tree(root: Path):
     (root / "a.md").write_text("a")
     (root / "sub" / "b.txt").write_text("b")
     (root / "sub" / "deep" / "c.pdf").write_bytes(b"%PDF-fake")
-    (root / "skip.py").write_text("nope")            # not whitelisted
-    (root / ".hidden.md").write_text("hidden file")   # hidden file
+    (root / "skip.py").write_text("nope")  # not whitelisted
+    (root / ".hidden.md").write_text("hidden file")  # hidden file
     (root / ".git").mkdir()
     (root / ".git" / "x.md").write_text("in hidden dir")
     (root / "node_modules").mkdir()
@@ -38,10 +44,10 @@ def test_diff_new_changed_unchanged_deleted(tmp_path):
     b = tmp_path / "sub" / "b.txt"
     indexed = [
         info(str(a), file_hash=file_sha256(a), mtime=a.stat().st_mtime),  # unchanged (mtime match)
-        info(str(b), file_hash="stale-hash", mtime=-1.0),                  # changed (hash differs)
-        info(str(tmp_path / "gone.md")),                                    # deleted from disk
-        info("https://x.io/p", source_type="url"),                          # never deleted by sync
-        info("note-1", source_type="data"),                                 # never deleted by sync
+        info(str(b), file_hash="stale-hash", mtime=-1.0),  # changed (hash differs)
+        info(str(tmp_path / "gone.md")),  # deleted from disk
+        info("https://x.io/p", source_type="url"),  # never deleted by sync
+        info("note-1", source_type="data"),  # never deleted by sync
     ]
     diff = compute_diff(entries, indexed, max_file_size=10**9)
     assert diff.unchanged == [a]

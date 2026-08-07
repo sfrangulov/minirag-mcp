@@ -118,8 +118,10 @@ def compute_diff(
 
     to_delete = [src for src in indexed_files if src not in seen]
     return SyncDiff(
-        to_ingest=to_ingest, to_delete=sorted(to_delete),
-        unchanged=unchanged, oversized=oversized,
+        to_ingest=to_ingest,
+        to_delete=sorted(to_delete),
+        unchanged=unchanged,
+        oversized=oversized,
     )
 
 
@@ -158,9 +160,7 @@ def compute_states(entries: list[ScanEntry], indexed: list[SourceInfo]) -> list[
                 FileState(str(e.path), "file", prior.title, "ingested", prior.chunk_count)
             )
         else:
-            states.append(
-                FileState(str(e.path), "file", prior.title, "stale", prior.chunk_count)
-            )
+            states.append(FileState(str(e.path), "file", prior.title, "stale", prior.chunk_count))
     for s in indexed:
         if s.source_type in ("data", "url"):
             states.append(FileState(s.source, s.source_type, s.title, "ingested", s.chunk_count))

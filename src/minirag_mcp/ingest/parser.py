@@ -10,8 +10,20 @@ from pathlib import Path
 from markitdown import MarkItDown
 
 SUPPORTED_EXTENSIONS = frozenset(
-    {".md", ".markdown", ".txt", ".pdf", ".docx", ".pptx", ".xlsx",
-     ".html", ".htm", ".csv", ".epub", ".ipynb"}
+    {
+        ".md",
+        ".markdown",
+        ".txt",
+        ".pdf",
+        ".docx",
+        ".pptx",
+        ".xlsx",
+        ".html",
+        ".htm",
+        ".csv",
+        ".epub",
+        ".ipynb",
+    }
 )
 
 _H1_RE = re.compile(r"^#\s+(.+?)\s*$")

@@ -5,8 +5,15 @@ from minirag_mcp.store import ChunkRecord, Store, relevance_cutoff
 
 def rec(source, i, text, vec):
     return ChunkRecord(
-        id=f"{source}#{i}", source=source, source_type="file", title="T",
-        chunk_index=i, text=text, vector=vec, file_hash="h", mtime=1.0,
+        id=f"{source}#{i}",
+        source=source,
+        source_type="file",
+        title="T",
+        chunk_index=i,
+        text=text,
+        vector=vec,
+        file_hash="h",
+        mtime=1.0,
         ingested_at="2026-08-07T00:00:00+00:00",
     )
 
@@ -18,10 +25,13 @@ def V(x):  # 8-dim vector pointing "x of the way" between axis 0 and axis 1
 @pytest.fixture
 def store(tmp_path):
     s = Store(tmp_path / "db", dim=8)
-    s.replace_source("/auth.md", [
-        rec("/auth.md", 0, "OAuth2 token authentication flow", V(0.0)),
-        rec("/auth.md", 1, "The API returns ERR_CONNECTION_REFUSED when down", V(0.1)),
-    ])
+    s.replace_source(
+        "/auth.md",
+        [
+            rec("/auth.md", 0, "OAuth2 token authentication flow", V(0.0)),
+            rec("/auth.md", 1, "The API returns ERR_CONNECTION_REFUSED when down", V(0.1)),
+        ],
+    )
     s.replace_source("/cook.md", [rec("/cook.md", 0, "Borscht recipe with beets", V(1.0))])
     return s
 

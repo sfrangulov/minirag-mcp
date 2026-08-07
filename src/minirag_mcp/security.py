@@ -28,6 +28,4 @@ def resolve_in_roots(
 def check_url_scheme(url: str) -> None:
     scheme = urlparse(url).scheme.lower()
     if scheme not in ("http", "https"):
-        raise SecurityError(
-            f"Only http/https URLs are allowed, got scheme {scheme or '(none)'!r}"
-        )
+        raise SecurityError(f"Only http/https URLs are allowed, got scheme {scheme or '(none)'!r}")

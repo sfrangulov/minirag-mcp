@@ -31,8 +31,12 @@ class _Ctx:
 
 def _result_dict(r: SearchResult) -> dict:
     return {
-        "text": r.text, "source": r.source, "title": r.title,
-        "chunkIndex": r.chunk_index, "score": r.score, "distance": r.distance,
+        "text": r.text,
+        "source": r.source,
+        "title": r.title,
+        "chunkIndex": r.chunk_index,
+        "score": r.score,
+        "distance": r.distance,
     }
 
 
@@ -58,9 +62,7 @@ def create_app(
             raise ToolError(f"Configuration error: {config_error or 'no configuration'}")
         if holder["ctx"] is None:
             emb = (
-                embedder
-                if embedder is not None
-                else Embedder(config.model_name, config.cache_dir)
+                embedder if embedder is not None else Embedder(config.model_name, config.cache_dir)
             )
             store = Store(config.db_path, dim=emb.dim)
             pipeline = Pipeline(store, emb, config)
@@ -78,6 +80,7 @@ def create_app(
                 raise ToolError(str(e.args[0]) if e.args else str(e)) from e
             except Exception as e:
                 raise ToolError(str(e)) from e
+
         return inner
 
     @mcp.tool
@@ -164,9 +167,13 @@ def create_app(
             raise ToolError("query must not be empty")
         c = ctx()
         results = c.store.search(
-            query, c.embedder.embed_query(query),
-            top_k=topK, hybrid_weight=c.config.hybrid_weight, scopes=_scopes(scope),
-            max_distance=c.config.max_distance, grouping=c.config.grouping,
+            query,
+            c.embedder.embed_query(query),
+            top_k=topK,
+            hybrid_weight=c.config.hybrid_weight,
+            scopes=_scopes(scope),
+            max_distance=c.config.max_distance,
+            grouping=c.config.grouping,
             max_files=c.config.max_files,
         )
         sources: dict[str, dict] = {}
@@ -258,8 +265,11 @@ def create_app(
         return {
             "files": [
                 {
-                    "source": s.source, "sourceType": s.source_type, "title": s.title,
-                    "state": s.state, "chunkCount": s.chunk_count,
+                    "source": s.source,
+                    "sourceType": s.source_type,
+                    "title": s.title,
+                    "state": s.state,
+                    "chunkCount": s.chunk_count,
                 }
                 for s in states
             ]

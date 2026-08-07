@@ -43,7 +43,7 @@ def _split_long_paragraph(text: str, max_chars: int) -> list[str]:
 def split_markdown(markdown: str, *, max_chars: int = 1500) -> list[Block]:
     lines = markdown.split("\n")
     blocks: list[Block] = []
-    para: list[str] = []          # accumulating non-code lines
+    para: list[str] = []  # accumulating non-code lines
     pending_heading: str | None = None
 
     def flush_para() -> None:
@@ -70,11 +70,9 @@ def split_markdown(markdown: str, *, max_chars: int = 1500) -> list[Block]:
             while i < len(lines):
                 code.append(lines[i])
                 lstripped = lines[i].lstrip()
-                if (
-                    lstripped.startswith(open_seq[0])
-                    and len(lstripped) - len(lstripped.lstrip(open_seq[0]))
-                    >= len(open_seq)
-                ):
+                if lstripped.startswith(open_seq[0]) and len(lstripped) - len(
+                    lstripped.lstrip(open_seq[0])
+                ) >= len(open_seq):
                     break
                 i += 1
             if pending_heading is not None:

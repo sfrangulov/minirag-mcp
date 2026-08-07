@@ -106,9 +106,7 @@ def load_config(
 
     cache_raw = cache_dir_flag or env.get("CACHE_DIR")
     cache_dir = (
-        _resolve(cache_raw)
-        if cache_raw
-        else platformdirs.user_cache_path("minirag-mcp") / "models"
+        _resolve(cache_raw) if cache_raw else platformdirs.user_cache_path("minirag-mcp") / "models"
     )
 
     weight_raw = env.get("RAG_HYBRID_WEIGHT")

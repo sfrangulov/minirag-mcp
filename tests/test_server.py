@@ -27,9 +27,17 @@ async def test_all_eleven_tools_listed(app):
     async with Client(mcp) as c:
         names = {t.name for t in await c.list_tools()}
     assert names == {
-        "sync_start", "sync_status", "ingest_file", "ingest_data", "ingest_url",
-        "query_documents", "read_chunk_neighbors", "read_file", "list_files",
-        "delete_file", "status",
+        "sync_start",
+        "sync_status",
+        "ingest_file",
+        "ingest_data",
+        "ingest_url",
+        "query_documents",
+        "read_chunk_neighbors",
+        "read_file",
+        "list_files",
+        "delete_file",
+        "status",
     }
 
 
@@ -51,10 +59,12 @@ async def test_sync_then_query_then_neighbors(app):
         assert {"source", "title", "hits"} <= set(res["sources"][0])
         assert res["sources"][0]["source"] == top["source"]  # rank order preserved
 
-        nb = (await c.call_tool(
-            "read_chunk_neighbors",
-            {"filePath": top["source"], "chunkIndex": top["chunkIndex"]},
-        )).data
+        nb = (
+            await c.call_tool(
+                "read_chunk_neighbors",
+                {"filePath": top["source"], "chunkIndex": top["chunkIndex"]},
+            )
+        ).data
         assert nb["chunks"]
 
 
@@ -97,10 +107,12 @@ async def test_ingest_data_and_url(app, monkeypatch):
     monkeypatch.setattr(pmod, "parse_url", lambda url: ParsedDoc("# R\n\nRemote body.", "R"))
     mcp, _ = app
     async with Client(mcp) as c:
-        r = (await c.call_tool(
-            "ingest_data",
-            {"data": "# Note\n\nSaved note body.", "source": "note-1", "format": "markdown"},
-        )).data
+        r = (
+            await c.call_tool(
+                "ingest_data",
+                {"data": "# Note\n\nSaved note body.", "source": "note-1", "format": "markdown"},
+            )
+        ).data
         assert r["source"] == "note-1"
         r2 = (await c.call_tool("ingest_url", {"url": "https://example.com/x"})).data
         assert r2["source"] == "https://example.com/x"

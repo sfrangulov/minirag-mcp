@@ -73,10 +73,18 @@ def test_sync_and_read_neighbors(corpus, capsys):
     out = capsys.readouterr().out
     assert "ingested" in out
 
-    run([
-        "read-neighbors", "--file-path", str(corpus / "a.md"), "--chunk-index", "0",
-        "--base-dir", str(corpus), "--json",
-    ])
+    run(
+        [
+            "read-neighbors",
+            "--file-path",
+            str(corpus / "a.md"),
+            "--chunk-index",
+            "0",
+            "--base-dir",
+            str(corpus),
+            "--json",
+        ]
+    )
     assert json.loads(capsys.readouterr().out)["chunks"]
 
 
