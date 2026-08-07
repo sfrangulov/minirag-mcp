@@ -29,16 +29,37 @@ class SyncDiff:
     oversized: list[Path]
 
 
+def _contained(real: Path, real_roots: Sequence[Path]) -> bool:
+    """True if `real` (already resolved) sits inside any of `real_roots` (already resolved).
+
+    Same containment rule as security.resolve_in_roots: equal to a root, or having
+    that root among its parents.
+    """
+    return any(real == r or r in real.parents for r in real_roots)
+
+
 def scan_roots(roots: Sequence[Path]) -> list[ScanEntry]:
     """Recursively scan roots for files with whitelisted extensions.
 
     Skips hidden directories (dot-prefixed) and SKIP_DIRS. Prunes directory traversal
-    for SKIP_DIRS and hidden dirs, but includes symlinked files with whitelisted extensions.
-    Symlinked directories are not traversed (os.walk followlinks=False avoids cycles).
-    Overlapping roots are tolerated: each file is reported once (deduplicated by path).
+    for SKIP_DIRS and hidden dirs. Symlinked directories are not traversed
+    (os.walk followlinks=False avoids cycles).
+
+    Symlinked files are included **only when their target stays inside a configured
+    root** — the same containment rule security.resolve_in_roots applies. A symlink
+    whose real path escapes every root is skipped silently: it is not an error, it is
+    simply not part of the corpus. Without this check the extension whitelist would be
+    matched against the link *name* while the parser reads the *target*, so a
+    `notes.md -> ~/.ssh/id_rsa` link would pull an arbitrary readable file into the
+    index. Non-escaping entries are reported by their on-disk path, not their resolved
+    target, so source ids stay stable.
+
+    Overlapping roots are tolerated: each file is reported once (deduplicated by
+    resolved path).
 
     Returns entries sorted by path.
     """
+    real_roots = [Path(r).resolve() for r in roots]
     entries: list[ScanEntry] = []
     seen: set[Path] = set()
     for root in roots:
@@ -56,6 +77,8 @@ def scan_roots(roots: Sequence[Path]) -> list[ScanEntry]:
                 resolved = p.resolve()
                 if resolved in seen:
                     continue
+                if not _contained(resolved, real_roots):
+                    continue  # symlink escaping every root: not part of the corpus
                 seen.add(resolved)
                 st = p.stat()
                 entries.append(ScanEntry(path=p, size=st.st_size, mtime=st.st_mtime))

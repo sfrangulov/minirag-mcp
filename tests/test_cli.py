@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pytest
 
@@ -27,9 +28,9 @@ def corpus(tmp_path):
 
 
 def test_ingest_directory_recursive_and_query(corpus, capsys):
-    run(["ingest", str(corpus), "--base-dir", str(corpus)])
-    out = capsys.readouterr().out
-    assert "2" in out  # 2 files ingested
+    run(["ingest", str(corpus), "--base-dir", str(corpus), "--json"])
+    ingested = json.loads(capsys.readouterr().out)["ingested"]
+    assert sorted(Path(i["source"]).name for i in ingested) == ["a.md", "b.md"]
 
     run(["query", "ERR_CONNECTION_REFUSED", "--base-dir", str(corpus), "--json"])
     payload = json.loads(capsys.readouterr().out)
@@ -69,9 +70,9 @@ def test_read_full_source(corpus, capsys):
 
 
 def test_sync_and_read_neighbors(corpus, capsys):
-    run(["sync", "--base-dir", str(corpus)])
-    out = capsys.readouterr().out
-    assert "ingested" in out
+    run(["sync", "--base-dir", str(corpus), "--json"])
+    counts = json.loads(capsys.readouterr().out)["counts"]
+    assert counts["ingested"] == 2 and counts["failed"] == 0
 
     run(
         [
@@ -106,8 +107,9 @@ def test_error_exits_nonzero(corpus, capsys):
 
 def test_env_used_when_no_flags(corpus, capsys, monkeypatch):
     monkeypatch.setenv("BASE_DIR", str(corpus))
-    run(["ingest", str(corpus)])
-    assert "2" in capsys.readouterr().out
+    run(["ingest", str(corpus), "--json"])
+    ingested = json.loads(capsys.readouterr().out)["ingested"]
+    assert sorted(Path(i["source"]).name for i in ingested) == ["a.md", "b.md"]
 
 
 def test_unknown_model_name_is_clean_error(corpus, capsys, monkeypatch):
@@ -146,3 +148,73 @@ def test_status_and_read_match_server_fields(corpus, capsys):
     run(["read", str(corpus / "a.md"), "--base-dir", str(corpus), "--json"])
     payload = json.loads(capsys.readouterr().out)
     assert {"source", "sourceType", "title", "chunkCount", "text"} <= set(payload)
+
+
+def test_query_reports_sources_like_the_server(corpus, capsys):
+    run(["ingest", str(corpus), "--base-dir", str(corpus)])
+    capsys.readouterr()
+    run(["query", "tokens and auth", "--base-dir", str(corpus), "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert {"results", "sources"} <= set(payload)
+    assert payload["sources"], "expected an aggregated sources list"
+    assert all({"source", "title", "hits"} == set(s) for s in payload["sources"])
+    # sources are the distinct result sources, in rank order, with hit counts
+    ranked = list(dict.fromkeys(r["source"] for r in payload["results"]))
+    assert [s["source"] for s in payload["sources"]] == ranked
+    assert sum(s["hits"] for s in payload["sources"]) == len(payload["results"])
+
+
+def test_query_human_output_lists_sources(corpus, capsys):
+    run(["ingest", str(corpus), "--base-dir", str(corpus)])
+    capsys.readouterr()
+    run(["query", "tokens and auth", "--base-dir", str(corpus)])
+    out = capsys.readouterr().out
+    assert "Sources:" in out and "a.md" in out
+
+
+def test_read_neighbors_matches_server_fields(corpus, capsys):
+    run(["ingest", str(corpus / "a.md"), "--base-dir", str(corpus)])
+    capsys.readouterr()
+    run(
+        [
+            "read-neighbors",
+            "--file-path",
+            str(corpus / "a.md"),
+            "--chunk-index",
+            "0",
+            "--base-dir",
+            str(corpus),
+            "--json",
+        ]
+    )
+    chunks = json.loads(capsys.readouterr().out)["chunks"]
+    assert chunks
+    assert all({"source", "title", "chunkIndex", "text"} <= set(c) for c in chunks)
+    assert all(c["source"] == str(corpus / "a.md") for c in chunks)
+
+
+def test_sync_exits_nonzero_when_a_file_fails(corpus, capsys, monkeypatch):
+    monkeypatch.setenv("MAX_FILE_SIZE", "5")  # every corpus file is bigger than this
+    with pytest.raises(SystemExit) as exc:
+        run(["sync", "--base-dir", str(corpus), "--json"])
+    assert exc.value.code == 1
+    out = capsys.readouterr()
+    counts = json.loads(out.out)["counts"]
+    assert counts["failed"] == 2 and counts["ingested"] == 0
+    assert "MAX_FILE_SIZE" in out.err  # per-file warnings still printed
+
+
+def test_status_reports_config_error_and_exits_zero(corpus, capsys, monkeypatch):
+    monkeypatch.setenv("BASE_DIRS", "{not json")
+    run(["status", "--json"])  # must not raise SystemExit
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["version"] and "BASE_DIRS" in payload["configError"]
+    assert "roots" not in payload
+
+
+def test_other_commands_still_fail_loudly_on_config_error(corpus, capsys, monkeypatch):
+    monkeypatch.setenv("BASE_DIRS", "{not json")
+    with pytest.raises(SystemExit) as exc:
+        run(["list", "--json"])
+    assert exc.value.code == 1
+    assert "BASE_DIRS" in capsys.readouterr().err

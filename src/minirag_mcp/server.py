@@ -15,8 +15,9 @@ from minirag_mcp.config import Config, ConfigError, load_config
 from minirag_mcp.embedder import Embedder
 from minirag_mcp.ingest.pipeline import Pipeline
 from minirag_mcp.ingest.scanner import compute_states, scan_roots
+from minirag_mcp.results import aggregate_sources, result_dict
 from minirag_mcp.security import resolve_in_roots
-from minirag_mcp.store import SearchResult, Store
+from minirag_mcp.store import Store
 from minirag_mcp.sync import SyncManager
 
 
@@ -27,17 +28,6 @@ class _Ctx:
     embedder: object
     pipeline: Pipeline
     sync: SyncManager
-
-
-def _result_dict(r: SearchResult) -> dict:
-    return {
-        "text": r.text,
-        "source": r.source,
-        "title": r.title,
-        "chunkIndex": r.chunk_index,
-        "score": r.score,
-        "distance": r.distance,
-    }
 
 
 def _scopes(scope: str | list[str] | None) -> tuple[str, ...]:
@@ -176,11 +166,10 @@ def create_app(
             grouping=c.config.grouping,
             max_files=c.config.max_files,
         )
-        sources: dict[str, dict] = {}
-        for r in results:  # rank order: first hit of a source fixes its position
-            agg = sources.setdefault(r.source, {"source": r.source, "title": r.title, "hits": 0})
-            agg["hits"] += 1
-        return {"results": [_result_dict(r) for r in results], "sources": list(sources.values())}
+        return {
+            "results": [result_dict(r) for r in results],
+            "sources": aggregate_sources(results),
+        }
 
     @mcp.tool
     @guard
@@ -206,7 +195,7 @@ def create_app(
         else:
             raise ToolError("Provide filePath or source")
         chunks = c.store.neighbors(key, chunkIndex, before=before, after=after)
-        return {"chunks": [_result_dict(r) for r in chunks]}
+        return {"chunks": [result_dict(r) for r in chunks]}
 
     @mcp.tool
     @guard

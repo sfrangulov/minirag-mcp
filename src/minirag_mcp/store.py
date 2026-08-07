@@ -71,7 +71,8 @@ def relevance_cutoff(distances: Sequence[float], mode: str) -> int:
     cuts from jitter and detects only materially significant distance jumps.
 
     Args:
-        distances: sorted sequence of distances (e.g., from vector search)
+        distances: distances sorted ascending (callers must sort; the gap math is
+            meaningless on an arbitrary order such as RRF rank)
         mode: "similar" → cut at first boundary; "related" → cut at second
 
     Returns:
@@ -83,7 +84,9 @@ def relevance_cutoff(distances: Sequence[float], mode: str) -> int:
     gaps = [distances[i + 1] - distances[i] for i in range(n - 1)]
     mean = statistics.fmean(gaps)
     threshold = mean * GAP_FACTOR
-    boundaries = [i + 1 for i, g in enumerate(gaps) if g > threshold and g > 0]
+    if threshold <= 0:
+        return n  # degenerate (all-equal or unsorted input): no meaningful boundary
+    boundaries = [i + 1 for i, g in enumerate(gaps) if g > threshold]
     if not boundaries:
         return n
     if mode == "similar":
@@ -116,6 +119,10 @@ def _weighted_rrf(
     return scores
 
 
+class DimensionMismatchError(Exception):
+    """An existing index was built with a different embedding dimension than requested."""
+
+
 class Store:
     def __init__(self, db_path: Path, dim: int):
         db_path.mkdir(parents=True, exist_ok=True)
@@ -140,6 +147,26 @@ class Store:
             )
             self._table = self._db.create_table(TABLE, schema=schema)
             self._table.create_index("text", config=FTS())
+        else:
+            self._check_dim(db_path, dim)
+
+    def _check_dim(self, db_path: Path, dim: int) -> None:
+        """Fail early and clearly when an existing index has a different vector width.
+
+        Without this, a MODEL_NAME change against an existing DB_PATH surfaces much
+        later as LanceDB's "There is no vector column in the data" — which is both
+        false and unactionable.
+        """
+        field = self._table.schema.field("vector")
+        existing = getattr(field.type, "list_size", None)
+        if existing is None or existing == dim:
+            return
+        raise DimensionMismatchError(
+            f"Index at {db_path} was built with {existing}-dimensional vectors, "
+            f"but the configured embedding model produces {dim} dimensions. "
+            f"Vectors from different models are not comparable: point DB_PATH at a new "
+            f"directory, or delete the index and re-ingest."
+        )
 
     def replace_source(self, source: str, records: Sequence[ChunkRecord]) -> None:
         self._table.delete(f"source = '{_sql_str(source)}'")
@@ -251,6 +278,24 @@ class Store:
         grouping: str | None = None,
         max_files: int | None = None,
     ) -> list[SearchResult]:
+        """Hybrid search: vector + BM25 fused by weighted RRF, then filtered.
+
+        Results are returned in fused-rank order. A result carries a `distance` only
+        when it appeared in the vector search's fetch window; a hit found by FTS alone
+        has `distance is None`, and the two distance-based filters treat that case
+        explicitly rather than letting such rows slip through unjudged:
+
+        - `max_distance` drops every result without a distance. The caller asked for a
+          distance bound, and a row that was never ranked by distance cannot be shown
+          to satisfy it.
+        - `grouping` ("similar" | "related") cuts at a natural gap in the distances
+          sorted **ascending**, considering only results that have one; results without
+          a distance are kept unconditionally, since a distance-gap rule has nothing to
+          judge them by. Surviving results keep their fused-rank order.
+
+        `max_files` then keeps only the first N distinct sources in rank order, and the
+        list is truncated to `top_k` last.
+        """
         fetch = max(top_k * 4, 50)
         clause = _scope_clause(scopes)
 
@@ -290,8 +335,8 @@ class Store:
         results: list[SearchResult] = []
         for r in ordered:
             distance = dist_by_id.get(r["id"], r.get("_distance"))
-            if max_distance is not None and distance is not None and distance > max_distance:
-                continue
+            if max_distance is not None and (distance is None or distance > max_distance):
+                continue  # an FTS-only hit has no distance, so it cannot meet the bound
             score = rrf_scores.get(r["id"])
             if score is None:
                 score = 1.0 / (1.0 + distance) if distance is not None else 0.0
@@ -306,13 +351,16 @@ class Store:
                 )
             )
 
-        if (
-            grouping in ("similar", "related")
-            and results
-            and all(r.distance is not None for r in results)
-        ):
-            cut = relevance_cutoff([r.distance for r in results], grouping)
-            results = results[:cut]
+        if grouping in ("similar", "related") and results:
+            # The gap rule needs an ascending distance ordering, not the RRF order the
+            # results are in. Judge only the results that carry a distance; keep the
+            # FTS-only ones, which were never ranked by distance at all. Matching on
+            # the surviving distances means exact ties across the boundary survive
+            # together — identical distances give no basis for splitting them.
+            distances = sorted(r.distance for r in results if r.distance is not None)
+            if distances:
+                kept = set(distances[: relevance_cutoff(distances, grouping)])
+                results = [r for r in results if r.distance is None or r.distance in kept]
 
         if max_files is not None:
             keep: list[SearchResult] = []

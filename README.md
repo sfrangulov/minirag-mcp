@@ -188,6 +188,14 @@ minirag-mcp delete ~/docs/old-notes.md
 The 9 subcommands: `ingest`, `ingest-url`, `sync`, `query`, `read-neighbors`,
 `read`, `list`, `status`, `delete`.
 
+Each subcommand's `--json` output carries the same fields as the matching MCP
+tool. Exit status is `0` on success and `1` on failure; `ingest` and `sync`
+both count any per-file failure as a failure of the run, while still printing
+the full counts and a `warn:` line per file. The one exception is `status`,
+which is the command you reach for when the configuration is broken: on a
+configuration error it reports `{version, configError}` and exits `0`, exactly
+like the `status` MCP tool. Every other command exits `1` on the same error.
+
 ## Search Tuning
 
 Four environment variables shape `query_documents`/`minirag-mcp query`
@@ -213,13 +221,21 @@ only looking at each side's ranking.
 - `0.6` (default) — leans slightly toward exact-term matches while still
   benefiting from semantic recall.
 
+<a id="hits-without-a-distance"></a>
+**Hits without a distance.** The vector side only fetches a bounded window of
+candidates, so at any weight above `0.0` the keyword side can surface a chunk
+the vector side never scored. Such a hit is returned with `distance: null` —
+it was ranked by BM25 alone. The two distance-based settings below each say
+explicitly what they do with those hits, because "no distance" cannot be
+compared against a distance threshold.
+
 ### `RAG_GROUPING` (unset by default; `similar` or `related`)
 
 Cuts the result list at a natural relevance boundary instead of returning a
-fixed `topK`. A boundary is any gap between two consecutive (sorted)
-result distances that exceeds the **mean gap across the whole list by a
-factor of 2** — this ignores small jitter and only reacts to a materially
-significant jump in relevance.
+fixed `topK`. A boundary is any gap between two consecutive distances — taken
+over the results **sorted by distance, ascending** — that exceeds the **mean
+gap across the whole list by a factor of 2**. This ignores small jitter and
+only reacts to a materially significant jump in relevance.
 
 - `similar` — keep only the first relevance group (everything before the
   first boundary).
@@ -227,8 +243,12 @@ significant jump in relevance.
   boundary, if one exists).
 - Unset — no grouping; return up to `topK` results regardless of gaps.
 
-Grouping needs at least 3 candidate results and a distance value on every
-one of them; otherwise it's skipped and `topK` results are returned as-is.
+Only results that *have* a distance are judged, and at least 3 of them are
+needed for a boundary to exist at all. [Hits without a
+distance](#hits-without-a-distance) are **kept unconditionally** — a
+distance-gap rule has nothing to measure them by. Surviving results keep
+their fused-rank order; grouping changes which results come back, never the
+order they come back in.
 
 ### `RAG_MAX_DISTANCE` (unset by default)
 
@@ -237,6 +257,12 @@ LanceDB's raw metric distance for the table (lower is more similar); it is
 not normalized to `0.0`–`1.0`. Run a query without this set first to see the
 distance range typical for your corpus and embedding model before picking a
 cutoff.
+
+Setting this also **drops every [hit without a
+distance](#hits-without-a-distance)**: you asked for results within a
+distance bound, and a chunk that was never scored by the vector side cannot
+be shown to satisfy one. Expect a keyword-heavy query to return fewer results
+with this set than without it, beyond the ones actually filtered by distance.
 
 ### `RAG_MAX_FILES` (unset by default)
 
@@ -272,6 +298,14 @@ merges with them.
   requires containment inside a configured document root; a symlink or path
   that escapes the root(s) is rejected with a clear error, not silently
   followed.
+- The same containment rule applies to scanning, so `sync`/`sync_start`,
+  `ingest <dir>`, and `list` cannot pull in a file the roots don't contain. A
+  symlink inside a root whose target escapes every root is skipped silently —
+  it isn't an error, it simply isn't part of the corpus. (This matters because
+  the extension whitelist matches the link's *name* while the parser reads the
+  *target*: without the check, a `notes.md` pointing at `~/.ssh/id_rsa` would
+  be indexed and returned by search.) Symlinks pointing to files that stay
+  inside a root are followed and indexed as normal, under the link's path.
 - MCP tool file paths must be absolute. The CLI accepts relative paths and
   resolves them against the current directory.
 - `MAX_FILE_SIZE` is enforced before a file is parsed.
@@ -283,6 +317,12 @@ merges with them.
 - Single local user, no authentication. One writer per `DB_PATH` at a time
   (LanceDB doesn't support concurrent writers); reading while a sync is in
   progress is fine.
+- Re-indexing a source replaces its chunks by deleting the old ones and
+  writing the new ones, so a sync interrupted mid-file (Ctrl-C, a crash, a
+  server restart) can leave that one source temporarily absent from the
+  index while its file is still on disk. This is self-healing: the next
+  `sync`/`sync_start` sees the file as not indexed and re-ingests it. Nothing
+  on disk is ever modified, and no other source is affected.
 - Backup: copy the `DB_PATH` directory while no writer (an ingest or sync)
   is active.
 

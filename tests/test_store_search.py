@@ -87,10 +87,126 @@ def test_keyword_boost_disabled_keeps_vector_order(store):
     assert got[0].source == "/cook.md"  # pure vector: the recipe wins
 
 
-def test_malformed_fts_query_degrades_to_vector(store):
+def test_malformed_fts_query_returns_no_rows_rather_than_raising(store):
+    """Characterizes LanceDB: malformed FTS syntax yields 0 rows, it does not raise.
+
+    Asserted against the table directly — through Store.search the except clause would
+    mask a change here. The degradation path itself is covered by the injection test
+    below, since no input we could find actually raises.
+    """
+    rows = store._table.search('"unbalanced quote AND (', query_type="fts").limit(5).to_list()
+    assert rows == []
     got = store.search('"unbalanced quote AND (', V(0.0), top_k=3, hybrid_weight=0.6)
-    assert got  # no exception, vector side still answers
+    assert got  # the vector side still answers
 
 
 def test_relevance_cutoff_ignores_jitter():
     assert relevance_cutoff([0.10, 0.11, 0.20, 0.21, 0.30], "similar") == 5
+
+
+def test_relevance_cutoff_no_cut_when_threshold_non_positive():
+    assert relevance_cutoff([0.5, 0.5, 0.5, 0.5], "similar") == 4  # mean gap 0 => no boundary
+
+
+# --- hybrid-mode filters: FTS-only hits (no distance) at the DEFAULT weight ----------
+#
+# `fetch = max(top_k * 4, 50)`, so with top_k=12 the vector side only ever fetches 50 rows.
+# The corpus below puts 56 rows closer to the query than the three "keyed" rows, so the
+# keyed rows can only ever arrive via FTS — they come back with `distance is None`, which
+# is the exact case both distance filters have to handle. Keep `top_k` at 12 in these
+# tests: a larger top_k widens the fetch window and the FTS-only rows disappear.
+
+
+def FARAWAY(i):  # farther from V(0.0) than any V(x) can be, so it never enters the window
+    return [-1.0 - i * 0.01, 0.0] + [0.0] * 6
+
+
+@pytest.fixture
+def hybrid_store(tmp_path):
+    s = Store(tmp_path / "hybrid-db", dim=8)
+    # Two tight clusters near the query; both match the keyword.
+    s.replace_source(
+        "/near.md",
+        [rec("/near.md", i, "widget " * 100 + f"near {i}", V(i * 0.001)) for i in range(3)],
+    )
+    s.replace_source(
+        "/mid.md",
+        [rec("/mid.md", i, "widget " * 100 + f"mid {i}", V(0.30 + i * 0.001)) for i in range(3)],
+    )
+    # Filler: far but inside the fetch window, and deliberately keyword-free.
+    s.replace_source(
+        "/filler.md",
+        [rec("/filler.md", i, f"sprocket filler body {i}", V(1.0 - i * 0.0005)) for i in range(50)],
+    )
+    # Keyed: strong keyword match, but too far to ever be fetched by the vector side.
+    s.replace_source(
+        "/keyed.md",
+        [rec("/keyed.md", i, "widget " * 50 + f"keyed {i}", FARAWAY(i)) for i in range(3)],
+    )
+    return s
+
+
+def test_hybrid_corpus_really_yields_fts_only_hits(hybrid_store):
+    """Guard for the fixture: without distance-less hits the tests below prove nothing."""
+    got = hybrid_store.search("widget", V(0.0), top_k=12, hybrid_weight=0.6)
+    assert any(r.distance is None for r in got), "expected FTS-only hits with no distance"
+    assert any(r.distance is not None and r.distance > 1.0 for r in got), "expected far hits"
+
+
+def test_grouping_similar_cuts_far_results_at_default_hybrid_weight(hybrid_store):
+    """Regression: grouping was skipped whenever any hit lacked a distance (the default)."""
+    ungrouped = hybrid_store.search("widget", V(0.0), top_k=12, hybrid_weight=0.6)
+
+    got = hybrid_store.search("widget", V(0.0), top_k=12, hybrid_weight=0.6, grouping="similar")
+    kept = sorted(r.distance for r in got if r.distance is not None)
+    assert len(got) < len(ungrouped), "the cut must actually drop results"
+    assert len(kept) == 3, "only the near cluster survives the first boundary"
+    assert max(kept) < 0.01
+    assert all(r.source != "/mid.md" for r in got)  # second cluster cut away
+
+
+def test_grouping_related_keeps_two_clusters_at_default_hybrid_weight(hybrid_store):
+    ungrouped = hybrid_store.search("widget", V(0.0), top_k=12, hybrid_weight=0.6)
+
+    got = hybrid_store.search("widget", V(0.0), top_k=12, hybrid_weight=0.6, grouping="related")
+    kept = sorted(r.distance for r in got if r.distance is not None)
+    assert len(got) < len(ungrouped), "the cut must actually drop results"
+    assert len(kept) == 6, "near + mid clusters survive the second boundary"
+    assert max(kept) < 0.2  # the far filler cluster (~1.98) is gone
+    assert any(0.1 < d < 0.2 for d in kept)  # the mid cluster is still there
+
+
+def test_grouping_keeps_fts_only_hits_and_preserves_rrf_order(hybrid_store):
+    ungrouped = hybrid_store.search("widget", V(0.0), top_k=12, hybrid_weight=0.6)
+    got = hybrid_store.search("widget", V(0.0), top_k=12, hybrid_weight=0.6, grouping="related")
+    assert any(r.distance is None for r in got), "distance-less hits are never cut by grouping"
+    survivors = [(r.source, r.chunk_index) for r in got]
+    order = [(r.source, r.chunk_index) for r in ungrouped]
+    assert survivors == [x for x in order if x in set(survivors)]
+
+
+def test_max_distance_drops_hits_without_a_distance(hybrid_store):
+    """Regression: FTS-only hits sailed past RAG_MAX_DISTANCE because distance was None."""
+    unbounded = hybrid_store.search("widget", V(0.0), top_k=12, hybrid_weight=0.6)
+    assert any(r.distance is None for r in unbounded)
+
+    got = hybrid_store.search("widget", V(0.0), top_k=12, hybrid_weight=0.6, max_distance=0.5)
+    assert got, "the near/mid clusters are within the bound"
+    assert all(r.distance is not None and r.distance <= 0.5 for r in got)
+
+
+def test_fts_failure_degrades_to_vector_ranking(store, monkeypatch):
+    """LanceDB tolerates malformed FTS syntax, so inject a real failure to cover the except."""
+    real_search = store._table.search
+    calls = {"fts": 0}
+
+    def failing_search(*args, **kwargs):
+        if kwargs.get("query_type") == "fts":
+            calls["fts"] += 1
+            raise RuntimeError("FTS index unavailable")
+        return real_search(*args, **kwargs)
+
+    monkeypatch.setattr(store._table, "search", failing_search)
+    got = store.search("ERR_CONNECTION_REFUSED", V(1.0), top_k=3, hybrid_weight=0.6)
+    assert calls["fts"] == 1, "the FTS path must actually have been taken"
+    assert got and got[0].source == "/cook.md"  # degraded to pure vector order

@@ -111,6 +111,48 @@ def test_run_sync_scope_through_symlink(env, tmp_path):
     assert counts["ingested"] == 1 and errors == []
 
 
+def test_run_sync_never_indexes_symlink_escaping_the_root(env, tmp_path):
+    """Security: a symlink inside a root pointing outside it must not be ingested.
+
+    The extension whitelist sees the link name (.md) while the parser reads the
+    target, so without a containment check any readable file — extension-less
+    private keys included — lands in the index.
+    """
+    cfg, store, pipeline, root = env
+    outside = tmp_path.parent / f"{tmp_path.name}_outside"  # sibling of the document root
+    outside.mkdir()
+    secret = outside / "id_rsa"
+    secret.write_text("-----BEGIN PRIVATE KEY-----\nSUPERSECRET\n-----END PRIVATE KEY-----\n")
+    (root / "readme.md").symlink_to(secret)
+    (root / "real.md").write_text("# Real\n\nOrdinary body text that belongs in the corpus.")
+
+    counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+
+    assert counts["ingested"] == 1 and errors == []
+    assert store.get_source(str(root / "readme.md")) is None
+    assert all("SUPERSECRET" not in c.text for c in store.all_chunks(str(root / "real.md")))
+    indexed = {s.source for s in store.list_sources()}
+    assert indexed == {str(root / "real.md")}
+
+
+def test_run_sync_purges_content_leaked_by_an_escaping_symlink(env, tmp_path):
+    """An index written before the containment check is cleaned up by the next sync."""
+    cfg, store, pipeline, root = env
+    outside = tmp_path.parent / f"{tmp_path.name}_leak"
+    outside.mkdir()
+    secret = outside / "id_rsa"
+    secret.write_text("-----BEGIN PRIVATE KEY-----\nLEAKED\n-----END PRIVATE KEY-----\n")
+    link = root / "readme.md"
+    link.symlink_to(secret)
+    pipeline.ingest_file(link)  # simulate the pre-fix state: the target got indexed
+    assert store.get_source(str(link)) is not None
+
+    run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+
+    assert store.get_source(str(link)) is None
+    assert store.chunk_count() == 0
+
+
 def test_finished_at_set_when_state_terminal(env):
     cfg, store, pipeline, root = env
     seed(root)

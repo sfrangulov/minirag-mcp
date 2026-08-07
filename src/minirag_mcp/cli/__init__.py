@@ -15,8 +15,9 @@ from minirag_mcp.config import Config, ConfigError, load_config
 from minirag_mcp.embedder import Embedder, UnknownModelError
 from minirag_mcp.ingest.pipeline import IngestResult, Pipeline
 from minirag_mcp.ingest.scanner import compute_states, scan_roots
+from minirag_mcp.results import aggregate_sources, result_dict
 from minirag_mcp.security import SecurityError, resolve_in_roots
-from minirag_mcp.store import SearchResult, Store
+from minirag_mcp.store import DimensionMismatchError, SearchResult, Store
 from minirag_mcp.sync import run_sync
 
 app = App(name="minirag-mcp", version=__version__)
@@ -48,6 +49,21 @@ def _fail(msg: str) -> None:
     raise SystemExit(1)
 
 
+def _load_cfg(
+    base_dir: list[str] | None,
+    db_path: str | None,
+    cache_dir: str | None,
+    model_name: str | None,
+) -> Config:
+    return load_config(
+        os.environ,
+        base_dir_flags=base_dir or (),
+        db_path_flag=db_path,
+        cache_dir_flag=cache_dir,
+        model_name_flag=model_name,
+    )
+
+
 def _load(
     base_dir: list[str] | None,
     db_path: str | None,
@@ -55,13 +71,7 @@ def _load(
     model_name: str | None,
 ) -> tuple[Config, Store, Pipeline]:
     try:
-        cfg = load_config(
-            os.environ,
-            base_dir_flags=base_dir or (),
-            db_path_flag=db_path,
-            cache_dir_flag=cache_dir,
-            model_name_flag=model_name,
-        )
+        cfg = _load_cfg(base_dir, db_path, cache_dir, model_name)
         emb = _make_embedder(cfg)
         store = Store(cfg.db_path, dim=emb.dim)
         return cfg, store, Pipeline(store, emb, cfg)
@@ -70,6 +80,9 @@ def _load(
         raise AssertionError from e  # unreachable
     except UnknownModelError as e:
         _fail(f"{e} — see fastembed's supported models")
+        raise AssertionError from e  # unreachable
+    except DimensionMismatchError as e:
+        _fail(str(e))
         raise AssertionError from e  # unreachable
 
 
@@ -178,9 +191,10 @@ def sync(
     )
     human = ", ".join(f"{k}: {v}" for k, v in counts.items())
     _emit({"counts": counts, "errors": errors}, json, human)
-    if errors:
-        for err in errors:
-            print(f"warn: {err['source']}: {err['error']}", file=sys.stderr)
+    for err in errors:
+        print(f"warn: {err['source']}: {err['error']}", file=sys.stderr)
+    if counts["failed"] > 0:
+        raise SystemExit(1)  # same contract as `ingest`: failed files are a failed run
 
 
 @app.command
@@ -207,20 +221,16 @@ def query(
         grouping=cfg.grouping,
         max_files=cfg.max_files,
     )
-    payload = {
-        "results": [
-            {
-                "text": r.text,
-                "source": r.source,
-                "title": r.title,
-                "chunkIndex": r.chunk_index,
-                "score": r.score,
-                "distance": r.distance,
-            }
-            for r in results
-        ]
-    }
-    _emit(payload, json, "\n".join(_result_line(r) for r in results) or "no results")
+    sources = aggregate_sources(results)
+    payload = {"results": [result_dict(r) for r in results], "sources": sources}
+    if results:
+        human = "\n".join(_result_line(r) for r in results)
+        human += "\n\nSources:\n" + "\n".join(
+            f"  {s['source']} ({s['hits']} hit{'s' if s['hits'] != 1 else ''})" for s in sources
+        )
+    else:
+        human = "no results"
+    _emit(payload, json, human)
 
 
 @app.command(name="read-neighbors")
@@ -249,8 +259,12 @@ def read_neighbors(
     else:
         _fail("provide --file-path or --source")
     chunks = store.neighbors(key, chunk_index, before=before, after=after)
-    payload = {"chunks": [{"chunkIndex": r.chunk_index, "text": r.text} for r in chunks]}
-    _emit(payload, json, "\n\n".join(f"[{r.chunk_index}] {r.text}" for r in chunks) or "no chunks")
+    payload = {"chunks": [result_dict(r) for r in chunks]}
+    human = (
+        "\n\n".join(f"[{r.chunk_index}] {r.source} — {r.title}\n{r.text}" for r in chunks)
+        or "no chunks"
+    )
+    _emit(payload, json, human)
 
 
 @app.command
@@ -333,6 +347,15 @@ def status(
     json: JsonFlag = False,
 ):
     """Show index and configuration status."""
+    # Degraded mode, matching the server's `status` tool: a broken configuration is
+    # exactly what you run `status` to diagnose, so it reports the error and exits 0.
+    # Every other command still fails loudly on the same ConfigError.
+    try:
+        _load_cfg(base_dir, db_path, cache_dir, model_name)
+    except ConfigError as e:
+        payload = {"version": __version__, "configError": str(e)}
+        _emit(payload, json, "\n".join(f"{k}: {v}" for k, v in payload.items()))
+        return
     cfg, store, _ = _load(base_dir, db_path, cache_dir, model_name)
     payload = {
         "version": __version__,

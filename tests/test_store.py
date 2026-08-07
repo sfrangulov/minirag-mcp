@@ -1,6 +1,6 @@
 import pytest
 
-from minirag_mcp.store import ChunkRecord, Store
+from minirag_mcp.store import ChunkRecord, DimensionMismatchError, Store
 
 
 def rec(source, i, text, vec=None, source_type="file", title="T"):
@@ -93,6 +93,22 @@ def test_persistence_across_instances(tmp_path):
     s1.replace_source("/a.md", [rec("/a.md", 0, "x")])
     s2 = Store(tmp_path / "db", dim=8)  # reopen, no create conflict
     assert s2.chunk_count() == 1
+
+
+def test_reopening_with_a_different_dim_names_both_dimensions(tmp_path):
+    """A MODEL_NAME change against an existing DB_PATH must say so, not blame the schema."""
+    Store(tmp_path / "db", dim=8).replace_source("/a.md", [rec("/a.md", 0, "x")])
+    with pytest.raises(DimensionMismatchError) as exc:
+        Store(tmp_path / "db", dim=16)
+    msg = str(exc.value)
+    assert "8" in msg and "16" in msg
+    assert "no vector column" not in msg
+    assert "DB_PATH" in msg or "re-ingest" in msg  # names a remedy
+
+
+def test_reopening_with_the_same_dim_is_fine(tmp_path):
+    Store(tmp_path / "db", dim=8).replace_source("/a.md", [rec("/a.md", 0, "x")])
+    assert Store(tmp_path / "db", dim=8).chunk_count() == 1
 
 
 def test_scope_prefix_with_like_wildcards_not_overmatching(store):

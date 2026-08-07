@@ -119,6 +119,29 @@ def test_compute_states_ignores_data_source_colliding_with_file_path(tmp_path):
     assert [s.state for s in disk_rows] == ["not_ingested"]
 
 
+def test_scan_roots_skips_symlink_escaping_root(tmp_path):
+    root = tmp_path / "root"
+    outside = tmp_path / "outside"
+    root.mkdir()
+    outside.mkdir()
+    secret = outside / "secret_no_extension"
+    secret.write_text("PRIVATE")
+    (root / "innocent.md").symlink_to(secret)
+    (root / "real.md").write_text("real content")
+    assert [e.path.name for e in scan_roots([root])] == ["real.md"]
+
+
+def test_scan_roots_keeps_symlink_pointing_inside_root(tmp_path):
+    root = tmp_path / "root"
+    (root / "sub").mkdir(parents=True)
+    target = root / "sub" / "target.md"
+    target.write_text("inside the root")
+    (root / "alias.md").symlink_to(target)
+    # The on-disk path is reported (not the resolved target), and the target is
+    # deduped away because it resolves to the same file.
+    assert [e.path.name for e in scan_roots([root])] == ["alias.md"]
+
+
 def test_scan_roots_dedupes_overlapping_roots(tmp_path):
     inner = tmp_path / "inner"
     inner.mkdir()
