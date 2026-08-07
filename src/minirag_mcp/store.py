@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import statistics
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -9,6 +10,7 @@ from pathlib import Path
 import lancedb
 import pyarrow as pa
 from lancedb.index import FTS
+from lancedb.rerankers import LinearCombinationReranker
 
 TABLE = "chunks"
 _LIST_LIMIT = 2**31 - 1  # LanceDB scalar queries default to limit 10 — always set explicitly
@@ -61,6 +63,20 @@ def _scope_clause(scopes: tuple[str, ...]) -> str | None:
 _META_COLS = ["source", "source_type", "title", "chunk_index", "file_hash", "mtime"]
 
 
+def relevance_cutoff(distances: Sequence[float], mode: str) -> int:
+    n = len(distances)
+    if n < 3:
+        return n
+    gaps = [distances[i + 1] - distances[i] for i in range(n - 1)]
+    mean = statistics.fmean(gaps)
+    boundaries = [i + 1 for i, g in enumerate(gaps) if g > mean and g > 0]
+    if not boundaries:
+        return n
+    if mode == "similar":
+        return boundaries[0]
+    return boundaries[1] if len(boundaries) >= 2 else n
+
+
 class Store:
     def __init__(self, db_path: Path, dim: int):
         db_path.mkdir(parents=True, exist_ok=True)
@@ -90,6 +106,7 @@ class Store:
         self._table.delete(f"source = '{_sql_str(source)}'")
         if records:
             self._table.add([asdict(r) for r in records])
+            self._table.optimize()
 
     def delete_source(self, source: str) -> int:
         clause = f"source = '{_sql_str(source)}'"
@@ -167,3 +184,73 @@ class Store:
 
     def source_count(self) -> int:
         return len({r["source"] for r in self._iter_meta()})
+
+    def search(
+        self,
+        query_text: str,
+        query_vector: list[float],
+        *,
+        top_k: int = 8,
+        hybrid_weight: float = 0.6,
+        scopes: tuple[str, ...] = (),
+        max_distance: float | None = None,
+        grouping: str | None = None,
+        max_files: int | None = None,
+    ) -> list[SearchResult]:
+        fetch = max(top_k * 4, 50)
+        clause = _scope_clause(scopes)
+
+        vq = self._table.search(query_vector).limit(fetch)
+        if clause:
+            vq = vq.where(clause, prefilter=True)
+        vrows = vq.to_list()
+        dist_by_id = {r["id"]: r["_distance"] for r in vrows}
+
+        if hybrid_weight <= 0.0:
+            ordered = vrows
+        else:
+            hq = (
+                self._table.search(query_type="hybrid")
+                .vector(query_vector)
+                .text(query_text)
+                .limit(fetch)
+            )
+            if clause:
+                hq = hq.where(clause, prefilter=True)
+            ordered = hq.rerank(
+                LinearCombinationReranker(weight=1.0 - hybrid_weight)
+            ).to_list()
+
+        results: list[SearchResult] = []
+        for r in ordered:
+            distance = dist_by_id.get(r["id"], r.get("_distance"))
+            if max_distance is not None and distance is not None and distance > max_distance:
+                continue
+            score = r.get("_relevance_score")
+            if score is None:
+                score = 1.0 / (1.0 + distance) if distance is not None else 0.0
+            results.append(
+                SearchResult(
+                    text=r["text"], source=r["source"], title=r["title"],
+                    chunk_index=r["chunk_index"], score=float(score), distance=distance,
+                )
+            )
+
+        if grouping in ("similar", "related") and results and all(
+            r.distance is not None for r in results
+        ):
+            cut = relevance_cutoff([r.distance for r in results], grouping)
+            results = results[:cut]
+
+        if max_files is not None:
+            keep: list[SearchResult] = []
+            seen: list[str] = []
+            for r in results:
+                if r.source not in seen:
+                    if len(seen) >= max_files:
+                        continue
+                    seen.append(r.source)
+                keep.append(r)
+            results = keep
+
+        return results[:top_k]
