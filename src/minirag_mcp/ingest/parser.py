@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -102,6 +103,9 @@ _SECTION_NUMBER_RE = re.compile(r"^(?:\d+|[ivxlcdm]+)(?:[.)]\s*|\s+)")
 _HEADING_TRIM = "*_`~#[]() \t.:;,!-–—"
 # An inline image, which markitdown emits for a heading that is only a picture
 _IMAGE_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
+# The same, restricted to an inlined `data:` URI — the picture itself, not a link to
+# one — with the alt text captured so it can be kept.
+_DATA_URI_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(\s*data:[^)]*\)")
 # A leftover extension in a stem, as "report.pdf.pdf" leaves "report.pdf"
 _EXTENSION_SUFFIX_RE = re.compile(
     r"\.(?:" + "|".join(sorted(e.lstrip(".") for e in SUPPORTED_EXTENSIONS)) + r")$",
@@ -135,10 +139,10 @@ def _md() -> MarkItDown:
     return _converter
 
 
-def _first_h1(markdown: str) -> str | None:
-    """First ATX H1 outside fenced code blocks.
+def _lines_with_fence_state(markdown: str) -> Iterator[tuple[str, bool]]:
+    """Every line, paired with whether it belongs to a fenced code block.
 
-    A `# ` line inside a fence is code (a shell or Python comment), not a title.
+    The opening and closing fence lines count as inside: they are part of the block.
     """
     fence: str | None = None
     for line in markdown.split("\n"):
@@ -147,13 +151,48 @@ def _first_h1(markdown: str) -> str | None:
             match = _FENCE_RE.match(stripped)
             if match:
                 fence = match.group(1)
-                continue
-            heading = _H1_RE.match(line)
-            if heading:
-                return heading.group(1).strip()
-        elif stripped.startswith(fence[0] * len(fence)):
-            fence = None
+                yield line, True
+            else:
+                yield line, False
+        else:
+            yield line, True
+            if stripped.startswith(fence[0] * len(fence)):
+                fence = None
+
+
+def _first_h1(markdown: str) -> str | None:
+    """First ATX H1 outside fenced code blocks.
+
+    A `# ` line inside a fence is code (a shell or Python comment), not a title.
+    """
+    for line, in_fence in _lines_with_fence_state(markdown):
+        if in_fence:
+            continue
+        heading = _H1_RE.match(line)
+        if heading:
+            return heading.group(1).strip()
     return None
+
+
+def strip_data_uri_images(markdown: str) -> str:
+    """Drop embedded-image placeholders, keeping their alt text.
+
+    markitdown renders an embedded picture as `![alt](data:image/png;base64,...)`:
+    4442 of 52231 chunks on a measured 558-document corpus carried one, and they are
+    noise in search results and in read_file output alike. Alt text is content the
+    author wrote, so it survives as plain text; a placeholder without any goes whole.
+
+    Only `data:` URIs are stripped — an image link to a path or an http URL is a
+    reference the reader can follow. Fenced code blocks are left untouched, where a
+    data: URI is the subject of the document rather than decoration. A document that
+    is nothing but placeholders keeps them: removing decoration must not remove the
+    document.
+    """
+    stripped = "\n".join(
+        line if in_fence else _DATA_URI_IMAGE_RE.sub(lambda m: m.group(1).strip(), line)
+        for line, in_fence in _lines_with_fence_state(markdown)
+    )
+    return markdown if markdown.strip() and not stripped.strip() else stripped
 
 
 def _is_informative_stem(stem: str) -> bool:
@@ -259,12 +298,17 @@ def _file_title(markdown: str, explicit: str | None, stem: str) -> str:
     return _display_stem(stem) or stem
 
 
+def _converted_markdown(result) -> str:
+    """The converter's Markdown, cleaned. Every entry point goes through here."""
+    return strip_data_uri_images(result.markdown or "")
+
+
 def parse_file(path: Path) -> ParsedDoc:
     try:
         result = _md().convert(str(path))
     except Exception as e:  # markitdown may raise lib-specific errors too
         raise ParserError(f"Failed to convert {path}: {e}") from e
-    markdown = result.markdown or ""
+    markdown = _converted_markdown(result)
     return ParsedDoc(markdown=markdown, title=_file_title(markdown, result.title, path.stem))
 
 
@@ -273,7 +317,7 @@ def parse_html(html: str, title: str | None = None) -> ParsedDoc:
         result = _md().convert_stream(io.BytesIO(html.encode("utf-8")), file_extension=".html")
     except Exception as e:
         raise ParserError(f"Failed to convert HTML: {e}") from e
-    markdown = result.markdown or ""
+    markdown = _converted_markdown(result)
     found = find_title(markdown, title or result.title)
     return ParsedDoc(markdown=markdown, title=found or "Untitled", has_title=found is not None)
 
@@ -283,6 +327,6 @@ def parse_url(url: str) -> ParsedDoc:
         result = _md().convert_url(url)
     except Exception as e:
         raise ParserError(f"Failed to fetch/convert {url}: {e}") from e
-    markdown = result.markdown or ""
+    markdown = _converted_markdown(result)
     found = find_title(markdown, result.title)
     return ParsedDoc(markdown=markdown, title=found or url, has_title=found is not None)

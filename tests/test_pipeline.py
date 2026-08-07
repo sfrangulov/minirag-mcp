@@ -256,3 +256,19 @@ def test_ingest_url_mocked(pipe, monkeypatch, public_dns):
     res = p.ingest_url("https://example.com/docs")
     assert res.source == "https://example.com/docs"
     assert store.get_source(res.source).source_type == "url"
+
+
+def test_image_placeholders_are_stripped_but_never_empty_a_document(pipe):
+    """The placeholders leave the index; a document made only of them still ingests."""
+    p, store, root = pipe
+    doc = root / "И-112 Хранение ТМЗ.md"
+    png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="
+    doc.write_text(f"# И-112\n\n![Схема обмена]({png})\n\nТело документа.\n", encoding="utf-8")
+    p.ingest_file(doc)
+    text = "\n\n".join(c.text for c in store.all_chunks(str(doc)))
+    assert "base64" not in text
+    assert "Схема обмена" in text  # alt text is content and stays
+
+    only_image = root / "Скан договора.md"
+    only_image.write_text(f"![]({png})\n", encoding="utf-8")
+    assert p.ingest_file(only_image).chunk_count == 1

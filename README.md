@@ -126,6 +126,13 @@ up by `sync_start`/`sync` and `ingest_file`/`ingest`, converted to Markdown by
 `.md` `.markdown` `.txt` `.pdf` `.docx` `.pptx` `.xlsx` `.html` `.htm` `.csv`
 `.epub` `.ipynb`
 
+Embedded pictures are not indexed. `markitdown` inlines each one as an
+`![alt](data:image/png;base64,…)` placeholder — 8.5% of chunks on a measured
+558-document corpus carried one — so the placeholder is removed before
+chunking and only its alt text is kept. Image links that point at a path or an
+http URL are references, not inlined pictures, and stay as written, as does a
+`data:` URI inside a fenced code block.
+
 Two more ways to get content in without a file on disk:
 
 - **`ingest_data`** — hand the server text, Markdown, or HTML content

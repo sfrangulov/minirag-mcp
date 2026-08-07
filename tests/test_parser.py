@@ -10,6 +10,7 @@ from minirag_mcp.ingest.parser import (
     extract_title,
     parse_file,
     parse_html,
+    strip_data_uri_images,
 )
 
 
@@ -234,3 +235,45 @@ def test_stem_normalisation_keeps_meaningful_punctuation(tmp_path):
 def test_parse_html_and_url_titles_unaffected_by_stem_rule():
     # parse_html has no filename at all; its fallback stays "Untitled".
     assert parse_html("<html><body><p>no title tag</p></body></html>").title == "Untitled"
+
+
+PNG = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="
+
+
+def test_data_uri_image_keeps_its_alt_text():
+    """Alt text is content the author wrote; the base64 blob around it is not."""
+    md = f"Intro paragraph.\n\n![Схема обмена]({PNG})\n\nOutro."
+    assert strip_data_uri_images(md) == "Intro paragraph.\n\nСхема обмена\n\nOutro."
+
+
+def test_data_uri_image_without_alt_text_goes_entirely():
+    md = f"Intro paragraph.\n\n![]({PNG})\n\nOutro."
+    assert strip_data_uri_images(md) == "Intro paragraph.\n\n\n\nOutro."
+
+
+def test_ordinary_image_links_are_left_alone():
+    """A link to a file or an http URL is a reference, not an inlined picture."""
+    md = "![diagram](images/diagram.png)\n\n![logo](https://example.com/logo.svg)"
+    assert strip_data_uri_images(md) == md
+
+
+def test_data_uri_inside_a_code_fence_is_content():
+    """Inside a fence the URI is the subject of the document, not decoration."""
+    md = f"Example:\n\n```markdown\n![]({PNG})\n```\n\nDone."
+    assert strip_data_uri_images(md) == md
+
+
+def test_a_document_that_is_only_a_placeholder_keeps_it():
+    """Removing decoration must not remove the document."""
+    md = f"![]({PNG})"
+    assert strip_data_uri_images(md) == md
+    assert strip_data_uri_images("") == ""
+
+
+def test_every_entry_point_strips_placeholders(tmp_path):
+    f = tmp_path / "И-112 Хранение ТМЗ.md"
+    f.write_text(f"# И-112 Хранение ТМЗ\n\n![Схема]({PNG})\n\nТело документа.\n", encoding="utf-8")
+    from_file = parse_file(f).markdown
+    assert "base64" not in from_file and "Схема" in from_file
+    from_html = parse_html(f'<h1>T</h1><p>body</p><img alt="Схема" src="{PNG}">').markdown
+    assert "base64" not in from_html and from_html.endswith("Схема")
