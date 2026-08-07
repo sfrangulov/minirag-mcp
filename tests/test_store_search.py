@@ -70,3 +70,17 @@ def test_relevance_cutoff():
     d2 = [0.10, 0.11, 0.40, 0.41, 0.80, 0.81]  # two big gaps
     assert relevance_cutoff(d2, "similar") == 2
     assert relevance_cutoff(d2, "related") == 4
+
+
+def test_keyword_boost_disabled_keeps_vector_order(store):
+    got = store.search("ERR_CONNECTION_REFUSED", V(1.0), top_k=3, hybrid_weight=0.0)
+    assert got[0].source == "/cook.md"  # pure vector: the recipe wins
+
+
+def test_malformed_fts_query_degrades_to_vector(store):
+    got = store.search('"unbalanced quote AND (', V(0.0), top_k=3, hybrid_weight=0.6)
+    assert got  # no exception, vector side still answers
+
+
+def test_relevance_cutoff_ignores_jitter():
+    assert relevance_cutoff([0.10, 0.11, 0.20, 0.21, 0.30], "similar") == 5

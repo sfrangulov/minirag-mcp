@@ -10,10 +10,11 @@ from pathlib import Path
 import lancedb
 import pyarrow as pa
 from lancedb.index import FTS
-from lancedb.rerankers import LinearCombinationReranker
 
 TABLE = "chunks"
 _LIST_LIMIT = 2**31 - 1  # LanceDB scalar queries default to limit 10 — always set explicitly
+RRF_K = 60  # standard RRF damping constant
+GAP_FACTOR = 2.0  # relevance_cutoff boundary must exceed mean gap by this factor
 
 
 @dataclass(frozen=True)
@@ -64,17 +65,55 @@ _META_COLS = ["source", "source_type", "title", "chunk_index", "file_hash", "mti
 
 
 def relevance_cutoff(distances: Sequence[float], mode: str) -> int:
+    """Identify natural gaps in distance ordering for clustering into relevance groups.
+
+    A boundary occurs where gap > mean(gaps) * GAP_FACTOR. This avoids spurious
+    cuts from jitter and detects only materially significant distance jumps.
+
+    Args:
+        distances: sorted sequence of distances (e.g., from vector search)
+        mode: "similar" → cut at first boundary; "related" → cut at second
+
+    Returns:
+        Index to cut the list at (len(distances) if no boundary found)
+    """
     n = len(distances)
     if n < 3:
         return n
     gaps = [distances[i + 1] - distances[i] for i in range(n - 1)]
     mean = statistics.fmean(gaps)
-    boundaries = [i + 1 for i, g in enumerate(gaps) if g > mean and g > 0]
+    threshold = mean * GAP_FACTOR
+    boundaries = [i + 1 for i, g in enumerate(gaps) if g > threshold and g > 0]
     if not boundaries:
         return n
     if mode == "similar":
         return boundaries[0]
     return boundaries[1] if len(boundaries) >= 2 else n
+
+
+def _weighted_rrf(
+    vector_ids: Sequence[str], fts_ids: Sequence[str], keyword_weight: float, k: int = RRF_K
+) -> dict[str, float]:
+    """Fuse two ranked id lists by reciprocal rank.
+
+    Rank-based fusion sidesteps the incomparable scales of L2 distance and BM25:
+    only positions matter. keyword_weight is the FTS side's share (0..1).
+
+    Args:
+        vector_ids: id list from vector search (ranked by distance)
+        fts_ids: id list from FTS search (ranked by BM25)
+        keyword_weight: how much to weight FTS results (0 = pure vector, 1 = pure FTS)
+        k: RRF damping constant (default 60)
+
+    Returns:
+        dict mapping id → fused score, higher is better
+    """
+    scores: dict[str, float] = {}
+    for rank, rid in enumerate(vector_ids):
+        scores[rid] = scores.get(rid, 0.0) + (1.0 - keyword_weight) / (k + rank + 1)
+    for rank, rid in enumerate(fts_ids):
+        scores[rid] = scores.get(rid, 0.0) + keyword_weight / (k + rank + 1)
+    return scores
 
 
 class Store:
@@ -106,7 +145,6 @@ class Store:
         self._table.delete(f"source = '{_sql_str(source)}'")
         if records:
             self._table.add([asdict(r) for r in records])
-            self._table.optimize()
 
     def delete_source(self, source: str) -> int:
         clause = f"source = '{_sql_str(source)}'"
@@ -206,27 +244,39 @@ class Store:
         vrows = vq.to_list()
         dist_by_id = {r["id"]: r["_distance"] for r in vrows}
 
+        fts_rows: list[dict] = []
+        rrf_scores: dict[str, float] = {}
+
         if hybrid_weight <= 0.0:
             ordered = vrows
         else:
-            hq = (
-                self._table.search(query_type="hybrid")
-                .vector(query_vector)
-                .text(query_text)
-                .limit(fetch)
+            try:
+                fq = self._table.search(query_text, query_type="fts").limit(fetch)
+                if clause:
+                    fq = fq.where(clause)
+                fts_rows = fq.to_list()
+            except Exception:
+                fts_rows = []  # malformed FTS query degrades to vector-only ranking
+
+            # Fuse vector and FTS results by reciprocal rank
+            by_id = {r["id"]: r for r in vrows}
+            by_id.update({r["id"]: r for r in fts_rows})
+            rrf_scores = _weighted_rrf(
+                [r["id"] for r in vrows],
+                [r["id"] for r in fts_rows],
+                hybrid_weight,
             )
-            if clause:
-                hq = hq.where(clause, prefilter=True)
-            ordered = hq.rerank(
-                LinearCombinationReranker(weight=1.0 - hybrid_weight)
-            ).to_list()
+            ordered = [
+                by_id[rid]
+                for rid, _ in sorted(rrf_scores.items(), key=lambda kv: kv[1], reverse=True)
+            ]
 
         results: list[SearchResult] = []
         for r in ordered:
             distance = dist_by_id.get(r["id"], r.get("_distance"))
             if max_distance is not None and distance is not None and distance > max_distance:
                 continue
-            score = r.get("_relevance_score")
+            score = rrf_scores.get(r["id"])
             if score is None:
                 score = 1.0 / (1.0 + distance) if distance is not None else 0.0
             results.append(
