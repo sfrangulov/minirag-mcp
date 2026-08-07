@@ -11,7 +11,7 @@ SEPARATOR = "\n\n"
 
 
 def cosine(a: Sequence[float], b: Sequence[float]) -> float:
-    dot = sum(x * y for x, y in zip(a, b, strict=False))
+    dot = sum(x * y for x, y in zip(a, b, strict=True))
     na = math.sqrt(sum(x * x for x in a))
     nb = math.sqrt(sum(x * x for x in b))
     if na == 0.0 or nb == 0.0:
@@ -27,13 +27,19 @@ def merge_blocks(
     min_length: int = 50,
     similarity_threshold: float = 0.60,
 ) -> list[str]:
+    """Merge adjacent blocks by embedding similarity, with size and code-block rules.
+
+    The final fold pass prioritizes "never emit a sub-min_length chunk" over the
+    max_chars target: folding may exceed max_chars by up to min_length-1 chars
+    (plus whatever an atomic code block already exceeds it by). max_chars is a
+    sizing heuristic, not a hard limit."""
     if not blocks:
         return []
     vectors = embed([b.text for b in blocks])
 
     chunks: list[str] = [blocks[0].text]
     prev_vec = vectors[0]
-    for block, vec in zip(blocks[1:], vectors[1:], strict=False):
+    for block, vec in zip(blocks[1:], vectors[1:], strict=True):
         candidate = chunks[-1] + SEPARATOR + block.text
         fits = len(candidate) <= max_chars
         similar = block.is_code or cosine(prev_vec, vec) >= similarity_threshold

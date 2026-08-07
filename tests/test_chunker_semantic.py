@@ -58,3 +58,13 @@ def test_dissimilar_stay_separate():
     embed = StubEmbedder({"first topic here": [1.0, 0.0], "second topic here": [0.0, 1.0]})
     out = merge_blocks([T("first topic here"), T("second topic here")], embed, min_length=1)
     assert len(out) == 2
+
+
+def test_short_chunk_folds_into_oversized_code_neighbor():
+    """The fold pass keeps content together even past max_chars — documented
+    trade-off."""
+    code = "```\n" + "x = 1\n" * 300 + "```"
+    embed = StubEmbedder({"intro": [1.0, 0.0], code: [0.0, 1.0]})
+    out = merge_blocks([T("intro"), C(code)], embed, max_chars=1500, min_length=50)
+    assert len(out) == 1  # folded, nothing dropped, no sub-min_length chunk
+    assert out[0] == "intro\n\n" + code  # no content lost
