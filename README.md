@@ -40,14 +40,19 @@ built on [fastmcp](https://github.com/jlowin/fastmcp),
 
 ## Quick Start
 
-Pick your client. All of them launch the same `uvx minirag-mcp` process; only
-the config format differs. Replace `/absolute/path/to/docs` with the folder
-you want indexed.
+Not on PyPI yet — install straight from this repository. Every client below
+launches the same process; only the config format differs. Replace
+`/absolute/path/to/docs` with the folder you want indexed.
+
+The invocation is `uvx --from git+https://github.com/sfrangulov/minirag-mcp minirag-mcp`.
+It resolves and caches the package on first run, so start-up is slow once and
+fast afterwards. To pin a revision, append `@<tag-or-sha>` to the URL.
 
 ### Claude Code
 
 ```bash
-claude mcp add minirag --scope user --env BASE_DIR=/absolute/path/to/docs -- uvx minirag-mcp
+claude mcp add minirag --scope user --env BASE_DIR=/absolute/path/to/docs \
+  -- uvx --from git+https://github.com/sfrangulov/minirag-mcp minirag-mcp
 ```
 
 ### Cursor (`~/.cursor/mcp.json`)
@@ -57,7 +62,11 @@ claude mcp add minirag --scope user --env BASE_DIR=/absolute/path/to/docs -- uvx
   "mcpServers": {
     "minirag": {
       "command": "uvx",
-      "args": ["minirag-mcp"],
+      "args": [
+        "--from",
+        "git+https://github.com/sfrangulov/minirag-mcp",
+        "minirag-mcp"
+      ],
       "env": {
         "BASE_DIR": "/absolute/path/to/docs"
       }
@@ -71,10 +80,21 @@ claude mcp add minirag --scope user --env BASE_DIR=/absolute/path/to/docs -- uvx
 ```toml
 [mcp_servers.minirag]
 command = "uvx"
-args = ["minirag-mcp"]
+args = ["--from", "git+https://github.com/sfrangulov/minirag-mcp", "minirag-mcp"]
 
 [mcp_servers.minirag.env]
 BASE_DIR = "/absolute/path/to/docs"
+```
+
+### From a clone
+
+For development, or to use the CLI without the `--from` prefix everywhere:
+
+```bash
+git clone https://github.com/sfrangulov/minirag-mcp
+cd minirag-mcp
+uv sync
+uv run minirag-mcp status --base-dir /absolute/path/to/docs
 ```
 
 ### First use
@@ -400,9 +420,10 @@ strings: `export BASE_DIRS='["/docs/a", "/docs/b"]'`. `status` keeps working
 even with a broken `BASE_DIRS`; every other tool fails until it's fixed.
 
 **MCP client doesn't show the tools.**
-- Run `uvx minirag-mcp` directly in a terminal — it should hang silently,
-  waiting on stdio (Ctrl-C to exit). If that fails, the client will fail the
-  same way.
+- Run the same command the client runs
+  (`uvx --from git+https://github.com/sfrangulov/minirag-mcp minirag-mcp`)
+  directly in a terminal — it should hang silently, waiting on stdio (Ctrl-C
+  to exit). If that fails, the client will fail the same way.
 - Restart the client after adding or editing the server config.
 - Confirm `uv`/`uvx` is on the `PATH` the client's process sees — GUI apps
   sometimes launch with a different `PATH` than your shell.
@@ -411,4 +432,4 @@ even with a broken `BASE_DIRS`; every other tool fails until it's fixed.
 
 ## License
 
-MIT.
+MIT — see [LICENSE](LICENSE).
