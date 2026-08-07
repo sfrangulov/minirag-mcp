@@ -120,6 +120,16 @@ def _weighted_rrf(
     return scores
 
 
+def _is_missing_table(exc: Exception) -> bool:
+    """True only for lancedb's "no such table" signal, not for any other open failure.
+
+    lancedb 0.36 raises ValueError("Table 'chunks' was not found"), and
+    FileNotFoundError on the code path that checks the dataset directory. A corrupt
+    manifest or an unreadable directory arrives as RuntimeError instead.
+    """
+    return isinstance(exc, FileNotFoundError) or "was not found" in str(exc)
+
+
 class DimensionMismatchError(Exception):
     """An existing index was built with a different embedding dimension than requested."""
 
@@ -133,7 +143,12 @@ class Store:
         self.missing_fts_indices: tuple[str, ...] = ()
         try:
             self._table = self._db.open_table(TABLE)
-        except Exception:
+        except (FileNotFoundError, ValueError) as e:
+            # Only a missing table means "create it". Letting every failure fall through
+            # to create_table turns a corrupt table or a permissions problem into a
+            # create-time error that names neither cause.
+            if not _is_missing_table(e):
+                raise
             schema = pa.schema(
                 [
                     pa.field("id", pa.string()),
@@ -219,7 +234,7 @@ class Store:
 
     def delete_source(self, source: str) -> int:
         clause = f"source = '{sql_str(source)}'"
-        before = len(self._table.search().where(clause).select(["id"]).limit(_LIST_LIMIT).to_list())
+        before = self._table.count_rows(filter=clause)
         if before:
             self._table.delete(clause)
         return before

@@ -147,10 +147,12 @@ class Pipeline:
                 f"Unsupported file extension {path.suffix!r}; supported: "
                 + ", ".join(sorted(SUPPORTED_EXTENSIONS))
             )
-        size = path.stat().st_size
-        if size > self.config.max_file_size:
+        # One stat for both checks: the recorded mtime must describe the same file
+        # state whose size was accepted.
+        info = path.stat()
+        if info.st_size > self.config.max_file_size:
             raise FileTooLargeError(
-                f"{path} is {size} bytes; MAX_FILE_SIZE is {self.config.max_file_size}"
+                f"{path} is {info.st_size} bytes; MAX_FILE_SIZE is {self.config.max_file_size}"
             )
         doc = parse_file(path)
         return self._chunk_and_store(
@@ -161,7 +163,7 @@ class Pipeline:
             # a file's title is always a real one: metadata, a heading, or its name
             seed_title=True,
             file_hash=file_sha256(path),
-            mtime=path.stat().st_mtime,
+            mtime=info.st_mtime,
         )
 
     def ingest_data(

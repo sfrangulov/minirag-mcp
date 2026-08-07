@@ -1,5 +1,6 @@
 import os
 
+import lancedb.db
 import pytest
 
 from minirag_mcp.store import ChunkRecord, DimensionMismatchError, Store
@@ -214,3 +215,15 @@ def test_scope_prefix_with_like_wildcards_not_overmatching(store):
         store.replace_source(src, [rec(src, 0, "x")])
     assert [s.source for s in store.list_sources(scopes=("/docs_api",))] == ["/docs_api/f1.md"]
     assert [s.source for s in store.list_sources(scopes=("/100%done",))] == ["/100%done/f4.md"]
+
+
+def test_open_failure_that_is_not_a_missing_table_propagates(tmp_path, monkeypatch):
+    db_path = tmp_path / "db"
+    Store(db_path, dim=8)  # the table now exists
+
+    def unreadable(self, name, **kwargs):
+        raise RuntimeError("lance error: LanceError(IO): Permission denied (os error 13)")
+
+    monkeypatch.setattr(lancedb.db.LanceDBConnection, "open_table", unreadable)
+    with pytest.raises(RuntimeError, match="Permission denied"):
+        Store(db_path, dim=8)
