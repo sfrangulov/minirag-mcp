@@ -1,5 +1,8 @@
 """Slow tests: real model download (~220 MB). Run with: uv run pytest -m slow"""
 
+import os
+from pathlib import Path
+
 import pytest
 
 from minirag_mcp.config import DEFAULT_MODEL
@@ -7,9 +10,18 @@ from minirag_mcp.embedder import Embedder
 
 pytestmark = pytest.mark.slow
 
+# CI points this at a restored cache so the download happens once, not once per run.
+CACHE_ENV = "MINIRAG_TEST_MODEL_CACHE"
 
-def test_real_embeddings_shape_and_similarity(tmp_path):
-    emb = Embedder(DEFAULT_MODEL, cache_dir=tmp_path / "models")
+
+@pytest.fixture
+def model_cache(tmp_path) -> Path:
+    shared = os.environ.get(CACHE_ENV)
+    return Path(shared) if shared else tmp_path / "models"
+
+
+def test_real_embeddings_shape_and_similarity(model_cache):
+    emb = Embedder(DEFAULT_MODEL, cache_dir=model_cache)
 
     # Short 2-3 word fragments do NOT reliably show cross-lingual alignment in
     # this model — measured 0.44 same-topic vs 0.56 unrelated on fragments

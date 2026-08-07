@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main, debts]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 5 * * 1" # Mondays, for the slow job only
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python-version }}
+      - run: uv sync
+      - run: uv run ruff check src tests
+      - run: uv run ruff format --check src tests
+      - run: uv run pytest -q
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv build
+      # Installing from the wheel into an empty venv is the only check that the
+      # packaged distribution — not the source tree — has a working entry point.
+      - name: Smoke-test the installed console script
+        run: |
+          uv venv /tmp/smoke
+          VIRTUAL_ENV=/tmp/smoke uv pip install dist/*.whl
+          /tmp/smoke/bin/minirag-mcp status --base-dir .
+
+  slow:
+    # Downloads a ~220 MB embedding model: never on push or pull_request.
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    env:
+      MINIRAG_TEST_MODEL_CACHE: ${{ github.workspace }}/.model-cache
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.model-cache
+          key: fastembed-${{ runner.os }}-${{ hashFiles('src/minirag_mcp/config.py') }}
+      - run: uv sync
+      - run: uv run pytest -q -m slow

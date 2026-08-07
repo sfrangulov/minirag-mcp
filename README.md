@@ -1,5 +1,7 @@
 # minirag-mcp
 
+[![CI](https://github.com/sfrangulov/minirag-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/sfrangulov/minirag-mcp/actions/workflows/ci.yml)
+
 A local-first RAG (retrieval-augmented generation) MCP server. Point it at a
 folder of documents and it gives your MCP client (Claude Code, Cursor, Codex,
 ...) hybrid search — semantic vector similarity plus a keyword boost for
