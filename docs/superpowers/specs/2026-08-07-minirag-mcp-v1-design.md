@@ -143,11 +143,12 @@ minirag-mcp status
 minirag-mcp delete <path> | --source <id>
 ```
 
-Global options before the subcommand: `--db-path`, `--cache-dir`,
-`--model-name`; `--base-dir` is repeatable on `ingest` and `list`. CLI flags
-take precedence over env vars; env var names are shared with the server.
-Default document root for the CLI is the current directory. Output is
-human-readable text; `--json` switches to machine-readable.
+The option quartet `--base-dir`/`--db-path`/`--cache-dir`/`--model-name` is
+accepted by every subcommand, given *after* the subcommand; `--base-dir` is
+repeatable. CLI flags take precedence over env vars; env var names are
+shared with the server. Default document root for the CLI is the current
+directory. Output is human-readable text; `--json` switches to
+machine-readable.
 
 ## Configuration
 
@@ -161,7 +162,7 @@ human-readable text; `--json` switches to machine-readable.
 | `MAX_FILE_SIZE` | `104857600` (100 MB) | per-file limit |
 | `CHUNK_MIN_LENGTH` | `50` | minimum chunk length, chars |
 | `RAG_HYBRID_WEIGHT` | `0.6` | keyword boost 0.0–1.0 (0 = pure vector) |
-| `RAG_GROUPING` | unset | `similar` = first relevance group; `related` = up to two groups (vector-distance gap boundaries) |
+| `RAG_GROUPING` | unset | `similar` = first relevance group; `related` = up to two groups. A boundary is a gap between consecutive sorted result distances that exceeds the mean gap by a factor `GAP_FACTOR = 2.0` |
 | `RAG_MAX_DISTANCE` | unset | drop results above this distance |
 | `RAG_MAX_FILES` | unset | keep results from top-N files only |
 
@@ -223,12 +224,17 @@ Scanner whitelist: `.md .markdown .txt .pdf .docx .pptx .xlsx .html .htm .csv
 .epub .ipynb`. Hidden entries (dot-prefixed) and `node_modules`,
 `__pycache__`, `.venv`, `venv` directories are skipped.
 
-**Query:** embed query → LanceDB hybrid search (explicit query vector + query
-text; no embedding function registered on the table) → keyword weight from
-`RAG_HYBRID_WEIGHT` via linear-combination reranking (exact reranker choice
-verified at implementation; fallback: RRF + manual term-boost rerank) →
-optional `RAG_MAX_DISTANCE` filter → optional relevance-gap grouping →
-optional `RAG_MAX_FILES` → optional `scope` prefix filter on `source`.
+**Query:** embed query → LanceDB vector search (explicit query vector; no
+embedding function registered on the table) and BM25 full-text search, run
+independently → fuse the two ranked id lists with an in-house weighted
+Reciprocal Rank Fusion (`RAG_HYBRID_WEIGHT` sets the FTS side's share, RRF
+damping constant `k = 60`) → optional `RAG_MAX_DISTANCE` filter → optional
+relevance-gap grouping → optional `RAG_MAX_FILES` → optional `scope` prefix
+filter on `source`. Weighted RRF replaces LanceDB's built-in
+`LinearCombinationReranker`, which was tried first: L2 vector distance and
+BM25 relevance live on incomparable scales, so a raw-score blend lets a
+strong vector match bury an exact-term hit regardless of the configured
+weight — RRF sidesteps this by fusing on rank position only.
 
 **Neighbors:** fetch by `source` + `chunk_index` range `[i−before, i+after]`
 (defaults: `before=1`, `after=1`), ordered.

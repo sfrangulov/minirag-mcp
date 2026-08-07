@@ -292,10 +292,12 @@ def create_app(
         """Report configuration and index status. Works even when configuration is invalid.
 
         Always includes version. When configuration is valid, also includes
-        roots, dbPath, model, hybridWeight, and — once the index has been
-        touched — chunkCount/sourceCount. When configuration is invalid,
-        includes configError instead, and every other tool raises an error
-        referencing it until the configuration is fixed.
+        roots, dbPath, model, hybridWeight, and chunkCount/sourceCount (both
+        present on every call, 0 before anything is indexed) — or, if opening
+        the index itself fails, indexError instead of the counts. When
+        configuration is invalid, includes configError instead, and every
+        other tool raises an error referencing it until the configuration is
+        fixed.
         """
         if config is None or config_error is not None:
             return {"version": __version__, "configError": config_error or "no configuration"}
