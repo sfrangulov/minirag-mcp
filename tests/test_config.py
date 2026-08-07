@@ -1,8 +1,9 @@
+import dataclasses
 from pathlib import Path
 
 import pytest
 
-from minirag_mcp.config import DEFAULT_MODEL, Config, ConfigError, load_config
+from minirag_mcp.config import DEFAULT_MODEL, ConfigError, load_config
 
 
 def test_defaults_from_cwd(tmp_path):
@@ -78,10 +79,15 @@ def test_search_tuning_env(tmp_path):
         "RAG_MAX_FILES": "2",
     }
     cfg = load_config(env, cwd=tmp_path)
-    assert (cfg.hybrid_weight, cfg.grouping, cfg.max_distance, cfg.max_files) == (0.8, "related", 0.5, 2)
+    assert (cfg.hybrid_weight, cfg.grouping, cfg.max_distance, cfg.max_files) == (
+        0.8,
+        "related",
+        0.5,
+        2,
+    )
 
 
 def test_config_is_frozen(tmp_path):
     cfg = load_config({}, cwd=tmp_path)
-    with pytest.raises(Exception):
+    with pytest.raises(dataclasses.FrozenInstanceError):
         cfg.model_name = "x"  # type: ignore[misc]

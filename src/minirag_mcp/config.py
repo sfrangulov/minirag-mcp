@@ -52,7 +52,9 @@ def _roots(env: Mapping[str, str], base_dir_flags: Sequence[str], cwd: Path) -> 
             or not parsed
             or not all(isinstance(p, str) and p.strip() for p in parsed)
         ):
-            raise ConfigError("BASE_DIRS must be a JSON array of one or more non-empty path strings")
+            raise ConfigError(
+                "BASE_DIRS must be a JSON array of one or more non-empty path strings"
+            )
         return tuple(_resolve(p) for p in parsed)
     base = env.get("BASE_DIR", "").strip()
     if base:
@@ -69,7 +71,8 @@ def _int(env: Mapping[str, str], key: str, default: int, lo: int, hi: int | None
     except ValueError as e:
         raise ConfigError(f"{key} must be an integer, got {raw!r}") from e
     if val < lo or (hi is not None and val > hi):
-        raise ConfigError(f"{key} must be in range [{lo}, {hi if hi is not None else '∞'}], got {val}")
+        hi_str = hi if hi is not None else "∞"
+        raise ConfigError(f"{key} must be in range [{lo}, {hi_str}], got {val}")
     return val
 
 
@@ -102,7 +105,11 @@ def load_config(
     db_path = _resolve(db_raw) if db_raw else roots[0] / ".minirag" / "lancedb"
 
     cache_raw = cache_dir_flag or env.get("CACHE_DIR")
-    cache_dir = _resolve(cache_raw) if cache_raw else platformdirs.user_cache_path("minirag-mcp") / "models"
+    cache_dir = (
+        _resolve(cache_raw)
+        if cache_raw
+        else platformdirs.user_cache_path("minirag-mcp") / "models"
+    )
 
     weight_raw = env.get("RAG_HYBRID_WEIGHT")
     if weight_raw is None:
