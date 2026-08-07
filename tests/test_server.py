@@ -123,3 +123,27 @@ async def test_degraded_mode_status_alive_others_fail(tmp_path, fake_embedder):
         assert "BASE_DIRS" in st["configError"]
         with pytest.raises(Exception, match="BASE_DIRS"):
             await c.call_tool("list_files", {})
+
+
+async def test_read_file_distinguishes_failure_reasons(app):
+    mcp, root = app
+    missing = root / "nope.md"
+    directory = root / "sub"
+    unindexed = root / "auth.md"
+    async with Client(mcp) as c:
+        with pytest.raises(Exception, match="does not exist") as missing_exc:
+            await c.call_tool("read_file", {"filePath": str(missing)})
+        with pytest.raises(Exception, match="Not a file") as dir_exc:
+            await c.call_tool("read_file", {"filePath": str(directory)})
+        with pytest.raises(Exception, match="not found in index") as unindexed_exc:
+            await c.call_tool("read_file", {"filePath": str(unindexed)})
+    messages = {str(missing_exc.value), str(dir_exc.value), str(unindexed_exc.value)}
+    assert len(messages) == 3, f"expected three distinct error messages, got {messages}"
+
+
+async def test_all_tools_have_substantive_descriptions(app):
+    mcp, _ = app
+    async with Client(mcp) as c:
+        tools = await c.list_tools()
+    for t in tools:
+        assert t.description and len(t.description) > 40, f"{t.name} description too thin"

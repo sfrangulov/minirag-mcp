@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from functools import wraps
+from pathlib import Path
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
@@ -87,6 +88,8 @@ def create_app(
         Returns a jobId immediately; poll sync_status until state is
         'succeeded' or 'failed'. New and changed files are ingested,
         byte-identical files skipped, vanished files removed from the index.
+        Only the latest sync job is retained — starting a new one, or a
+        server restart, discards the previous job's record.
         """
         c = ctx()
         scope = None
@@ -97,13 +100,24 @@ def create_app(
     @mcp.tool
     @guard
     def sync_status(jobId: str) -> dict:
-        """Poll a sync job started by sync_start."""
+        """Poll a sync job started by sync_start.
+
+        Returns state ('pending' | 'running' | 'succeeded' | 'failed'),
+        counts (scanned/ingested/skipped/deleted/failed), and any per-file
+        errors. Only the latest job is retained — an old jobId, or any
+        jobId from before a server restart, raises an error.
+        """
         return ctx().sync.status(jobId).to_dict()
 
     @mcp.tool
     @guard
     def ingest_file(filePath: str) -> dict:
-        """Ingest or re-ingest one file (absolute path inside a document root)."""
+        """Ingest or re-ingest one file, replacing any content already indexed for it.
+
+        filePath must be an absolute path inside a configured document root.
+        Re-ingesting an already-indexed file discards its old chunks and
+        replaces them with freshly parsed ones.
+        """
         c = ctx()
         path = resolve_in_roots(filePath, c.config.roots)
         r = c.pipeline.ingest_file(path)
@@ -112,21 +126,40 @@ def create_app(
     @mcp.tool
     @guard
     def ingest_data(data: str, source: str, format: str = "text", title: str | None = None) -> dict:
-        """Ingest text/markdown/html content held by the client under a stable source id."""
+        """Ingest text/markdown/html content the client holds, under a source id you choose.
+
+        format is one of "text", "markdown", or "html" (default "text").
+        source is a stable identifier you pick, not a filesystem path —
+        re-using it replaces the previously ingested content for that id,
+        so reuse the same source to update an item.
+        """
         r = ctx().pipeline.ingest_data(data, source=source, fmt=format, title=title)
         return {"source": r.source, "chunkCount": r.chunk_count, "title": r.title}
 
     @mcp.tool
     @guard
     def ingest_url(url: str, source: str | None = None, title: str | None = None) -> dict:
-        """Fetch an http(s) URL, convert it to Markdown, and index it."""
+        """Fetch an http(s) URL, convert it to Markdown, and index it.
+
+        Only http and https schemes are accepted. This is the one tool that
+        reaches the network — every other tool works purely against local
+        files and the local index. source defaults to the URL itself; pass
+        one to control the index key or to update a previously ingested URL.
+        """
         r = ctx().pipeline.ingest_url(url, source=source, title=title)
         return {"source": r.source, "chunkCount": r.chunk_count, "title": r.title}
 
     @mcp.tool
     @guard
     def query_documents(query: str, topK: int = 8, scope: str | list[str] | None = None) -> dict:
-        """Hybrid search: semantic similarity + keyword boost for exact terms."""
+        """Hybrid search: semantic similarity plus a keyword boost for exact terms.
+
+        Returns `results` — ranked chunks with text, source, title,
+        chunkIndex, and score — and `sources`, the distinct sources among
+        those results in rank order, each with a hits count. Use `sources`
+        to answer "which documents cover this topic" without inspecting
+        individual chunks.
+        """
         if not query.strip():
             raise ToolError("query must not be empty")
         c = ctx()
@@ -151,7 +184,13 @@ def create_app(
         before: int = 1,
         after: int = 1,
     ) -> dict:
-        """Read chunks surrounding a search result for more context."""
+        """Read the chunks immediately before and after a search result, for context.
+
+        Provide exactly one of filePath (absolute path inside a document
+        root) or source (the id of a data/url item). before/after control
+        how many chunks to include on each side of chunkIndex (both
+        default to 1).
+        """
         c = ctx()
         if filePath is not None:
             key = str(resolve_in_roots(filePath, c.config.roots))
@@ -165,17 +204,31 @@ def create_app(
     @mcp.tool
     @guard
     def read_file(filePath: str | None = None, source: str | None = None) -> dict:
-        """Read a source's full indexed content (all chunks in order, as Markdown)."""
+        """Read a source's entire indexed content as Markdown (all chunks joined).
+
+        Provide exactly one of filePath (absolute path inside a document
+        root) or source (the id of a data/url item). The response holds
+        the full document text, so large documents produce large
+        responses — prefer read_chunk_neighbors when only the context
+        around one chunk is needed.
+        """
         c = ctx()
+        not_indexed_hint = ""
         if filePath is not None:
             key = str(resolve_in_roots(filePath, c.config.roots))
+            p = Path(key)
+            if not p.exists():
+                raise ToolError(f"File does not exist: {key}")
+            if not p.is_file():
+                raise ToolError(f"Not a file: {key}")
+            not_indexed_hint = " — ingest it first with ingest_file or sync_start."
         elif source is not None:
             key = source
         else:
             raise ToolError("Provide filePath or source")
         chunks = c.store.all_chunks(key)
         if not chunks:
-            raise ToolError(f"Source not found in index: {key}")
+            raise ToolError(f"Source not found in index: {key}{not_indexed_hint}")
         info = c.store.get_source(key)
         return {
             "source": key,
@@ -188,7 +241,13 @@ def create_app(
     @mcp.tool
     @guard
     def list_files(scope: str | list[str] | None = None) -> dict:
-        """List files on disk (with ingestion state) and indexed data/url sources."""
+        """List files found on disk under the document roots, plus indexed data/url sources.
+
+        Each disk file is reported with a state: "ingested" (index matches
+        disk), "stale" (changed on disk since it was indexed), or
+        "not_ingested" (never indexed). Data and url sources always appear
+        as "ingested" since they only exist once ingested.
+        """
         c = ctx()
         scopes = _scopes(scope)
         entries = scan_roots(c.config.roots)
@@ -209,7 +268,13 @@ def create_app(
     @mcp.tool
     @guard
     def delete_file(filePath: str | None = None, source: str | None = None) -> dict:
-        """Delete an indexed file (by absolute path) or a data/url item (by source id)."""
+        """Delete an indexed file, data item, or url item from the index.
+
+        Provide exactly one of filePath (absolute path inside a document
+        root) or source (the id of a data/url item). This only removes the
+        index entry — a file left in place under a document root is
+        re-ingested by a later sync_start.
+        """
         c = ctx()
         if filePath is not None:
             key = str(resolve_in_roots(filePath, c.config.roots))
@@ -224,7 +289,14 @@ def create_app(
 
     @mcp.tool
     def status() -> dict:
-        """Index and configuration status. Works even when configuration is invalid."""
+        """Report configuration and index status. Works even when configuration is invalid.
+
+        Always includes version. When configuration is valid, also includes
+        roots, dbPath, model, hybridWeight, and — once the index has been
+        touched — chunkCount/sourceCount. When configuration is invalid,
+        includes configError instead, and every other tool raises an error
+        referencing it until the configuration is fixed.
+        """
         if config is None or config_error is not None:
             return {"version": __version__, "configError": config_error or "no configuration"}
         out: dict = {
