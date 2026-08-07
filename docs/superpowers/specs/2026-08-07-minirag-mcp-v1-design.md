@@ -3,7 +3,7 @@
 - **Date:** 2026-08-07
 - **Status:** Approved (brainstorm with user, this session)
 - **Reference:** [shinpr/mcp-local-rag](https://github.com/shinpr/mcp-local-rag) (TypeScript)
-- **Tracking:** beads `minirag-mcp-jpw` (design), `minirag-mcp-01m` (plan), `minirag-mcp-l7s` (deferred ingest_url)
+- **Tracking:** beads `minirag-mcp-jpw` (design), `minirag-mcp-01m` (plan); `minirag-mcp-l7s` closed — `ingest_url` folded into v1
 
 ## Overview
 
@@ -14,28 +14,35 @@ nothing to external services after the embedding model is downloaded.
 
 Differences from the reference:
 
-- **markitdown** replaces per-format parsers — more input formats (PDF, DOCX,
-  PPTX, XLSX, HTML, CSV, EPub, ipynb, …).
-- **trafilatura** replaces Mozilla Readability for HTML main-content extraction.
+- **markitdown** is the single conversion path for everything — files, HTML,
+  and URLs (PDF, DOCX, PPTX, XLSX, HTML, CSV, EPub, ipynb, …). No separate
+  readability layer: markitdown's HtmlConverter converts the whole `<body>`
+  without boilerplate removal — accepted trade-off (user decision 2026-08-07);
+  revisit with a readability pass only if index noise hurts in practice.
+- **`ingest_url` tool** (not in the reference): the server fetches a page
+  itself via markitdown's `convert_url` — YouTube/Wikipedia/RSS get special
+  handling for free.
 - **Multilingual embedding model by default** (Russian + English corpora work
   out of the box).
+- **Smarter default storage**: index lives next to the documents, model cache
+  is global (see Configuration).
 - Python stack: fastmcp, fastembed, LanceDB Python bindings.
 
 All documentation, tool descriptions, and code are in English.
 
 ## Goals
 
-1. Tool-for-tool parity with the reference's 9 MCP tools and CLI commands.
-2. Same environment-variable contract (names and defaults) where applicable.
-3. Fully local: no network access after model download (trafilatura is used as
-   an HTML *cleaner*, never as a fetcher, in v1).
+1. Tool-for-tool parity with the reference's 9 MCP tools and CLI commands,
+   plus `ingest_url` (10 tools total).
+2. Same environment-variable contract (names) where applicable; defaults
+   deviate deliberately for `DB_PATH`/`CACHE_DIR` (see Configuration).
+3. Local-first: file/data ingestion and search never touch the network after
+   the one-time model download. `ingest_url` is the only network operation and
+   runs only on explicit request — documentation must state this clearly.
 4. Distributable as a PyPI package runnable via `uvx minirag-mcp`.
 
 ## Non-goals (deferred)
 
-- `ingest_url` (server-side web fetching) — beads `minirag-mcp-l7s`. Verified
-  2026-08-07: markitdown ships `convert_url()` and YouTube/Wikipedia/RSS
-  converters, so this is cheap to add later.
 - PDF visual mode (vision-model captions for figures).
 - `RAG_DEVICE` / `RAG_DTYPE` (fastembed manages ONNX providers itself).
 - Multi-writer coordination. Single writer per `DB_PATH`, as in the reference.
@@ -47,8 +54,8 @@ All documentation, tool descriptions, and code are in English.
 | Language | Python ≥ 3.11 | markitdown needs ≥ 3.10 |
 | Package/dev manager | uv | `uv build`, `uv run pytest` |
 | MCP framework | fastmcp (v3) | stdio transport |
-| File → Markdown | markitdown + extras `[pdf, docx, pptx, xlsx]` | everything becomes Markdown |
-| HTML main content | trafilatura | markdown output, metadata; fallback → markitdown HtmlConverter |
+| File/HTML/URL → Markdown | markitdown + extras `[pdf, docx, pptx, xlsx]` | everything becomes Markdown; `convert_url` for `ingest_url` |
+| Paths | platformdirs | global model cache location |
 | Embeddings | fastembed | ONNX, no torch; default model `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` (384-dim, ~220 MB quantized), override via `MODEL_NAME` |
 | Store | LanceDB (embedded) | vectors + BM25 FTS + native hybrid search |
 | CLI | cyclopts | already a transitive dependency of fastmcp (verified: `fastmcp-slim[server]` requires `cyclopts>=4.0.0`) — zero added deps |
@@ -57,12 +64,12 @@ All documentation, tool descriptions, and code are in English.
 Verified facts (2026-08-07, sources checked live):
 
 - `defuddle` does not exist on PyPI; `pydefuddle` 0.1.0 is a one-release port
-  (rejected as a core dependency). trafilatura 2.2.0 chosen instead.
+  (rejected as a core dependency). A readability layer was considered
+  (trafilatura) and dropped by user decision — markitdown only.
 - markitdown `HtmlConverter` converts the whole `<body>` (only strips
-  `<script>`/`<style>`) — it does **no** boilerplate removal, which is why
-  trafilatura stays in the pipeline.
-- markitdown has `convert_url()`/`convert_uri()` out of the box (relevant only
-  for the deferred `ingest_url`).
+  `<script>`/`<style>`) — no boilerplate removal; accepted trade-off.
+- markitdown has `convert_url()`/`convert_uri()` out of the box; `convert_uri`
+  also accepts `file:`/`data:` URIs, hence the scheme whitelist in Security.
 - fastembed's registry id for the default model is
   `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` (dim=384,
   0.22 GB, quantized ONNX weights from `qdrant/…-onnx-Q`).
@@ -85,8 +92,7 @@ src/minirag_mcp/
   config.py       — env + CLI-flag resolution (flags > env > defaults)
   security.py     — root containment checks, symlink-escape rejection
   ingest/
-    parser.py     — markitdown wrapper (file → Markdown + title);
-                    trafilatura wrapper (HTML → Markdown, markitdown fallback)
+    parser.py     — markitdown wrapper: file/HTML/URL → Markdown + title
     pipeline.py   — parse → chunk → embed → store (replace by source)
     scanner.py    — recursive root walk, extension whitelist, sha256 diff
   chunker/
@@ -102,14 +108,15 @@ src/minirag_mcp/
 Each module is independently testable; `server.py` and `cli/` share the same
 core (`pipeline`, `store`, `embedder`) and contain no business logic.
 
-## MCP tools (parity: 9)
+## MCP tools (10 = 9 parity + ingest_url)
 
 | Tool | Input | Output |
 |---|---|---|
 | `sync_start` | `path?` (absolute, inside a root) | `{jobId}` immediately; work runs in background thread |
 | `sync_status` | `jobId` | `{state: pending\|running\|succeeded\|failed, counts, errors}` |
 | `ingest_file` | `filePath` (absolute, inside a root) | `{source, chunkCount, title}` — re-ingest replaces chunks |
-| `ingest_data` | `data`, `source` (stable id), `format: text\|markdown\|html`, `title?` | same; html is cleaned with trafilatura first |
+| `ingest_data` | `data`, `source` (stable id), `format: text\|markdown\|html`, `title?` | same; html goes through markitdown HtmlConverter |
+| `ingest_url` | `url` (http/https only), `source?` (default: the URL), `title?` | fetch + convert via markitdown `convert_url`; re-ingest replaces |
 | `query_documents` | `query`, `topK?` (default 8), `scope?` (absolute path prefix or list) | results: `{text, source, title, chunkIndex, score}` |
 | `read_chunk_neighbors` | `chunkIndex` + `filePath` or `source`, `before?`, `after?` | surrounding chunks in order |
 | `list_files` | `scope?` | supported files under roots + ingestion state (ingested / not ingested / stale) + `ingest_data` sources |
@@ -125,6 +132,7 @@ the latest job is retained; a server restart discards it.
 ```
 minirag-mcp ingest <path...>       # files or directories (recursive)
 minirag-mcp sync [path]            # synchronous, progress to stderr
+minirag-mcp ingest-url <url> [--source S]
 minirag-mcp query "..." [--scope P]...
 minirag-mcp read-neighbors (--file-path P | --source S) --chunk-index N
 minirag-mcp list
@@ -144,8 +152,8 @@ human-readable text; `--json` switches to machine-readable.
 |---|---|---|
 | `BASE_DIR` | current directory | one document root; also the security boundary |
 | `BASE_DIRS` | unset | JSON array of roots; takes precedence over `BASE_DIR`; invalid value is a hard config error (no fallback), `status` stays available |
-| `DB_PATH` | `./lancedb/` | LanceDB directory |
-| `CACHE_DIR` | `./models/` | embedding model cache |
+| `DB_PATH` | `<first root>/.minirag/lancedb` | LanceDB directory; lives next to the documents (deviation from the reference's cwd-relative `./lancedb/` — cwd is unpredictable under MCP clients) |
+| `CACHE_DIR` | platformdirs user cache, e.g. `~/Library/Caches/minirag-mcp/models` (macOS) | embedding model cache; global so the ~220 MB model is never duplicated per corpus (deviation from `./models/`) |
 | `MODEL_NAME` | `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` | fastembed model id |
 | `MAX_FILE_SIZE` | `104857600` (100 MB) | per-file limit |
 | `CHUNK_MIN_LENGTH` | `50` | minimum chunk length, chars |
@@ -166,8 +174,8 @@ One LanceDB table, `chunks`:
 | Column | Type | Notes |
 |---|---|---|
 | `id` | str | `"{source}#{chunk_index}"` |
-| `source` | str | absolute file path, or logical id for `ingest_data` |
-| `source_type` | str | `file` \| `data` |
+| `source` | str | absolute file path, logical id for `ingest_data`, or URL |
+| `source_type` | str | `file` \| `data` \| `url` |
 | `title` | str | converter metadata → first H1 → basename/source id |
 | `chunk_index` | int | 0-based, contiguous per source |
 | `text` | str | chunk content (Markdown) |
@@ -190,9 +198,13 @@ keyword queries underperform.
 markitdown → title → chunk → embed (batch) → atomic replace of the source's
 chunks (delete by source + add).
 
-**Ingest (data):** `text`/`markdown` pass through; `html` → trafilatura
-(markdown output; on empty result fall back to markitdown HtmlConverter) →
-same pipeline. Re-using a `source` id replaces its chunks.
+**Ingest (data):** `text`/`markdown` pass through; `html` → markitdown
+HtmlConverter → same pipeline. Re-using a `source` id replaces its chunks.
+
+**Ingest (url):** scheme check (`http`/`https` only) → markitdown
+`convert_url` (network fetch; special converters for YouTube/Wikipedia/RSS
+apply automatically) → same pipeline. `source` defaults to the URL string;
+re-ingesting the same source replaces its chunks.
 
 **Sync:** `sync_start` validates the optional path, creates the job record,
 returns `jobId`, and spawns one background thread (onnxruntime releases the
@@ -238,7 +250,11 @@ test corpus; they are internal (not env-configurable) in v1.
 - MCP file paths must be absolute (parity). CLI accepts relative paths and
   resolves them against the current directory.
 - `MAX_FILE_SIZE` enforced before parsing.
-- No network I/O in v1 except the one-time model download by fastembed.
+- `ingest_url` accepts only `http`/`https` schemes. `file:` and `data:` URIs
+  are rejected — markitdown's `convert_uri` would otherwise read arbitrary
+  local files, bypassing the document-root boundary.
+- No other network I/O: only `ingest_url` (explicit) and the one-time model
+  download by fastembed.
 - Single local user; no auth (parity). One writer per `DB_PATH`; concurrent
   read-while-sync allowed. Backup = copy the `DB_PATH` directory while no
   writer is active.
@@ -247,7 +263,8 @@ test corpus; they are internal (not env-configurable) in v1.
 
 - Tool failures raise fastmcp `ToolError` with actionable messages
   (path outside roots, file too large, unsupported format, model download
-  failure, invalid `BASE_DIRS`, unknown `jobId`, source not found).
+  failure, invalid `BASE_DIRS`, unknown `jobId`, source not found, disallowed
+  URL scheme, URL fetch failure — network error, timeout, non-2xx).
 - Config errors do not crash the server: tools that need the config fail with
   the config error; `status` always answers and explains what is wrong.
 - Per-file sync errors do not abort the job; they are collected in the job
@@ -258,12 +275,12 @@ test corpus; they are internal (not env-configurable) in v1.
 
 - **Unit (fast, fake embedder via DI):** chunker (code fences intact,
   boundaries, `CHUNK_MIN_LENGTH` behavior), security (symlink escape, path
-  containment, `BASE_DIRS` validation), config precedence (flags > env >
-  defaults), result post-processing (distance filter, gap grouping, max-files,
+  containment, `BASE_DIRS` validation, URL scheme whitelist), config
+  precedence (flags > env > defaults), result post-processing (distance filter, gap grouping, max-files,
   scope matching), scanner diff logic.
 - **Integration (slow marker, real model, cached locally):** full
   ingest → query on a tmpdir corpus (RU + EN, one PDF/DOCX fixture, code-block
   markdown), hybrid ranking sanity (exact identifier query finds its chunk).
-- **E2E:** fastmcp in-memory client exercising all 9 tools over the MCP
-  protocol; CLI smoke via runner (ingest → query → delete; flag-over-env
-  precedence).
+- **E2E:** fastmcp in-memory client exercising all 10 tools over the MCP
+  protocol (`ingest_url` with a mocked fetch — tests stay offline); CLI smoke
+  via runner (ingest → query → delete; flag-over-env precedence).
