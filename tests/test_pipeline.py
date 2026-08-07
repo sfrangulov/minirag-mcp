@@ -126,14 +126,44 @@ def test_a_redirect_to_cloud_metadata_indexes_nothing(pipe, redirect_server):
 
 
 def test_allow_private_urls_config_reaches_ingest_url(tmp_path, fake_embedder, monkeypatch):
+    """ALLOW_PRIVATE_URLS=1 must reach parse_url as allow_private=True — otherwise a
+    user who sets the flag still gets refused, while being told to set the flag they
+    already set."""
     import minirag_mcp.ingest.pipeline as mod
     from minirag_mcp.ingest.parser import ParsedDoc
 
-    monkeypatch.setattr(mod, "parse_url", lambda u, **kw: ParsedDoc("# W\n\nWiki body.", "W"))
+    calls: list[dict] = []
+
+    def fake_parse_url(u, **kw):
+        calls.append(kw)
+        return ParsedDoc("# W\n\nWiki body.", "W")
+
+    monkeypatch.setattr(mod, "parse_url", fake_parse_url)
     cfg = load_config({"BASE_DIR": str(tmp_path), "ALLOW_PRIVATE_URLS": "1"}, cwd=tmp_path)
     store = Store(tmp_path / "db-private", dim=fake_embedder.dim)
     res = Pipeline(store, fake_embedder, cfg).ingest_url("http://192.168.1.10/wiki")
     assert res.source == "http://192.168.1.10/wiki"
+    assert calls == [{"allow_private": True}]
+
+
+def test_allow_private_urls_off_reaches_ingest_url_as_false(pipe, monkeypatch, public_dns):
+    """The other direction of the same plumbing: with the flag off (the default),
+    parse_url must receive allow_private=False explicitly, not merely whatever a stub
+    happened to default to."""
+    import minirag_mcp.ingest.pipeline as mod
+    from minirag_mcp.ingest.parser import ParsedDoc
+
+    p, _, _ = pipe
+    calls: list[dict] = []
+
+    def fake_parse_url(u, **kw):
+        calls.append(kw)
+        return ParsedDoc("# Remote\n\nFetched body.", "Remote")
+
+    monkeypatch.setattr(mod, "parse_url", fake_parse_url)
+    res = p.ingest_url("https://example.com/docs")
+    assert res.source == "https://example.com/docs"
+    assert calls == [{"allow_private": False}]
 
 
 def test_title_line_seeded_into_first_chunk_only(pipe):

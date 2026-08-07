@@ -7,6 +7,7 @@ import re
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 from markitdown import MarkItDown
@@ -389,6 +390,17 @@ def parse_html(html: str, title: str | None = None) -> ParsedDoc:
     return ParsedDoc(markdown=markdown, title=found or "Untitled", has_title=found is not None)
 
 
+def _same_endpoint(a: str, b: str) -> bool:
+    """Whether two URLs name the same host and port — chosen over a raw string
+    compare because requests normalizes a URL before the guard ever sees it (a bare
+    authority like "http://host" becomes "http://host/"), which a string compare would
+    misreport as a redirect. Host and port are also the only part of the URL a
+    redirect hop can actually change that matters here: where the request goes next.
+    """
+    pa, pb = urlparse(a), urlparse(b)
+    return (pa.hostname, pa.port) == (pb.hostname, pb.port)
+
+
 def parse_url(url: str, *, allow_private: bool = False) -> ParsedDoc:
     """Fetch and convert a URL, with the host rule enforced on every redirect hop.
 
@@ -400,7 +412,7 @@ def parse_url(url: str, *, allow_private: bool = False) -> ParsedDoc:
     except BlockedFetchError as e:
         # The refusal must reach the user as a refusal, naming the host that was
         # blocked and — when it was not the URL they asked for — the redirect.
-        if e.url != url:
+        if not _same_endpoint(e.url, url):
             raise ParserError(
                 f"Refused to fetch {url}: it redirected to {e.url}, which this server "
                 f"must not fetch. {e.reason}"

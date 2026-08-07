@@ -313,6 +313,19 @@ def test_a_blocked_url_asked_for_directly_is_not_reported_as_a_redirect(redirect
     assert redirect_server.hits == []  # refused before the socket was opened
 
 
+def test_a_bare_authority_blocked_url_is_not_reported_as_a_redirect(redirect_server):
+    """requests normalizes a path-less URL by appending "/" before the guard ever sees
+    it (`http://host` -> `http://host/`), so a raw string compare between the checked
+    URL and the one the caller gave would call that normalization a redirect. Nothing
+    redirected here — the host itself is blocked on the very first request."""
+    with pytest.raises(ParserError) as exc:
+        parse_url(redirect_server.url("", host="metadata.test"))
+    msg = str(exc.value)
+    assert "metadata.test" in msg and "link-local" in msg
+    assert "redirected" not in msg
+    assert redirect_server.hits == []  # refused before the socket was opened
+
+
 def test_a_redirect_chain_across_public_hosts_is_followed(redirect_server):
     """The guard refuses blocked hops, not redirects."""
     doc = parse_url(redirect_server.url("/chain/3"))
