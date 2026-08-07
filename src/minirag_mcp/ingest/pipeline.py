@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from minirag_mcp.chunker.semantic import merge_blocks
+from minirag_mcp.chunker.semantic import MergedChunk, merge_blocks
 from minirag_mcp.chunker.structural import split_markdown
 from minirag_mcp.config import Config
 from minirag_mcp.ingest import parser as _parser
@@ -77,6 +77,16 @@ class Pipeline:
         self.embedder = embedder
         self.config = config
 
+    def _embed_missing(self, chunks: list[MergedChunk]) -> list[list[float]]:
+        """Vectors for every chunk, embedding only those that do not carry one.
+
+        Merging already embedded each block to decide the merges; re-embedding a chunk
+        that is still exactly one unaltered block would double the cost of an ingest.
+        """
+        pending = [c.text for c in chunks if c.vector is None]
+        fresh = iter(self.embedder.embed_documents(pending) if pending else [])
+        return [c.vector if c.vector is not None else next(fresh) for c in chunks]
+
     def _chunk_and_store(
         self,
         markdown: str,
@@ -96,17 +106,22 @@ class Pipeline:
         belongs in the embedded text.
         """
         blocks = split_markdown(markdown, max_chars=MAX_CHUNK_CHARS)
-        texts = merge_blocks(
+        chunks = merge_blocks(
             blocks,
             self.embedder.embed_documents,
             max_chars=MAX_CHUNK_CHARS,
             min_length=self.config.chunk_min_length,
         )
-        if not texts:
+        if not chunks:
             raise EmptyDocumentError(f"No text content extracted from {source}")
         if seed_title:
-            texts[0] = _seed_title(texts[0], title)
-        vectors = self.embedder.embed_documents(texts)
+            seeded = _seed_title(chunks[0].text, title)
+            # Seeding rewrites the text, so the block vector merging computed for it no
+            # longer describes it — and chunk 0 is the chunk the title exists to reach.
+            if seeded != chunks[0].text:
+                chunks[0] = MergedChunk(seeded, None)
+        texts = [c.text for c in chunks]
+        vectors = self._embed_missing(chunks)
         now = datetime.now(UTC).isoformat()
         records = [
             ChunkRecord(

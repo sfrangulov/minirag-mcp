@@ -272,3 +272,115 @@ def test_image_placeholders_are_stripped_but_never_empty_a_document(pipe):
     only_image = root / "Скан договора.md"
     only_image.write_text(f"![]({png})\n", encoding="utf-8")
     assert p.ingest_file(only_image).chunk_count == 1
+
+
+class RecordingEmbedder:
+    """The shared fake, wrapped to record every batch handed to embed_documents."""
+
+    def __init__(self, inner):
+        self.inner = inner
+        self.dim = inner.dim
+        self.model_name = inner.model_name
+        self.batches: list[list[str]] = []
+
+    def embed_documents(self, texts):
+        self.batches.append(list(texts))
+        return self.inner.embed_documents(texts)
+
+    def embed_query(self, text):
+        return self.inner.embed_query(text)
+
+    @property
+    def embedded_texts(self) -> int:
+        return sum(len(b) for b in self.batches)
+
+
+def _recording_pipeline(tmp_path, fake_embedder, name):
+    emb = RecordingEmbedder(fake_embedder)
+    cfg = load_config({"BASE_DIR": str(tmp_path)}, cwd=tmp_path)
+    return Pipeline(Store(tmp_path / name, dim=emb.dim), emb, cfg), emb
+
+
+def _capture_records(monkeypatch, pipeline):
+    stored: dict[str, list] = {}
+    real = pipeline.store.replace_source
+
+    def spy(source, records):
+        stored[source] = list(records)
+        return real(source, records)
+
+    monkeypatch.setattr(pipeline.store, "replace_source", spy)
+    return stored
+
+
+def test_unmerged_chunks_are_not_embedded_twice(tmp_path, fake_embedder, monkeypatch):
+    """merge_blocks embeds every block to decide the merges; only what merging changed
+    needs a second embedding. Chunk 0 counts as changed once the title is seeded."""
+    p, emb = _recording_pipeline(tmp_path, fake_embedder, "db-reuse")
+    stored = _capture_records(monkeypatch, p)
+    a, b = "Абзац А. " * 100, "Абзац Б. " * 100  # 900 chars each: never merge with a peer
+    code = "```\nx = 1\n```"  # a code block attaches to its predecessor unconditionally
+    doc = tmp_path / "И-112 Хранение ТМЗ.md"
+    doc.write_text(f"{a}\n\n{code}\n\n{b}", encoding="utf-8")
+    res = p.ingest_file(doc)
+
+    assert res.chunk_count == 2
+    records = stored[str(doc)]
+    blocks, rechunked = emb.batches
+    assert len(blocks) == 3, "every block is embedded once, to decide the merges"
+    # chunk 1 is block B untouched, so its block vector stands and it is not re-embedded
+    assert records[1].text == b.strip()
+    assert b.strip() not in rechunked
+    assert emb.embedded_texts == 4 < 3 + res.chunk_count
+    # every stored vector describes the text stored beside it — including chunk 0, whose
+    # cached vector must have been dropped when merging and title seeding rewrote it
+    for r in records:
+        assert r.vector == fake_embedder.embed_documents([r.text])[0]
+    assert records[0].text.startswith("# И-112 Хранение ТМЗ\n\n")
+
+
+def test_reused_vectors_match_a_direct_embedding_of_the_stored_text(
+    tmp_path, fake_embedder, monkeypatch
+):
+    """The whole index rests on this: a vector must describe the text it is stored with,
+    whatever path it took to get there."""
+    p, emb = _recording_pipeline(tmp_path, fake_embedder, "db-vectors")
+    stored = _capture_records(monkeypatch, p)
+    doc = tmp_path / "И-112 Хранение ТМЗ на складах.md"
+    doc.write_text(
+        "# И-112 Хранение ТМЗ на складах\n\n"
+        + "\n\n".join(
+            f"## Раздел {i}\n\nАбзац {i} про хранение товарно-материальных запасов, "
+            f"достаточно длинный чтобы стать отдельным блоком."
+            for i in range(1, 21)
+        ),
+        encoding="utf-8",
+    )
+    res = p.ingest_file(doc)
+    records = stored[str(doc)]
+    assert len(records) == res.chunk_count > 1
+    for r in records:
+        assert r.vector == fake_embedder.embed_documents([r.text])[0]
+    blocks = len(emb.batches[0])
+    assert emb.embedded_texts < blocks + res.chunk_count  # the old cost, embedding twice
+
+
+def test_title_seeding_invalidates_the_cached_vector_of_chunk_zero(
+    tmp_path, fake_embedder, monkeypatch
+):
+    """Chunk 0 can be an unmerged block, and seeding rewrites its text after merging
+    handed back a vector for the text as it was. Keeping that vector would mis-embed the
+    one chunk the title exists to reach."""
+    p, emb = _recording_pipeline(tmp_path, fake_embedder, "db-seeded")
+    stored = _capture_records(monkeypatch, p)
+    doc = tmp_path / "И-112 Хранение ТМЗ.md"
+    doc.write_text("Абзац А. " * 100 + "\n\n" + "Абзац Б. " * 100, encoding="utf-8")
+    res = p.ingest_file(doc)
+
+    assert res.chunk_count == 2, "two blocks too long to merge, so neither is altered"
+    first, second = stored[str(doc)]
+    assert first.text.startswith(f"# {res.title}\n\n")
+    assert first.vector == fake_embedder.embed_documents([first.text])[0]
+    assert first.vector != fake_embedder.embed_documents([emb.batches[0][0]])[0]
+    assert second.vector == fake_embedder.embed_documents([second.text])[0]
+    assert emb.embedded_texts == 3  # 2 blocks + the reseeded chunk 0, not 4
