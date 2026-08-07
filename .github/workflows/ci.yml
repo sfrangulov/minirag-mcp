@@ -15,7 +15,10 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        python-version: ["3.11", "3.12"]
+        # 3.13 is what development happens on, and security.py reasons explicitly
+        # about interpreter-version differences in `ipaddress` — untested versions
+        # are the ones that break.
+        python-version: ["3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6

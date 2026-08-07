@@ -110,6 +110,8 @@ def test_url_bad_scheme(url):
         ("192.168.1.1", "private"),
         ("[::1]", "loopback"),
         ("[::ffff:127.0.0.1]", "loopback"),  # IPv4-mapped IPv6
+        ("[::ffff:169.254.169.254]", "link-local"),
+        ("[::ffff:10.0.0.1]", "private"),
         ("0.0.0.0", "unspecified"),
     ],
 )
@@ -120,6 +122,22 @@ def test_blocked_address_literal_rejected(host, reason):
     assert host.strip("[]") in msg  # names the host
     assert reason in msg  # names the reason
     assert "ALLOW_PRIVATE_URLS" in msg  # names the way out
+
+
+def test_ipv4_mapped_addresses_are_judged_by_the_address_they_carry():
+    """`::ffff:x.x.x.x` must get whatever verdict `x.x.x.x` gets — blocked when the
+    IPv4 address is blocked, and *fetchable* when it is not.
+
+    The second half is the load-bearing one, and it is why this test exists rather
+    than an unwrap in `_blocked_kind`. Every property the check reads already looks
+    through the wrapper (verified identical on 3.11.13, 3.12.11, 3.13.6 and 3.14.6),
+    so no unwrapping of our own is needed. On an interpreter that stopped doing so, a
+    mapped public address would land inside `::ffff:0:0/96` — listed private — and be
+    refused: fail-closed, but wrong, and this assertion is what would catch it.
+    """
+    check_url(f"http://[::ffff:{PUBLIC_IP}]/p")  # no raise
+    with pytest.raises(SecurityError, match="loopback"):
+        check_url("http://[::ffff:127.0.0.1]/p")
 
 
 def test_blocked_address_literal_needs_no_resolver(monkeypatch):

@@ -50,12 +50,12 @@ def resolve_in_roots(
 def _blocked_kind(ip: IPAddress) -> str | None:
     """Name why `ip` must not be fetched from, or None if it is fetchable.
 
-    An IPv4-mapped IPv6 address (`::ffff:127.0.0.1`) is judged by the IPv4 address it
-    carries: on Python 3.11/3.12 none of the properties below see through the wrapper.
+    An IPv4-mapped IPv6 address (`::ffff:127.0.0.1`) needs no unwrapping here: every
+    property below already reads through the wrapper to the IPv4 address it carries,
+    identically on 3.11.13, 3.12.11, 3.13.6 and 3.14.6. An interpreter that did not
+    would fail closed, since `::ffff:0:0/96` is itself listed private — and
+    test_ipv4_mapped_addresses_are_judged_by_the_address_they_carry says so out loud.
     """
-    mapped = getattr(ip, "ipv4_mapped", None)
-    if mapped is not None:
-        ip = mapped
     return next((kind for kind, attr in _BLOCKED_KINDS if getattr(ip, attr)), None)
 
 
