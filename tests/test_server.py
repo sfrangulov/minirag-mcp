@@ -1,3 +1,6 @@
+import asyncio
+import time
+
 import pytest
 from fastmcp import Client
 
@@ -6,6 +9,35 @@ from minirag_mcp.server import create_app
 from minirag_mcp.store import MAX_TOP_K, Store
 
 # pytest-asyncio runs in auto mode (see pyproject) — bare `async def` tests are collected as-is.
+
+SYNC_TIMEOUT_SECONDS = 30.0
+SYNC_POLL_SECONDS = 0.02
+
+
+async def await_sync(client: Client, job_id: str) -> dict:
+    """Poll `sync_status` until the job reaches a terminal state, and return it.
+
+    Bounded by wall-clock time rather than by an attempt count: sync runs on a
+    background thread, so how many polls fit before it finishes is a property of
+    the machine, not of the job. A fixed number of no-wait iterations passes on a
+    fast laptop and races on a loaded CI runner — a bigger number would only move
+    the threshold, not remove it. Yielding between polls also lets the event loop
+    run, so this finishes as soon as the job does and costs one poll interval
+    locally.
+    """
+    deadline = time.monotonic() + SYNC_TIMEOUT_SECONDS
+    st: dict | None = None
+    while True:
+        st = (await client.call_tool("sync_status", {"jobId": job_id})).data
+        if st["state"] in ("succeeded", "failed"):
+            return st
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                f"sync job {job_id} did not finish within {SYNC_TIMEOUT_SECONDS:g}s; "
+                f"last state={st['state']!r} counts={st['counts']} "
+                f"errors={st['errors']} error={st['error']!r}"
+            )
+        await asyncio.sleep(SYNC_POLL_SECONDS)
 
 
 @pytest.fixture
@@ -46,11 +78,9 @@ async def test_sync_then_query_then_neighbors(app):
     mcp, root = app
     async with Client(mcp) as c:
         job = (await c.call_tool("sync_start", {})).data
-        for _ in range(100):
-            st = (await c.call_tool("sync_status", {"jobId": job["jobId"]})).data
-            if st["state"] in ("succeeded", "failed"):
-                break
-        assert st["state"] == "succeeded" and st["counts"]["ingested"] == 2
+        st = await await_sync(c, job["jobId"])
+        assert st["state"] == "succeeded", f"sync failed: {st['error']!r} {st['errors']}"
+        assert st["counts"]["ingested"] == 2, st["counts"]
 
         res = (await c.call_tool("query_documents", {"query": "ERR_CONNECTION_REFUSED"})).data
         assert res["results"], "expected at least one search result"
