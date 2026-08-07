@@ -86,3 +86,10 @@ def test_persistence_across_instances(tmp_path):
     s1.replace_source("/a.md", [rec("/a.md", 0, "x")])
     s2 = Store(tmp_path / "db", dim=8)  # reopen, no create conflict
     assert s2.chunk_count() == 1
+
+
+def test_scope_prefix_with_like_wildcards_not_overmatching(store):
+    for src in ("/docs_api/f1.md", "/docsXapi/f2.md", "/100%done/f4.md", "/100Xdone/f5.md"):
+        store.replace_source(src, [rec(src, 0, "x")])
+    assert [s.source for s in store.list_sources(scopes=("/docs_api",))] == ["/docs_api/f1.md"]
+    assert [s.source for s in store.list_sources(scopes=("/100%done",))] == ["/100%done/f4.md"]

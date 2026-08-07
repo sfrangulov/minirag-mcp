@@ -55,7 +55,7 @@ def _sql_str(s: str) -> str:
 def _scope_clause(scopes: tuple[str, ...]) -> str | None:
     if not scopes:
         return None
-    return " OR ".join(f"source LIKE '{_sql_str(p)}%'" for p in scopes)
+    return " OR ".join(f"starts_with(source, '{_sql_str(p)}')" for p in scopes)
 
 
 _META_COLS = ["source", "source_type", "title", "chunk_index", "file_hash", "mtime"]
