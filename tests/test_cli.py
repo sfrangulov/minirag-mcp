@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 import minirag_mcp.cli as cli
+from minirag_mcp.store import MAX_TOP_K, Store
 
 # Captured at import time, before the autouse fixture below ever patches
 # cli._make_embedder — lets tests that need the real factory restore it.
@@ -230,3 +231,26 @@ def test_other_commands_still_fail_loudly_on_config_error(corpus, capsys, monkey
         run(["list", "--json"])
     assert exc.value.code == 1
     assert "BASE_DIRS" in capsys.readouterr().err
+
+
+def test_query_top_k_is_clamped_and_must_be_positive(corpus, capsys, monkeypatch):
+    """An oversized --top-k is capped rather than refused; the store never sees it raw."""
+    seen: list[int] = []
+    real = Store.search
+
+    def spy(self, *args, **kwargs):
+        seen.append(kwargs["top_k"])
+        return real(self, *args, **kwargs)
+
+    run(["ingest", str(corpus), "--base-dir", str(corpus)])
+    capsys.readouterr()
+    monkeypatch.setattr(Store, "search", spy)
+    run(["query", "tokens and auth", "--base-dir", str(corpus), "--top-k", "100000000", "--json"])
+    assert json.loads(capsys.readouterr().out)["results"], "a clamped query still returns results"
+
+    for bad in ("0", "-5"):
+        with pytest.raises(SystemExit) as exc:
+            run(["query", "tokens and auth", "--base-dir", str(corpus), "--top-k", bad])
+        assert exc.value.code == 1
+        assert "--top-k must be at least 1" in capsys.readouterr().err
+    assert seen == [MAX_TOP_K]  # clamped, and the two refused runs never reached the store

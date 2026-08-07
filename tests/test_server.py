@@ -3,6 +3,7 @@ from fastmcp import Client
 
 from minirag_mcp.config import load_config
 from minirag_mcp.server import create_app
+from minirag_mcp.store import MAX_TOP_K, Store
 
 # pytest-asyncio runs in auto mode (see pyproject) — bare `async def` tests are collected as-is.
 
@@ -174,3 +175,25 @@ async def test_all_tools_have_substantive_descriptions(app):
         tools = await c.list_tools()
     for t in tools:
         assert t.description and len(t.description) > 40, f"{t.name} description too thin"
+
+
+async def test_query_top_k_is_clamped_and_must_be_positive(app, monkeypatch):
+    """An oversized topK is capped rather than refused; the store never sees it raw."""
+    seen: list[int] = []
+    real = Store.search
+
+    def spy(self, *args, **kwargs):
+        seen.append(kwargs["top_k"])
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Store, "search", spy)
+    mcp, root = app
+    async with Client(mcp) as c:
+        await c.call_tool("ingest_file", {"filePath": str(root / "auth.md")})
+        res = (await c.call_tool("query_documents", {"query": "token", "topK": 10**8})).data
+        assert res["results"], "a clamped query still returns results"
+        with pytest.raises(Exception, match="topK must be at least 1"):
+            await c.call_tool("query_documents", {"query": "token", "topK": 0})
+        with pytest.raises(Exception, match="topK must be at least 1"):
+            await c.call_tool("query_documents", {"query": "token", "topK": -5})
+    assert seen == [MAX_TOP_K]  # clamped, and the two refused calls never reached the store

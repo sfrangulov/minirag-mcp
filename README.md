@@ -228,6 +228,12 @@ like the `status` MCP tool. Every other command exits `1` on the same error.
 Four environment variables shape `query_documents`/`minirag-mcp query`
 results; none of them are exposed as MCP tool arguments.
 
+`topK` (`--top-k` on the CLI) must be at least 1 and is capped at **100**.
+Search fetches a multiple of `topK` candidates from each of the vector and
+keyword sides, so an unbounded `topK` is an unbounded scan. A larger value is
+clamped to the cap rather than rejected — asking for too much context is a bad
+guess, not an error — while `0` or a negative value is refused outright.
+
 ### `RAG_HYBRID_WEIGHT` (default `0.6`, range `0.0`–`1.0`)
 
 `query_documents` runs a vector search and a BM25 full-text search in

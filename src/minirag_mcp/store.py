@@ -21,6 +21,11 @@ FTS_COLUMNS = ("text", "title")
 _LIST_LIMIT = 2**31 - 1  # LanceDB scalar queries default to limit 10 — always set explicitly
 RRF_K = 60  # standard RRF damping constant
 GAP_FACTOR = 2.0  # relevance_cutoff boundary must exceed mean gap by this factor
+# Largest top_k the query interfaces will pass down. `search` fetches a multiple of
+# top_k from both the vector and the keyword side, so an unbounded top_k is an
+# unbounded scan. Callers clamp rather than reject: an oversized request is a bad
+# guess at how much context is useful, not an error.
+MAX_TOP_K = 100
 
 
 @dataclass(frozen=True)

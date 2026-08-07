@@ -18,7 +18,7 @@ from minirag_mcp.ingest.scanner import compute_states, scan_roots
 from minirag_mcp.results import aggregate_sources, result_dict
 from minirag_mcp.scope import is_under
 from minirag_mcp.security import resolve_in_roots
-from minirag_mcp.store import Store
+from minirag_mcp.store import MAX_TOP_K, Store
 from minirag_mcp.sync import SyncManager
 
 
@@ -155,14 +155,19 @@ def create_app(
         those results in rank order, each with a hits count. Use `sources`
         to answer "which documents cover this topic" without inspecting
         individual chunks.
+
+        topK must be at least 1 and is capped at 100; a larger value is
+        silently clamped to the cap rather than rejected.
         """
         if not query.strip():
             raise ToolError("query must not be empty")
+        if topK < 1:
+            raise ToolError(f"topK must be at least 1, got {topK}")
         c = ctx()
         results = c.store.search(
             query,
             c.embedder.embed_query(query),
-            top_k=topK,
+            top_k=min(topK, MAX_TOP_K),
             hybrid_weight=c.config.hybrid_weight,
             scopes=_scopes(scope),
             max_distance=c.config.max_distance,
