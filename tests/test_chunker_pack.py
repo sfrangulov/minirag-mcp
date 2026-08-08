@@ -113,6 +113,21 @@ def test_transcript_units_carry_the_window_label_and_the_meeting_title():
         assert TRANSCRIPT_TITLE in head
 
 
+def test_a_prefix_too_long_for_the_budget_degrades():
+    """The prefix ladder only means anything if the packer walks it. A `_choose_prefix`
+    that returned the first candidate unconditionally passed every test this project
+    had — the one test that claimed to cover this only inspected the ladder that
+    `sections.py` builds, which is the same tuple whatever the packer does with it."""
+    title = "Совещание руководителей " * 60
+    chunks = chunk_markdown(TRANSCRIPT, count_tokens=count, title=title)
+    labelled = [c for c in chunks if c.text.startswith("[")]
+    assert labelled, "the transcript windows have to be labelled at all"
+    for c in labelled:
+        assert c.text.split("\n", 1)[0] in ("[00:00–02:00]", "[02:00–04:00]"), c.text[:80]
+        assert "Совещание руководителей Совещание" not in c.text, "the title did not fit"
+    assert all(count(c.text) <= DEFAULT_TOKEN_BUDGET for c in chunks)
+
+
 def test_heading_units_carry_the_breadcrumb():
     chunks = chunk_markdown(SPEC, count_tokens=count, budget=40)
     glossary = [c for c in chunks if "Бизнес-процесс" in c.text]
@@ -183,6 +198,20 @@ def test_the_seeded_title_is_counted_against_the_budget():
     assert chunks[0].text.startswith(f"# {title}\n\n")
     assert all(count(c.text) <= DEFAULT_TOKEN_BUDGET for c in chunks)
     assert sum(c.text.count(title) for c in chunks) == 1, "chunk 0 only"
+
+
+def test_a_childless_bodiless_heading_reaches_a_chunk():
+    """Where the data loss actually shows: the section was dropped before packing, so
+    `Резервные требования` — a whole numbered clause of the spec — was in no chunk, in
+    no breadcrumb, and therefore in nothing the index could return."""
+    markdown = (
+        "# 1 Общие положения\n\nТекст первого раздела.\n\n"
+        "# 2 Резервные требования\n\n"
+        "# 3 Прочее\n\nТекст третьего раздела.\n"
+    )
+    chunks = chunk_markdown(markdown, count_tokens=count)
+    assert any("2 Резервные требования" in c.text for c in chunks), [c.text for c in chunks]
+    assert all(count(c.text) <= DEFAULT_TOKEN_BUDGET for c in chunks)
 
 
 def test_a_document_that_already_carries_its_title_is_not_seeded():

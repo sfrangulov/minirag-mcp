@@ -93,12 +93,22 @@ def test_speaker_prefixed_timestamps_window_the_same_way():
     assert "Skachkov, Dmitry" in sections[1].body  # the speaker survives into the text
 
 
-def test_transcript_prefix_degrades_to_the_timestamp_alone():
-    """A long meeting title can be most of the budget; the label must survive it."""
+def test_transcript_prefixes_offer_a_ladder_down_to_the_bare_label():
+    """A long meeting title can be most of the budget, so every window offers a shorter
+    candidate below the titled one and an empty one below that.
+
+    This pins the ladder `sections.py` builds, and only that — walking it is
+    `_choose_prefix`'s job, and it is `test_a_prefix_too_long_for_the_budget_degrades`
+    in test_chunker_pack.py that proves the packer actually does. Asserting the ladder
+    here and calling it "the label must survive it" is what let a `_choose_prefix` that
+    always returned the first candidate pass the whole suite."""
     sections = split_sections(TRANSCRIPT, title="x" * 400)
     window = next(s for s in sections if s.prefixes[0].startswith("["))
     assert window.prefixes[1] == "[00:00–02:00]"
     assert window.prefixes[-1] == ""
+    assert [len(p) for p in window.prefixes] == sorted(
+        (len(p) for p in window.prefixes), reverse=True
+    ), "a ladder is only useful if every rung is shorter than the one above it"
 
 
 @pytest.mark.parametrize(
@@ -118,10 +128,48 @@ def test_heading_breadcrumb_carries_the_ancestors():
 def test_a_heading_with_no_body_survives_in_its_children():
     """`# 1 Общие положения` has no text of its own, only `## 1.1` below it. Emitting
     it as a chunk would add a title-only vector; dropping it loses nothing, because
-    every child carries it in the breadcrumb."""
+    every child carries it in the breadcrumb.
+
+    The previous version of this test asserted `not any(s.body.strip() == "")` and
+    `all(... for s in sections[:1])` — the first is guaranteed by the empty-body filter
+    in `split_sections` and the second by SPEC's ordering, so it passed with the drop
+    rule and without it. What has to be pinned is *where* the heading's words went."""
     sections = split_sections(SPEC)
-    assert not any(s.body.strip() == "" for s in sections)
-    assert all("1 Общие положения" in s.prefixes[0] for s in sections[:1])
+    parent = "1 Общие положения"
+    assert not any(s.prefixes[0] == parent for s in sections), "no section of its own"
+    assert not any(s.body.strip() == parent for s in sections), "and no chunk of its own"
+    children = [s for s in sections if s.prefixes[0].startswith(f"{parent} > ")]
+    assert children, "so a child's breadcrumb has to be carrying it"
+    assert [s.prefixes[0] for s in children] == [f"{parent} > 1.1 Глоссарий"]
+
+
+def test_a_childless_heading_with_no_body_becomes_its_own_section():
+    """A heading is content — often the most searchable line in a specification. When
+    no child carries it into a breadcrumb, its words used to reach neither a chunk nor
+    a stored prefix: the section was kept with an empty body and then filtered out by
+    `split_sections`, so the heading was absent from the index entirely."""
+    markdown = (
+        "# 1 Общие положения\n\nТекст первого раздела.\n\n"
+        "# 2 Резервные требования\n\n"
+        "# 3 Прочее\n\nТекст третьего раздела.\n"
+    )
+    sections = split_sections(markdown)
+    bodies = [s.body for s in sections]
+    assert "2 Резервные требования" in bodies, bodies
+    assert all(s.body.strip() for s in sections)
+    # its own text is the body, so the breadcrumb must not repeat it
+    orphan = next(s for s in sections if s.body == "2 Резервные требования")
+    assert orphan.prefixes == ("",)
+
+
+def test_a_nested_childless_heading_keeps_its_ancestors_in_the_breadcrumb():
+    """`## 2.1` is the innermost heading with nothing under it, so it becomes the body
+    — and `# 2`, which has no body either, still reaches the index through it."""
+    markdown = "# 1 Общие\n\nТекст.\n\n# 2 Схема\n\n## 2.1 Порядок согласования\n"
+    sections = split_sections(markdown)
+    orphan = next(s for s in sections if s.body == "2.1 Порядок согласования")
+    assert orphan.prefixes[0] == "2 Схема"
+    assert not any(s.body == "2 Схема" for s in sections), "the parent is in the prefix, not twice"
 
 
 def test_word_bold_runs_come_off_the_breadcrumb():

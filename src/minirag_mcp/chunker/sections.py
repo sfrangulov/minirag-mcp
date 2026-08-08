@@ -301,16 +301,33 @@ def _heading_sections(markdown: str) -> list[Section]:
     kept: list[Section] = []
     for i, section in enumerate(raw):
         if not section.body.strip():
+            if not section.chain:
+                continue  # whatever preceded the first heading, and it was blank
             # A heading with no text of its own is dropped when a nested heading
             # follows it, because its words survive inside that child's breadcrumb.
-            # A childless empty heading is kept, so no heading text is ever lost.
             nxt = raw[i + 1] if i + 1 < len(raw) else None
             if nxt is not None and nxt.chain[: len(section.chain)] == section.chain:
                 continue
-            if not section.chain:
-                continue
+            # Nothing downstream carries this one, so it becomes its own text.
+            section = _heading_as_body(section)
         kept.append(section)
     return kept
+
+
+def _heading_as_body(section: Section) -> Section:
+    """A heading with no body and no descendants, rewritten so its words *are* the body.
+
+    A heading is content — in a specification it is often the most searchable line on
+    the page — and a section with an empty body reaches neither a chunk nor a stored
+    prefix, so leaving its text in the prefix alone would drop it from the index
+    entirely. Its breadcrumb shrinks to the ancestors: the heading is the body now, and
+    repeating it in the prefix would embed the same words twice in one unit.
+    """
+    ancestors = section.chain[:-1]
+    prefixes = ("",)
+    if ancestors:
+        prefixes = tuple(dict.fromkeys((_BREADCRUMB_JOIN.join(ancestors), ancestors[-1], "")))
+    return replace(section, prefixes=prefixes, body=section.chain[-1])
 
 
 def _generic_sections(markdown: str) -> list[Section]:
