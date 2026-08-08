@@ -1,7 +1,9 @@
 import threading
+import time
 
 import pytest
 
+import minirag_mcp.sync as sync_mod
 from minirag_mcp.config import load_config
 from minirag_mcp.ingest.pipeline import Pipeline
 from minirag_mcp.lock import SyncLock, SyncLockBusy, sync_lock
@@ -220,8 +222,6 @@ def test_manager_holds_the_lock_for_the_job_and_releases_it_after(env):
 
 def test_manager_releases_the_lock_when_the_job_fails(env, monkeypatch):
     """A catastrophic failure must not strand the lock for the process's lifetime."""
-    import minirag_mcp.sync as sync_mod
-
     cfg, store, pipeline, root = env
     seed(root)
     monkeypatch.setattr(
@@ -263,6 +263,58 @@ def test_in_process_guard_fires_before_the_cross_process_lock(env):
     finally:
         gate.set()
         mgr.wait()
+
+
+def test_restarting_the_moment_a_job_reports_terminal_is_never_refused(env, monkeypatch):
+    """Regression: the documented start → poll → start pattern hit our own flock.
+
+    The worker used to publish the terminal state and only then release the
+    cross-process lock. A client doing exactly what `sync_start` documents —
+    poll `sync_status` until the state is terminal, then start the next sync —
+    could land in the gap: the in-process guard let it through, because the job
+    reads 'succeeded', and the flock this same process was still holding refused
+    it, with a message naming the caller's own PID.
+
+    The gap is a few microseconds wide, so the test widens it at the seam it
+    belongs to rather than betting on the scheduler: `release()` is made to
+    linger before it lets the flock go. That invents nothing — releasing really
+    does take three syscalls, and a loaded machine or a slow filesystem stretches
+    them — it only makes the existing interval long enough to observe. With the
+    old ordering the poller sees 'succeeded' during the lingering and is refused
+    every single time; with the release moved ahead of the state, no delay can
+    expose a window, because there is none to expose.
+
+    (Shortening `sys.setswitchinterval` was tried first and rejected: measured
+    against the old ordering it does not concentrate the race — 400 restarts at
+    each of 1e-7, 1e-6, 1e-5, 1e-4 and the 5e-3 default yielded 0 or 1 refusals,
+    the same ~5-in-1000 as an untouched interpreter. A test that flaky proves
+    nothing when it passes.)
+    """
+    cfg, store, pipeline, root = env
+    seed(root)
+
+    class LingeringLock(SyncLock):
+        """Holds the flock well past the moment a poller could act on the job."""
+
+        def release(self) -> None:
+            if self.held:
+                time.sleep(0.05)
+            super().release()
+
+    monkeypatch.setattr(sync_mod, "SyncLock", LingeringLock)
+    mgr = SyncManager(pipeline, store, cfg)
+
+    first = mgr.start()
+    while mgr.status(first).state not in ("succeeded", "failed"):
+        pass  # a client polling sync_status, with nothing in between
+    assert mgr.status(first).state == "succeeded"
+
+    try:
+        second = mgr.start()
+    except SyncLockBusy as e:  # the bug: refused by the lock this process holds
+        pytest.fail(f"a sync that had just reported terminal was refused by our own lock: {e}")
+    mgr.wait()
+    assert mgr.status(second).state == "succeeded"
 
 
 def test_finished_at_set_when_state_terminal(env):

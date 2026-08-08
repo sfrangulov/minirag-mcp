@@ -146,12 +146,16 @@ class SyncManager:
         lock = SyncLock(self._store.db_path)
         with self._lock:
             # Order matters twice over. The in-process guard runs first, so a second
-            # job in this process is rejected as SyncBusyError and never reaches the
-            # flock — which is what keeps us from deadlocking against ourselves, since
-            # a same-process second acquire conflicts like any other rival. And the
-            # flock is taken before any state is recorded, so a refusal leaves the
-            # manager exactly as it found it rather than stranding a 'pending' job
-            # that would wedge every later start().
+            # job started while this one is still non-terminal is rejected as
+            # SyncBusyError and never reaches the flock — which is what keeps us from
+            # deadlocking against ourselves, since a same-process second acquire
+            # conflicts like any other rival. That only holds because the worker
+            # releases the flock *before* it publishes the terminal state (see
+            # `work` below): the guard covers the window in which we hold the lock,
+            # and stops covering it only once the lock is gone. And the flock is
+            # taken before any state is recorded, so a refusal leaves the manager
+            # exactly as it found it rather than stranding a 'pending' job that would
+            # wedge every later start().
             if self._job is not None and self._job.state in ("pending", "running"):
                 raise SyncBusyError("A sync job is already running")
             # Acquired here, in the caller's thread, rather than inside the worker:
@@ -165,9 +169,27 @@ class SyncManager:
 
         def work() -> None:
             job.state = "running"
-            # Invariant: finished_at is stamped before state flips to a terminal
-            # value, so a poller never observes a terminal state with finished_at
-            # still None.
+            # Two orderings, both on the way out, and both on the same principle:
+            # the terminal state is published last, because it is the signal the
+            # client acts on.
+            #
+            # finished_at first, so a poller never observes a terminal state with
+            # finished_at still None.
+            #
+            # Then the flock — before the terminal state, not after. A client that
+            # follows the documented pattern (start, poll sync_status until
+            # terminal, start again) would otherwise clear the in-process guard,
+            # because the job reads 'succeeded', and then collide with the flock
+            # this very process is still holding: refused with a message naming its
+            # own PID. Released first, the same early restart meets only the
+            # in-process guard, which still reads 'running' — a SyncBusyError, which
+            # is the right answer to "a sync is in flight" and is already handled.
+            #
+            # The whole exit runs from `finally`, so it also covers what no
+            # `except Exception` sees — a KeyboardInterrupt, say. Such a job is
+            # reported failed rather than left reading 'running', which would hold
+            # the in-process guard shut for the lifetime of the process.
+            terminal = "failed"
             try:
                 counts, errors = _run_sync_unlocked(
                     self._pipeline,
@@ -177,17 +199,22 @@ class SyncManager:
                     scope,
                     None,
                 )
-                job.counts, job.errors = counts, errors
-                job.finished_at = _now()
-                job.state = "succeeded"
             except Exception as e:  # catastrophic failure (scan error, DB down, ...)
                 job.error = str(e)
-                job.finished_at = _now()
-                job.state = "failed"
+            else:
+                job.counts, job.errors = counts, errors
+                terminal = "succeeded"
             finally:
-                # Released on the worker thread, not the one that acquired it. flock
-                # belongs to the open file description, so the handoff is legitimate.
-                lock.release()
+                job.finished_at = _now()
+                try:
+                    # Released on the worker thread, not the one that acquired it.
+                    # flock belongs to the open file description, so the handoff is
+                    # legitimate.
+                    lock.release()
+                finally:
+                    # Even if releasing somehow blew up: a job that never reaches a
+                    # terminal state wedges every later start() in this process.
+                    job.state = terminal
 
         try:
             self._thread = threading.Thread(target=work, name="minirag-sync", daemon=True)
