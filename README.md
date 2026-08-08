@@ -223,9 +223,19 @@ Two rules hold everywhere. **A markdown table breaks between rows, never inside
 one**, and its header row is repeated in every chunk built from it, so a row
 chunk still says what its columns mean; a single row longer than the whole
 budget is split at whitespace as a last resort, and even then the parent
-section holds it intact. And **a fenced code block is atomic** — the one thing
-allowed to exceed the budget, because code split mid-block is wrong rather than
-merely partial.
+section holds it intact. A table header row with no data rows under it is the
+content, and is kept as an ordinary row rather than discarded as a header with
+nothing to head.
+
+And **a fenced code block is atomic** — the one thing allowed to exceed the
+budget, because code split mid-block is wrong rather than merely partial. That
+exception is bounded at both ends. It requires a genuine fence, with a closing
+marker, so one stray ``` line cannot make the rest of a document indivisible;
+and it stops at four budgets, past which the block is split at line boundaries
+after all and every piece carries `[code block split to fit the token budget]`.
+The encoder has seen the same first 128 tokens either way, so past that point
+keeping the block whole buys no retrieval quality and only inflates every
+response that returns it.
 
 Measured against the previous scheme on the same 558 documents: 64,697 chunks
 against 50,575, **none of them over the 128-token ceiling** (14.7% were), median

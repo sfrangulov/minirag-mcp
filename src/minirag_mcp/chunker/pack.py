@@ -5,10 +5,16 @@ anything past that is not merely unranked, it is *invisible* — measured on the
 index, 22.8% of all indexed tokens were being discarded before they reached the model.
 A unit is therefore grown greedily until one more piece would cross the budget.
 
-One exception, and it is deliberate: a fenced code block is atomic. Splitting code
-mid-block produces fragments that are wrong rather than merely partial, so an
+One exception, and it is deliberate: a *genuine* fenced code block is atomic. Splitting
+code mid-block produces fragments that are wrong rather than merely partial, so an
 over-budget fence is emitted whole and the encoder truncates it. Everything else —
 prose, table rows, even a single word longer than the budget — is split until it fits.
+
+The exception is bounded at both ends, because an unbounded exception is a hole rather
+than an exception. It needs a closing marker, so a single stray ``` line does not turn
+the rest of a document into one indivisible chunk; and it stops at
+`FENCE_BUDGET_MULTIPLE` budgets, past which the fence is split anyway and every piece
+says so.
 """
 
 from __future__ import annotations
@@ -36,6 +42,20 @@ MIN_BODY_TOKENS = 24
 # How many leading lines `join_parent` will consider shared. A heading breadcrumb plus
 # its blank line plus a table's two header lines is exactly four.
 MAX_SHARED_LINES = 4
+# How far over the budget a fenced code block may run before it is split after all.
+# The exception is worth paying for a snippet: a fence cut in the middle is wrong
+# rather than merely partial. It stops being worth paying for a file. The encoder sees
+# only the first `budget` tokens either way, so past this multiple the exception buys
+# no retrieval quality at all — it only costs the index, and every response that
+# returns the chunk, the entire remainder of the block. Four budgets is ~440 tokens at
+# the default, on the order of a 40-line function: the largest fence where reading it
+# whole is still the point.
+FENCE_BUDGET_MULTIPLE = 4
+# Carried by every piece of a fence that had to be split. Deliberately constant: the
+# pieces of one fence are consecutive units of one section, so an identical first line
+# is exactly what `join_parent` collapses back to a single line when the section is
+# rebuilt for reading.
+FENCE_SPLIT_NOTE = "[code block split to fit the token budget]"
 
 
 @dataclass(frozen=True)
@@ -95,9 +115,16 @@ def _block_atoms(block_text: str) -> list[Atom]:
                 j += 1
             run = lines[i:j]
             head = _table_header(run)
-            if head:
+            if head and len(run) > head:
                 header = "\n".join(run[:head])
                 atoms += [Atom(text=row, kind=ROW, header=header, sep="\n") for row in run[head:]]
+            elif head:
+                # A header row and a delimiter row with no data rows under them. There
+                # is nothing to repeat the header *in front of*, so the header is the
+                # content: emitted as ordinary rows, exactly like a header too wide to
+                # repeat. Treating it as a header with no rows dropped it entirely, and
+                # a column list is often the only text a stub section has.
+                atoms += [Atom(text=row, kind=ROW, header="", sep="\n") for row in run[:head]]
             else:
                 atoms += _text_atoms(run)
             i = j
@@ -118,7 +145,11 @@ def section_atoms(body: str) -> list[Atom]:
     """
     atoms: list[Atom] = []
     for block in split_markdown(body, max_chars=None):
-        if block.is_code:
+        # `closed` is what tells a fence from a stray marker. Without it a single ```
+        # line — markitdown emits them out of Word tables often enough — makes every
+        # line after it one indivisible atom, and the budget stops applying to the
+        # rest of the document.
+        if block.is_code and block.closed:
             fresh = [Atom(text=block.text, kind=CODE, sep="\n\n")]
         else:
             fresh = _block_atoms(block.text)
@@ -185,6 +216,28 @@ def _force_split(text: str, wrap, count_tokens: CountTokens, budget: int) -> lis
     return [p for p in out if p.strip()]
 
 
+def _split_fence(prefix: str, code: str, count_tokens: CountTokens, budget: int) -> list[str]:
+    """Cut a fence that ran past the ceiling, at line boundaries, marking every piece.
+
+    Line boundaries rather than `_force_split`'s whitespace, because code read a line
+    at a time is still readable and code read a word at a time is not. The note goes in
+    front of the code, not after it, so a caller sees it before the fragment it
+    qualifies — and so `join_parent` finds it as a shared leading line and emits it
+    once when the section is put back together.
+    """
+
+    def wrap(text: str) -> str:
+        return _render(prefix, "", f"{FENCE_SPLIT_NOTE}\n{text}")
+
+    pieces: list[str] = []
+    for rough in _greedy(code.split("\n"), "\n", wrap, count_tokens, budget):
+        if rough.strip() and count_tokens(wrap(rough)) <= budget:
+            pieces.append(rough)
+        else:
+            pieces += _force_split(rough, wrap, count_tokens, budget)
+    return [wrap(piece) for piece in pieces]
+
+
 def _resolve_headers(
     atoms: Sequence[Atom], prefix: str, count_tokens: CountTokens, budget: int
 ) -> list[Atom]:
@@ -219,7 +272,8 @@ def _resolve_headers(
 def pack_section(section: Section, count_tokens: CountTokens, budget: int) -> list[str]:
     """Retrieval units for one section, every one within `budget` tokens.
 
-    The only unit that may exceed it is a fenced code block, which is atomic.
+    The only unit that may exceed it is a closed fenced code block, which is atomic —
+    and only up to `FENCE_BUDGET_MULTIPLE` budgets, past which even that is split.
     """
     atoms = section_atoms(section.body)
     if not atoms:
@@ -235,7 +289,12 @@ def pack_section(section: Section, count_tokens: CountTokens, budget: int) -> li
         header = run[0].header
         body = _join(run)
         rendered = _render(prefix, header, body)
-        if run[0].kind == CODE or count_tokens(rendered) <= budget:
+        if run[0].kind == CODE:
+            if count_tokens(rendered) <= budget * FENCE_BUDGET_MULTIPLE:
+                units.append(rendered)
+            else:
+                units.extend(_split_fence(prefix, body, count_tokens, budget))
+        elif count_tokens(rendered) <= budget:
             units.append(rendered)
         else:
             units.extend(

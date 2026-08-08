@@ -18,6 +18,12 @@ _HEADING_RE = re.compile(r"^#{1,6}\s")
 class Block:
     text: str
     is_code: bool
+    # Whether a closing fence was actually found. CommonMark lets an unclosed fence run
+    # to the end of the document, and it still reads as code — but "there is a closing
+    # marker" is what tells a stray ``` line apart from a real block, and downstream
+    # rules that treat code as indivisible need that distinction. Non-code blocks are
+    # trivially closed.
+    closed: bool = True
 
 
 def _split_long_paragraph(text: str, max_chars: int | None) -> list[str]:
@@ -72,6 +78,7 @@ def split_markdown(markdown: str, *, max_chars: int | None = 1500) -> list[Block
             flush_para()
             open_seq = fence.group(1)
             code = [line]
+            closed = False
             i += 1
             while i < len(lines):
                 code.append(lines[i])
@@ -79,13 +86,14 @@ def split_markdown(markdown: str, *, max_chars: int | None = 1500) -> list[Block
                 if lstripped.startswith(open_seq[0]) and len(lstripped) - len(
                     lstripped.lstrip(open_seq[0])
                 ) >= len(open_seq):
+                    closed = True
                     break
                 i += 1
             if pending_heading is not None:
                 code.insert(0, "")
                 code.insert(0, pending_heading)
                 pending_heading = None
-            blocks.append(Block(text="\n".join(code).strip(), is_code=True))
+            blocks.append(Block(text="\n".join(code).strip(), is_code=True, closed=closed))
         elif _HEADING_RE.match(line):
             flush_para()
             if pending_heading is not None:

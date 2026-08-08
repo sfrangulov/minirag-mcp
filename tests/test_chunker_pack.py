@@ -12,6 +12,7 @@ from corpus_samples import (
     TRANSCRIPT_WITH_SPEAKERS,
 )
 from minirag_mcp.chunker import DEFAULT_TOKEN_BUDGET, chunk_markdown, join_parent
+from minirag_mcp.chunker.pack import FENCE_BUDGET_MULTIPLE, FENCE_SPLIT_NOTE
 from minirag_mcp.chunker.pack import join_parent as join
 from minirag_mcp.chunker.sections import split_sections
 from minirag_mcp.chunker.tokens import estimate_tokens
@@ -70,13 +71,48 @@ def test_a_word_longer_than_the_budget_is_still_split():
 def test_code_fences_stay_atomic_even_over_budget():
     """The one deliberate exception: a fence split in the middle is wrong, not merely
     partial, and the property is load-bearing for indexing source files."""
-    code = "```python\n" + "\n".join(f"line_{i} = {i}" for i in range(200)) + "\n```"
+    code = "```python\n" + "\n".join(f"line_{i} = {i}" for i in range(60)) + "\n```"
     chunks = chunk_markdown(f"Вступление.\n\n{code}\n\nПослесловие.", count_tokens=count)
     fenced = [c for c in chunks if "```" in c.text]
     assert len(fenced) == 1
     assert fenced[0].text.count("```") == 2
-    assert "line_0 = 0" in fenced[0].text and "line_199 = 199" in fenced[0].text
+    assert "line_0 = 0" in fenced[0].text and "line_59 = 59" in fenced[0].text
     assert count(fenced[0].text) > DEFAULT_TOKEN_BUDGET  # over budget on purpose
+    assert count(fenced[0].text) <= DEFAULT_TOKEN_BUDGET * FENCE_BUDGET_MULTIPLE
+
+
+def test_a_stray_fence_marker_does_not_make_the_rest_of_the_document_atomic():
+    """The exception has to be triggered by a *fence*, not by a backtick line. An
+    unclosed marker made every line after it one indivisible atom, so `text` and
+    `parentText` could be megabytes of which the encoder saw 128 tokens."""
+    tail = "\n\n".join(f"Абзац номер {i} про хранение запасов на складах." for i in range(60))
+    chunks = chunk_markdown(f"Вступление.\n\n```\n\n{tail}", count_tokens=count)
+    assert len(chunks) > 1
+    for c in chunks:
+        assert count(c.text) <= DEFAULT_TOKEN_BUDGET, repr(c.text[:120])
+    joined = " ".join(c.text for c in chunks)
+    assert "Абзац номер 0" in joined and "Абзац номер 59" in joined
+    # the size ceiling alone would also cut this up — what has to hold is that the
+    # prose was never treated as code in the first place
+    assert not any(FENCE_SPLIT_NOTE in c.text for c in chunks), "prose read as a code block"
+
+
+def test_a_fence_past_the_ceiling_is_split_and_says_so():
+    """An exception with no ceiling is not an exception. Past a few budgets the encoder
+    has seen the same first 128 tokens either way, so keeping the rest whole buys no
+    retrieval quality and only inflates every response carrying the chunk."""
+    code = "```python\n" + "\n".join(f"line_{i} = {i}" for i in range(400)) + "\n```"
+    chunks = chunk_markdown(f"Вступление.\n\n{code}\n\nПослесловие.", count_tokens=count)
+    pieces = [c for c in chunks if FENCE_SPLIT_NOTE in c.text]
+    assert len(pieces) > 1, "a 400-line fence cannot stay whole"
+    for c in pieces:
+        assert c.text.startswith(FENCE_SPLIT_NOTE), "the note comes before what it qualifies"
+        assert count(c.text) <= DEFAULT_TOKEN_BUDGET, repr(c.text[:120])
+    body = "\n".join(ln for c in pieces for ln in c.text.split("\n")[1:])
+    assert "line_0 = 0" in body and "line_399 = 399" in body
+    # rebuilt for reading, the note appears once rather than once per piece
+    rebuilt = join_parent([c.text for c in pieces])
+    assert rebuilt.count(FENCE_SPLIT_NOTE) == 1
 
 
 def test_table_rows_are_never_split_and_the_header_repeats():
@@ -101,6 +137,21 @@ def test_a_header_too_wide_to_repeat_is_still_stored_once():
     texts = [c.text for c in chunks]
     assert sum(t.count("Колонка номер 0") for t in texts) == 1
     assert all(count(t) <= 60 for t in texts)
+
+
+def test_a_table_with_a_header_and_no_data_rows_keeps_its_header():
+    """markitdown emits these from an empty spreadsheet range or a stub table in a
+    spec. The header was treated as a header to repeat in front of rows, there were no
+    rows, and the column names — the only text there is — were dropped."""
+    md = "# Раздел\n\nВведение.\n\n| Параметр сверки | Ответственный |\n| --- | --- |\n\nДалее."
+    chunks = chunk_markdown(md, count_tokens=count)
+    joined = "\n".join(c.text for c in chunks)
+    assert "| Параметр сверки | Ответственный |" in joined, joined
+
+    # and a document that is *only* such a table still produces a chunk, rather than
+    # coming out empty and being rejected as having no text content at all
+    alone = chunk_markdown("| Параметр сверки | Ответственный |\n| --- | --- |", count_tokens=count)
+    assert alone and "Параметр сверки" in alone[0].text
 
 
 def test_transcript_units_carry_the_window_label_and_the_meeting_title():
