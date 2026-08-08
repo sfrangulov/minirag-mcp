@@ -207,11 +207,21 @@ trusted — the 107 real transcripts in the corpus have 50.0%–51.7% of their
 non-blank lines matching it and all 452 other documents have exactly 0.0%, so
 the threshold sits in the middle of an empty gap rather than on a tuned edge.
 
-Two rules hold everywhere: **a markdown table row is never cut in half** (its
-header row is repeated in every chunk built from it, so a row chunk still says
-what its columns mean), and **a fenced code block is atomic** — the one thing
-allowed to exceed the budget, because code split mid-block is wrong rather
-than merely partial.
+Two rules hold everywhere. **A markdown table breaks between rows, never inside
+one**, and its header row is repeated in every chunk built from it, so a row
+chunk still says what its columns mean; a single row longer than the whole
+budget is split at whitespace as a last resort, and even then the parent
+section holds it intact. And **a fenced code block is atomic** — the one thing
+allowed to exceed the budget, because code split mid-block is wrong rather than
+merely partial.
+
+Measured against the previous scheme on the same 558 documents: **no chunk over
+the 128-token ceiling** (was 14.7%), median chunk 94 tokens (was 50), and
+ingest **1.7× faster** despite producing 50% more chunks — the deleted semantic
+merge stage was one of two embedding passes per document. Of five benchmark
+queries, three keep their top-ranked document; the two that change now rank
+first the document whose *title* names the query subject, where the old index
+returned a transcript fragment.
 
 **Changing the scheme requires a re-sync**, and that is detected rather than
 assumed: every chunk records the scheme it was cut with, and `status` reports
