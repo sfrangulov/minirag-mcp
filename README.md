@@ -447,9 +447,14 @@ merges with them.
   controls DNS for a name you ask the server to ingest.
 - No other network I/O happens: only an explicit `ingest_url` call and the
   one-time embedding-model download ever leave the machine.
-- Single local user, no authentication. One writer per `DB_PATH` at a time
-  (LanceDB doesn't support concurrent writers); reading while a sync is in
-  progress is fine.
+- Single local user, no authentication. Concurrent writers against one
+  `DB_PATH` are safe — LanceDB commits optimistically and retries, so parallel
+  ingests neither lose rows nor leave a source half-replaced. Two *syncs* at
+  once are simply wasteful, since both re-walk and re-index the same corpus, so
+  `sync`/`sync_start` takes an advisory lock on `<DB_PATH>/.sync.lock` and a
+  second one refuses immediately, naming the process that holds it and how long
+  it has been running. Single-file ingests and reads are never blocked, and the
+  lock is released by the kernel if a sync is killed, so it can't go stale.
 - Re-indexing a source replaces its chunks by deleting the old ones and
   writing the new ones, so a sync interrupted mid-file (Ctrl-C, a crash, a
   server restart) can leave that one source temporarily absent from the
