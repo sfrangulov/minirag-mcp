@@ -20,8 +20,8 @@ class Block:
     is_code: bool
 
 
-def _split_long_paragraph(text: str, max_chars: int) -> list[str]:
-    if len(text) <= max_chars:
+def _split_long_paragraph(text: str, max_chars: int | None) -> list[str]:
+    if max_chars is None or len(text) <= max_chars:
         return [text]
     pieces: list[str] = []
     words = text.split(" ")
@@ -40,7 +40,13 @@ def _split_long_paragraph(text: str, max_chars: int) -> list[str]:
     return pieces
 
 
-def split_markdown(markdown: str, *, max_chars: int = 1500) -> list[Block]:
+def split_markdown(markdown: str, *, max_chars: int | None = 1500) -> list[Block]:
+    """Split Markdown into paragraph/code blocks.
+
+    `max_chars=None` leaves long paragraphs whole, which is what the token-budget
+    packer wants: it decides sizes itself, in tokens, and needs the paragraphs
+    unsliced to do it.
+    """
     lines = markdown.split("\n")
     blocks: list[Block] = []
     para: list[str] = []  # accumulating non-code lines

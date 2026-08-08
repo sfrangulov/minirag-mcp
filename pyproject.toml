@@ -76,3 +76,8 @@ src = ["src", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# Verbatim excerpts from the real corpus. Rewrapping a markdown table row or a
+# transcript turn would change the very shape the chunker is being tested against.
+"tests/corpus_samples.py" = ["E501"]
