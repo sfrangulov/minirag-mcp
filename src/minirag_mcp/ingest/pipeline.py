@@ -7,12 +7,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from minirag_mcp.chunker import (
-    SCHEME_VERSION,
-    Chunk,
-    chunk_markdown,
-    estimate_tokens,
-)
+from minirag_mcp.chunker import SCHEME_VERSION, chunk_markdown, estimate_tokens
 from minirag_mcp.config import Config
 from minirag_mcp.ingest import parser as _parser
 from minirag_mcp.ingest.parser import (
@@ -25,21 +20,6 @@ from minirag_mcp.security import check_url
 from minirag_mcp.store import ChunkRecord, Store
 
 DATA_FORMATS = ("text", "markdown", "html")
-
-
-def _seed_title(text: str, title: str) -> str:
-    """Put the title in front of the first chunk's text, once.
-
-    Keyword search reads the title column directly, but the vector side only ever
-    sees chunk text — so without this a filename-derived title would be invisible to
-    semantic search. Applied after chunking (it can never move a chunk boundary) and
-    before embedding (the vector reflects it). A chunk that already carries the title
-    is left alone: that keeps re-ingest idempotent, and it keeps chunk 0 looking like
-    its siblings, which is what lets the parent section be rebuilt from them.
-    """
-    if not title.strip() or title in text:
-        return text
-    return f"# {title}\n\n{text}"
 
 
 class UnsupportedFormatError(Exception):
@@ -102,10 +82,11 @@ class Pipeline:
     ) -> IngestResult:
         """Chunk, embed and store, replacing whatever `source` held before.
 
-        `seed_title` says whether `title` is a real title and may therefore be written
-        into chunk 0's text. Only the caller knows: a data source with no title of its
-        own is titled after its source id, and a titleless page after its URL — neither
-        belongs in the embedded text.
+        `seed_title` says whether `title` is a real title and may therefore reach the
+        chunk text — as chunk 0's opening line, and as part of a transcript window's
+        label. Only the caller knows: a data source with no title of its own is titled
+        after its source id, and a titleless page after its URL, and neither an id nor
+        an address describes a document well enough to embed.
         """
         chunks = chunk_markdown(
             markdown,
@@ -115,10 +96,6 @@ class Pipeline:
         )
         if not chunks:
             raise EmptyDocumentError(f"No text content extracted from {source}")
-        if seed_title:
-            seeded = _seed_title(chunks[0].text, title)
-            if seeded != chunks[0].text:
-                chunks[0] = Chunk(text=seeded, parent_index=chunks[0].parent_index)
         texts = [c.text for c in chunks]
         vectors = self.embedder.embed_documents(texts)
         now = datetime.now(UTC).isoformat()

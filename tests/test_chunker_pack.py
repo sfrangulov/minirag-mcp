@@ -172,3 +172,19 @@ def test_join_parent_edge_cases():
     assert join(["a", "  ", "b"]) == "a\n\nb"
     assert join(["| x |", "| y |"]) == "| x |\n| y |"
     assert join(["head\n\nfirst", "head\n\nsecond"]) == "head\n\nfirst\n\nsecond"
+
+
+def test_the_seeded_title_is_counted_against_the_budget():
+    """Seeding a *finished* chunk is how 3 of 64,692 chunks on the real corpus ended up
+    over budget — every one of them chunk 0. The title goes in before packing."""
+    title = "И-41 БНУ Налоговый учет транспортный, имущественный, земельный налоги, эмиссии"
+    markdown = "**Функциональная спецификация**\n\n" + "Требование к системе. " * 60
+    chunks = chunk_markdown(markdown, count_tokens=count, title=title)
+    assert chunks[0].text.startswith(f"# {title}\n\n")
+    assert all(count(c.text) <= DEFAULT_TOKEN_BUDGET for c in chunks)
+    assert sum(c.text.count(title) for c in chunks) == 1, "chunk 0 only"
+
+
+def test_a_document_that_already_carries_its_title_is_not_seeded():
+    chunks = chunk_markdown("# MD Title\n\nBody here.", count_tokens=count, title="MD Title")
+    assert chunks[0].text == "# MD Title\n\nBody here."
