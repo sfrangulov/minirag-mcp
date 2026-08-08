@@ -1,5 +1,6 @@
 import pytest
 
+from conftest import FakeEmbedder
 from minirag_mcp.config import load_config
 from minirag_mcp.ingest.parser import ParserError
 from minirag_mcp.ingest.pipeline import (
@@ -356,74 +357,84 @@ def _capture_records(monkeypatch, pipeline):
     return stored
 
 
-def test_unmerged_chunks_are_not_embedded_twice(tmp_path, fake_embedder, monkeypatch):
-    """merge_blocks embeds every block to decide the merges; only what merging changed
-    needs a second embedding. Chunk 0 counts as changed once the title is seeded."""
-    p, emb = _recording_pipeline(tmp_path, fake_embedder, "db-reuse")
-    stored = _capture_records(monkeypatch, p)
-    a, b = "Абзац А. " * 100, "Абзац Б. " * 100  # 900 chars each: never merge with a peer
-    code = "```\nx = 1\n```"  # a code block attaches to its predecessor unconditionally
-    doc = tmp_path / "И-112 Хранение ТМЗ.md"
-    doc.write_text(f"{a}\n\n{code}\n\n{b}", encoding="utf-8")
-    res = p.ingest_file(doc)
+def test_every_stored_vector_describes_its_stored_text(tmp_path, fake_embedder, monkeypatch):
+    """The whole index rests on this: a vector must describe the text it is stored with.
 
-    assert res.chunk_count == 2
-    records = stored[str(doc)]
-    blocks, rechunked = emb.batches
-    assert len(blocks) == 3, "every block is embedded once, to decide the merges"
-    # chunk 1 is block B untouched, so its block vector stands and it is not re-embedded
-    assert records[1].text == b.strip()
-    assert b.strip() not in rechunked
-    assert emb.embedded_texts == 4 < 3 + res.chunk_count
-    # every stored vector describes the text stored beside it — including chunk 0, whose
-    # cached vector must have been dropped when merging and title seeding rewrote it
-    for r in records:
-        assert r.vector == fake_embedder.embed_documents([r.text])[0]
-    assert records[0].text.startswith("# И-112 Хранение ТМЗ\n\n")
-
-
-def test_reused_vectors_match_a_direct_embedding_of_the_stored_text(
-    tmp_path, fake_embedder, monkeypatch
-):
-    """The whole index rests on this: a vector must describe the text it is stored with,
-    whatever path it took to get there."""
+    The old pipeline embedded each block once to decide the semantic merges and reused
+    those vectors, which made this a live hazard. Structure-first chunking embeds the
+    finished text once and only once, so the property is now easy — and worth pinning,
+    because nothing else in the system would notice if it broke."""
     p, emb = _recording_pipeline(tmp_path, fake_embedder, "db-vectors")
-    stored = _capture_records(monkeypatch, p)
-    doc = tmp_path / "И-112 Хранение ТМЗ на складах.md"
-    doc.write_text(
-        "# И-112 Хранение ТМЗ на складах\n\n"
-        + "\n\n".join(
-            f"## Раздел {i}\n\nАбзац {i} про хранение товарно-материальных запасов, "
-            f"достаточно длинный чтобы стать отдельным блоком."
-            for i in range(1, 21)
-        ),
-        encoding="utf-8",
-    )
-    res = p.ingest_file(doc)
-    records = stored[str(doc)]
-    assert len(records) == res.chunk_count > 1
-    for r in records:
-        assert r.vector == fake_embedder.embed_documents([r.text])[0]
-    blocks = len(emb.batches[0])
-    assert emb.embedded_texts < blocks + res.chunk_count  # the old cost, embedding twice
-
-
-def test_title_seeding_invalidates_the_cached_vector_of_chunk_zero(
-    tmp_path, fake_embedder, monkeypatch
-):
-    """Chunk 0 can be an unmerged block, and seeding rewrites its text after merging
-    handed back a vector for the text as it was. Keeping that vector would mis-embed the
-    one chunk the title exists to reach."""
-    p, emb = _recording_pipeline(tmp_path, fake_embedder, "db-seeded")
     stored = _capture_records(monkeypatch, p)
     doc = tmp_path / "И-112 Хранение ТМЗ.md"
     doc.write_text("Абзац А. " * 100 + "\n\n" + "Абзац Б. " * 100, encoding="utf-8")
     res = p.ingest_file(doc)
 
-    assert res.chunk_count == 2, "two blocks too long to merge, so neither is altered"
-    first, second = stored[str(doc)]
-    assert first.text.startswith(f"# {res.title}\n\n")
+    records = stored[str(doc)]
+    assert len(records) == res.chunk_count > 1
+    for r in records:
+        assert r.vector == fake_embedder.embed_documents([r.text])[0]
+    # exactly one embedding pass, over the final texts: no block pass, no re-embedding
+    assert emb.batches == [[r.text for r in records]]
+
+
+def test_title_seeding_embeds_the_seeded_text(tmp_path, fake_embedder, monkeypatch):
+    """Seeding rewrites chunk 0, so the vector stored for it has to be the seeded one —
+    chunk 0 is the chunk the title exists to make reachable."""
+    p, emb = _recording_pipeline(tmp_path, fake_embedder, "db-seeded")
+    stored = _capture_records(monkeypatch, p)
+    doc = tmp_path / "И-112 Хранение ТМЗ.md"
+    doc.write_text("Абзац А. " * 100 + "\n\n" + "Абзац Б. " * 100, encoding="utf-8")
+    p.ingest_file(doc)
+
+    first = stored[str(doc)][0]
+    assert first.text.startswith("# И-112 Хранение ТМЗ\n\n")
     assert first.vector == fake_embedder.embed_documents([first.text])[0]
-    assert first.vector != fake_embedder.embed_documents([emb.batches[0][0]])[0]
-    assert second.vector == fake_embedder.embed_documents([second.text])[0]
-    assert emb.embedded_texts == 3  # 2 blocks + the reseeded chunk 0, not 4
+    assert emb.batches[0][0] == first.text
+
+
+def test_chunks_carry_a_parent_id_scoped_to_their_source(pipe):
+    p, store, root = pipe
+    f = root / "spec.md"
+    f.write_text(
+        "# 1 Хранение\n\n"
+        + " ".join(f"Правило {i} про хранение запасов." for i in range(40))
+        + "\n\n# 2 Выдача\n\nКоротко про выдачу.",
+        encoding="utf-8",
+    )
+    p.ingest_file(f)
+    chunks = store.all_chunks(str(f))
+    parents = {c.parent_id for c in chunks}
+    assert len(parents) == 2, "two headings, two sections"
+    assert all(pid.startswith(f"{f}#p") for pid in parents)
+    # the section comes back whole, and is not stored a second time to do it
+    first = sorted(c for c in parents)[0]
+    section = store.parent_text(first)
+    members = [c for c in chunks if c.parent_id == first]
+    assert len(members) > 1
+    assert all(m.text.split("\n")[-1] in section for m in members)
+
+
+def test_the_stored_chunks_respect_the_token_budget(pipe):
+    p, store, root = pipe
+    f = root / "long.md"
+    f.write_text("# 1 Раздел\n\n" + "Правило про хранение запасов. " * 400, encoding="utf-8")
+    p.ingest_file(f)
+    counter = FakeEmbedder().count_tokens
+    chunks = store.all_chunks(str(f))
+    assert len(chunks) > 1
+    assert all(counter(c.text) <= 110 for c in chunks)
+
+
+def test_a_smaller_budget_produces_more_chunks(tmp_path, fake_embedder):
+    """CHUNK_TOKEN_BUDGET has to reach the chunker, not merely be parsed."""
+    root = tmp_path / "docs"
+    root.mkdir()
+    f = root / "long.md"
+    f.write_text("# 1 Раздел\n\n" + "Правило про хранение запасов. " * 400, encoding="utf-8")
+    counts = []
+    for budget in ("110", "40"):
+        cfg = load_config({"BASE_DIR": str(root), "CHUNK_TOKEN_BUDGET": budget}, cwd=root)
+        store = Store(tmp_path / f"db-{budget}", dim=fake_embedder.dim)
+        counts.append(Pipeline(store, fake_embedder, cfg).ingest_file(f).chunk_count)
+    assert counts[1] > counts[0]

@@ -12,7 +12,7 @@ def test_defaults_from_cwd(tmp_path):
     assert cfg.db_path == tmp_path.resolve() / ".minirag" / "lancedb"
     assert cfg.model_name == DEFAULT_MODEL
     assert cfg.max_file_size == 104857600
-    assert cfg.chunk_min_length == 50
+    assert cfg.token_budget == 110
     assert cfg.hybrid_weight == 0.6
     assert cfg.grouping is None and cfg.max_distance is None and cfg.max_files is None
     assert cfg.allow_private_urls is False  # the SSRF guard is on unless turned off
@@ -58,8 +58,8 @@ def test_flags_beat_env(tmp_path):
     [
         {"MAX_FILE_SIZE": "abc"},
         {"MAX_FILE_SIZE": "0"},
-        {"CHUNK_MIN_LENGTH": "0"},
-        {"CHUNK_MIN_LENGTH": "10001"},
+        {"CHUNK_TOKEN_BUDGET": "0"},
+        {"CHUNK_TOKEN_BUDGET": "129"},
         {"RAG_HYBRID_WEIGHT": "1.5"},
         {"RAG_HYBRID_WEIGHT": "-0.1"},
         {"RAG_GROUPING": "bogus"},
