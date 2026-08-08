@@ -48,6 +48,13 @@ Replace `/absolute/path/to/docs` with the folder you want indexed.
 The invocation is `uvx minirag-mcp`. It resolves and caches the package on
 first run, so start-up is slow once and fast afterwards.
 
+`uvx` resolves that name from PyPI, so the snippets below work from release
+**0.1.0** onward; on an earlier revision use [From an unreleased
+revision](#from-an-unreleased-revision) instead. That distinction is worth
+checking before you paste: `claude mcp add` writes the entry without ever
+running the command, so an unresolvable package looks like a successful setup
+and only fails later, silently, when the client tries to launch the server.
+
 ### Claude Code
 
 ```bash
@@ -97,7 +104,7 @@ Append `@<tag-or-sha>` to the URL to pin a revision.
 
 ### From a clone
 
-For development, or to use the CLI without the `--from` prefix everywhere:
+For development, or to run the CLI against a working tree you can edit:
 
 ```bash
 git clone https://github.com/sfrangulov/minirag-mcp
@@ -505,19 +512,43 @@ publishing](https://docs.pypi.org/trusted-publishers/): the workflow mints a
 short-lived OIDC token for the upload, so there is no PyPI API token in the
 repository secrets, in the workflow, or on anyone's laptop.
 
+**The workflow has to land on `main` before any tag is cut.** GitHub fires the
+`release` event only for a workflow file that exists on the **default branch**,
+and the run it starts is pinned to the tagged commit (`GITHUB_SHA` is "last
+commit in the tagged release"). Tag a commit that predates
+[`release.yml`](.github/workflows/release.yml) reaching `main` and publishing
+the release is a silent no-op — no run is queued, nothing turns red, and the
+release simply sits there looking like a build that hung.
+
 1. Bump `version` in `pyproject.toml` and commit.
 2. Tag it: `git tag vX.Y.Z && git push origin vX.Y.Z`.
 3. Publish a GitHub release for that tag.
 
-Publishing the release runs
-[`release.yml`](.github/workflows/release.yml), which builds the sdist and
-wheel, runs `twine check`, smoke-tests the built wheel, and verifies the built
-version matches the tag — a mismatch fails the run before anything is
-uploaded. Only then does a separate job upload to PyPI. That job runs in the
-`pypi` environment, so giving the environment a required reviewer turns the
-upload into a manual approval step. A publish that failed after the release
-already exists can be retried with `workflow_dispatch` instead of a new
-release.
+Publishing the release runs `release.yml`. It runs `ruff` and `pytest` first —
+`ci.yml` has no tag trigger, so a tag is the one ref CI never covers and this
+is the only thing standing between an untested commit and PyPI — then builds
+the sdist and wheel, smoke-tests the wheel in a clean venv, and checks the
+built version against the tag. That last check is unconditional and ref-based:
+a mismatch fails the build, and so does any attempt to publish from a branch
+ref, since a branch carries no version to check a build against.
+`twine check --strict` also runs, but read it narrowly: it validates the
+distribution metadata and catches an empty long description, and it does *not*
+validate this project's Markdown README, because `readme_renderer` only
+understands reStructuredText.
+
+Only then does a separate job upload to PyPI. That job runs in the `pypi`
+environment, which restricts deployments to `v*` tags. It has **no required
+reviewer** — adding one under Settings → Environments → `pypi` is a one-click
+change that would turn the upload into a manual approval step, but as
+configured today the gate is the ref restriction, not a human.
+
+**If a publish fails after the release already exists**, use GitHub's *Re-run
+failed jobs* on the original release run: that replays the same `release`
+event, so every guard above still applies. `workflow_dispatch` is the fallback
+and only works when the ref you select is the tag — a dispatch from a branch is
+refused. Uploads are idempotent (`skip-existing: true`), so retrying after a
+partial upload finishes the remaining files instead of dying on "File already
+exists".
 
 ## License
 
