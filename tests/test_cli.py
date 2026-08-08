@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 import minirag_mcp.cli as cli
+from minirag_mcp.chunker import SCHEME_VERSION
 from minirag_mcp.lock import sync_lock
 from minirag_mcp.store import MAX_TOP_K, Store
 
@@ -330,3 +331,37 @@ def test_query_top_k_is_clamped_and_must_be_positive(corpus, capsys, monkeypatch
         assert exc.value.code == 1
         assert "--top-k must be at least 1" in capsys.readouterr().err
     assert seen == [MAX_TOP_K]  # clamped, and the two refused runs never reached the store
+
+
+def test_cli_query_returns_the_same_parent_fields_as_the_server(corpus, capsys):
+    """The two interfaces share `result_dict`; this is what catches them drifting."""
+    (corpus / "spec.md").write_text(
+        "# 1 Хранение\n\n"
+        + " ".join(f"Правило {i} про хранение товарно-материальных запасов." for i in range(40)),
+        encoding="utf-8",
+    )
+    run(["ingest", str(corpus / "spec.md"), "--base-dir", str(corpus)])
+    capsys.readouterr()
+    run(["query", "хранение запасов", "--base-dir", str(corpus), "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    hit = next(r for r in payload["results"] if r["source"].endswith("spec.md"))
+    assert set(hit) == {
+        "text",
+        "source",
+        "title",
+        "chunkIndex",
+        "score",
+        "distance",
+        "parentId",
+        "parentText",
+    }
+    assert hit["text"] in hit["parentText"]
+
+
+def test_cli_status_reports_the_chunking_scheme(corpus, capsys):
+    run(["ingest", str(corpus / "a.md"), "--base-dir", str(corpus)])
+    capsys.readouterr()
+    run(["status", "--base-dir", str(corpus), "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["chunkScheme"] == SCHEME_VERSION
+    assert payload["staleChunkCount"] == 0

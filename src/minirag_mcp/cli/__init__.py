@@ -11,12 +11,13 @@ from typing import Annotated
 from cyclopts import App, Parameter
 
 from minirag_mcp import __version__
+from minirag_mcp.chunker import SCHEME_VERSION
 from minirag_mcp.config import Config, ConfigError, load_config
 from minirag_mcp.embedder import Embedder, UnknownModelError
 from minirag_mcp.ingest.pipeline import IngestResult, Pipeline
 from minirag_mcp.ingest.scanner import compute_states, scan_roots
 from minirag_mcp.lock import SyncLockBusy
-from minirag_mcp.results import aggregate_sources, result_dict
+from minirag_mcp.results import aggregate_sources, result_dict, scheme_status
 from minirag_mcp.scope import is_under
 from minirag_mcp.security import SecurityError, resolve_in_roots
 from minirag_mcp.store import MAX_TOP_K, DimensionMismatchError, SearchResult, Store
@@ -377,8 +378,10 @@ def status(
         "dbPath": str(cfg.db_path),
         "model": cfg.model_name,
         "hybridWeight": cfg.hybrid_weight,
+        "chunkScheme": SCHEME_VERSION,
         "chunkCount": store.chunk_count(),
         "sourceCount": store.source_count(),
+        **scheme_status(store),
     }
     human = "\n".join(f"{k}: {v}" for k, v in payload.items())
     _emit(payload, json, human)

@@ -11,11 +11,12 @@ from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 
 from minirag_mcp import __version__
+from minirag_mcp.chunker import SCHEME_VERSION
 from minirag_mcp.config import Config, ConfigError, load_config
 from minirag_mcp.embedder import Embedder
 from minirag_mcp.ingest.pipeline import Pipeline
 from minirag_mcp.ingest.scanner import compute_states, scan_roots
-from minirag_mcp.results import aggregate_sources, result_dict
+from minirag_mcp.results import aggregate_sources, result_dict, scheme_status
 from minirag_mcp.scope import is_under
 from minirag_mcp.security import resolve_in_roots
 from minirag_mcp.store import MAX_TOP_K, Store
@@ -161,6 +162,13 @@ def create_app(
         those results in rank order, each with a hits count. Use `sources`
         to answer "which documents cover this topic" without inspecting
         individual chunks.
+
+        `text` is the passage that matched and that `score` describes.
+        `parentText` is the whole section it sits in — a transcript time
+        window, a heading section, a slide, a table — reconstructed from
+        the neighbouring chunks; read it when the match alone is too small
+        to act on. It is null for chunks indexed before parent sections
+        existed; re-sync to fill it in.
 
         topK must be at least 1 and is capped at 100; a larger value is
         silently clamped to the cap rather than rejected.
@@ -311,6 +319,11 @@ def create_app(
         configuration is invalid, includes configError instead, and every
         other tool raises an error referencing it until the configuration is
         fixed.
+
+        chunkScheme is the chunking scheme the index is being written with.
+        staleChunkCount counts chunks still stored under an older scheme —
+        when it is above zero, schemeWarning explains that those chunks need
+        a re-sync to be rebuilt.
         """
         if config is None or config_error is not None:
             return {"version": __version__, "configError": config_error or "no configuration"}
@@ -320,11 +333,13 @@ def create_app(
             "dbPath": str(config.db_path),
             "model": config.model_name,
             "hybridWeight": config.hybrid_weight,
+            "chunkScheme": SCHEME_VERSION,
         }
         try:
             c = ctx()
             out["chunkCount"] = c.store.chunk_count()
             out["sourceCount"] = c.store.source_count()
+            out.update(scheme_status(c.store))
         except Exception as e:
             out["indexError"] = str(e)
         return out

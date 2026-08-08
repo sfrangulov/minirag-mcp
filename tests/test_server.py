@@ -5,10 +5,11 @@ import pytest
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
+from minirag_mcp.chunker import SCHEME_VERSION
 from minirag_mcp.config import load_config
 from minirag_mcp.lock import sync_lock
 from minirag_mcp.server import create_app
-from minirag_mcp.store import MAX_TOP_K, Store
+from minirag_mcp.store import MAX_TOP_K, ChunkRecord, Store
 
 # pytest-asyncio runs in auto mode (see pyproject) — bare `async def` tests are collected as-is.
 
@@ -258,3 +259,64 @@ async def test_query_top_k_is_clamped_and_must_be_positive(app, monkeypatch):
         with pytest.raises(Exception, match="topK must be at least 1"):
             await c.call_tool("query_documents", {"query": "token", "topK": -5})
     assert seen == [MAX_TOP_K]  # clamped, and the two refused calls never reached the store
+
+
+async def test_query_returns_the_parent_section_alongside_the_chunk(app):
+    """Additive, not a replacement: a client already reading `text` keeps getting the
+    passage that was ranked, and gains the section around it in a new field."""
+    mcp, root = app
+    (root / "spec.md").write_text(
+        "# 1 Хранение\n\n"
+        + " ".join(f"Правило {i} про хранение товарно-материальных запасов." for i in range(40)),
+        encoding="utf-8",
+    )
+    async with Client(mcp) as c:
+        await c.call_tool("ingest_file", {"filePath": str(root / "spec.md")})
+        res = (await c.call_tool("query_documents", {"query": "хранение запасов"})).data
+    hit = next(r for r in res["results"] if r["source"].endswith("spec.md"))
+    assert {"text", "parentText", "parentId"} <= set(hit)
+    assert hit["parentId"].startswith(str(root / "spec.md") + "#p")
+    assert hit["text"] in hit["parentText"]
+    assert len(hit["parentText"]) > len(hit["text"]), "the section must be bigger than the hit"
+
+
+async def test_status_reports_the_chunking_scheme(app):
+    mcp, root = app
+    async with Client(mcp) as c:
+        await c.call_tool("ingest_file", {"filePath": str(root / "auth.md")})
+        st = (await c.call_tool("status", {})).data
+    assert st["chunkScheme"] == SCHEME_VERSION
+    assert st["staleChunkCount"] == 0
+    assert "schemeWarning" not in st
+
+
+async def test_status_tells_the_user_to_re_sync_a_stale_index(tmp_path, fake_embedder):
+    """The migration has to be *detected*. A stale index still answers queries, so
+    nothing else would ever mention that its vectors describe truncated text."""
+    root = tmp_path / "docs"
+    root.mkdir()
+    cfg = load_config({"BASE_DIR": str(root)}, cwd=root)
+    store = Store(cfg.db_path, dim=fake_embedder.dim)
+    store.replace_source(
+        "/old.md",
+        [
+            ChunkRecord(
+                id="/old.md#0",
+                source="/old.md",
+                source_type="file",
+                title="Old",
+                chunk_index=0,
+                text="кусок, нарезанный старой схемой",
+                vector=[0.1] * fake_embedder.dim,
+                file_hash="h",
+                mtime=1.0,
+                ingested_at="2026-01-01T00:00:00+00:00",
+                parent_id="",
+                scheme_version=SCHEME_VERSION - 1,
+            )
+        ],
+    )
+    async with Client(create_app(cfg, embedder=fake_embedder)) as c:
+        st = (await c.call_tool("status", {})).data
+    assert st["staleChunkCount"] == 1
+    assert "re-sync" in st["schemeWarning"].lower()
