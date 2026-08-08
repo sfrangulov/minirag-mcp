@@ -228,21 +228,40 @@ def _is_table(text: str) -> bool:
     return bool(lines) and sum(1 for ln in lines if TABLE_ROW.match(ln)) * 2 > len(lines)
 
 
+def _split_table(table: str, limit: int) -> list[str]:
+    """Cut a table at row boundaries, repeating its header row in every piece.
+
+    Without the repeat, every piece after the first would start with a data row, and
+    both the reader and the packer would read those rows as prose rather than as a
+    table with named columns. One 782-row, 65 KB table in the corpus is why this
+    exists: as a single section it would be handed back whole for any hit inside it.
+    """
+    lines = table.split("\n")
+    head = 2 if len(lines) >= 2 and TABLE_DELIMITER.match(lines[1]) else 0
+    if not head:
+        return _pack_to(lines, "\n", limit)
+    header = lines[:head]
+    room = max(limit - len("\n".join(header)) - 1, 1)
+    return ["\n".join([*header, piece]) for piece in _pack_to(lines[head:], "\n", room)]
+
+
 def _split_oversized(body: str, limit: int) -> list[str]:
     """Cut a section body down to `limit`, at the largest boundary that still works.
 
-    Paragraphs first, then sentences: a body with no blank line in it has no paragraph
-    to cut at, and leaving it whole would make a whole document one "section". A table
-    is exempt — splitting it between sections would leave the second half without the
-    header row that says what its columns are, and the packer would then read those
-    rows as prose.
+    Paragraphs first; then rows if the body is a table, sentences if it is not. A body
+    with no blank line in it has no paragraph to cut at, and leaving it whole would
+    make a whole document one "section". The bound is soft in one place only: a single
+    table row or sentence longer than `limit` is not cut further here — the packer
+    handles that, and cutting it would produce a section no one could read.
     """
     if len(body) <= limit:
         return [body]
     out: list[str] = []
     for piece in _pack_to(body.split("\n\n"), "\n\n", limit):
-        if len(piece) <= limit or _is_table(piece):
+        if len(piece) <= limit:
             out.append(piece)
+        elif _is_table(piece):
+            out += _split_table(piece, limit)
         else:
             out += _pack_to(SENTENCE_END.split(piece), " ", limit)
     return out

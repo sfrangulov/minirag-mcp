@@ -186,3 +186,22 @@ def test_no_category_can_hand_back_an_unbounded_section():
         assert sections
         assert all(len(s.body) <= 4000 for s in sections), markdown[:40]
     assert " ".join(s.body for s in split_sections(wall)).split() == wall.split()
+
+
+def test_a_huge_table_is_split_into_sections_that_are_still_tables():
+    """The corpus has a 782-row, 65 KB table. As one section it would be handed back
+    whole for any hit inside it — and cutting it without repeating the header would
+    leave every piece but the first as anonymous columns."""
+    header = "| № | Показатель | Периодичность |"
+    delimiter = "| --- | --- | --- |"
+    rows = [
+        f"| {i} | Показатель номер {i} по форме статистической отчетности | месяц |"
+        for i in range(200)
+    ]
+    sections = split_sections("\n".join([header, delimiter, *rows]))
+    assert len(sections) > 1
+    assert all(len(s.body) <= 4000 for s in sections)
+    for s in sections:
+        assert s.body.split("\n")[:2] == [header, delimiter]
+    kept = [ln for s in sections for ln in s.body.split("\n") if ln not in (header, delimiter)]
+    assert kept == rows, "every row survives, exactly once, in order"

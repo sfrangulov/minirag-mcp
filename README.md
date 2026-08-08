@@ -198,7 +198,7 @@ specifications and instructions alike:
 |---|---|---|
 | Transcript — a regular timestamp line, with or without a speaker in front | 120-second window, labelled `[MM:SS–MM:SS]` plus the meeting title | successive turns packed to the budget |
 | Slides — `<!-- Slide number: N -->` markers | one slide | the slide, split only if over budget |
-| Headings — two or more ATX headings (specs, instructions, spreadsheets) | heading section, capped at 4,000 characters | paragraphs and rows packed to the budget, each carrying the heading breadcrumb |
+| Headings — two or more ATX headings (specs, instructions, spreadsheets) | heading section | paragraphs and rows packed to the budget, each carrying the heading breadcrumb |
 | Anything else | one structural block | the block, packed to the budget |
 
 Detection **fails safe**: anything that does not clearly match falls to the
@@ -206,6 +206,15 @@ generic path. The transcript pattern in particular was measured before being
 trusted — the 107 real transcripts in the corpus have 50.0%–51.7% of their
 non-blank lines matching it and all 452 other documents have exactly 0.0%, so
 the threshold sits in the middle of an empty gap rather than on a tuned edge.
+
+Sections are capped at **4,000 characters**, because a section is what comes back
+in a response: a section over the cap is cut at paragraph boundaries, or at row
+boundaries with the header row repeated when it is a table, or at sentence
+boundaries when it is one unbroken paragraph. The cap is soft in exactly one
+place — a single table row or sentence longer than 4,000 characters on its own is
+left whole rather than cut into something unreadable. Measured over the corpus:
+12,508 sections, median 1,182 characters, 99th percentile 3,967, and 32 sections
+(0.26%) over the cap, the largest of them a single 21 KB Word table cell.
 
 Two rules hold everywhere. **A markdown table breaks between rows, never inside
 one**, and its header row is repeated in every chunk built from it, so a row
