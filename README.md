@@ -224,13 +224,13 @@ section holds it intact. And **a fenced code block is atomic** — the one thing
 allowed to exceed the budget, because code split mid-block is wrong rather than
 merely partial.
 
-Measured against the previous scheme on the same 558 documents: **no chunk over
-the 128-token ceiling** (was 14.7%), median chunk 94 tokens (was 50), and
-ingest **1.7× faster** despite producing 50% more chunks — the deleted semantic
-merge stage was one of two embedding passes per document. Of five benchmark
-queries, three keep their top-ranked document; the two that change now rank
-first the document whose *title* names the query subject, where the old index
-returned a transcript fragment.
+Measured against the previous scheme on the same 558 documents: 64,697 chunks
+against 50,575, **none of them over the 128-token ceiling** (14.7% were), median
+chunk 94 tokens against 50, and ingest **1.7× faster** despite the extra chunks —
+the deleted semantic merge stage was one of two embedding passes per document. Of
+five benchmark queries, three keep their top-ranked document; the two that change
+now rank first the document whose *title* names the query subject, where the old
+index returned a transcript fragment.
 
 **Changing the scheme requires a re-sync**, and that is detected rather than
 assumed: every chunk records the scheme it was cut with, and `status` reports
