@@ -7,6 +7,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from minirag_mcp.chunker import SCHEME_VERSION
 from minirag_mcp.ingest.parser import SUPPORTED_EXTENSIONS
 from minirag_mcp.ingest.pipeline import file_sha256
 from minirag_mcp.scope import is_under
@@ -113,6 +114,10 @@ def compute_diff(
     (cp -p, rsync -a, git checkout) may leave a stale index entry. Re-sync will detect and
     update it only if mtime differs (then hash is compared).
 
+    A source whose chunks predate the current chunking scheme is re-ingested whatever
+    its bytes say. Its file has not changed; what it was cut into has. Without this,
+    `status` would tell the user to re-sync and the re-sync would skip every file.
+
     Args:
         entries: Scanned disk files.
         indexed: Files currently in the index (SourceInfo from Store).
@@ -138,7 +143,7 @@ def compute_diff(
             oversized.append(e.path)
             continue
         prior = indexed_files.get(str(e.path))
-        if prior is None:
+        if prior is None or prior.scheme_version < SCHEME_VERSION:
             to_ingest.append(e.path)
         elif prior.mtime == e.mtime or prior.file_hash == file_sha256(e.path):
             unchanged.append(e.path)

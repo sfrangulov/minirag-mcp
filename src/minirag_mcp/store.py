@@ -70,9 +70,20 @@ class SourceInfo:
     chunk_count: int
     file_hash: str
     mtime: float
+    # Oldest chunking scheme among this source's chunks. Below SCHEME_VERSION means
+    # the source needs re-ingesting even though its bytes on disk are unchanged.
+    scheme_version: int = SCHEME_VERSION
 
 
-_META_COLS = ["source", "source_type", "title", "chunk_index", "file_hash", "mtime"]
+_META_COLS = [
+    "source",
+    "source_type",
+    "title",
+    "chunk_index",
+    "file_hash",
+    "mtime",
+    "scheme_version",
+]
 
 
 def relevance_cutoff(distances: Sequence[float], mode: str) -> int:
@@ -148,6 +159,13 @@ class DimensionMismatchError(Exception):
 # place on open; the SQL expression is the value every pre-existing row gets, and
 # scheme_version 0 is precisely the marker that says "cut by an older scheme".
 _ADDED_COLUMNS = {"parent_id": "''", "scheme_version": "CAST(0 AS INT)"}
+
+
+def _scheme_of(row: dict) -> int:
+    """A row's chunking scheme. A row with no such column predates every scheme."""
+    value = row.get("scheme_version")
+    return 0 if value is None else int(value)
+
 
 RESYNC_HINT = (
     "This index was built by an older chunking scheme: its chunk boundaries follow the "
@@ -335,8 +353,13 @@ class Store:
             for r in rows
         ]
 
+    def _meta_columns(self) -> list[str]:
+        """`_META_COLS`, minus anything an un-migrated older index does not have."""
+        present = set(self._table.schema.names)
+        return [c for c in _META_COLS if c in present]
+
     def _iter_meta(self, scopes: tuple[str, ...] = ()) -> list[dict]:
-        q = self._table.search().select(_META_COLS)
+        q = self._table.search().select(self._meta_columns())
         clause = sql_clause(scopes)
         if clause:
             q = q.where(clause)
@@ -345,9 +368,12 @@ class Store:
     def list_sources(self, scopes: tuple[str, ...] = ()) -> list[SourceInfo]:
         by_source: dict[str, dict] = {}
         counts: dict[str, int] = {}
+        schemes: dict[str, int] = {}
         for row in self._iter_meta(scopes):
             by_source.setdefault(row["source"], row)
             counts[row["source"]] = counts.get(row["source"], 0) + 1
+            scheme = _scheme_of(row)
+            schemes[row["source"]] = min(schemes.get(row["source"], scheme), scheme)
         return [
             SourceInfo(
                 source=src,
@@ -356,6 +382,7 @@ class Store:
                 chunk_count=counts[src],
                 file_hash=row["file_hash"],
                 mtime=row["mtime"],
+                scheme_version=schemes[src],
             )
             for src, row in sorted(by_source.items())
         ]
@@ -364,7 +391,7 @@ class Store:
         rows = (
             self._table.search()
             .where(f"source = '{sql_str(source)}'")
-            .select(_META_COLS)
+            .select(self._meta_columns())
             .limit(_LIST_LIMIT)
             .to_list()
         )
@@ -378,6 +405,7 @@ class Store:
             chunk_count=len(rows),
             file_hash=r["file_hash"],
             mtime=r["mtime"],
+            scheme_version=min(_scheme_of(row) for row in rows),
         )
 
     def stale_chunk_count(self) -> int:

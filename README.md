@@ -31,6 +31,10 @@ built on [fastmcp](https://github.com/jlowin/fastmcp),
   See [Titles and filenames](#titles-and-filenames).
 - **Multilingual by default** — the default embedding model covers 50+
   languages, so English and Russian corpora both work out of the box.
+- **Chunks sized in tokens, passages returned whole** — what gets ranked is a
+  small unit that fits the embedding model's 128-token ceiling; what comes back
+  is the section around it — a transcript time window, a heading section, a
+  slide, a table. See [Chunking](#chunking).
 - **12 file formats** ingested via `markitdown` (PDF, DOCX, PPTX, XLSX,
   HTML, CSV, EPUB, Jupyter notebooks, Markdown, and plain text), plus direct
   text/markdown/HTML ingestion and URL fetching.
@@ -160,6 +164,61 @@ Two more ways to get content in without a file on disk:
   `ALLOW_PRIVATE_URLS` says otherwise — see
   [Security and Operation](#security-and-operation).
 
+<a id="chunking"></a>
+## Chunking
+
+Two units, deliberately separated.
+
+**The retrieval unit** is what gets embedded and ranked, and it is sized in
+**tokens**, not characters, because the constraint is a token limit. The
+default model publishes `max_seq_length: 128` and that is its *trained*
+sequence length, not a misconfiguration — text past position 128 is not ranked
+badly, it is never seen. The budget is 110 tokens by default, counted with the
+model's own tokenizer, leaving margin for text that tokenizes worse than
+average.
+
+Why that matters, measured on a real 558-document Russian corpus with the
+tokenizer itself: prose runs at ~3.3 characters per token and markdown table
+rows at ~2.2. Under the previous character-based scheme, 14.7% of the 50,575
+chunks were over the ceiling and **22.8% of every token stored was discarded
+before it reached the model.** A character budget cannot fix that, because the
+ratio it would have to assume differs by 50% between prose and tables.
+
+**The parent section** is what a caller reads. `query_documents` returns
+`parentText` alongside `text`: `text` is the passage that matched and that
+`score` describes, `parentText` is the whole section it sits in. The section
+costs no extra storage — chunks cut from one section share a `parentId`, and
+the section is rebuilt by concatenating them in order.
+
+Splitting is **structure-first**, and the category is read off the converted
+Markdown rather than the file extension, since one `.docx` covers transcripts,
+specifications and instructions alike:
+
+| Detected as | Section (returned) | Retrieval unit |
+|---|---|---|
+| Transcript — a regular timestamp line, with or without a speaker in front | 120-second window, labelled `[MM:SS–MM:SS]` plus the meeting title | successive turns packed to the budget |
+| Slides — `<!-- Slide number: N -->` markers | one slide | the slide, split only if over budget |
+| Headings — two or more ATX headings (specs, instructions, spreadsheets) | heading section, capped at 4,000 characters | paragraphs and rows packed to the budget, each carrying the heading breadcrumb |
+| Anything else | one structural block | the block, packed to the budget |
+
+Detection **fails safe**: anything that does not clearly match falls to the
+generic path. The transcript pattern in particular was measured before being
+trusted — the 107 real transcripts in the corpus have 50.0%–51.7% of their
+non-blank lines matching it and all 452 other documents have exactly 0.0%, so
+the threshold sits in the middle of an empty gap rather than on a tuned edge.
+
+Two rules hold everywhere: **a markdown table row is never cut in half** (its
+header row is repeated in every chunk built from it, so a row chunk still says
+what its columns mean), and **a fenced code block is atomic** — the one thing
+allowed to exceed the budget, because code split mid-block is wrong rather
+than merely partial.
+
+**Changing the scheme requires a re-sync**, and that is detected rather than
+assumed: every chunk records the scheme it was cut with, and `status` reports
+`staleChunkCount` plus a `schemeWarning` while any chunk from an older scheme
+remains. A stale index answers queries perfectly happily — nothing else would
+ever mention that its vectors describe truncated text.
+
 ## MCP Tools
 
 11 tools, all backed by the same index:
@@ -171,12 +230,12 @@ Two more ways to get content in without a file on disk:
 | `ingest_file` | Ingest or re-ingest one file, replacing any content already indexed for it. |
 | `ingest_data` | Ingest text/markdown/html content the client holds, under a source id you choose. |
 | `ingest_url` | Fetch an http(s) URL, convert it to Markdown, and index it. |
-| `query_documents` | Hybrid search: semantic similarity plus a keyword boost for exact terms. |
+| `query_documents` | Hybrid search: semantic similarity plus a keyword boost for exact terms. Each hit carries `text` (the passage that matched) and `parentText` (the section around it) — see [Chunking](#chunking). |
 | `read_chunk_neighbors` | Read the chunks immediately before and after a search result, for context. |
 | `read_file` | Read a source's entire indexed content as Markdown (all chunks joined). |
 | `list_files` | List files found on disk under the document roots, plus indexed data/url sources. |
 | `delete_file` | Delete an indexed file, data item, or url item from the index. |
-| `status` | Report configuration and index status. Works even when configuration is invalid. |
+| `status` | Report configuration and index status, including whether the index predates the current chunking scheme. Works even when configuration is invalid. |
 
 MCP tool file paths (`filePath`) must be absolute and inside a configured
 document root.
@@ -301,7 +360,9 @@ gives the title `И-112 ЗПС Хранение ТМЗ`.
 
 The title is also prepended as a `# Title` line to the first chunk's text
 before embedding, so it reaches semantic search too — later chunks are
-untouched, and chunk boundaries, ids and counts are unaffected. Data and URL
+untouched, and chunk boundaries, ids and counts are unaffected. A chunk that
+already carries the title is left alone, which keeps re-ingest idempotent and
+keeps chunk 0 looking like its siblings, so its section still reconstructs. Data and URL
 sources are seeded only when they have a title of their own (given explicitly
 or found in the content): a source id or a bare URL identifies a document
 without describing it, and injecting it would only add noise to the vector.
@@ -382,7 +443,7 @@ merges with them.
 | `CACHE_DIR` | platformdirs user cache dir, e.g. `~/Library/Caches/minirag-mcp/models` on macOS | Embedding model cache. Global by default so the ~220 MB model is downloaded once and shared across every corpus, not duplicated per project. |
 | `MODEL_NAME` | `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` | fastembed model id. **Changing this makes existing vectors incompatible with new queries** (different model, different embedding space — even a same-dimension model isn't comparable) — pair a `MODEL_NAME` change with a new `DB_PATH` or a full re-ingest. |
 | `MAX_FILE_SIZE` | `104857600` (100 MB) | Per-file size limit, enforced before parsing. |
-| `CHUNK_MIN_LENGTH` | `50` | Minimum chunk length in characters; shorter chunks merge into a neighbor instead of being dropped. |
+| `CHUNK_TOKEN_BUDGET` | `110` | Retrieval-unit size, in the embedding model's own tokens. Range 16–128; the upper bound is the model's trained sequence length, past which the encoder does not see the text at all. See [Chunking](#chunking). |
 | `RAG_HYBRID_WEIGHT` | `0.6` | See [Search Tuning](#search-tuning). |
 | `RAG_GROUPING` | unset | See [Search Tuning](#search-tuning). |
 | `RAG_MAX_DISTANCE` | unset | See [Search Tuning](#search-tuning). |
@@ -474,6 +535,16 @@ merges with them.
 Nothing has been indexed yet, or your query's `scope` excludes everything
 that matches. Run `sync_start` (or `minirag-mcp sync`) first, then confirm
 with `status` or `list_files` that `chunkCount`/`sourceCount` are non-zero.
+
+**`status` reports `staleChunkCount` above zero.**
+Those chunks were cut by an older chunking scheme: their boundaries follow the
+old rules and their vectors were computed over text the embedding model
+truncated, so they rank against today's queries as something other than what
+they say. Re-sync to rebuild them — `sync_start`, or `minirag-mcp sync`. A sync
+normally skips a file whose bytes are unchanged, but a source cut by an older
+scheme is re-ingested anyway: the file has not changed, what it was cut into
+has. Searching still works in the meantime; it is simply searching text the
+model only half saw.
 
 **Model download fails on first use.**
 The first ingestion downloads ~220 MB from Hugging Face via fastembed; a
