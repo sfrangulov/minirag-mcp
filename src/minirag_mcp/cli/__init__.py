@@ -15,6 +15,7 @@ from minirag_mcp.config import Config, ConfigError, load_config
 from minirag_mcp.embedder import Embedder, UnknownModelError
 from minirag_mcp.ingest.pipeline import IngestResult, Pipeline
 from minirag_mcp.ingest.scanner import compute_states, scan_roots
+from minirag_mcp.lock import SyncLockBusy
 from minirag_mcp.results import aggregate_sources, result_dict
 from minirag_mcp.scope import is_under
 from minirag_mcp.security import SecurityError, resolve_in_roots
@@ -174,7 +175,10 @@ def sync(
     model_name: ModelNameOpt = None,
     json: JsonFlag = False,
 ):
-    """Reconcile the index with the document roots (synchronous)."""
+    """Reconcile the index with the document roots (synchronous).
+
+    Refuses to start if another process is already syncing this index.
+    """
     cfg, store, pipeline = _load(base_dir, db_path, cache_dir, model_name)
     scope = None
     if path is not None:
@@ -182,14 +186,18 @@ def sync(
             scope = resolve_in_roots(path, cfg.roots, require_absolute=False)
         except SecurityError as e:
             _fail(str(e))
-    counts, errors = run_sync(
-        pipeline,
-        store,
-        cfg.roots,
-        cfg.max_file_size,
-        scope=scope,
-        on_event=lambda m: print(m, file=sys.stderr),
-    )
+    try:
+        counts, errors = run_sync(
+            pipeline,
+            store,
+            cfg.roots,
+            cfg.max_file_size,
+            scope=scope,
+            on_event=lambda m: print(m, file=sys.stderr),
+        )
+    except SyncLockBusy as e:
+        _fail(str(e))
+        raise AssertionError from e  # unreachable
     human = ", ".join(f"{k}: {v}" for k, v in counts.items())
     _emit({"counts": counts, "errors": errors}, json, human)
     for err in errors:

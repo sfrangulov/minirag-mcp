@@ -1,9 +1,13 @@
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 import minirag_mcp.cli as cli
+from minirag_mcp.lock import sync_lock
 from minirag_mcp.store import MAX_TOP_K, Store
 
 # Captured at import time, before the autouse fixture below ever patches
@@ -116,6 +120,78 @@ def test_error_exits_nonzero(corpus, capsys):
         run(["delete", str(corpus / "never-ingested.md"), "--base-dir", str(corpus)])
     assert exc.value.code == 1
     assert "not found" in capsys.readouterr().err.lower()
+
+
+def test_sync_refuses_while_another_process_holds_the_lock(corpus, capsys):
+    """A second sync must say so on stderr and exit non-zero, not run anyway.
+
+    The lock is held from this process, which contends identically to a foreign
+    one (flock keys on the open file description). See tests/test_lock.py for the
+    genuinely cross-process coverage.
+    """
+    with sync_lock(corpus / ".minirag" / "lancedb"):
+        with pytest.raises(SystemExit) as exc:
+            run(["sync", "--base-dir", str(corpus)])
+    assert exc.value.code == 1
+    captured = capsys.readouterr()
+    assert "syncing this index" in captured.err and "DB_PATH" in captured.err
+    assert "Traceback" not in captured.err
+    assert captured.out == ""  # no counts printed for a run that never happened
+
+
+def test_sync_completes_and_exits_zero_when_the_lock_file_cannot_be_opened(corpus):
+    """The advisory lock must never be the reason a sync fails.
+
+    A root-owned `.sync.lock` left by one `sudo minirag-mcp sync` is the realistic
+    shape of this; chmod 000 reproduces it without sudo. Before the lock existed
+    this synced cleanly, and it has to keep doing so — with a warning, not 26
+    lines of PermissionError traceback and exit 1.
+
+    Run as a real child process, because what is under test is the process's exit
+    status and which stream the warning lands on. stdout is the MCP stdio channel
+    and carries nothing but the payload; pytest's in-process capture would show
+    neither, since it intercepts warnings before they reach a stream. The child
+    borrows the suite's fake embedder so that no model is downloaded — everything
+    else, argv parsing included, is the CLI as shipped.
+    """
+    if os.geteuid() == 0:  # pragma: no cover - the suite is not meant to run as root
+        pytest.skip("running as root: chmod 000 denies nothing")
+    lock_file = corpus / ".minirag" / "lancedb" / ".sync.lock"
+    lock_file.parent.mkdir(parents=True)
+    lock_file.write_text("")
+    lock_file.chmod(0o000)
+
+    script = (
+        "import sys\n"
+        f"sys.path.insert(0, {str(Path(__file__).parent)!r})\n"
+        "from conftest import FakeEmbedder\n"
+        "import minirag_mcp.cli as cli\n"
+        "cli._make_embedder = lambda cfg: FakeEmbedder()\n"
+        f"cli.app(['sync', '--base-dir', {str(corpus)!r}, '--json'])\n"
+    )
+    env = {k: v for k, v in os.environ.items() if k not in ("BASE_DIR", "BASE_DIRS", "DB_PATH")}
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", script], capture_output=True, text=True, timeout=180, env=env
+        )
+    finally:
+        lock_file.chmod(0o644)  # or the tmp dir cannot be cleaned up
+
+    assert proc.returncode == 0, proc.stderr
+    counts = json.loads(proc.stdout)["counts"]
+    assert counts["ingested"] == 2 and counts["failed"] == 0  # the work really happened
+    assert "Traceback" not in proc.stderr, proc.stderr
+    assert "Could not take the sync lock" in proc.stderr
+    assert "Permission denied" in proc.stderr  # the reason, from the errno
+    assert str(lock_file) in proc.stderr  # and which path
+    assert "sync lock" not in proc.stdout  # stdout stays the MCP stdio channel
+
+
+def test_ingest_is_not_blocked_by_a_held_sync_lock(corpus, capsys):
+    """The lock is scoped to sync: single-file ingests stay unblocked."""
+    with sync_lock(corpus / ".minirag" / "lancedb"):
+        run(["ingest", str(corpus / "a.md"), "--base-dir", str(corpus), "--json"])
+    assert json.loads(capsys.readouterr().out)["ingested"]
 
 
 def test_env_used_when_no_flags(corpus, capsys, monkeypatch):

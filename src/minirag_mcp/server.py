@@ -84,6 +84,12 @@ def create_app(
         byte-identical files skipped, vanished files removed from the index.
         Only the latest sync job is retained — starting a new one, or a
         server restart, discards the previous job's record.
+
+        Only one sync runs against an index at a time. If one is already in
+        progress — in this server or in another process, such as a
+        `minirag-mcp sync` in a terminal — this call fails immediately with a
+        message identifying it, and no job is started. Single-file ingests and
+        queries are never blocked by a running sync.
         """
         c = ctx()
         scope = None
