@@ -55,6 +55,8 @@ HEADINGS_MIN = 2
 # retrieval units of prose at the default budget.
 SECTION_MAX_CHARS = 4000
 _BREADCRUMB_JOIN = " > "
+# Stands in for the heading levels an elided breadcrumb dropped.
+_BREADCRUMB_ELLIPSIS = "…"
 # Markdown emphasis and numbering punctuation wrapped around heading text
 _HEADING_TRIM = "*_`~ \t"
 
@@ -267,6 +269,29 @@ def _split_oversized(body: str, limit: int) -> list[str]:
     return out
 
 
+def breadcrumb_ladder(chain: tuple[str, ...]) -> tuple[str, ...]:
+    """Candidate breadcrumbs for one heading chain, longest first, ending with `""`.
+
+    A deep chain is shortened **from the middle**. The outermost heading says which part
+    of the document this is and the innermost says what the text is actually about; the
+    levels between them are the ones a reader can infer, and on the corpus's numbered
+    specifications they are also the longest. Dropping the whole breadcrumb instead —
+    which is what a two-rung ladder forces — throws away the document-level context in
+    order to save the middle of it.
+
+    `_choose_prefix` walks this and takes the first rung that fits its share of the
+    budget, so the rungs only have to descend, not to be optimal.
+    """
+    if not chain:
+        return ("",)
+    rungs = [_BREADCRUMB_JOIN.join(chain)]
+    # keep the outermost heading, the innermost `keep`, and elide what is between
+    for keep in range(len(chain) - 2, 0, -1):
+        rungs.append(_BREADCRUMB_JOIN.join((chain[0], _BREADCRUMB_ELLIPSIS, *chain[-keep:])))
+    rungs += [chain[-1], ""]
+    return tuple(dict.fromkeys(rungs))
+
+
 def _heading_sections(markdown: str) -> list[Section]:
     """One section per ATX heading, carrying the heading breadcrumb as its prefix."""
     raw: list[Section] = []
@@ -277,14 +302,9 @@ def _heading_sections(markdown: str) -> list[Section]:
         body = "\n".join(buffer).strip()
         buffer.clear()
         chain = tuple(text for _, text in stack)
-        full = _BREADCRUMB_JOIN.join(chain)
-        if not chain:
-            raw.append(Section(prefixes=("",), body=body, chain=chain))
-            return
-        # Degrade from the whole breadcrumb to the innermost heading alone: a deep
-        # breadcrumb can be longer than the text it introduces.
-        prefixes = tuple(dict.fromkeys((full, chain[-1], "")))
-        raw.append(Section(prefixes=prefixes, body=body, chain=chain))
+        # Degrade from the whole breadcrumb down to nothing: a deep breadcrumb can be
+        # longer than the text it introduces.
+        raw.append(Section(prefixes=breadcrumb_ladder(chain), body=body, chain=chain))
 
     for line, in_code in _iter_lines(markdown):
         match = None if in_code else HEADING_LINE.match(line)
@@ -323,11 +343,11 @@ def _heading_as_body(section: Section) -> Section:
     entirely. Its breadcrumb shrinks to the ancestors: the heading is the body now, and
     repeating it in the prefix would embed the same words twice in one unit.
     """
-    ancestors = section.chain[:-1]
-    prefixes = ("",)
-    if ancestors:
-        prefixes = tuple(dict.fromkeys((_BREADCRUMB_JOIN.join(ancestors), ancestors[-1], "")))
-    return replace(section, prefixes=prefixes, body=section.chain[-1])
+    return replace(
+        section,
+        prefixes=breadcrumb_ladder(section.chain[:-1]),
+        body=section.chain[-1],
+    )
 
 
 def _generic_sections(markdown: str) -> list[Section]:

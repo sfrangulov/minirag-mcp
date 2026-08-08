@@ -21,7 +21,7 @@ from minirag_mcp.chunker.tokens import CountTokens, estimate_tokens
 # Bumped whenever chunk boundaries or chunk text change meaning. Stored on every row so
 # an index built by an older scheme is *detected* rather than assumed: its vectors were
 # computed over different text and are not comparable with new ones.
-SCHEME_VERSION = 2
+SCHEME_VERSION = 3
 # The trained sequence length of the multilingual MiniLM models this tool ships with.
 MODEL_MAX_TOKENS = 128
 # Left under the ceiling on purpose: prefixes, table headers and mixed-script text all

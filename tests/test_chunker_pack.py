@@ -12,7 +12,11 @@ from corpus_samples import (
     TRANSCRIPT_WITH_SPEAKERS,
 )
 from minirag_mcp.chunker import DEFAULT_TOKEN_BUDGET, chunk_markdown, join_parent
-from minirag_mcp.chunker.pack import FENCE_BUDGET_MULTIPLE, FENCE_SPLIT_NOTE
+from minirag_mcp.chunker.pack import (
+    FENCE_BUDGET_MULTIPLE,
+    FENCE_SPLIT_NOTE,
+    _prefix_room,
+)
 from minirag_mcp.chunker.pack import join_parent as join
 from minirag_mcp.chunker.sections import split_sections
 from minirag_mcp.chunker.tokens import estimate_tokens
@@ -177,6 +181,27 @@ def test_a_prefix_too_long_for_the_budget_degrades():
         assert c.text.split("\n", 1)[0] in ("[00:00–02:00]", "[02:00–04:00]"), c.text[:80]
         assert "Совещание руководителей Совещание" not in c.text, "the title did not fit"
     assert all(count(c.text) <= DEFAULT_TOKEN_BUDGET for c in chunks)
+
+
+def test_a_deep_breadcrumb_never_takes_most_of_the_budget():
+    """`MIN_BODY_TOKENS` is a floor, not a share: it let a six-level breadcrumb take 78%
+    of a chunk, leaving a stub of body. Chunks like that embed to near-identical vectors
+    — they are mostly the same words — and compete for the same top-k slots."""
+    headings = "\n\n".join(
+        f"{'#' * (i + 1)} {i + 1} Раздел уровня {i + 1} про хранение запасов" for i in range(6)
+    )
+    body = " ".join(f"Требование {i} к системе учета запасов." for i in range(40))
+    chunks = chunk_markdown(f"{headings}\n\n{body}", count_tokens=count)
+    deep = [c for c in chunks if "Требование" in c.text]
+    assert deep
+    for c in deep:
+        prefix = c.text.split("\n\n", 1)[0]
+        assert count(prefix) <= _prefix_room(DEFAULT_TOKEN_BUDGET), prefix
+        assert count(prefix) * 2 <= count(c.text), "the body has to be the majority"
+        # elided from the middle: the document-level and the innermost heading survive
+        assert prefix.startswith("1 Раздел уровня 1")
+        assert prefix.endswith("6 Раздел уровня 6 про хранение запасов")
+        assert "…" in prefix
 
 
 def test_heading_units_carry_the_breadcrumb():

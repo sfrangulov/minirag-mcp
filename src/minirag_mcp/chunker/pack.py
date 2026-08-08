@@ -39,6 +39,13 @@ CODE = "code"
 # Room a prefix must leave for the text it introduces. A breadcrumb or a table header
 # that would swallow the budget is dropped in favour of a shorter one.
 MIN_BODY_TOKENS = 24
+# Largest share of the budget a prefix may take. `MIN_BODY_TOKENS` alone is a floor, not
+# a share: at the default budget it lets a breadcrumb take 78% of the unit, and on
+# deeply nested specification headings it did — leaving chunks that are almost entirely
+# prefix with a stub of body, so distinct chunks embed to near-identical vectors and
+# compete for the same top-k slots. A third caps the context at half the text it
+# introduces, which is also where the corpus's prefix-dominated chunks disappear.
+MAX_PREFIX_SHARE = 1 / 3
 # How many leading lines `join_parent` will consider shared. A heading breadcrumb plus
 # its blank line plus a table's two header lines is exactly four.
 MAX_SHARED_LINES = 4
@@ -175,10 +182,20 @@ def _join(atoms: Sequence[Atom]) -> str:
     return atoms[0].text + "".join(a.sep + a.text for a in atoms[1:])
 
 
+def _prefix_room(budget: int) -> int:
+    """Tokens a prefix may occupy: the tighter of an absolute floor and a share.
+
+    The floor (`MIN_BODY_TOKENS`) is what keeps a small budget usable at all; the share
+    (`MAX_PREFIX_SHARE`) is what stops a large one from being spent mostly on context.
+    """
+    return min(budget - MIN_BODY_TOKENS, int(budget * MAX_PREFIX_SHARE))
+
+
 def _choose_prefix(prefixes: Sequence[str], count_tokens: CountTokens, budget: int) -> str:
     """The most informative prefix that still leaves room for real text."""
+    room = _prefix_room(budget)
     for prefix in prefixes:
-        if not prefix or count_tokens(_render(prefix, "", "")) <= budget - MIN_BODY_TOKENS:
+        if not prefix or count_tokens(_render(prefix, "", "")) <= room:
             return prefix
     return ""
 

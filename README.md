@@ -210,6 +210,15 @@ trusted — the 107 real transcripts in the corpus have 50.0%–51.7% of their
 non-blank lines matching it and all 452 other documents have exactly 0.0%, so
 the threshold sits in the middle of an empty gap rather than on a tuned edge.
 
+A breadcrumb never takes more than **a third of the budget**. On a deeply nested
+specification heading the full chain used to consume most of a chunk, leaving a
+stub of body — and chunks that are mostly the same prefix embed to nearly the
+same vector and compete for the same top-k slots. Past that share the breadcrumb
+is elided from the *middle*, keeping the outermost heading and the innermost
+ones: `1 Общие положения > … > 3.4.2 Порядок согласования`. A heading with no
+text of its own and no nested heading under it becomes a chunk of its own text,
+since nothing else would carry its words into the index.
+
 Sections are capped at **4,000 characters**, because a section is what comes back
 in a response: a section over the cap is cut at paragraph boundaries, or at row
 boundaries with the header row repeated when it is a table, or at sentence
