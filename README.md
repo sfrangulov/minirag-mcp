@@ -42,19 +42,17 @@ built on [fastmcp](https://github.com/jlowin/fastmcp),
 
 ## Quick Start
 
-Not on PyPI yet — install straight from this repository. Every client below
-launches the same process; only the config format differs. Replace
-`/absolute/path/to/docs` with the folder you want indexed.
+Every client below launches the same process; only the config format differs.
+Replace `/absolute/path/to/docs` with the folder you want indexed.
 
-The invocation is `uvx --from git+https://github.com/sfrangulov/minirag-mcp minirag-mcp`.
-It resolves and caches the package on first run, so start-up is slow once and
-fast afterwards. To pin a revision, append `@<tag-or-sha>` to the URL.
+The invocation is `uvx minirag-mcp`. It resolves and caches the package on
+first run, so start-up is slow once and fast afterwards.
 
 ### Claude Code
 
 ```bash
 claude mcp add minirag --scope user --env BASE_DIR=/absolute/path/to/docs \
-  -- uvx --from git+https://github.com/sfrangulov/minirag-mcp minirag-mcp
+  -- uvx minirag-mcp
 ```
 
 ### Cursor (`~/.cursor/mcp.json`)
@@ -64,11 +62,7 @@ claude mcp add minirag --scope user --env BASE_DIR=/absolute/path/to/docs \
   "mcpServers": {
     "minirag": {
       "command": "uvx",
-      "args": [
-        "--from",
-        "git+https://github.com/sfrangulov/minirag-mcp",
-        "minirag-mcp"
-      ],
+      "args": ["minirag-mcp"],
       "env": {
         "BASE_DIR": "/absolute/path/to/docs"
       }
@@ -82,11 +76,24 @@ claude mcp add minirag --scope user --env BASE_DIR=/absolute/path/to/docs \
 ```toml
 [mcp_servers.minirag]
 command = "uvx"
-args = ["--from", "git+https://github.com/sfrangulov/minirag-mcp", "minirag-mcp"]
+args = ["minirag-mcp"]
 
 [mcp_servers.minirag.env]
 BASE_DIR = "/absolute/path/to/docs"
 ```
+
+### From an unreleased revision
+
+To run a revision that hasn't been released to PyPI — an unreleased fix, or one
+specific commit — install from this repository instead. In any snippet above,
+replace `uvx minirag-mcp` with:
+
+```
+uvx --from git+https://github.com/sfrangulov/minirag-mcp minirag-mcp
+```
+
+As an argument list, that is `["--from", "git+https://github.com/sfrangulov/minirag-mcp", "minirag-mcp"]`.
+Append `@<tag-or-sha>` to the URL to pin a revision.
 
 ### From a clone
 
@@ -482,15 +489,35 @@ strings: `export BASE_DIRS='["/docs/a", "/docs/b"]'`. `status` keeps working
 even with a broken `BASE_DIRS`; every other tool fails until it's fixed.
 
 **MCP client doesn't show the tools.**
-- Run the same command the client runs
-  (`uvx --from git+https://github.com/sfrangulov/minirag-mcp minirag-mcp`)
-  directly in a terminal — it should hang silently, waiting on stdio (Ctrl-C
-  to exit). If that fails, the client will fail the same way.
+- Run the same command the client runs (`uvx minirag-mcp`) directly in a
+  terminal — it should hang silently, waiting on stdio (Ctrl-C to exit). If
+  that fails, the client will fail the same way.
 - Restart the client after adding or editing the server config.
 - Confirm `uv`/`uvx` is on the `PATH` the client's process sees — GUI apps
   sometimes launch with a different `PATH` than your shell.
 - Run `minirag-mcp status --base-dir <root>` from a terminal to confirm the
   configuration resolves the way you expect.
+
+## Releasing
+
+Maintainers only. Releases reach PyPI through [trusted
+publishing](https://docs.pypi.org/trusted-publishers/): the workflow mints a
+short-lived OIDC token for the upload, so there is no PyPI API token in the
+repository secrets, in the workflow, or on anyone's laptop.
+
+1. Bump `version` in `pyproject.toml` and commit.
+2. Tag it: `git tag vX.Y.Z && git push origin vX.Y.Z`.
+3. Publish a GitHub release for that tag.
+
+Publishing the release runs
+[`release.yml`](.github/workflows/release.yml), which builds the sdist and
+wheel, runs `twine check`, smoke-tests the built wheel, and verifies the built
+version matches the tag — a mismatch fails the run before anything is
+uploaded. Only then does a separate job upload to PyPI. That job runs in the
+`pypi` environment, so giving the environment a required reviewer turns the
+upload into a manual approval step. A publish that failed after the release
+already exists can be retried with `workflow_dispatch` instead of a new
+release.
 
 ## License
 
