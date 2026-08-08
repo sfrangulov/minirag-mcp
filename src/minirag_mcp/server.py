@@ -262,9 +262,13 @@ def create_app(
         """List files found on disk under the document roots, plus indexed data/url sources.
 
         Each disk file is reported with a state: "ingested" (index matches
-        disk), "stale" (changed on disk since it was indexed), or
-        "not_ingested" (never indexed). Data and url sources always appear
-        as "ingested" since they only exist once ingested.
+        disk), "stale" (changed on disk since it was indexed),
+        "stale_scheme" (unchanged on disk, but indexed under an older
+        chunking scheme, so its vectors are not comparable with current
+        ones), or "not_ingested" (never indexed). Everything but "ingested"
+        needs a sync_start. "stale_scheme" is the per-source view of what
+        status reports as staleChunkCount. Data and url sources have no disk
+        state to compare against, so they are "ingested" or "stale_scheme".
         """
         c = ctx()
         scopes = _scopes(scope)

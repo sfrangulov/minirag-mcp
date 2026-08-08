@@ -290,6 +290,54 @@ async def test_status_reports_the_chunking_scheme(app):
     assert "schemeWarning" not in st
 
 
+async def test_the_listing_and_status_agree_on_a_scheme_stale_source(tmp_path, fake_embedder):
+    """`status` said the index was stale and to re-sync; `list_files` said the same
+    file was "ingested". An agent decides what needs work from the listing, so the two
+    have to tell it the same thing."""
+    root = tmp_path / "docs"
+    root.mkdir()
+    doc = root / "auth.md"
+    doc.write_text("# Auth Guide\n\nOAuth2 token authentication flow explained at length here.")
+    cfg = load_config({"BASE_DIR": str(root)}, cwd=root)
+
+    async with Client(create_app(cfg, embedder=fake_embedder)) as c:
+        await c.call_tool("ingest_file", {"filePath": str(doc)})
+        listed = (await c.call_tool("list_files", {})).data["files"]
+    assert {f["source"]: f["state"] for f in listed}[str(doc)] == "ingested"
+
+    # age the stored chunks by one scheme, exactly as an index built by an older
+    # release would look, without touching the file on disk
+    store = Store(cfg.db_path, dim=fake_embedder.dim)
+    info = store.get_source(str(doc))
+    store.replace_source(
+        str(doc),
+        [
+            ChunkRecord(
+                id=f"{r.source}#{r.chunk_index}",
+                source=r.source,
+                source_type="file",
+                title=r.title,
+                chunk_index=r.chunk_index,
+                text=r.text,
+                vector=[0.1] * fake_embedder.dim,
+                file_hash=info.file_hash,
+                mtime=info.mtime,
+                ingested_at="2026-01-01T00:00:00+00:00",
+                parent_id=r.parent_id,
+                scheme_version=SCHEME_VERSION - 1,
+            )
+            for r in store.all_chunks(str(doc))
+        ],
+    )
+
+    async with Client(create_app(cfg, embedder=fake_embedder)) as c:
+        st = (await c.call_tool("status", {})).data
+        listed = (await c.call_tool("list_files", {})).data["files"]
+
+    assert st["staleChunkCount"] > 0 and "re-sync" in st["schemeWarning"].lower()
+    assert {f["source"]: f["state"] for f in listed}[str(doc)] == "stale_scheme"
+
+
 async def test_status_tells_the_user_to_re_sync_a_stale_index(tmp_path, fake_embedder):
     """The migration has to be *detected*. A stale index still answers queries, so
     nothing else would ever mention that its vectors describe truncated text."""

@@ -329,7 +329,12 @@ def list_cmd(
     model_name: ModelNameOpt = None,
     json: JsonFlag = False,
 ):
-    """List files on disk with ingestion state, plus indexed data/url sources."""
+    """List files on disk with ingestion state, plus indexed data/url sources.
+
+    States: ingested, stale (changed on disk), stale_scheme (unchanged on disk but
+    indexed under an older chunking scheme), not_ingested. Everything but ingested
+    needs a sync.
+    """
     cfg, store, _ = _load(base_dir, db_path, cache_dir, model_name)
     scopes = tuple(scope or ())
     entries = scan_roots(cfg.roots)

@@ -164,23 +164,42 @@ class FileState:
     source: str
     source_type: str
     title: str
-    state: str  # "ingested" | "not_ingested" | "stale"
+    state: str  # "ingested" | "not_ingested" | "stale" | "stale_scheme"
     chunk_count: int
 
 
+def _indexed_state(prior: SourceInfo) -> str:
+    """Whether an indexed source is current, or was cut by an older chunking scheme.
+
+    A scheme-stale source needs the same action as a changed one — re-ingest — and
+    `compute_diff` already re-ingests it. Reporting it as plain "ingested" is what made
+    the listing contradict `status`, which says the index is stale and to re-sync; an
+    agent choosing what to work on from the listing would have seen nothing to do.
+    """
+    return "stale_scheme" if prior.scheme_version < SCHEME_VERSION else "ingested"
+
+
 def compute_states(entries: list[ScanEntry], indexed: list[SourceInfo]) -> list[FileState]:
-    """Compute file states: ingested, stale, or not_ingested for disk files + data/url sources.
+    """Compute file states for disk files plus indexed data/url sources.
 
     States for disk files (source_type="file"):
-    - "ingested": mtime matches indexed record, or content hash matches (file unchanged).
+    - "ingested": mtime matches indexed record, or content hash matches (file unchanged),
+      and its chunks were cut by the current chunking scheme.
     - "stale": mtime differs AND hash differs (file changed on disk).
+    - "stale_scheme": unchanged on disk, but indexed under an older chunking scheme —
+      its vectors were computed over differently cut text and are not comparable with
+      new ones, so it needs re-ingesting all the same.
     - "not_ingested": file not in index.
+
+    A file that is both changed on disk and scheme-stale reports "stale": the bytes are
+    the more surprising fact, and the remedy is identical either way.
 
     Uses mtime fast-path: if mtime matches, no hash is computed. Equal mtime is trusted,
     so mtime-preserving restores (cp -p, rsync -a, git checkout) may mark changed files
     as ingested. Re-sync will detect and correct if mtime changes.
 
-    Indexed data/url sources are appended as "ingested" and never filtered.
+    Indexed data/url sources are appended and never filtered; they have no disk state to
+    compare against, but they can be scheme-stale like any other source.
     Results sorted by source path.
     """
     by_source = {s.source: s for s in indexed if s.source_type == "file"}
@@ -190,13 +209,14 @@ def compute_states(entries: list[ScanEntry], indexed: list[SourceInfo]) -> list[
         if prior is None:
             states.append(FileState(str(e.path), "file", "", "not_ingested", 0))
         elif prior.mtime == e.mtime or prior.file_hash == file_sha256(e.path):
-            states.append(
-                FileState(str(e.path), "file", prior.title, "ingested", prior.chunk_count)
-            )
+            state = _indexed_state(prior)
+            states.append(FileState(str(e.path), "file", prior.title, state, prior.chunk_count))
         else:
             states.append(FileState(str(e.path), "file", prior.title, "stale", prior.chunk_count))
     for s in indexed:
         if s.source_type in ("data", "url"):
-            states.append(FileState(s.source, s.source_type, s.title, "ingested", s.chunk_count))
+            states.append(
+                FileState(s.source, s.source_type, s.title, _indexed_state(s), s.chunk_count)
+            )
     states.sort(key=lambda s: s.source)
     return states
