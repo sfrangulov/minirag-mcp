@@ -75,6 +75,34 @@ def test_read_full_source(corpus, capsys):
     assert "Alpha body" in payload["text"] and payload["chunkCount"] >= 1
 
 
+def test_cli_read_reconstructs_a_multi_chunk_table_like_the_server(corpus, capsys):
+    """Same reconstruction as the server's read_file: the two share `join_document`,
+    and this is what catches them drifting."""
+    header = "| № | Показатель | Периодичность |"
+    delimiter = "| --- | --- | --- |"
+    rows = [
+        f"| {i} | Показатель номер {i} по форме статистической отчетности | месяц |"
+        for i in range(30)
+    ]
+    doc = corpus / "table.md"
+    doc.write_text(
+        "# 1 Отчетность\n\n## 1.1 Формы\n\n" + "\n".join([header, delimiter, *rows]),
+        encoding="utf-8",
+    )
+    run(["ingest", str(doc), "--base-dir", str(corpus)])
+    capsys.readouterr()
+    run(["read", str(doc), "--base-dir", str(corpus), "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["chunkCount"] > 3
+    text = payload["text"]
+    assert text.count(header) == 1 and text.count(delimiter) == 1
+    assert text.count("1 Отчетность > 1.1 Формы") == 1
+    assert [ln for ln in text.split("\n") if ln.startswith("| ") and "---" not in ln] == [
+        header,
+        *rows,
+    ]
+
+
 def test_sync_and_read_neighbors(corpus, capsys):
     run(["sync", "--base-dir", str(corpus), "--json"])
     counts = json.loads(capsys.readouterr().out)["counts"]
@@ -353,9 +381,9 @@ def test_cli_query_returns_the_same_parent_fields_as_the_server(corpus, capsys):
         "score",
         "distance",
         "parentId",
-        "parentText",
     }
-    assert hit["text"] in hit["parentText"]
+    assert hit["text"] in payload["parents"][hit["parentId"]]
+    assert len(payload["parents"]) < len(payload["results"]), "sections are not repeated"
 
 
 def test_cli_status_reports_the_chunking_scheme(corpus, capsys):

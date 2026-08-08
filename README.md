@@ -187,11 +187,21 @@ chunks were over the ceiling and **22.8% of every token stored was discarded
 before it reached the model.** A character budget cannot fix that, because the
 ratio it would have to assume differs by 50% between prose and tables.
 
-**The parent section** is what a caller reads. `query_documents` returns
-`parentText` alongside `text`: `text` is the passage that matched and that
-`score` describes, `parentText` is the whole section it sits in. The section
-costs no extra storage — chunks cut from one section share a `parentId`, and
-the section is rebuilt by concatenating them in order.
+**The parent section** is what a caller reads. `text` is the passage that
+matched and that `score` describes; `parentId` names the section it sits in,
+and `query_documents` returns a `parents` map from that id to the section's
+text. It is a map rather than a field on each hit because several hits of one
+query routinely land in the same section — that is what a good chunking scheme
+does — and repeating the section per hit made about a third of a response the
+same words resent. The section costs no extra storage either: chunks cut from
+one section share the `parentId`, and the section is rebuilt from them on
+demand.
+
+`read_file` reconstructs a document the same way rather than concatenating its
+chunks. Each chunk repeats whatever context its own vector needed — a heading
+breadcrumb, a table's header row — and printing that once per chunk inflated
+the document by 22% at the median and 2.64x at the tail, and put a header row
+in the middle of a table.
 
 Splitting is **structure-first**, and the category is read off the converted
 Markdown rather than the file extension, since one `.docx` covers transcripts,
@@ -271,9 +281,9 @@ ever mention that its vectors describe truncated text.
 | `ingest_file` | Ingest or re-ingest one file, replacing any content already indexed for it. |
 | `ingest_data` | Ingest text/markdown/html content the client holds, under a source id you choose. |
 | `ingest_url` | Fetch an http(s) URL, convert it to Markdown, and index it. |
-| `query_documents` | Hybrid search: semantic similarity plus a keyword boost for exact terms. Each hit carries `text` (the passage that matched) and `parentText` (the section around it) — see [Chunking](#chunking). |
+| `query_documents` | Hybrid search: semantic similarity plus a keyword boost for exact terms. Each hit carries `text` (the passage that matched) and `parentId`; the enclosing sections come back once each in the response's `parents` map — see [Chunking](#chunking). |
 | `read_chunk_neighbors` | Read the chunks immediately before and after a search result, for context. |
-| `read_file` | Read a source's entire indexed content as Markdown (all chunks joined). |
+| `read_file` | Read a source's entire indexed content as Markdown, reconstructed from its chunks rather than concatenated from them. |
 | `list_files` | List files found on disk under the document roots, plus indexed data/url sources. |
 | `delete_file` | Delete an indexed file, data item, or url item from the index. |
 | `status` | Report configuration and index status, including whether the index predates the current chunking scheme. Works even when configuration is invalid. |
