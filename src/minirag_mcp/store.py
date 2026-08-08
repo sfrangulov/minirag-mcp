@@ -167,10 +167,11 @@ def _scheme_of(row: dict) -> int:
     return 0 if value is None else int(value)
 
 
+# Reads as the second half of "N chunk(s) predate the current chunking scheme."
 RESYNC_HINT = (
-    "This index was built by an older chunking scheme: its chunk boundaries follow the "
-    "old rules and its vectors were computed over text the embedding model truncated. "
-    "Re-sync to rebuild it (sync_start, or `minirag-mcp sync`)."
+    "Their boundaries follow the old rules and their vectors were computed over text "
+    "the embedding model truncated. Re-sync to rebuild them (sync_start, or "
+    "`minirag-mcp sync`)."
 )
 
 
@@ -240,8 +241,9 @@ class Store:
             self.schema_migrated = False
             warnings.warn(
                 f"Could not add the {', '.join(sorted(missing))} column(s) to the index at "
-                f"{db_path}: {e}. {RESYNC_HINT} Ingesting into this index will fail until "
-                f"the columns exist — reopen it with write access and no concurrent writer.",
+                f"{db_path}: {e}. This index predates the current chunking scheme, and it "
+                f"cannot be re-ingested until those columns exist — reopen it with write "
+                f"access and no concurrent writer. Searching it still works.",
                 RuntimeWarning,
                 stacklevel=3,
             )
