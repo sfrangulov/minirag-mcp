@@ -13,6 +13,15 @@ The lock is an exclusive, non-blocking `flock` on `<db_path>/.sync.lock`. While
 held, the file contains the holder's PID and start time as JSON, so a contender
 can say *who* is syncing and for how long.
 
+Contention is the only thing that refuses a sync. Every other way of failing to
+take the lock — a lock file we may not open, a `DB_PATH` that is a regular file,
+a read-only index directory, a platform without `fcntl` — warns and proceeds
+unlocked, because an advisory lock that cannot be taken must not be more
+disruptive than the problem it prevents. Degrading costs the pre-existing
+behaviour, two syncs at once, which is wasteful and not corrupting; refusing
+would cost the sync itself, and with it every use of a tool whose whole job is
+to index files.
+
 There is no stale-lock recovery path, because there is nothing to recover from:
 `flock` is owned by the open file description and the kernel drops it when the
 process dies, however it dies. That is a claim worth distrusting, so it is
@@ -35,6 +44,7 @@ Known limitations:
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import warnings
@@ -55,6 +65,13 @@ except ImportError:  # pragma: no cover - POSIX-only; the tests all run on POSIX
     fcntl = None
 
 LOCK_FILENAME = ".sync.lock"
+
+# What `flock(LOCK_EX | LOCK_NB)` reports when someone else holds the lock. POSIX
+# specifies EWOULDBLOCK (EAGAIN on Linux and macOS alike); EACCES is listed here
+# because some platforms use it for the same "already locked" answer. Every other
+# errno means the lock could not be established at all, which is not contention
+# and must not refuse the sync.
+_CONTENTION_ERRNOS = frozenset({errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES})
 
 
 class SyncLockBusy(Exception):
@@ -135,6 +152,17 @@ def _elapsed(started_at: str | None) -> str | None:
     return _format_duration(seconds)
 
 
+def _warn_unlocked(path: Path, e: OSError) -> None:
+    """Say the lock could not be taken, name why, and let the sync go ahead."""
+    reason = os.strerror(e.errno) if e.errno is not None else str(e)
+    warnings.warn(
+        f"Could not take the sync lock at {path} ({reason}), so this sync runs unlocked: "
+        "a second sync against this index will not be refused.",
+        RuntimeWarning,
+        stacklevel=3,  # the caller of acquire(), not acquire() and not this helper
+    )
+
+
 def _busy_message(path: Path, pid: int | None, started_at: str | None) -> str:
     tail = "Wait for it to finish, or use a different DB_PATH."
     if pid is None:
@@ -169,7 +197,15 @@ class SyncLock:
         return self._fd is not None
 
     def acquire(self) -> None:
-        """Take the lock, or raise SyncLockBusy naming whoever has it."""
+        """Take the lock, or raise SyncLockBusy naming whoever has it.
+
+        Contention is the only failure that refuses. Anything else that stops the
+        lock being established — an unopenable lock file, a db_path that is a
+        regular file, a read-only index directory, a filesystem with no `flock` —
+        warns and returns without a lock, and the caller syncs unlocked. `held`
+        is then False and `release()` is a no-op, so the caller needs to know
+        nothing about which of the two happened.
+        """
         if self._fd is not None:
             raise RuntimeError(f"This SyncLock already holds {self.path}")
         if fcntl is None:
@@ -180,12 +216,27 @@ class SyncLock:
                 stacklevel=2,
             )
             return
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o644)
+        except OSError as e:
+            # Not contention — we never got as far as asking. A root-owned or
+            # chmod-000 lock file, a DB_PATH that is a regular file, a dangling
+            # symlink, a read-only index directory: none of these are a reason to
+            # take a working tool down, and before this lock existed every one of
+            # them synced fine.
+            _warn_unlocked(self.path, e)
+            return
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as e:
             os.close(fd)
+            if e.errno not in _CONTENTION_ERRNOS:
+                # The kernel declined to lock this file at all — a filesystem with
+                # no flock support, or one that has run out of lock records. Nobody
+                # is holding anything, so there is nobody to name.
+                _warn_unlocked(self.path, e)
+                return
             pid, started_at = _read_holder(self.path)
             raise SyncLockBusy(
                 _busy_message(self.path, pid, started_at),

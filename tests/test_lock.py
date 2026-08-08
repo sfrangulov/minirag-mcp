@@ -12,6 +12,7 @@ deadlock. Spawn costs a fresh interpreter per child and buys determinism.
 
 from __future__ import annotations
 
+import errno
 import json
 import multiprocessing
 import os
@@ -262,6 +263,120 @@ def test_a_start_time_in_the_future_does_not_render_a_duration(held):
     with pytest.raises(SyncLockBusy, match=r"\(PID 7\) is syncing this index"):
         with sync_lock(held.path.parent):
             pass
+
+
+# --- a lock that cannot be established at all ------------------------------------
+#
+# None of these are contention: nobody holds anything, we never got as far as
+# asking. Before this lock existed every one of them synced cleanly, so refusing
+# now would make an advisory lock more disruptive than the duplicate work it
+# exists to prevent. Each must warn and hand back an unheld lock instead.
+#
+# These stop at `acquire()` rather than running a whole sync because two of the
+# shapes (a read-only index directory, a db_path that is a regular file) leave
+# nowhere for LanceDB to write either; `tests/test_cli.py` carries the end-to-end
+# proof that a real `sync` completes and exits 0 with an unusable lock file.
+
+
+def _chmod_000_lock_file(db_path: Path) -> None:
+    db_path.mkdir(parents=True)
+    lock_file = db_path / LOCK_FILENAME
+    lock_file.write_text("")
+    lock_file.chmod(0o000)
+
+
+def _read_only_lock_file(db_path: Path) -> None:
+    db_path.mkdir(parents=True)
+    lock_file = db_path / LOCK_FILENAME
+    lock_file.write_text("")
+    lock_file.chmod(0o444)  # O_RDWR is refused; the lock needs to stamp the holder
+
+
+def _lock_path_is_a_directory(db_path: Path) -> None:
+    (db_path / LOCK_FILENAME).mkdir(parents=True)
+
+
+def _lock_path_is_a_dangling_symlink(db_path: Path) -> None:
+    db_path.mkdir(parents=True)
+    (db_path / LOCK_FILENAME).symlink_to(db_path / "gone" / "nowhere")
+
+
+def _read_only_db_dir(db_path: Path) -> None:
+    db_path.mkdir(parents=True)
+    db_path.chmod(0o555)  # no lock file yet, and no way to create one
+
+
+def _db_path_is_a_regular_file(db_path: Path) -> None:
+    db_path.parent.mkdir(parents=True)
+    db_path.write_text("not a directory")  # mkdir(parents=True) cannot make this one
+
+
+def _restore_permissions(root: Path) -> None:
+    """Undo the chmods, so pytest can clear the tmp dir and the next test can read it."""
+    for p in [root, *root.rglob("*")]:
+        try:
+            p.chmod(0o755 if p.is_dir() else 0o644)
+        except OSError:  # a dangling symlink, and anything else already unreachable
+            pass
+
+
+@pytest.fixture
+def not_root():
+    if os.geteuid() == 0:  # pragma: no cover - the suite is not meant to run as root
+        pytest.skip("running as root: chmod denies nothing")
+
+
+@pytest.mark.parametrize(
+    ("shape", "expected_errno"),
+    [
+        (_chmod_000_lock_file, errno.EACCES),
+        (_read_only_lock_file, errno.EACCES),
+        (_lock_path_is_a_directory, errno.EISDIR),
+        (_lock_path_is_a_dangling_symlink, errno.ENOENT),
+        (_read_only_db_dir, errno.EACCES),
+        (_db_path_is_a_regular_file, errno.EEXIST),
+    ],
+    ids=["chmod-000", "read-only-file", "directory", "dangling-symlink", "read-only-dir", "file"],
+)
+def test_a_lock_that_cannot_be_established_warns_instead_of_raising(
+    tmp_path, not_root, shape, expected_errno
+):
+    """Regression: these escaped acquire() as raw OSErrors and killed the sync."""
+    db_path = tmp_path / ".minirag" / "lancedb"
+    shape(db_path)
+    try:
+        lock = SyncLock(db_path)
+        with pytest.warns(RuntimeWarning) as recorded:
+            lock.acquire()  # the regression: PermissionError, IsADirectoryError, ...
+
+        assert not lock.held
+        lock.release()  # a no-op, and it must stay quiet about it
+        assert len(recorded) == 1
+        message = str(recorded[0].message)
+        assert str(db_path / LOCK_FILENAME) in message, message
+        assert os.strerror(expected_errno) in message, message
+        assert "unlocked" in message, message
+    finally:
+        _restore_permissions(tmp_path)
+
+
+def test_a_filesystem_that_cannot_flock_at_all_is_not_reported_as_contention(db_path, monkeypatch):
+    """ENOTSUP from flock means nobody holds it — naming a rival would be a lie."""
+
+    def unsupported(fd, operation):
+        raise OSError(errno.ENOTSUP, os.strerror(errno.ENOTSUP))
+
+    monkeypatch.setattr("fcntl.flock", unsupported)
+    lock = SyncLock(db_path)
+    with pytest.warns(RuntimeWarning, match="Could not take the sync lock"):
+        lock.acquire()
+    assert not lock.held
+
+
+def test_real_contention_is_still_refused_and_never_degrades(held):
+    """The one failure that must stay fatal: someone genuinely holds it."""
+    with pytest.raises(SyncLockBusy):
+        SyncLock(held.path.parent).acquire()
 
 
 # --- the lock must not touch anything that is not a sync -------------------------
