@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 import minirag_mcp.cli as cli
+from minirag_mcp.store import MAX_TOP_K, Store
 
 # Captured at import time, before the autouse fixture below ever patches
 # cli._make_embedder — lets tests that need the real factory restore it.
@@ -89,13 +90,25 @@ def test_sync_and_read_neighbors(corpus, capsys):
     assert json.loads(capsys.readouterr().out)["chunks"]
 
 
-def test_ingest_url_mocked(corpus, capsys, monkeypatch):
+def test_ingest_url_mocked(corpus, capsys, monkeypatch, public_dns):
     import minirag_mcp.ingest.pipeline as pmod
     from minirag_mcp.ingest.parser import ParsedDoc
 
-    monkeypatch.setattr(pmod, "parse_url", lambda url: ParsedDoc("# R\n\nRemote body.", "R"))
+    monkeypatch.setattr(pmod, "parse_url", lambda url, **kw: ParsedDoc("# R\n\nRemote body.", "R"))
     run(["ingest-url", "https://example.com/p", "--base-dir", str(corpus)])
     assert "example.com" in capsys.readouterr().out
+
+
+def test_list_scope_stops_at_a_path_component_boundary(tmp_path, capsys):
+    (tmp_path / "proj").mkdir()
+    (tmp_path / "project-secret").mkdir()
+    (tmp_path / "proj" / "a.md").write_text("# A\n\nProject body long enough to index.")
+    (tmp_path / "project-secret" / "b.md").write_text("# B\n\nSecret body long enough to index.")
+    run(["ingest", str(tmp_path / "project-secret"), "--base-dir", str(tmp_path)])
+    capsys.readouterr()
+    run(["list", "--base-dir", str(tmp_path), "--scope", str(tmp_path / "proj"), "--json"])
+    files = json.loads(capsys.readouterr().out)["files"]
+    assert [f["source"] for f in files] == [str(tmp_path / "proj" / "a.md")]
 
 
 def test_error_exits_nonzero(corpus, capsys):
@@ -218,3 +231,26 @@ def test_other_commands_still_fail_loudly_on_config_error(corpus, capsys, monkey
         run(["list", "--json"])
     assert exc.value.code == 1
     assert "BASE_DIRS" in capsys.readouterr().err
+
+
+def test_query_top_k_is_clamped_and_must_be_positive(corpus, capsys, monkeypatch):
+    """An oversized --top-k is capped rather than refused; the store never sees it raw."""
+    seen: list[int] = []
+    real = Store.search
+
+    def spy(self, *args, **kwargs):
+        seen.append(kwargs["top_k"])
+        return real(self, *args, **kwargs)
+
+    run(["ingest", str(corpus), "--base-dir", str(corpus)])
+    capsys.readouterr()
+    monkeypatch.setattr(Store, "search", spy)
+    run(["query", "tokens and auth", "--base-dir", str(corpus), "--top-k", "100000000", "--json"])
+    assert json.loads(capsys.readouterr().out)["results"], "a clamped query still returns results"
+
+    for bad in ("0", "-5"):
+        with pytest.raises(SystemExit) as exc:
+            run(["query", "tokens and auth", "--base-dir", str(corpus), "--top-k", bad])
+        assert exc.value.code == 1
+        assert "--top-k must be at least 1" in capsys.readouterr().err
+    assert seen == [MAX_TOP_K]  # clamped, and the two refused runs never reached the store

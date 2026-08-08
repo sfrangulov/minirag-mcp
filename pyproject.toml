@@ -12,6 +12,9 @@ dependencies = [
     "markitdown[pdf,docx,pptx,xlsx]>=0.1.7",
     "cyclopts>=4.0",
     "platformdirs>=4.0",
+    # markitdown already pulls this in, but we import it directly: the URL fetch runs
+    # through a requests session we build and guard ourselves.
+    "requests>=2.32",
 ]
 
 [project.scripts]
@@ -25,7 +28,41 @@ build-backend = "hatchling.build"
 packages = ["src/minirag_mcp"]
 
 [dependency-groups]
-dev = ["pytest>=8", "pytest-asyncio>=1.0", "ruff>=0.6"]
+dev = ["pytest>=8", "pytest-asyncio>=1.0", "ruff>=0.6", "bump-my-version>=1.5.1"]
+
+# `uv run bump-my-version bump <major|minor|patch>` does the whole release
+# prologue: rewrite `version` above, commit it, tag it. It never pushes — the
+# push is what makes a version number real on PyPI, and everything up to it is
+# still reversible, so that stays a separate, deliberate command.
+#
+# `__version__` is derived from installed metadata, so `version` in [project]
+# is the only place a number lives and the only thing this has to rewrite.
+[tool.bumpversion]
+current_version = "0.1.0"
+commit = true
+message = "chore: release v{new_version}"
+tag = true
+# release.yml strips one leading "v" from the tag before comparing it against
+# the built wheel's version, so the tag has to be spelled exactly this way.
+# Change one without the other and a release either fails that check or needs
+# a retag after the fact.
+tag_name = "v{new_version}"
+tag_message = "v{new_version}"
+sign_tags = false
+# A bump has to be the only thing in its commit; refuse to sweep up whatever
+# else happens to be in the tree.
+allow_dirty = false
+
+# bump-my-version 1.5.1 also rewrites `project.version` unprompted, but that is
+# not documented configuration and a release now depends on that line being
+# right, so it is pinned here too. The two agree; the line is simply written
+# twice. Anchored to a whole line because `current_version = "0.1.0"` above
+# ends in the same `version = "0.1.0"` text, which a bare search would match.
+[[tool.bumpversion.files]]
+filename = "pyproject.toml"
+regex = true
+search = '^version = "{current_version}"$'
+replace = 'version = "{new_version}"'
 
 [tool.pytest.ini_options]
 addopts = "-m 'not slow'"

@@ -15,6 +15,7 @@ def test_defaults_from_cwd(tmp_path):
     assert cfg.chunk_min_length == 50
     assert cfg.hybrid_weight == 0.6
     assert cfg.grouping is None and cfg.max_distance is None and cfg.max_files is None
+    assert cfg.allow_private_urls is False  # the SSRF guard is on unless turned off
     assert "minirag-mcp" in str(cfg.cache_dir)  # platformdirs cache, not cwd-relative
 
 
@@ -64,11 +65,22 @@ def test_flags_beat_env(tmp_path):
         {"RAG_GROUPING": "bogus"},
         {"RAG_MAX_DISTANCE": "-1"},
         {"RAG_MAX_FILES": "0"},
+        {"ALLOW_PRIVATE_URLS": "maybe"},
+        {"ALLOW_PRIVATE_URLS": "2"},
     ],
 )
 def test_invalid_numeric_env(env, tmp_path):
     with pytest.raises(ConfigError):
         load_config(env, cwd=tmp_path)
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [("1", True), ("true", True), ("TRUE", True), ("yes", True), ("on", True)]
+    + [("0", False), ("false", False), ("no", False), ("off", False), ("", False)],
+)
+def test_allow_private_urls_env(raw, expected, tmp_path):
+    assert load_config({"ALLOW_PRIVATE_URLS": raw}, cwd=tmp_path).allow_private_urls is expected
 
 
 def test_search_tuning_env(tmp_path):

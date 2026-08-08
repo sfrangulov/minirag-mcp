@@ -50,8 +50,21 @@ def test_keyword_boost_lifts_exact_term(store):
 
 
 def test_scope_filter(store):
-    got = store.search("token", V(0.0), top_k=5, hybrid_weight=0.5, scopes=("/auth",))
+    got = store.search("token", V(0.0), top_k=5, hybrid_weight=0.5, scopes=("/auth.md",))
     assert got and all(g.source == "/auth.md" for g in got)
+
+
+def test_query_scope_does_not_reach_a_sibling_directory(tmp_path):
+    """`/data/proj` must not pull in `/data/project-secret` — scope is the only thing
+    narrowing what a caller can see, so a bare string prefix is a disclosure."""
+    s = Store(tmp_path / "db", dim=8)
+    s.replace_source("/data/proj/f.md", [rec("/data/proj/f.md", 0, "shared body", V(0.0))])
+    s.replace_source(
+        "/data/project-secret/f.md",
+        [rec("/data/project-secret/f.md", 0, "shared body", V(0.0))],
+    )
+    got = s.search("shared body", V(0.0), top_k=5, hybrid_weight=0.5, scopes=("/data/proj",))
+    assert [g.source for g in got] == ["/data/proj/f.md"]
 
 
 def test_max_distance_filter(store):

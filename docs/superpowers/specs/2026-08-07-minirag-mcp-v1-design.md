@@ -118,7 +118,7 @@ core (`pipeline`, `store`, `embedder`) and contain no business logic.
 | `ingest_file` | `filePath` (absolute, inside a root) | `{source, chunkCount, title}` — re-ingest replaces chunks |
 | `ingest_data` | `data`, `source` (stable id), `format: text\|markdown\|html`, `title?` | same; html goes through markitdown HtmlConverter |
 | `ingest_url` | `url` (http/https only), `source?` (default: the URL), `title?` | fetch + convert via markitdown `convert_url`; re-ingest replaces |
-| `query_documents` | `query`, `topK?` (default 8), `scope?` (absolute path prefix or list) | `results`: `{text, source, title, chunkIndex, score}`; plus `sources`: distinct matched sources in rank order with `{source, title, hits}` |
+| `query_documents` | `query`, `topK?` (default 8), `scope?` (absolute path, or a list of them) | `results`: `{text, source, title, chunkIndex, score}`; plus `sources`: distinct matched sources in rank order with `{source, title, hits}` |
 | `read_chunk_neighbors` | `chunkIndex` + `filePath` or `source`, `before?`, `after?` | surrounding chunks in order |
 | `read_file` | `filePath` or `source` | the source's full indexed Markdown: `{source, sourceType, title, chunkCount, text}` (chunks joined in order) |
 | `list_files` | `scope?` | files on disk under roots with state `ingested` \| `not_ingested` \| `stale` (hash/mtime mismatch), plus indexed `data`/`url` sources |
@@ -205,7 +205,9 @@ chunks (delete by source + add).
 **Ingest (data):** `text`/`markdown` pass through; `html` → markitdown
 HtmlConverter → same pipeline. Re-using a `source` id replaces its chunks.
 
-**Ingest (url):** scheme check (`http`/`https` only) → markitdown
+**Ingest (url):** URL check (scheme `http`/`https`, and a host that is not and
+does not resolve to a loopback/link-local/private/reserved/unspecified
+address) → markitdown
 `convert_url` (network fetch; special converters for YouTube/Wikipedia/RSS
 apply automatically) → same pipeline. `source` defaults to the URL string;
 re-ingesting the same source replaces its chunks.
@@ -224,17 +226,27 @@ Scanner whitelist: `.md .markdown .txt .pdf .docx .pptx .xlsx .html .htm .csv
 .epub .ipynb`. Hidden entries (dot-prefixed) and `node_modules`,
 `__pycache__`, `.venv`, `venv` directories are skipped.
 
-**Query:** embed query → LanceDB vector search (explicit query vector; no
-embedding function registered on the table) and BM25 full-text search, run
+**Query:** embed query → optional `scope` filter on `source`, applied as a
+`where` **prefilter on both** the vector search and the BM25 search, so each
+side spends its fetch window inside the scope instead of on candidates that
+would be discarded afterwards → LanceDB vector search (explicit query vector;
+no embedding function registered on the table) and BM25 full-text search, run
 independently → fuse the two ranked id lists with an in-house weighted
 Reciprocal Rank Fusion (`RAG_HYBRID_WEIGHT` sets the FTS side's share, RRF
 damping constant `k = 60`) → optional `RAG_MAX_DISTANCE` filter → optional
-relevance-gap grouping → optional `RAG_MAX_FILES` → optional `scope` prefix
-filter on `source`. Weighted RRF replaces LanceDB's built-in
+relevance-gap grouping → optional `RAG_MAX_FILES`. Weighted RRF replaces LanceDB's built-in
 `LinearCombinationReranker`, which was tried first: L2 vector distance and
 BM25 relevance live on incomparable scales, so a raw-score blend lets a
 strong vector match bury an exact-term hit regardless of the configured
 weight — RRF sidesteps this by fusing on rank position only.
+
+**Scope semantics:** a scope means "this exact source, or something under it" —
+never a bare string prefix, which would let `/data/proj` disclose
+`/data/project-secret/f.md`. `minirag_mcp.scope` holds the single definition:
+`is_under` for in-process filtering (scanner, `list_files`) and `sql_clause` for
+the LanceDB `where` form, `(source = '<p>' OR starts_with(source, '<p>/'))` per
+prefix. The separator is `/`, not `os.sep`, because source ids are not all
+filesystem paths: data ids are arbitrary strings and url ids are URLs.
 
 **Neighbors:** fetch by `source` + `chunk_index` range `[i−before, i+after]`
 (defaults: `before=1`, `after=1`), ordered.
@@ -273,6 +285,14 @@ test corpus; they are internal (not env-configurable) in v1.
 - `ingest_url` accepts only `http`/`https` schemes. `file:` and `data:` URIs
   are rejected — markitdown's `convert_uri` would otherwise read arbitrary
   local files, bypassing the document-root boundary.
+- `ingest_url` also rejects a host that is, or resolves to, a
+  loopback/link-local/private/reserved/unspecified address: the URL is usually
+  chosen by an LLM that may be acting on text from an indexed document, which
+  makes an unrestricted host a prompt-injection path to cloud metadata and to
+  internal services. Every resolved address is checked, not just the first;
+  resolution is bounded by a short timeout and a resolution failure is a fetch
+  error, not a security verdict. `ALLOW_PRIVATE_URLS=1` opts out of the host
+  rule only.
 - No other network I/O: only `ingest_url` (explicit) and the one-time model
   download by fastembed.
 - Single local user; no auth (parity). One writer per `DB_PATH`; concurrent

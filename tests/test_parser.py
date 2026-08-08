@@ -1,6 +1,8 @@
 import pytest
 
+from conftest import SECRET_BODY
 from minirag_mcp.ingest.parser import (
+    MAX_REDIRECTS,
     SUPPORTED_EXTENSIONS,
     ParsedDoc,
     ParserError,
@@ -10,6 +12,8 @@ from minirag_mcp.ingest.parser import (
     extract_title,
     parse_file,
     parse_html,
+    parse_url,
+    strip_data_uri_images,
 )
 
 
@@ -234,3 +238,113 @@ def test_stem_normalisation_keeps_meaningful_punctuation(tmp_path):
 def test_parse_html_and_url_titles_unaffected_by_stem_rule():
     # parse_html has no filename at all; its fallback stays "Untitled".
     assert parse_html("<html><body><p>no title tag</p></body></html>").title == "Untitled"
+
+
+PNG = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="
+
+
+def test_data_uri_image_keeps_its_alt_text():
+    """Alt text is content the author wrote; the base64 blob around it is not."""
+    md = f"Intro paragraph.\n\n![Схема обмена]({PNG})\n\nOutro."
+    assert strip_data_uri_images(md) == "Intro paragraph.\n\nСхема обмена\n\nOutro."
+
+
+def test_data_uri_image_without_alt_text_goes_entirely():
+    md = f"Intro paragraph.\n\n![]({PNG})\n\nOutro."
+    assert strip_data_uri_images(md) == "Intro paragraph.\n\n\n\nOutro."
+
+
+def test_ordinary_image_links_are_left_alone():
+    """A link to a file or an http URL is a reference, not an inlined picture."""
+    md = "![diagram](images/diagram.png)\n\n![logo](https://example.com/logo.svg)"
+    assert strip_data_uri_images(md) == md
+
+
+def test_data_uri_inside_a_code_fence_is_content():
+    """Inside a fence the URI is the subject of the document, not decoration."""
+    md = f"Example:\n\n```markdown\n![]({PNG})\n```\n\nDone."
+    assert strip_data_uri_images(md) == md
+
+
+def test_a_document_that_is_only_a_placeholder_keeps_it():
+    """Removing decoration must not remove the document."""
+    md = f"![]({PNG})"
+    assert strip_data_uri_images(md) == md
+    assert strip_data_uri_images("") == ""
+
+
+# --- the host rule survives a redirect (SSRF) ----------------------------------------
+
+
+def test_redirect_to_cloud_metadata_is_refused(redirect_server):
+    """The bypass this guard exists for: an allowed public host answering
+    `302 -> http://<metadata>/`. Checking only the URL the caller supplied leaves the
+    hop unexamined, and the metadata response reaches the converter."""
+    with pytest.raises(ParserError) as exc:
+        parse_url(redirect_server.url("/redirect-to-metadata"))
+    msg = str(exc.value)
+    assert "metadata.test" in msg  # names the blocked host
+    assert "169.254.169.254" in msg and "link-local" in msg  # and why
+    assert "redirected" in msg  # and that a redirect, not the given URL, was refused
+    assert "ALLOW_PRIVATE_URLS" in msg  # and the way out
+    # The strongest evidence: the request was never made. The stand-in metadata
+    # endpoint is this same server, so a followed redirect would show up here.
+    assert redirect_server.hits == [f"public.test:{redirect_server.port}/redirect-to-metadata"]
+
+
+def test_the_refused_redirect_target_really_would_have_been_served(redirect_server):
+    """Turning the host rule off fetches exactly what the refusal withheld — so the
+    refusal is doing work, and the guard reads the setting in force at call time
+    rather than whatever the cached converter was first built with."""
+    url = redirect_server.url("/redirect-to-metadata")
+    with pytest.raises(ParserError):
+        parse_url(url)
+    assert SECRET_BODY in parse_url(url, allow_private=True).markdown
+
+
+def test_a_blocked_url_asked_for_directly_is_not_reported_as_a_redirect(redirect_server):
+    """The same guard covers the first request, and the refusal says what happened —
+    the caller asked for this host, nothing redirected them to it."""
+    with pytest.raises(ParserError) as exc:
+        parse_url(redirect_server.url("/latest/meta-data/", host="metadata.test"))
+    msg = str(exc.value)
+    assert "metadata.test" in msg and "link-local" in msg
+    assert "redirected" not in msg
+    assert redirect_server.hits == []  # refused before the socket was opened
+
+
+def test_a_bare_authority_blocked_url_is_not_reported_as_a_redirect(redirect_server):
+    """requests normalizes a path-less URL by appending "/" before the guard ever sees
+    it (`http://host` -> `http://host/`), so a raw string compare between the checked
+    URL and the one the caller gave would call that normalization a redirect. Nothing
+    redirected here — the host itself is blocked on the very first request."""
+    with pytest.raises(ParserError) as exc:
+        parse_url(redirect_server.url("", host="metadata.test"))
+    msg = str(exc.value)
+    assert "metadata.test" in msg and "link-local" in msg
+    assert "redirected" not in msg
+    assert redirect_server.hits == []  # refused before the socket was opened
+
+
+def test_a_redirect_chain_across_public_hosts_is_followed(redirect_server):
+    """The guard refuses blocked hops, not redirects."""
+    doc = parse_url(redirect_server.url("/chain/3"))
+    assert "PUBLIC-BODY" in doc.markdown
+    assert doc.title == "Public Page"
+
+
+def test_redirects_are_capped(redirect_server):
+    """requests would follow 30. Each hop is another chance to reach somewhere the
+    guard has to refuse, and no document needs that many."""
+    assert MAX_REDIRECTS == 5
+    with pytest.raises(ParserError, match=f"Exceeded {MAX_REDIRECTS} redirects"):
+        parse_url(redirect_server.url(f"/chain/{MAX_REDIRECTS + 4}"))
+
+
+def test_every_entry_point_strips_placeholders(tmp_path):
+    f = tmp_path / "И-112 Хранение ТМЗ.md"
+    f.write_text(f"# И-112 Хранение ТМЗ\n\n![Схема]({PNG})\n\nТело документа.\n", encoding="utf-8")
+    from_file = parse_file(f).markdown
+    assert "base64" not in from_file and "Схема" in from_file
+    from_html = parse_html(f'<h1>T</h1><p>body</p><img alt="Схема" src="{PNG}">').markdown
+    assert "base64" not in from_html and from_html.endswith("Схема")

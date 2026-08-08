@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from minirag_mcp.chunker.semantic import merge_blocks
+from minirag_mcp.chunker.semantic import MergedChunk, merge_blocks
 from minirag_mcp.chunker.structural import split_markdown
 from minirag_mcp.config import Config
 from minirag_mcp.ingest import parser as _parser
@@ -17,7 +17,7 @@ from minirag_mcp.ingest.parser import (
     parse_file,
     parse_html,
 )
-from minirag_mcp.security import check_url_scheme
+from minirag_mcp.security import check_url
 from minirag_mcp.store import ChunkRecord, Store
 
 MAX_CHUNK_CHARS = 1500
@@ -67,8 +67,8 @@ def file_sha256(path: Path) -> str:
 
 
 # module-level alias so tests can monkeypatch minirag_mcp.ingest.pipeline.parse_url
-def parse_url(url: str):
-    return _parser.parse_url(url)
+def parse_url(url: str, *, allow_private: bool = False):
+    return _parser.parse_url(url, allow_private=allow_private)
 
 
 class Pipeline:
@@ -76,6 +76,16 @@ class Pipeline:
         self.store = store
         self.embedder = embedder
         self.config = config
+
+    def _embed_missing(self, chunks: list[MergedChunk]) -> list[list[float]]:
+        """Vectors for every chunk, embedding only those that do not carry one.
+
+        Merging already embedded each block to decide the merges; re-embedding a chunk
+        that is still exactly one unaltered block would double the cost of an ingest.
+        """
+        pending = [c.text for c in chunks if c.vector is None]
+        fresh = iter(self.embedder.embed_documents(pending) if pending else [])
+        return [c.vector if c.vector is not None else next(fresh) for c in chunks]
 
     def _chunk_and_store(
         self,
@@ -96,17 +106,22 @@ class Pipeline:
         belongs in the embedded text.
         """
         blocks = split_markdown(markdown, max_chars=MAX_CHUNK_CHARS)
-        texts = merge_blocks(
+        chunks = merge_blocks(
             blocks,
             self.embedder.embed_documents,
             max_chars=MAX_CHUNK_CHARS,
             min_length=self.config.chunk_min_length,
         )
-        if not texts:
+        if not chunks:
             raise EmptyDocumentError(f"No text content extracted from {source}")
         if seed_title:
-            texts[0] = _seed_title(texts[0], title)
-        vectors = self.embedder.embed_documents(texts)
+            seeded = _seed_title(chunks[0].text, title)
+            # Seeding rewrites the text, so the block vector merging computed for it no
+            # longer describes it — and chunk 0 is the chunk the title exists to reach.
+            if seeded != chunks[0].text:
+                chunks[0] = MergedChunk(seeded, None)
+        texts = [c.text for c in chunks]
+        vectors = self._embed_missing(chunks)
         now = datetime.now(UTC).isoformat()
         records = [
             ChunkRecord(
@@ -132,10 +147,12 @@ class Pipeline:
                 f"Unsupported file extension {path.suffix!r}; supported: "
                 + ", ".join(sorted(SUPPORTED_EXTENSIONS))
             )
-        size = path.stat().st_size
-        if size > self.config.max_file_size:
+        # One stat for both checks: the recorded mtime must describe the same file
+        # state whose size was accepted.
+        info = path.stat()
+        if info.st_size > self.config.max_file_size:
             raise FileTooLargeError(
-                f"{path} is {size} bytes; MAX_FILE_SIZE is {self.config.max_file_size}"
+                f"{path} is {info.st_size} bytes; MAX_FILE_SIZE is {self.config.max_file_size}"
             )
         doc = parse_file(path)
         return self._chunk_and_store(
@@ -146,7 +163,7 @@ class Pipeline:
             # a file's title is always a real one: metadata, a heading, or its name
             seed_title=True,
             file_hash=file_sha256(path),
-            mtime=path.stat().st_mtime,
+            mtime=info.st_mtime,
         )
 
     def ingest_data(
@@ -172,8 +189,11 @@ class Pipeline:
     def ingest_url(
         self, url: str, source: str | None = None, title: str | None = None
     ) -> IngestResult:
-        check_url_scheme(url)
-        doc = parse_url(url)
+        # Checked here so a URL the caller supplied is refused before any request is
+        # made; the same rule is re-applied per redirect hop inside parse_url, which
+        # is the only place that sees where a fetch is redirected to.
+        check_url(url, allow_private=self.config.allow_private_urls)
+        doc = parse_url(url, allow_private=self.config.allow_private_urls)
         explicit = title.strip() if title and title.strip() else None
         # A titleless page is titled after its URL, which is an address, not a title.
         real_title = explicit or (doc.title if doc.has_title else None)

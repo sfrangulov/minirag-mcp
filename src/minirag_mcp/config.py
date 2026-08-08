@@ -14,6 +14,8 @@ DEFAULT_MAX_FILE_SIZE = 104_857_600  # 100 MB
 DEFAULT_CHUNK_MIN_LENGTH = 50
 DEFAULT_HYBRID_WEIGHT = 0.6
 GROUPING_MODES = ("similar", "related")
+_TRUE = frozenset({"1", "true", "yes", "on"})
+_FALSE = frozenset({"0", "false", "no", "off", ""})  # an empty value reads as "not set"
 
 
 class ConfigError(Exception):
@@ -32,6 +34,7 @@ class Config:
     grouping: str | None
     max_distance: float | None
     max_files: int | None
+    allow_private_urls: bool
 
 
 def _resolve(p: str) -> Path:
@@ -74,6 +77,18 @@ def _int(env: Mapping[str, str], key: str, default: int, lo: int, hi: int | None
         hi_str = hi if hi is not None else "∞"
         raise ConfigError(f"{key} must be in range [{lo}, {hi_str}], got {val}")
     return val
+
+
+def _bool(env: Mapping[str, str], key: str, default: bool = False) -> bool:
+    raw = env.get(key)
+    if raw is None:
+        return default
+    val = raw.strip().lower()
+    if val in _TRUE:
+        return True
+    if val in _FALSE:
+        return False
+    raise ConfigError(f"{key} must be one of {sorted(_TRUE | (_FALSE - {''}))}, got {raw!r}")
 
 
 def _opt_float(env: Mapping[str, str], key: str, lo: float) -> float | None:
@@ -138,4 +153,5 @@ def load_config(
         grouping=grouping,
         max_distance=_opt_float(env, "RAG_MAX_DISTANCE", 0.0),
         max_files=max_files,
+        allow_private_urls=_bool(env, "ALLOW_PRIVATE_URLS"),
     )

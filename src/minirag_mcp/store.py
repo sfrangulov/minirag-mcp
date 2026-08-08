@@ -12,6 +12,8 @@ import lancedb
 import pyarrow as pa
 from lancedb.index import FTS
 
+from minirag_mcp.scope import sql_clause, sql_str
+
 TABLE = "chunks"
 # Columns carrying BM25 indexes. `title` is indexed because for many document sets the
 # filename is where the document code and subject live, and nowhere else.
@@ -19,6 +21,11 @@ FTS_COLUMNS = ("text", "title")
 _LIST_LIMIT = 2**31 - 1  # LanceDB scalar queries default to limit 10 — always set explicitly
 RRF_K = 60  # standard RRF damping constant
 GAP_FACTOR = 2.0  # relevance_cutoff boundary must exceed mean gap by this factor
+# Largest top_k the query interfaces will pass down. `search` fetches a multiple of
+# top_k from both the vector and the keyword side, so an unbounded top_k is an
+# unbounded scan. Callers clamp rather than reject: an oversized request is a bad
+# guess at how much context is useful, not an error.
+MAX_TOP_K = 100
 
 
 @dataclass(frozen=True)
@@ -53,16 +60,6 @@ class SourceInfo:
     chunk_count: int
     file_hash: str
     mtime: float
-
-
-def _sql_str(s: str) -> str:
-    return s.replace("'", "''")
-
-
-def _scope_clause(scopes: tuple[str, ...]) -> str | None:
-    if not scopes:
-        return None
-    return " OR ".join(f"starts_with(source, '{_sql_str(p)}')" for p in scopes)
 
 
 _META_COLS = ["source", "source_type", "title", "chunk_index", "file_hash", "mtime"]
@@ -123,6 +120,16 @@ def _weighted_rrf(
     return scores
 
 
+def _is_missing_table(exc: Exception) -> bool:
+    """True only for lancedb's "no such table" signal, not for any other open failure.
+
+    lancedb 0.36 raises ValueError("Table 'chunks' was not found"), and
+    FileNotFoundError on the code path that checks the dataset directory. A corrupt
+    manifest or an unreadable directory arrives as RuntimeError instead.
+    """
+    return isinstance(exc, FileNotFoundError) or "was not found" in str(exc)
+
+
 class DimensionMismatchError(Exception):
     """An existing index was built with a different embedding dimension than requested."""
 
@@ -136,7 +143,12 @@ class Store:
         self.missing_fts_indices: tuple[str, ...] = ()
         try:
             self._table = self._db.open_table(TABLE)
-        except Exception:
+        except (FileNotFoundError, ValueError) as e:
+            # Only a missing table means "create it". Letting every failure fall through
+            # to create_table turns a corrupt table or a permissions problem into a
+            # create-time error that names neither cause.
+            if not _is_missing_table(e):
+                raise
             schema = pa.schema(
                 [
                     pa.field("id", pa.string()),
@@ -216,13 +228,13 @@ class Store:
         )
 
     def replace_source(self, source: str, records: Sequence[ChunkRecord]) -> None:
-        self._table.delete(f"source = '{_sql_str(source)}'")
+        self._table.delete(f"source = '{sql_str(source)}'")
         if records:
             self._table.add([asdict(r) for r in records])
 
     def delete_source(self, source: str) -> int:
-        clause = f"source = '{_sql_str(source)}'"
-        before = len(self._table.search().where(clause).select(["id"]).limit(_LIST_LIMIT).to_list())
+        clause = f"source = '{sql_str(source)}'"
+        before = self._table.count_rows(filter=clause)
         if before:
             self._table.delete(clause)
         return before
@@ -231,7 +243,7 @@ class Store:
         self, source: str, chunk_index: int, before: int = 1, after: int = 1
     ) -> list[SearchResult]:
         lo, hi = max(0, chunk_index - before), chunk_index + after
-        clause = f"source = '{_sql_str(source)}' AND chunk_index >= {lo} AND chunk_index <= {hi}"
+        clause = f"source = '{sql_str(source)}' AND chunk_index >= {lo} AND chunk_index <= {hi}"
         rows = self._table.search().where(clause).limit(_LIST_LIMIT).to_list()
         rows.sort(key=lambda r: r["chunk_index"])
         return [
@@ -247,7 +259,7 @@ class Store:
         ]
 
     def all_chunks(self, source: str) -> list[SearchResult]:
-        clause = f"source = '{_sql_str(source)}'"
+        clause = f"source = '{sql_str(source)}'"
         rows = self._table.search().where(clause).limit(_LIST_LIMIT).to_list()
         rows.sort(key=lambda r: r["chunk_index"])
         return [
@@ -264,7 +276,7 @@ class Store:
 
     def _iter_meta(self, scopes: tuple[str, ...] = ()) -> list[dict]:
         q = self._table.search().select(_META_COLS)
-        clause = _scope_clause(scopes)
+        clause = sql_clause(scopes)
         if clause:
             q = q.where(clause)
         return q.limit(_LIST_LIMIT).to_list()
@@ -290,7 +302,7 @@ class Store:
     def get_source(self, source: str) -> SourceInfo | None:
         rows = (
             self._table.search()
-            .where(f"source = '{_sql_str(source)}'")
+            .where(f"source = '{sql_str(source)}'")
             .select(_META_COLS)
             .limit(_LIST_LIMIT)
             .to_list()
@@ -344,7 +356,7 @@ class Store:
         list is truncated to `top_k` last.
         """
         fetch = max(top_k * 4, 50)
-        clause = _scope_clause(scopes)
+        clause = sql_clause(scopes)
 
         vq = self._table.search(query_vector).limit(fetch)
         if clause:

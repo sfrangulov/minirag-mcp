@@ -1,10 +1,43 @@
+import asyncio
+import time
+
 import pytest
 from fastmcp import Client
 
 from minirag_mcp.config import load_config
 from minirag_mcp.server import create_app
+from minirag_mcp.store import MAX_TOP_K, Store
 
 # pytest-asyncio runs in auto mode (see pyproject) — bare `async def` tests are collected as-is.
+
+SYNC_TIMEOUT_SECONDS = 30.0
+SYNC_POLL_SECONDS = 0.02
+
+
+async def await_sync(client: Client, job_id: str) -> dict:
+    """Poll `sync_status` until the job reaches a terminal state, and return it.
+
+    Bounded by wall-clock time rather than by an attempt count: sync runs on a
+    background thread, so how many polls fit before it finishes is a property of
+    the machine, not of the job. A fixed number of no-wait iterations passes on a
+    fast laptop and races on a loaded CI runner — a bigger number would only move
+    the threshold, not remove it. Yielding between polls also lets the event loop
+    run, so this finishes as soon as the job does and costs one poll interval
+    locally.
+    """
+    deadline = time.monotonic() + SYNC_TIMEOUT_SECONDS
+    st: dict | None = None
+    while True:
+        st = (await client.call_tool("sync_status", {"jobId": job_id})).data
+        if st["state"] in ("succeeded", "failed"):
+            return st
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                f"sync job {job_id} did not finish within {SYNC_TIMEOUT_SECONDS:g}s; "
+                f"last state={st['state']!r} counts={st['counts']} "
+                f"errors={st['errors']} error={st['error']!r}"
+            )
+        await asyncio.sleep(SYNC_POLL_SECONDS)
 
 
 @pytest.fixture
@@ -45,11 +78,9 @@ async def test_sync_then_query_then_neighbors(app):
     mcp, root = app
     async with Client(mcp) as c:
         job = (await c.call_tool("sync_start", {})).data
-        for _ in range(100):
-            st = (await c.call_tool("sync_status", {"jobId": job["jobId"]})).data
-            if st["state"] in ("succeeded", "failed"):
-                break
-        assert st["state"] == "succeeded" and st["counts"]["ingested"] == 2
+        st = await await_sync(c, job["jobId"])
+        assert st["state"] == "succeeded", f"sync failed: {st['error']!r} {st['errors']}"
+        assert st["counts"]["ingested"] == 2, st["counts"]
 
         res = (await c.call_tool("query_documents", {"query": "ERR_CONNECTION_REFUSED"})).data
         assert res["results"], "expected at least one search result"
@@ -100,11 +131,11 @@ async def test_ingest_file_outside_root_is_tool_error(app):
             await c.call_tool("ingest_file", {"filePath": "/etc/passwd"})
 
 
-async def test_ingest_data_and_url(app, monkeypatch):
+async def test_ingest_data_and_url(app, monkeypatch, public_dns):
     import minirag_mcp.ingest.pipeline as pmod
     from minirag_mcp.ingest.parser import ParsedDoc
 
-    monkeypatch.setattr(pmod, "parse_url", lambda url: ParsedDoc("# R\n\nRemote body.", "R"))
+    monkeypatch.setattr(pmod, "parse_url", lambda url, **kw: ParsedDoc("# R\n\nRemote body.", "R"))
     mcp, _ = app
     async with Client(mcp) as c:
         r = (
@@ -118,6 +149,21 @@ async def test_ingest_data_and_url(app, monkeypatch):
         assert r2["source"] == "https://example.com/x"
         with pytest.raises(Exception, match="http"):
             await c.call_tool("ingest_url", {"url": "file:///etc/passwd"})
+
+
+async def test_list_files_scope_stops_at_a_path_component_boundary(tmp_path, fake_embedder):
+    """A scope of .../proj must not list .../project-secret, on disk or in the index."""
+    root = tmp_path / "docs"
+    (root / "proj").mkdir(parents=True)
+    (root / "project-secret").mkdir()
+    (root / "proj" / "a.md").write_text("# A\n\nProject body long enough to index.")
+    (root / "project-secret" / "b.md").write_text("# B\n\nSecret body long enough to index.")
+    cfg = load_config({"BASE_DIR": str(root)}, cwd=root)
+    mcp = create_app(cfg, embedder=fake_embedder)
+    async with Client(mcp) as c:
+        await c.call_tool("ingest_file", {"filePath": str(root / "project-secret" / "b.md")})
+        listed = (await c.call_tool("list_files", {"scope": str(root / "proj")})).data
+    assert [f["source"] for f in listed["files"]] == [str(root / "proj" / "a.md")]
 
 
 async def test_status_reports_counts(app):
@@ -159,3 +205,25 @@ async def test_all_tools_have_substantive_descriptions(app):
         tools = await c.list_tools()
     for t in tools:
         assert t.description and len(t.description) > 40, f"{t.name} description too thin"
+
+
+async def test_query_top_k_is_clamped_and_must_be_positive(app, monkeypatch):
+    """An oversized topK is capped rather than refused; the store never sees it raw."""
+    seen: list[int] = []
+    real = Store.search
+
+    def spy(self, *args, **kwargs):
+        seen.append(kwargs["top_k"])
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Store, "search", spy)
+    mcp, root = app
+    async with Client(mcp) as c:
+        await c.call_tool("ingest_file", {"filePath": str(root / "auth.md")})
+        res = (await c.call_tool("query_documents", {"query": "token", "topK": 10**8})).data
+        assert res["results"], "a clamped query still returns results"
+        with pytest.raises(Exception, match="topK must be at least 1"):
+            await c.call_tool("query_documents", {"query": "token", "topK": 0})
+        with pytest.raises(Exception, match="topK must be at least 1"):
+            await c.call_tool("query_documents", {"query": "token", "topK": -5})
+    assert seen == [MAX_TOP_K]  # clamped, and the two refused calls never reached the store

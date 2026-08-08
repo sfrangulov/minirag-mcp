@@ -16,8 +16,9 @@ from minirag_mcp.embedder import Embedder
 from minirag_mcp.ingest.pipeline import Pipeline
 from minirag_mcp.ingest.scanner import compute_states, scan_roots
 from minirag_mcp.results import aggregate_sources, result_dict
+from minirag_mcp.scope import is_under
 from minirag_mcp.security import resolve_in_roots
-from minirag_mcp.store import Store
+from minirag_mcp.store import MAX_TOP_K, Store
 from minirag_mcp.sync import SyncManager
 
 
@@ -134,7 +135,9 @@ def create_app(
     def ingest_url(url: str, source: str | None = None, title: str | None = None) -> dict:
         """Fetch an http(s) URL, convert it to Markdown, and index it.
 
-        Only http and https schemes are accepted. This is the one tool that
+        Only http and https schemes are accepted, and the host must not be a
+        private or local address (loopback, link-local, private, reserved) —
+        set ALLOW_PRIVATE_URLS=1 to lift that. This is the one tool that
         reaches the network — every other tool works purely against local
         files and the local index. source defaults to the URL itself; pass
         one to control the index key or to update a previously ingested URL.
@@ -152,14 +155,19 @@ def create_app(
         those results in rank order, each with a hits count. Use `sources`
         to answer "which documents cover this topic" without inspecting
         individual chunks.
+
+        topK must be at least 1 and is capped at 100; a larger value is
+        silently clamped to the cap rather than rejected.
         """
         if not query.strip():
             raise ToolError("query must not be empty")
+        if topK < 1:
+            raise ToolError(f"topK must be at least 1, got {topK}")
         c = ctx()
         results = c.store.search(
             query,
             c.embedder.embed_query(query),
-            top_k=topK,
+            top_k=min(topK, MAX_TOP_K),
             hybrid_weight=c.config.hybrid_weight,
             scopes=_scopes(scope),
             max_distance=c.config.max_distance,
@@ -248,7 +256,7 @@ def create_app(
         scopes = _scopes(scope)
         entries = scan_roots(c.config.roots)
         if scopes:
-            entries = [e for e in entries if any(str(e.path).startswith(p) for p in scopes)]
+            entries = [e for e in entries if any(is_under(str(e.path), p) for p in scopes)]
         indexed = c.store.list_sources(scopes=scopes)
         states = compute_states(entries, indexed)
         return {

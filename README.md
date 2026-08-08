@@ -1,5 +1,7 @@
 # minirag-mcp
 
+[![CI](https://github.com/sfrangulov/minirag-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/sfrangulov/minirag-mcp/actions/workflows/ci.yml)
+
 A local-first RAG (retrieval-augmented generation) MCP server. Point it at a
 folder of documents and it gives your MCP client (Claude Code, Cursor, Codex,
 ...) hybrid search — semantic vector similarity plus a keyword boost for
@@ -40,19 +42,24 @@ built on [fastmcp](https://github.com/jlowin/fastmcp),
 
 ## Quick Start
 
-Not on PyPI yet — install straight from this repository. Every client below
-launches the same process; only the config format differs. Replace
-`/absolute/path/to/docs` with the folder you want indexed.
+Every client below launches the same process; only the config format differs.
+Replace `/absolute/path/to/docs` with the folder you want indexed.
 
-The invocation is `uvx --from git+https://github.com/sfrangulov/minirag-mcp minirag-mcp`.
-It resolves and caches the package on first run, so start-up is slow once and
-fast afterwards. To pin a revision, append `@<tag-or-sha>` to the URL.
+The invocation is `uvx minirag-mcp`. It resolves and caches the package on
+first run, so start-up is slow once and fast afterwards.
+
+`uvx` resolves that name from PyPI, so the snippets below work from release
+**0.1.0** onward; on an earlier revision use [From an unreleased
+revision](#from-an-unreleased-revision) instead. That distinction is worth
+checking before you paste: `claude mcp add` writes the entry without ever
+running the command, so an unresolvable package looks like a successful setup
+and only fails later, silently, when the client tries to launch the server.
 
 ### Claude Code
 
 ```bash
 claude mcp add minirag --scope user --env BASE_DIR=/absolute/path/to/docs \
-  -- uvx --from git+https://github.com/sfrangulov/minirag-mcp minirag-mcp
+  -- uvx minirag-mcp
 ```
 
 ### Cursor (`~/.cursor/mcp.json`)
@@ -62,11 +69,7 @@ claude mcp add minirag --scope user --env BASE_DIR=/absolute/path/to/docs \
   "mcpServers": {
     "minirag": {
       "command": "uvx",
-      "args": [
-        "--from",
-        "git+https://github.com/sfrangulov/minirag-mcp",
-        "minirag-mcp"
-      ],
+      "args": ["minirag-mcp"],
       "env": {
         "BASE_DIR": "/absolute/path/to/docs"
       }
@@ -80,15 +83,28 @@ claude mcp add minirag --scope user --env BASE_DIR=/absolute/path/to/docs \
 ```toml
 [mcp_servers.minirag]
 command = "uvx"
-args = ["--from", "git+https://github.com/sfrangulov/minirag-mcp", "minirag-mcp"]
+args = ["minirag-mcp"]
 
 [mcp_servers.minirag.env]
 BASE_DIR = "/absolute/path/to/docs"
 ```
 
+### From an unreleased revision
+
+To run a revision that hasn't been released to PyPI — an unreleased fix, or one
+specific commit — install from this repository instead. In any snippet above,
+replace `uvx minirag-mcp` with:
+
+```
+uvx --from git+https://github.com/sfrangulov/minirag-mcp minirag-mcp
+```
+
+As an argument list, that is `["--from", "git+https://github.com/sfrangulov/minirag-mcp", "minirag-mcp"]`.
+Append `@<tag-or-sha>` to the URL to pin a revision.
+
 ### From a clone
 
-For development, or to use the CLI without the `--from` prefix everywhere:
+For development, or to run the CLI against a working tree you can edit:
 
 ```bash
 git clone https://github.com/sfrangulov/minirag-mcp
@@ -126,6 +142,13 @@ up by `sync_start`/`sync` and `ingest_file`/`ingest`, converted to Markdown by
 `.md` `.markdown` `.txt` `.pdf` `.docx` `.pptx` `.xlsx` `.html` `.htm` `.csv`
 `.epub` `.ipynb`
 
+Embedded pictures are not indexed. `markitdown` inlines each one as an
+`![alt](data:image/png;base64,…)` placeholder — 8.5% of chunks on a measured
+558-document corpus carried one — so the placeholder is removed before
+chunking and only its alt text is kept. Image links that point at a path or an
+http URL are references, not inlined pictures, and stay as written, as does a
+`data:` URI inside a fenced code block.
+
 Two more ways to get content in without a file on disk:
 
 - **`ingest_data`** — hand the server text, Markdown, or HTML content
@@ -133,7 +156,9 @@ Two more ways to get content in without a file on disk:
 - **`ingest_url`** — the server fetches an `http`/`https` URL itself via
   `markitdown`'s `convert_url` (YouTube, Wikipedia, and RSS get
   format-specific handling automatically). This is the one tool that reaches
-  the network.
+  the network. Private and local hosts are refused unless
+  `ALLOW_PRIVATE_URLS` says otherwise — see
+  [Security and Operation](#security-and-operation).
 
 ## MCP Tools
 
@@ -225,6 +250,12 @@ like the `status` MCP tool. Every other command exits `1` on the same error.
 
 Four environment variables shape `query_documents`/`minirag-mcp query`
 results; none of them are exposed as MCP tool arguments.
+
+`topK` (`--top-k` on the CLI) must be at least 1 and is capped at **100**.
+Search fetches a multiple of `topK` candidates from each of the vector and
+keyword sides, so an unbounded `topK` is an unbounded scan. A larger value is
+clamped to the cap rather than rejected — asking for too much context is a bad
+guess, not an error — while `0` or a negative value is refused outright.
 
 ### `RAG_HYBRID_WEIGHT` (default `0.6`, range `0.0`–`1.0`)
 
@@ -356,6 +387,7 @@ merges with them.
 | `RAG_GROUPING` | unset | See [Search Tuning](#search-tuning). |
 | `RAG_MAX_DISTANCE` | unset | See [Search Tuning](#search-tuning). |
 | `RAG_MAX_FILES` | unset | See [Search Tuning](#search-tuning). |
+| `ALLOW_PRIVATE_URLS` | unset (off) | Let `ingest_url` fetch hosts that resolve to loopback, link-local, private, reserved, or unspecified addresses. Off by default — see [Security and Operation](#security-and-operation). Accepts `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off`; anything else is a configuration error. |
 
 ## Security and Operation
 
@@ -373,10 +405,46 @@ merges with them.
   inside a root are followed and indexed as normal, under the link's path.
 - MCP tool file paths must be absolute. The CLI accepts relative paths and
   resolves them against the current directory.
+- `scope` (on `query_documents` and `list_files`, and `--scope` on the CLI)
+  narrows results to a path **and everything under it**. Matching stops at a
+  path separator, so `/docs/proj` covers `/docs/proj/notes.md` but never
+  `/docs/project-secret/notes.md`. The same rule covers data and url source
+  ids, with `/` as the separator: a scope of `https://example.com/docs` matches
+  `https://example.com/docs/page` and not `https://example.com/docs-private`.
 - `MAX_FILE_SIZE` is enforced before a file is parsed.
 - `ingest_url` accepts only `http`/`https` URLs. `file:` and `data:` schemes
   are rejected — `markitdown`'s `convert_uri` would otherwise read arbitrary
   local files, bypassing the document-root boundary entirely.
+- `ingest_url` also checks the **host**, not just the scheme: a host that is,
+  or resolves to, a loopback, link-local, private, reserved, or unspecified
+  address is refused. That covers cloud instance metadata
+  (`http://169.254.169.254/latest/meta-data/`), services bound to localhost
+  (`http://localhost:8080/admin`), and anything on the LAN. The URL is usually
+  chosen by an LLM which may be acting on text from an already-indexed
+  document, so without this an attacker-authored document is a
+  prompt-injection path into your network. A name is rejected if **any** of
+  its addresses is blocked, and the error names the host and the reason. A
+  host that simply fails to resolve is reported as a fetch error, not a
+  security refusal.
+- The host check runs again on **every redirect hop**, not just on the URL you
+  supplied. Checking only the given URL leaves the fetch itself open: a
+  permitted public host answering `302 -> http://169.254.169.254/` would have
+  had its redirect followed and the metadata response indexed. The check sits
+  in the HTTP transport, which sees each hop, and the chain is capped at 5
+  redirects (`requests` would follow 30). A refusal names the blocked host and
+  says the fetch was redirected there.
+- Set `ALLOW_PRIVATE_URLS=1` to turn the host check off — for a server you
+  point at an internal wiki on purpose. It applies to redirect hops as well as
+  to the URL you supply, and changes nothing else: `file:` and `data:` are
+  still rejected.
+- **Known gap: DNS rebinding.** The check resolves the host itself, and then
+  `requests` resolves it again when it opens the connection — two independent
+  lookups, so a name with a short TTL can answer with a public address for the
+  check and a private one for the fetch. Closing that means pinning the
+  validated address at the socket layer, which this server does not do. Read
+  the host rule accordingly: it stops accidental and injection-driven access to
+  obvious internal targets, and it is not a defence against an attacker who
+  controls DNS for a name you ask the server to ingest.
 - No other network I/O happens: only an explicit `ingest_url` call and the
   one-time embedding-model download ever leave the machine.
 - Single local user, no authentication. One writer per `DB_PATH` at a time
@@ -409,6 +477,14 @@ and retry.
 The file is bigger than the 100 MB default limit. Raise it:
 `export MAX_FILE_SIZE=209715200` (200 MB), or exclude the file.
 
+**"Refusing to fetch from host ..." / "... it redirected to ...".**
+`ingest_url` was pointed at — or redirected to — a host that is, or resolves
+to, a private or local address. If that is deliberate — an internal wiki, a
+service on this machine — set `ALLOW_PRIVATE_URLS=1`. If it is not, treat the
+URL as untrusted: it may have come from a document in the index rather than
+from you. A refusal that names a host you never typed means the page you asked
+for redirected there.
+
 **"Path outside configured document roots".**
 The path (or what a symlink resolves to) isn't inside any configured root.
 Check `status` for the active `roots`, and remember MCP tool paths must be
@@ -420,15 +496,75 @@ strings: `export BASE_DIRS='["/docs/a", "/docs/b"]'`. `status` keeps working
 even with a broken `BASE_DIRS`; every other tool fails until it's fixed.
 
 **MCP client doesn't show the tools.**
-- Run the same command the client runs
-  (`uvx --from git+https://github.com/sfrangulov/minirag-mcp minirag-mcp`)
-  directly in a terminal — it should hang silently, waiting on stdio (Ctrl-C
-  to exit). If that fails, the client will fail the same way.
+- Run the same command the client runs (`uvx minirag-mcp`) directly in a
+  terminal — it should hang silently, waiting on stdio (Ctrl-C to exit). If
+  that fails, the client will fail the same way.
 - Restart the client after adding or editing the server config.
 - Confirm `uv`/`uvx` is on the `PATH` the client's process sees — GUI apps
   sometimes launch with a different `PATH` than your shell.
 - Run `minirag-mcp status --base-dir <root>` from a terminal to confirm the
   configuration resolves the way you expect.
+
+## Releasing
+
+Maintainers only. Releases reach PyPI through [trusted
+publishing](https://docs.pypi.org/trusted-publishers/): the workflow mints a
+short-lived OIDC token for the upload, so there is no PyPI API token in the
+repository secrets, in the workflow, or on anyone's laptop.
+
+**The workflow has to land on `main` before any tag is cut.** GitHub fires the
+`release` event only for a workflow file that exists on the **default branch**,
+and the run it starts is pinned to the tagged commit (`GITHUB_SHA` is "last
+commit in the tagged release"). Tag a commit that predates
+[`release.yml`](.github/workflows/release.yml) reaching `main` and publishing
+the release is a silent no-op — no run is queued, nothing turns red, and the
+release simply sits there looking like a build that hung.
+
+1. Bump, commit and tag in one step, from a clean tree on `main`:
+
+   ```bash
+   uv run bump-my-version bump patch    # or: minor | major
+   ```
+
+   This rewrites `version` in `pyproject.toml`, commits that as
+   `chore: release vX.Y.Z`, and creates the `vX.Y.Z` tag — the spelling
+   `release.yml`'s version check expects. It deliberately does not push:
+   everything so far is local and reversible. Add `--dry-run --verbose` to see
+   exactly what it would do first.
+
+   `version` in `pyproject.toml` is the only place the number lives.
+   `__version__` — what the `status` tool and `minirag-mcp --version` report —
+   is read from the installed distribution's metadata, so it cannot drift from
+   what was packaged.
+
+2. Push the commit and the tag: `git push && git push origin vX.Y.Z`.
+3. Publish a GitHub release for that tag.
+
+Publishing the release runs `release.yml`. It runs `ruff` and `pytest` first —
+`ci.yml` has no tag trigger, so a tag is the one ref CI never covers and this
+is the only thing standing between an untested commit and PyPI — then builds
+the sdist and wheel, smoke-tests the wheel in a clean venv, and checks the
+built version against the tag. That last check is unconditional and ref-based:
+a mismatch fails the build, and so does any attempt to publish from a branch
+ref, since a branch carries no version to check a build against.
+`twine check --strict` also runs, but read it narrowly: it validates the
+distribution metadata and catches an empty long description, and it does *not*
+validate this project's Markdown README, because `readme_renderer` only
+understands reStructuredText.
+
+Only then does a separate job upload to PyPI. That job runs in the `pypi`
+environment, which restricts deployments to `v*` tags. It has **no required
+reviewer** — adding one under Settings → Environments → `pypi` is a one-click
+change that would turn the upload into a manual approval step, but as
+configured today the gate is the ref restriction, not a human.
+
+**If a publish fails after the release already exists**, use GitHub's *Re-run
+failed jobs* on the original release run: that replays the same `release`
+event, so every guard above still applies. `workflow_dispatch` is the fallback
+and only works when the ref you select is the tag — a dispatch from a branch is
+refused. Uploads are idempotent (`skip-existing: true`), so retrying after a
+partial upload finishes the remaining files instead of dying on "File already
+exists".
 
 ## License
 

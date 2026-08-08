@@ -15,3 +15,6 @@ models/
 
 # macOS
 .DS_Store
+
+# agent working files (reports, sdd scratch) — never committed
+.superpowers/

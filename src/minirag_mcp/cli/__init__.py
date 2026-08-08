@@ -16,8 +16,9 @@ from minirag_mcp.embedder import Embedder, UnknownModelError
 from minirag_mcp.ingest.pipeline import IngestResult, Pipeline
 from minirag_mcp.ingest.scanner import compute_states, scan_roots
 from minirag_mcp.results import aggregate_sources, result_dict
+from minirag_mcp.scope import is_under
 from minirag_mcp.security import SecurityError, resolve_in_roots
-from minirag_mcp.store import DimensionMismatchError, SearchResult, Store
+from minirag_mcp.store import MAX_TOP_K, DimensionMismatchError, SearchResult, Store
 from minirag_mcp.sync import run_sync
 
 app = App(name="minirag-mcp", version=__version__)
@@ -209,12 +210,17 @@ def query(
     model_name: ModelNameOpt = None,
     json: JsonFlag = False,
 ):
-    """Hybrid search over the index."""
+    """Hybrid search over the index.
+
+    --top-k must be at least 1 and is capped at 100; a larger value is clamped.
+    """
+    if top_k < 1:
+        _fail(f"--top-k must be at least 1, got {top_k}")
     cfg, store, pipeline = _load(base_dir, db_path, cache_dir, model_name)
     results = store.search(
         text,
         pipeline.embedder.embed_query(text),
-        top_k=top_k,
+        top_k=min(top_k, MAX_TOP_K),
         hybrid_weight=cfg.hybrid_weight,
         scopes=tuple(scope or ()),
         max_distance=cfg.max_distance,
@@ -319,7 +325,7 @@ def list_cmd(
     scopes = tuple(scope or ())
     entries = scan_roots(cfg.roots)
     if scopes:
-        entries = [e for e in entries if any(str(e.path).startswith(p) for p in scopes)]
+        entries = [e for e in entries if any(is_under(str(e.path), p) for p in scopes)]
     states = compute_states(entries, store.list_sources(scopes=scopes))
     payload = {
         "files": [
