@@ -5,7 +5,9 @@ from pathlib import Path
 
 import pytest
 
+from corpus_samples import SLIDES, SPEC, SPREADSHEET, TRANSCRIPT
 from minirag_mcp.chunker import DEFAULT_TOKEN_BUDGET, MODEL_MAX_TOKENS, chunk_markdown
+from minirag_mcp.chunker.tokens import estimate_tokens
 from minirag_mcp.config import DEFAULT_MODEL
 from minirag_mcp.embedder import Embedder, cosine
 
@@ -70,3 +72,34 @@ def test_real_token_counter_is_the_models_own(model_cache):
     )
     assert packed
     assert all(emb.count_tokens(c.text) <= DEFAULT_TOKEN_BUDGET for c in packed)
+
+
+def test_the_fallback_estimate_stays_on_the_safe_side_of_the_real_tokenizer(model_cache):
+    """The estimate is what the chunker falls back to when the tokenizer breaks, so it
+    has to err towards *more* tokens — otherwise the fallback quietly produces the
+    truncated vectors this whole design exists to prevent.
+
+    The design sketch put the ratio at 6.33 chars/token, which fails both assertions
+    below by a wide margin: that number came from a count the tokenizer had already
+    truncated at 128. Measured untruncated, this corpus runs at 3.45 chars/token
+    overall and 2.2 for markdown table rows.
+    """
+    emb = Embedder(DEFAULT_MODEL, cache_dir=model_cache)
+    pieces = [
+        line
+        for sample in (SPEC, TRANSCRIPT, SPREADSHEET, SLIDES)
+        for line in sample.split("\n")
+        if line.strip() and emb.count_tokens(line) < MODEL_MAX_TOKENS  # skip saturated counts
+    ]
+    assert len(pieces) > 40
+    estimated = [estimate_tokens(p) for p in pieces]
+    actual = [emb.count_tokens(p) for p in pieces]
+    # in aggregate — which is what the packer accumulates — it must never run short
+    assert sum(estimated) > sum(actual)
+    # and no single piece may be badly under-estimated. Not a bound: no character
+    # heuristic can be exact about `ax_ИсторияЗаменыТМЗКЗакупу`.
+    worst = min(e / a for e, a in zip(estimated, actual, strict=True))
+    assert worst > 0.7, (
+        worst,
+        min(zip(pieces, estimated, actual, strict=True), key=lambda t: t[1] / t[2]),
+    )

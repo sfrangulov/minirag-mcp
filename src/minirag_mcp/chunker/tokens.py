@@ -26,10 +26,24 @@ CHARS_PER_TOKEN = 2.5
 _SPECIAL_TOKENS = 2
 
 
+def _standalone(ch: str) -> bool:
+    """Characters this tokenizer family almost always gives a token of their own.
+
+    A markdown delimiter row is the extreme case: `| --- | --- |` is 13 characters and
+    10 tokens, four times denser than prose. Counting punctuation and digits one for
+    one cuts the estimate's under-counts from 14.3% of corpus lines to 4.6%.
+    """
+    return ch.isdigit() or (not ch.isalnum() and not ch.isspace())
+
+
 def estimate_tokens(text: str) -> int:
     """Tokenizer-free estimate, used only when the real counter is unavailable.
 
-    Deliberately pessimistic: it is better to under-fill the budget than to hand the
-    encoder text it will silently truncate.
+    Deliberately pessimistic — measured over 8,000 real corpus lines it comes out 1.40x
+    the true count on average — because it is better to under-fill the budget than to
+    hand the encoder text it will silently truncate. It is an estimate, not a bound: no
+    character heuristic can be exact about `ax_ИсторияЗаменыТМЗКЗакупу`, and the worst
+    line measured still lands 26% under. That is why it is only the fallback.
     """
-    return ceil(len(text) / CHARS_PER_TOKEN) + _SPECIAL_TOKENS
+    dense = sum(1 for ch in text if _standalone(ch))
+    return ceil((len(text) - dense) / CHARS_PER_TOKEN) + dense + _SPECIAL_TOKENS
