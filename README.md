@@ -520,8 +520,24 @@ commit in the tagged release"). Tag a commit that predates
 the release is a silent no-op — no run is queued, nothing turns red, and the
 release simply sits there looking like a build that hung.
 
-1. Bump `version` in `pyproject.toml` and commit.
-2. Tag it: `git tag vX.Y.Z && git push origin vX.Y.Z`.
+1. Bump, commit and tag in one step, from a clean tree on `main`:
+
+   ```bash
+   uv run bump-my-version bump patch    # or: minor | major
+   ```
+
+   This rewrites `version` in `pyproject.toml`, commits that as
+   `chore: release vX.Y.Z`, and creates the `vX.Y.Z` tag — the spelling
+   `release.yml`'s version check expects. It deliberately does not push:
+   everything so far is local and reversible. Add `--dry-run --verbose` to see
+   exactly what it would do first.
+
+   `version` in `pyproject.toml` is the only place the number lives.
+   `__version__` — what the `status` tool and `minirag-mcp --version` report —
+   is read from the installed distribution's metadata, so it cannot drift from
+   what was packaged.
+
+2. Push the commit and the tag: `git push && git push origin vX.Y.Z`.
 3. Publish a GitHub release for that tag.
 
 Publishing the release runs `release.yml`. It runs `ruff` and `pytest` first —
