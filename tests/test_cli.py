@@ -179,9 +179,29 @@ def test_sync_completes_and_exits_zero_when_the_lock_file_cannot_be_opened(corpu
     Run as a real child process, because what is under test is the process's exit
     status and which stream the warning lands on. stdout is the MCP stdio channel
     and carries nothing but the payload; pytest's in-process capture would show
-    neither, since it intercepts warnings before they reach a stream. The child
-    borrows the suite's fake embedder so that no model is downloaded — everything
-    else, argv parsing included, is the CLI as shipped.
+    neither, since it intercepts warnings before they reach a stream. Everything
+    else, argv parsing included, is the CLI as shipped — except two onnxruntime
+    consumers, stubbed out in sys.modules before `minirag_mcp.cli` is even
+    imported:
+
+    - `minirag_mcp.embedder` imports fastembed at module level, so patching
+      `cli._make_embedder` after the fact is too late to keep fastembed's own
+      `import onnxruntime` from running.
+    - `markitdown` — used for real by the ingest this test still exercises —
+      unconditionally constructs a `magika.Magika()` per `MarkItDown()`, and
+      that constructor eagerly builds a real `onnxruntime.InferenceSession`
+      for its file-type model. There is no constructor flag to skip it.
+
+    Either one loading onnxruntime is enough on its own to reproduce the crash
+    this test guards against: a short-lived interpreter with onnxruntime's
+    thread pool still alive can abort at finalization (`PyGILState_Release:
+    thread state ... must be current when releasing`) on some platforms —
+    observed on ubuntu-latest + Python 3.11, not on macOS or newer Python. The
+    lock degradation is what is under test, not embedding or file-type
+    sniffing, so both are faked: the fake magika reports a non-"ok" status,
+    which sends markitdown down its normal extension-based fallback path for
+    a plain .md file — the ingest is still real, just not routed through a
+    model.
     """
     if os.geteuid() == 0:  # pragma: no cover - the suite is not meant to run as root
         pytest.skip("running as root: chmod 000 denies nothing")
@@ -191,7 +211,16 @@ def test_sync_completes_and_exits_zero_when_the_lock_file_cannot_be_opened(corpu
     lock_file.chmod(0o000)
 
     script = (
-        "import sys\n"
+        "import sys, types\n"
+        "fake_fastembed = types.ModuleType('fastembed')\n"
+        "fake_fastembed.TextEmbedding = object\n"
+        "sys.modules['fastembed'] = fake_fastembed\n"
+        "fake_magika = types.ModuleType('magika')\n"
+        "fake_magika.Magika = type('Magika', (), {\n"
+        "    '__init__': lambda self, *a, **k: None,\n"
+        "    'identify_stream': lambda self, stream: types.SimpleNamespace(status='error'),\n"
+        "})\n"
+        "sys.modules['magika'] = fake_magika\n"
         f"sys.path.insert(0, {str(Path(__file__).parent)!r})\n"
         "from conftest import FakeEmbedder\n"
         "import minirag_mcp.cli as cli\n"
