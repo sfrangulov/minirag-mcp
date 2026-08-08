@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import math
 import warnings
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from fastembed import TextEmbedding
+
+# fastembed already pulls this in — its tokenizers *are* `tokenizers.Tokenizer` objects —
+# but we construct one directly, so it is declared as a dependency of ours too.
+from tokenizers import Tokenizer
 
 from minirag_mcp.chunker.tokens import estimate_tokens
 
@@ -26,6 +30,30 @@ def cosine(a: Sequence[float], b: Sequence[float]) -> float:
     return dot / (na * nb)
 
 
+def _untruncated_counter(model: TextEmbedding) -> Callable[[str], int]:
+    """A counter built on a *copy* of the model's tokenizer, with truncation switched off.
+
+    fastembed configures the tokenizer it embeds with for truncation at the model's
+    trained sequence length, so `TextEmbedding.token_count` cannot report a number above
+    that length: every over-long text counts as exactly the ceiling. A budget compared
+    against a saturating count stops meaning anything as it approaches that ceiling —
+    at the ceiling itself `count <= budget` is true of a one-megabyte string.
+
+    The copy matters. Turning truncation off on the model's own tokenizer would feed the
+    encoder sequences longer than the ONNX graph accepts, so this serializes the
+    configured tokenizer and rebuilds it, leaving the original untouched.
+    """
+    tokenizer = getattr(getattr(model, "model", None), "tokenizer", None)
+    if tokenizer is None:
+        raise AttributeError("fastembed model exposes no tokenizer to count with")
+    counting = Tokenizer.from_str(tokenizer.to_str())
+    counting.no_truncation()
+    # Padding would count towards `len(ids)`; the special tokens are wanted, the pad
+    # tokens are not, and the encoder does not attend to them either.
+    counting.no_padding()
+    return lambda text: len(counting.encode(text).ids)
+
+
 def _unit(vector: list[float]) -> list[float]:
     """Scale to unit length so LanceDB's L2 ranking matches cosine similarity.
 
@@ -42,6 +70,7 @@ class Embedder:
         self.cache_dir = cache_dir
         self._model: TextEmbedding | None = None
         self._dim: int | None = None
+        self._count: Callable[[str], int] | None = None
         self._tokenizer_broken = False
 
     @property
@@ -67,21 +96,26 @@ class Embedder:
     def count_tokens(self, text: str) -> int:
         """How many tokens this model would make of `text` — the chunker's budget unit.
 
-        Counts saturate at the model's trained sequence length (128 for the shipped
-        multilingual MiniLM), because fastembed's tokenizer has truncation configured.
-        That cannot affect a packing decision: the chunker only ever asks whether a
-        piece is within a budget set below that ceiling, and a saturated count is
-        already over any such budget.
+        The count is **not** truncated at the model's trained sequence length. A budget
+        is only a budget if the counter can report a number above it: with fastembed's
+        own `token_count`, which saturates at that length, `count <= budget` is
+        vacuously true for every text once the budget reaches the ceiling, and the
+        packer silently stops enforcing anything. So this counts with a copy of the
+        tokenizer that has truncation disabled (see `_untruncated_counter`), which is
+        also the only way the packer can be told how far over the ceiling a piece is.
 
-        `TextEmbedding.token_count` is public in fastembed 0.8, but it is one method
-        on one backend away from the tokenizer, and a chunker that silently stops
-        counting tokens would produce a corpus of truncated vectors with nothing to
-        show for it. So a failure degrades to the character estimate, loudly and once.
+        The tokenizer is two attributes away from a third-party backend, and a chunker
+        that silently stops counting tokens would produce a corpus of truncated vectors
+        with nothing to show for it. So a failure degrades to the character estimate,
+        loudly and once. It degrades *there* and never to `token_count`: the estimate is
+        rough but monotonic, and a saturating counter is not a counter at all.
         """
         if self._tokenizer_broken:
             return estimate_tokens(text)
         try:
-            return int(self._load().token_count(text))
+            if self._count is None:
+                self._count = _untruncated_counter(self._load())
+            return int(self._count(text))
         except Exception as e:
             self._tokenizer_broken = True
             warnings.warn(

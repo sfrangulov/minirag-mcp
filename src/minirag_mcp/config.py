@@ -149,9 +149,12 @@ def load_config(
         cache_dir=cache_dir,
         model_name=model_name_flag or env.get("MODEL_NAME") or DEFAULT_MODEL,
         max_file_size=_int(env, "MAX_FILE_SIZE", DEFAULT_MAX_FILE_SIZE, 1),
-        # Capped below the model's trained sequence length: past it the encoder does
-        # not see the text at all, so a larger budget would only build chunks whose
-        # tails are silently discarded.
+        # Capped at the model's trained sequence length: past it the encoder does not
+        # see the text at all, so a larger budget would only build chunks whose tails
+        # are silently discarded. The bound is inclusive, and that is only sound
+        # because `Embedder.count_tokens` counts with truncation disabled — a counter
+        # that saturated at the ceiling would make `count <= 128` true of every text
+        # and turn the documented maximum into "no budget at all".
         token_budget=_int(env, "CHUNK_TOKEN_BUDGET", DEFAULT_TOKEN_BUDGET, 16, MODEL_MAX_TOKENS),
         hybrid_weight=hybrid_weight,
         grouping=grouping,

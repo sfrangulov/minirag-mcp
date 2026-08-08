@@ -1251,6 +1251,7 @@ dependencies = [
     { name = "markitdown", extra = ["docx", "pdf", "pptx", "xlsx"] },
     { name = "platformdirs" },
     { name = "requests" },
+    { name = "tokenizers" },
 ]
 
 [package.dev-dependencies]
@@ -1270,6 +1271,7 @@ requires-dist = [
     { name = "markitdown", extras = ["pdf", "docx", "pptx", "xlsx"], specifier = ">=0.1.7" },
     { name = "platformdirs", specifier = ">=4.0" },
     { name = "requests", specifier = ">=2.32" },
+    { name = "tokenizers", specifier = ">=0.15" },
 ]
 
 [package.metadata.requires-dev]

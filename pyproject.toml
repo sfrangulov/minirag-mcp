@@ -15,6 +15,9 @@ dependencies = [
     # markitdown already pulls this in, but we import it directly: the URL fetch runs
     # through a requests session we build and guard ourselves.
     "requests>=2.32",
+    # fastembed already pulls this in, but we import it directly: the chunker's token
+    # counter is built from a copy of the model's own tokenizer with truncation off.
+    "tokenizers>=0.15",
 ]
 
 [project.scripts]

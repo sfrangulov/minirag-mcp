@@ -60,18 +60,26 @@ def test_real_token_counter_is_the_models_own(model_cache):
     assert emb.count_tokens(ru) > len(ru) / 6
     assert emb.count_tokens("") < emb.count_tokens(ru)
 
-    # Saturation at the model's ceiling is documented behaviour, and is exactly why the
-    # budget has to sit below it for the count to be usable as a comparison.
-    assert emb.count_tokens("слово " * 500) == MODEL_MAX_TOKENS
+    # The count must NOT saturate at the model's ceiling. fastembed's own
+    # `TextEmbedding.token_count` does — the tokenizer it hands out has truncation
+    # enabled — and a budget compared against a saturating count stops discriminating as
+    # it approaches that ceiling, which is what made CHUNK_TOKEN_BUDGET=128 mean "no
+    # budget at all".
+    long = "слово " * 500
+    assert emb._load().token_count(long) == MODEL_MAX_TOKENS  # the saturating counter
+    assert emb.count_tokens(long) > 500  # ours keeps counting
 
-    # A chunk packed to the budget must survive the encoder without truncation.
-    packed = chunk_markdown(
-        "# Раздел 1\n\n" + " ".join(f"термин{i} определение" for i in range(200)),
-        count_tokens=emb.count_tokens,
-        title="Спецификация",
-    )
-    assert packed
-    assert all(emb.count_tokens(c.text) <= DEFAULT_TOKEN_BUDGET for c in packed)
+    # A chunk packed to the budget must survive the encoder without truncation — at the
+    # default budget and at the largest one the configuration accepts.
+    for budget in (DEFAULT_TOKEN_BUDGET, MODEL_MAX_TOKENS):
+        packed = chunk_markdown(
+            "# Раздел 1\n\n" + " ".join(f"термин{i} определение" for i in range(200)),
+            count_tokens=emb.count_tokens,
+            title="Спецификация",
+            budget=budget,
+        )
+        assert packed
+        assert all(emb.count_tokens(c.text) <= budget for c in packed), budget
 
 
 def test_the_fallback_estimate_stays_on_the_safe_side_of_the_real_tokenizer(model_cache):
@@ -89,7 +97,7 @@ def test_the_fallback_estimate_stays_on_the_safe_side_of_the_real_tokenizer(mode
         line
         for sample in (SPEC, TRANSCRIPT, SPREADSHEET, SLIDES)
         for line in sample.split("\n")
-        if line.strip() and emb.count_tokens(line) < MODEL_MAX_TOKENS  # skip saturated counts
+        if line.strip()
     ]
     assert len(pieces) > 40
     estimated = [estimate_tokens(p) for p in pieces]

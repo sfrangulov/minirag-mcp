@@ -175,7 +175,10 @@ default model publishes `max_seq_length: 128` and that is its *trained*
 sequence length, not a misconfiguration — text past position 128 is not ranked
 badly, it is never seen. The budget is 110 tokens by default, counted with the
 model's own tokenizer, leaving margin for text that tokenizes worse than
-average.
+average. The counter runs that tokenizer with **truncation disabled**: the
+tokenizer fastembed hands out stops at 128, and a counter that cannot tell 128
+tokens from 900 is not a counter — compared against a budget of 128 it reports
+"within budget" for a text of any length.
 
 Why that matters, measured on a real 558-document Russian corpus with the
 tokenizer itself: prose runs at ~3.3 characters per token and markdown table
