@@ -175,3 +175,14 @@ def test_sections_never_lose_text():
             markdown[:40],
             dropped,
         )
+
+
+def test_no_category_can_hand_back_an_unbounded_section():
+    """A document with no blank line in it is one structural block, and a section is
+    what the caller gets back — so the cap cannot be a heading-path-only rule."""
+    wall = " ".join(f"предложение номер {i} про хранение запасов." for i in range(600))
+    for markdown in (wall, f"<!-- Slide number: 1 -->\n{wall}\n\n<!-- Slide number: 2 -->\nX"):
+        sections = split_sections(markdown)
+        assert sections
+        assert all(len(s.body) <= 4000 for s in sections), markdown[:40]
+    assert " ".join(s.body for s in split_sections(wall)).split() == wall.split()

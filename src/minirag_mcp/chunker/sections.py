@@ -15,7 +15,7 @@ Detection is fail-safe — anything that does not clearly match a category falls
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from minirag_mcp.chunker.structural import split_markdown
 
@@ -34,6 +34,9 @@ HEADING_LINE = re.compile(r"^(#{1,6})[ \t]+(.*?)[ \t]*$")
 FENCE = re.compile(r"^(```+|~~~+)")
 TABLE_ROW = re.compile(r"^[ \t]*\|.*\|[ \t]*$")
 TABLE_DELIMITER = re.compile(r"^[ \t]*\|(?:[ \t]*:?-+:?[ \t]*\|)+[ \t]*$")
+# Sentence boundary: the packer's smallest voluntary cut, and the fallback for a
+# section body with no paragraph break in it to cut at.
+SENTENCE_END = re.compile(r"(?<=[.!?…])\s+")
 
 # Measured against the live 558-document corpus: every one of the 107 real transcripts
 # has 50.0%-51.7% of its non-blank lines matching TIMESTAMP_LINE (timestamps and speech
@@ -47,9 +50,9 @@ TRANSCRIPT_WINDOW_SECONDS = 120
 # Two markers, so a document that merely quotes the marker once is not a deck.
 SLIDES_MIN_MARKERS = 2
 HEADINGS_MIN = 2
-# Cap on a heading section's size. Sections are what a caller gets back, and an
-# unbounded one would hand back a whole 40-page chapter for a one-line hit. Chosen as
-# roughly ten retrieval units of prose at the default budget.
+# Cap on a section's size. Sections are what a caller gets back, and an unbounded one
+# would hand back a whole 40-page chapter for a one-line hit. Chosen as roughly ten
+# retrieval units of prose at the default budget.
 SECTION_MAX_CHARS = 4000
 _BREADCRUMB_JOIN = " > "
 # Markdown emphasis and numbering punctuation wrapped around heading text
@@ -203,24 +206,46 @@ def clean_heading(text: str) -> str:
     return re.sub(r"\s+", " ", text.replace("**", " ").replace("__", " ")).strip(_HEADING_TRIM)
 
 
-def _split_oversized(body: str, limit: int) -> list[str]:
-    """Cut a section body into `limit`-sized pieces at paragraph boundaries."""
-    if len(body) <= limit:
-        return [body]
+def _pack_to(parts: list[str], glue: str, limit: int) -> list[str]:
     pieces: list[str] = []
     current: list[str] = []
     size = 0
-    for para in body.split("\n\n"):
-        add = len(para) + (2 if current else 0)
+    for part in parts:
+        add = len(part) + (len(glue) if current else 0)
         if current and size + add > limit:
-            pieces.append("\n\n".join(current))
-            current, size = [para], len(para)
+            pieces.append(glue.join(current))
+            current, size = [part], len(part)
         else:
-            current.append(para)
+            current.append(part)
             size += add
     if current:
-        pieces.append("\n\n".join(current))
+        pieces.append(glue.join(current))
     return pieces
+
+
+def _is_table(text: str) -> bool:
+    lines = [ln for ln in text.split("\n") if ln.strip()]
+    return bool(lines) and sum(1 for ln in lines if TABLE_ROW.match(ln)) * 2 > len(lines)
+
+
+def _split_oversized(body: str, limit: int) -> list[str]:
+    """Cut a section body down to `limit`, at the largest boundary that still works.
+
+    Paragraphs first, then sentences: a body with no blank line in it has no paragraph
+    to cut at, and leaving it whole would make a whole document one "section". A table
+    is exempt — splitting it between sections would leave the second half without the
+    header row that says what its columns are, and the packer would then read those
+    rows as prose.
+    """
+    if len(body) <= limit:
+        return [body]
+    out: list[str] = []
+    for piece in _pack_to(body.split("\n\n"), "\n\n", limit):
+        if len(piece) <= limit or _is_table(piece):
+            out.append(piece)
+        else:
+            out += _pack_to(SENTENCE_END.split(piece), " ", limit)
+    return out
 
 
 def _heading_sections(markdown: str) -> list[Section]:
@@ -265,8 +290,7 @@ def _heading_sections(markdown: str) -> list[Section]:
                 continue
             if not section.chain:
                 continue
-        for piece in _split_oversized(section.body, SECTION_MAX_CHARS):
-            kept.append(Section(prefixes=section.prefixes, body=piece, chain=section.chain))
+        kept.append(section)
     return kept
 
 
@@ -301,4 +325,10 @@ def split_sections(
     # here is what makes the whole detection step safe to be wrong.
     if not sections and markdown.strip():
         sections = _generic_sections(markdown)
-    return sections
+    # Applied to every category, not just the heading path: a section is what a caller
+    # gets back, so no strategy is allowed to hand back an unbounded one.
+    return [
+        replace(section, body=piece)
+        for section in sections
+        for piece in _split_oversized(section.body, SECTION_MAX_CHARS)
+    ]

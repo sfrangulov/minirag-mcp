@@ -13,11 +13,16 @@ prose, table rows, even a single word longer than the budget — is split until 
 
 from __future__ import annotations
 
-import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from minirag_mcp.chunker.sections import TABLE_DELIMITER, TABLE_ROW, TIMESTAMP_LINE, Section
+from minirag_mcp.chunker.sections import (
+    SENTENCE_END,
+    TABLE_DELIMITER,
+    TABLE_ROW,
+    TIMESTAMP_LINE,
+    Section,
+)
 from minirag_mcp.chunker.structural import split_markdown
 from minirag_mcp.chunker.tokens import CountTokens
 
@@ -31,7 +36,6 @@ MIN_BODY_TOKENS = 24
 # How many leading lines `join_parent` will consider shared. A heading breadcrumb plus
 # its blank line plus a table's two header lines is exactly four.
 MAX_SHARED_LINES = 4
-_SENTENCE_END = re.compile(r"(?<=[.!?…])\s+")
 
 
 @dataclass(frozen=True)
@@ -73,7 +77,7 @@ def _text_atoms(lines: Sequence[str]) -> list[Atom]:
             if atoms:
                 pending = "\n\n"
             continue
-        for j, part in enumerate(p for p in _SENTENCE_END.split(line) if p.strip()):
+        for j, part in enumerate(p for p in SENTENCE_END.split(line) if p.strip()):
             sep = " " if j else (pending or ("\n" if atoms else " "))
             atoms.append(Atom(text=part, kind=TEXT, sep=sep))
             pending = None
