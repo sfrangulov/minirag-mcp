@@ -2,13 +2,28 @@ name: Release
 
 on:
   release:
+    # `published` also fires for a pre-release, and that is deliberate: PyPI
+    # understands PEP 440 pre-release versions natively and `pip install`
+    # skips them unless the user passes `--pre`, so shipping 0.2.0rc1 costs a
+    # version number and reaches only people who asked for it. Gating them off
+    # would mean the rc is only ever tested by the maintainer. The version
+    # check below is what keeps a pre-release honest: the tag and
+    # pyproject.toml must still agree.
     types: [published]
-  # A publish that fails after the GitHub release exists can be retried from here
-  # without cutting a second release.
+  # Re-running a failed publish. The version check below is ref-based, so this
+  # is only usable from a tag — a dispatch from a branch fails the run.
+  # Prefer "Re-run failed jobs" on the original release run; see the README.
   workflow_dispatch:
 
 # Nothing is granted by default; the publish job opts into the one token it needs.
 permissions: {}
+
+# Two runs for the same project must not upload concurrently: a partial upload
+# racing a retry is exactly how a version ends up half-published. Never cancel
+# in flight — an upload interrupted mid-file is worse than one that waits.
+concurrency:
+  group: publish-pypi
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -20,11 +35,33 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
+
+      # ci.yml triggers on branch pushes, pull_request, dispatch and schedule —
+      # a tag push matches none of them, and nothing requires a release's commit
+      # to be an ancestor of a branch that has a green run. So a release cut
+      # from an untested commit would otherwise publish, permanently. This is
+      # the release gate, not a second CI: one leg on the project's development
+      # interpreter. Proving the code works on every OS and Python version is
+      # ci.yml's job, on the branch, before the tag exists.
+      - run: uv sync
+      - run: uv run ruff check src tests
+      - run: uv run pytest -q
+
       - run: uv build
 
-      # PyPI rejects a distribution whose README it cannot render, and a rejected
-      # upload still burns the version number. Catch it here instead.
-      - run: uvx twine check dist/*
+      # What this actually gives us, verified against twine 7.0.0: the
+      # distribution metadata parses and is valid (an unparseable Requires-Dist
+      # fails it), and `--strict` turns a missing or empty long_description into
+      # a non-zero exit instead of a warning.
+      #
+      # What it does NOT give us: any validation of the README itself. This
+      # project declares `readme = "README.md"` → text/markdown, and
+      # readme_renderer only validates reStructuredText — a deliberately
+      # mangled README.md passes this step. Do not read it as README coverage.
+      #
+      # Pinned to a major: this is a release gate, and an unbounded `uvx twine`
+      # would let its behaviour change with no commit to this repository.
+      - run: uvx twine@7 check --strict dist/*
 
       - name: Assert both distributions were built
         run: |
@@ -38,17 +75,39 @@ jobs:
 
       # A tag that disagrees with pyproject.toml is how the wrong artifact gets
       # published under a right-looking release; there is no way to unpublish it.
-      - name: Assert the built version matches the release tag
-        if: github.event_name == 'release'
+      #
+      # This check is ref-based and unconditional, deliberately. Keying it on
+      # `github.event_name == 'release'` would skip it on workflow_dispatch —
+      # and dispatch accepts any ref, so a feature branch whose version was
+      # already bumped could publish unfinished code under the next version
+      # number, unreclaimably. Since a branch carries no version to check a
+      # build against, a dispatch from a branch must fail rather than publish.
+      - name: Assert the built version matches the tag being released
         env:
-          TAG: ${{ github.event.release.tag_name }}
+          # `github.ref` is the unambiguous form — `refs/tags/v1.2.3` on a
+          # release and on a tag dispatch, `refs/heads/<branch>` otherwise —
+          # and `github.ref_name` is the same thing with the prefix stripped.
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
+          case "$REF" in
+          refs/tags/*) ;;
+          *)
+            echo "refusing to publish from non-tag ref '${REF}'." >&2
+            echo "a branch has no version to check the build against, so publishing" >&2
+            echo "from one would upload whatever 'version =' happens to say at that" >&2
+            echo "commit — and a PyPI version number can never be reused." >&2
+            echo "re-run this workflow from a v* tag instead, or better, use" >&2
+            echo "'Re-run failed jobs' on the original release run." >&2
+            exit 1
+            ;;
+          esac
           wheel=$(basename dist/*.whl)
           version=${wheel#*-}
           version=${version%%-*}
-          expected=${TAG#v}
+          expected=${REF_NAME#v}
           if [ "$version" != "$expected" ]; then
-            echo "built version '$version' does not match release tag '$TAG'" >&2
+            echo "built version '$version' does not match tag '$REF_NAME'" >&2
             echo "bump the version in pyproject.toml, or retag" >&2
             exit 1
           fi
@@ -66,8 +125,12 @@ jobs:
           name: dist
           path: dist/
 
-  # Separate job so the checks above run with no credentials at all, and so the
-  # `pypi` environment can gate the upload on a manual approval.
+  # Separate job so every check above runs with no credentials at all. The
+  # `pypi` environment restricts deployments to `v*` tags, so a run that somehow
+  # reached this job from any other ref cannot obtain the OIDC token. It has no
+  # required reviewer: adding one in Settings → Environments → pypi is a
+  # one-click hardening that turns the upload into a manual approval, but the
+  # gate as configured today is the ref restriction, not a human.
   publish:
     needs: build
     runs-on: ubuntu-latest
@@ -79,4 +142,17 @@ jobs:
         with:
           name: dist
           path: dist/
+      # The action ref is a moving branch, which is PyPA's own documented
+      # recommendation: an upload path is where you want a security fix to
+      # arrive without a commit here. The tradeoff — the step's behaviour can
+      # change under us — is accepted for this one action and rejected for
+      # everything else in this file.
       - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # The action uploads all of dist/ in one call and does not roll back:
+          # if the sdist lands and the wheel then fails, every retry re-uploads
+          # the same sdist filename, gets 400 "File already exists", and exits
+          # before reaching the wheel — leaving the version stuck sdist-only
+          # forever. This flag is exactly that case: skip what is already there
+          # and upload the rest, so a retry is idempotent.
+          skip-existing: true
