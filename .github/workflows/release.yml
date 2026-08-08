@@ -1,0 +1,82 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+  # A publish that fails after the GitHub release exists can be retried from here
+  # without cutting a second release.
+  workflow_dispatch:
+
+# Nothing is granted by default; the publish job opts into the one token it needs.
+permissions: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # actions/checkout
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv build
+
+      # PyPI rejects a distribution whose README it cannot render, and a rejected
+      # upload still burns the version number. Catch it here instead.
+      - run: uvx twine check dist/*
+
+      - name: Assert both distributions were built
+        run: |
+          shopt -s nullglob
+          sdists=(dist/*.tar.gz)
+          wheels=(dist/*.whl)
+          if [ ${#sdists[@]} -ne 1 ] || [ ${#wheels[@]} -ne 1 ]; then
+            echo "expected exactly one sdist and one wheel, got: ${sdists[*]} ${wheels[*]}" >&2
+            exit 1
+          fi
+
+      # A tag that disagrees with pyproject.toml is how the wrong artifact gets
+      # published under a right-looking release; there is no way to unpublish it.
+      - name: Assert the built version matches the release tag
+        if: github.event_name == 'release'
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          wheel=$(basename dist/*.whl)
+          version=${wheel#*-}
+          version=${version%%-*}
+          expected=${TAG#v}
+          if [ "$version" != "$expected" ]; then
+            echo "built version '$version' does not match release tag '$TAG'" >&2
+            echo "bump the version in pyproject.toml, or retag" >&2
+            exit 1
+          fi
+
+      # Installing from the wheel into an empty venv is the only check that the
+      # packaged distribution — not the source tree — has a working entry point.
+      - name: Smoke-test the installed console script
+        run: |
+          uv venv /tmp/smoke
+          VIRTUAL_ENV=/tmp/smoke uv pip install dist/*.whl
+          /tmp/smoke/bin/minirag-mcp status --base-dir .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  # Separate job so the checks above run with no credentials at all, and so the
+  # `pypi` environment can gate the upload on a manual approval.
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write # trusted publishing: OIDC in place of an API token
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
