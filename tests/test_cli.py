@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 import minirag_mcp.cli as cli
+from minirag_mcp.lock import sync_lock
 from minirag_mcp.store import MAX_TOP_K, Store
 
 # Captured at import time, before the autouse fixture below ever patches
@@ -116,6 +117,30 @@ def test_error_exits_nonzero(corpus, capsys):
         run(["delete", str(corpus / "never-ingested.md"), "--base-dir", str(corpus)])
     assert exc.value.code == 1
     assert "not found" in capsys.readouterr().err.lower()
+
+
+def test_sync_refuses_while_another_process_holds_the_lock(corpus, capsys):
+    """A second sync must say so on stderr and exit non-zero, not run anyway.
+
+    The lock is held from this process, which contends identically to a foreign
+    one (flock keys on the open file description). See tests/test_lock.py for the
+    genuinely cross-process coverage.
+    """
+    with sync_lock(corpus / ".minirag" / "lancedb"):
+        with pytest.raises(SystemExit) as exc:
+            run(["sync", "--base-dir", str(corpus)])
+    assert exc.value.code == 1
+    captured = capsys.readouterr()
+    assert "syncing this index" in captured.err and "DB_PATH" in captured.err
+    assert "Traceback" not in captured.err
+    assert captured.out == ""  # no counts printed for a run that never happened
+
+
+def test_ingest_is_not_blocked_by_a_held_sync_lock(corpus, capsys):
+    """The lock is scoped to sync: single-file ingests stay unblocked."""
+    with sync_lock(corpus / ".minirag" / "lancedb"):
+        run(["ingest", str(corpus / "a.md"), "--base-dir", str(corpus), "--json"])
+    assert json.loads(capsys.readouterr().out)["ingested"]
 
 
 def test_env_used_when_no_flags(corpus, capsys, monkeypatch):

@@ -12,6 +12,7 @@ from pathlib import Path
 from minirag_mcp.config import Config
 from minirag_mcp.ingest.pipeline import Pipeline
 from minirag_mcp.ingest.scanner import compute_diff, scan_roots
+from minirag_mcp.lock import SyncLock, sync_lock
 from minirag_mcp.store import Store
 
 
@@ -63,6 +64,11 @@ def run_sync(
 ) -> tuple[dict[str, int], list[dict]]:
     """Scan `roots`, diff against the store, ingest/delete accordingly.
 
+    Holds the cross-process sync lock (see `minirag_mcp.lock`) for the whole
+    run and raises `SyncLockBusy` if another process is already syncing this
+    index. `SyncManager` does not come through here — it takes the same lock
+    itself, earlier, and calls `_run_sync_unlocked`.
+
     `scope`, if given, is resolved to its canonical form (`Path.resolve()`)
     before use, matching `Config.roots` (which are always resolved). Without
     this, a non-canonical scope (e.g. an unresolved `/tmp` on macOS, where
@@ -70,6 +76,19 @@ def run_sync(
     comes back empty, the job "succeeds" with all-zero counts, and no error
     is ever raised.
     """
+    with sync_lock(store.db_path):
+        return _run_sync_unlocked(pipeline, store, roots, max_file_size, scope, on_event)
+
+
+def _run_sync_unlocked(
+    pipeline: Pipeline,
+    store: Store,
+    roots: Sequence[Path],
+    max_file_size: int,
+    scope: Path | None,
+    on_event: Callable[[str], None] | None,
+) -> tuple[dict[str, int], list[dict]]:
+    """The body of `run_sync`. The caller must already hold the sync lock."""
     scope = scope.resolve() if scope is not None else None
 
     def emit(msg: str) -> None:
@@ -119,9 +138,28 @@ class SyncManager:
         self._thread: threading.Thread | None = None
 
     def start(self, scope: Path | None = None) -> str:
+        """Start a background sync, or raise if one is already running.
+
+        `SyncBusyError` if this process is already running one, `SyncLockBusy`
+        if a different process is.
+        """
+        lock = SyncLock(self._store.db_path)
         with self._lock:
+            # Order matters twice over. The in-process guard runs first, so a second
+            # job in this process is rejected as SyncBusyError and never reaches the
+            # flock — which is what keeps us from deadlocking against ourselves, since
+            # a same-process second acquire conflicts like any other rival. And the
+            # flock is taken before any state is recorded, so a refusal leaves the
+            # manager exactly as it found it rather than stranding a 'pending' job
+            # that would wedge every later start().
             if self._job is not None and self._job.state in ("pending", "running"):
                 raise SyncBusyError("A sync job is already running")
+            # Acquired here, in the caller's thread, rather than inside the worker:
+            # acquiring in the worker would hand the caller a jobId for a job that is
+            # already doomed, and since only the latest job's record is kept, that
+            # failure is easy to miss entirely. Here, contention is an immediate
+            # error on sync_start — a ToolError the client can act on.
+            lock.acquire()
             job = SyncJob(job_id=uuid.uuid4().hex)
             self._job = job  # newer job replaces any finished record
 
@@ -131,12 +169,13 @@ class SyncManager:
             # value, so a poller never observes a terminal state with finished_at
             # still None.
             try:
-                counts, errors = run_sync(
+                counts, errors = _run_sync_unlocked(
                     self._pipeline,
                     self._store,
                     self._config.roots,
                     self._config.max_file_size,
-                    scope=scope,
+                    scope,
+                    None,
                 )
                 job.counts, job.errors = counts, errors
                 job.finished_at = _now()
@@ -145,9 +184,23 @@ class SyncManager:
                 job.error = str(e)
                 job.finished_at = _now()
                 job.state = "failed"
+            finally:
+                # Released on the worker thread, not the one that acquired it. flock
+                # belongs to the open file description, so the handoff is legitimate.
+                lock.release()
 
-        self._thread = threading.Thread(target=work, name="minirag-sync", daemon=True)
-        self._thread.start()
+        try:
+            self._thread = threading.Thread(target=work, name="minirag-sync", daemon=True)
+            self._thread.start()
+        except Exception as e:  # the OS refused a new thread
+            # Nobody will ever run `work`, so nobody will ever release the lock or
+            # move the job off 'pending'. Undo both here, or this process holds the
+            # lock until it exits and refuses every later sync.
+            lock.release()
+            job.error = f"could not start the sync worker thread: {e}"
+            job.finished_at = _now()
+            job.state = "failed"
+            raise
         return job.job_id
 
     def status(self, job_id: str) -> SyncJob:

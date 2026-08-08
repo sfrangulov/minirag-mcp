@@ -3,8 +3,10 @@ import time
 
 import pytest
 from fastmcp import Client
+from fastmcp.exceptions import ToolError
 
 from minirag_mcp.config import load_config
+from minirag_mcp.lock import sync_lock
 from minirag_mcp.server import create_app
 from minirag_mcp.store import MAX_TOP_K, Store
 
@@ -122,6 +124,35 @@ async def test_ingest_file_read_list_delete(app):
         assert d["deletedChunks"] >= 1
         with pytest.raises(Exception, match="not"):
             await c.call_tool("read_file", {"filePath": str(f)})
+
+
+async def test_sync_start_is_a_tool_error_while_another_process_syncs(app):
+    """Contention reaches the MCP client as a ToolError, and no job is started.
+
+    The lock is held from this process, which contends identically to a foreign
+    one; tests/test_lock.py covers the genuinely cross-process side.
+    """
+    mcp, root = app
+    async with Client(mcp) as c:
+        with sync_lock(root / ".minirag" / "lancedb"):
+            with pytest.raises(ToolError, match="syncing this index") as excinfo:
+                await c.call_tool("sync_start", {})
+            assert "DB_PATH" in str(excinfo.value)
+
+        # The refusal left nothing behind: a sync works as soon as the rival is gone.
+        job = (await c.call_tool("sync_start", {})).data
+        assert (await await_sync(c, job["jobId"]))["state"] == "succeeded"
+
+
+async def test_ingest_file_and_query_are_not_blocked_by_a_held_sync_lock(app):
+    """The lock is scoped to sync: single-file ingest and search stay unblocked."""
+    mcp, root = app
+    async with Client(mcp) as c:
+        with sync_lock(root / ".minirag" / "lancedb"):
+            r = (await c.call_tool("ingest_file", {"filePath": str(root / "auth.md")})).data
+            assert r["chunkCount"] >= 1
+            res = (await c.call_tool("query_documents", {"query": "OAuth2 token"})).data
+            assert res["results"], "expected search to work during a sync"
 
 
 async def test_ingest_file_outside_root_is_tool_error(app):

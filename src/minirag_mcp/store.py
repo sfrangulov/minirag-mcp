@@ -138,6 +138,11 @@ class Store:
     def __init__(self, db_path: Path, dim: int):
         db_path.mkdir(parents=True, exist_ok=True)
         self._db = lancedb.connect(str(db_path))
+        # The directory this index lives in. Exposed because the sync lock is a file
+        # inside it, and both sync entry points must derive that path the same way —
+        # deriving one from the Store and the other from Config would silently stop
+        # locking the moment those two disagreed.
+        self.db_path = db_path
         self.dim = dim
         # FTS columns this instance could not index (see _ensure_fts_indices)
         self.missing_fts_indices: tuple[str, ...] = ()
