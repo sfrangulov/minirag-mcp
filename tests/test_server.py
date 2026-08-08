@@ -5,10 +5,11 @@ import pytest
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
+from minirag_mcp.chunker import SCHEME_VERSION
 from minirag_mcp.config import load_config
 from minirag_mcp.lock import sync_lock
 from minirag_mcp.server import create_app
-from minirag_mcp.store import MAX_TOP_K, Store
+from minirag_mcp.store import MAX_TOP_K, ChunkRecord, Store
 
 # pytest-asyncio runs in auto mode (see pyproject) — bare `async def` tests are collected as-is.
 
@@ -258,3 +259,156 @@ async def test_query_top_k_is_clamped_and_must_be_positive(app, monkeypatch):
         with pytest.raises(Exception, match="topK must be at least 1"):
             await c.call_tool("query_documents", {"query": "token", "topK": -5})
     assert seen == [MAX_TOP_K]  # clamped, and the two refused calls never reached the store
+
+
+async def test_query_returns_each_parent_section_once(app):
+    """`text` stays the passage that was ranked; the section around it is named by
+    `parentId` and lives once in `parents`. Attaching it per hit resent the same
+    section for every hit inside it — about a third of the returned text."""
+    mcp, root = app
+    (root / "spec.md").write_text(
+        "# 1 Хранение\n\n"
+        + " ".join(f"Правило {i} про хранение товарно-материальных запасов." for i in range(40)),
+        encoding="utf-8",
+    )
+    async with Client(mcp) as c:
+        await c.call_tool("ingest_file", {"filePath": str(root / "spec.md")})
+        res = (await c.call_tool("query_documents", {"query": "хранение запасов"})).data
+
+    hits = [r for r in res["results"] if r["source"].endswith("spec.md")]
+    hit = hits[0]
+    assert "parentText" not in hit, "the section is not repeated on the hit"
+    assert hit["parentId"].startswith(str(root / "spec.md") + "#p")
+    section = res["parents"][hit["parentId"]]
+    assert hit["text"] in section
+    assert len(section) > len(hit["text"]), "the section must be bigger than the hit"
+
+    # several hits share one section, and it is serialized once for all of them
+    shared = [r for r in hits if r["parentId"] == hit["parentId"]]
+    assert len(shared) > 1, "need two hits in one section for this to prove anything"
+    assert list(res["parents"]).count(hit["parentId"]) == 1
+    assert len(res["parents"]) < len(res["results"])
+
+
+async def test_read_file_reconstructs_the_document_rather_than_concatenating_chunks(app):
+    """The tool is documented as returning the document. Joining raw chunk texts
+    repeated the table's header row and the heading breadcrumb once per chunk —
+    measured on the real corpus, +22% at the median and 2.64x at the tail — and planted
+    a header row in the middle of the table's rows, which is not valid Markdown."""
+    mcp, root = app
+    header = "| № | Показатель | Периодичность |"
+    delimiter = "| --- | --- | --- |"
+    rows = [
+        f"| {i} | Показатель номер {i} по форме статистической отчетности | месяц |"
+        for i in range(30)
+    ]
+    doc = root / "table.md"
+    doc.write_text(
+        "# 1 Отчетность\n\n## 1.1 Формы\n\n" + "\n".join([header, delimiter, *rows]),
+        encoding="utf-8",
+    )
+    async with Client(mcp) as c:
+        await c.call_tool("ingest_file", {"filePath": str(doc)})
+        full = (await c.call_tool("read_file", {"filePath": str(doc)})).data
+
+    assert full["chunkCount"] > 3, "the table has to span several chunks to prove anything"
+    text = full["text"]
+    assert text.count(header) == 1, "the header row is the document's, not each chunk's"
+    assert text.count(delimiter) == 1
+    assert text.count("1 Отчетность > 1.1 Формы") == 1
+    # every row survives, once, in order, and the table stays contiguous
+    assert [ln for ln in text.split("\n") if ln.startswith("| ") and "---" not in ln] == [
+        header,
+        *rows,
+    ]
+    assert f"{delimiter}\n{rows[0]}" in text
+
+
+async def test_status_reports_the_chunking_scheme(app):
+    mcp, root = app
+    async with Client(mcp) as c:
+        await c.call_tool("ingest_file", {"filePath": str(root / "auth.md")})
+        st = (await c.call_tool("status", {})).data
+    assert st["chunkScheme"] == SCHEME_VERSION
+    assert st["staleChunkCount"] == 0
+    assert "schemeWarning" not in st
+
+
+async def test_the_listing_and_status_agree_on_a_scheme_stale_source(tmp_path, fake_embedder):
+    """`status` said the index was stale and to re-sync; `list_files` said the same
+    file was "ingested". An agent decides what needs work from the listing, so the two
+    have to tell it the same thing."""
+    root = tmp_path / "docs"
+    root.mkdir()
+    doc = root / "auth.md"
+    doc.write_text("# Auth Guide\n\nOAuth2 token authentication flow explained at length here.")
+    cfg = load_config({"BASE_DIR": str(root)}, cwd=root)
+
+    async with Client(create_app(cfg, embedder=fake_embedder)) as c:
+        await c.call_tool("ingest_file", {"filePath": str(doc)})
+        listed = (await c.call_tool("list_files", {})).data["files"]
+    assert {f["source"]: f["state"] for f in listed}[str(doc)] == "ingested"
+
+    # age the stored chunks by one scheme, exactly as an index built by an older
+    # release would look, without touching the file on disk
+    store = Store(cfg.db_path, dim=fake_embedder.dim)
+    info = store.get_source(str(doc))
+    store.replace_source(
+        str(doc),
+        [
+            ChunkRecord(
+                id=f"{r.source}#{r.chunk_index}",
+                source=r.source,
+                source_type="file",
+                title=r.title,
+                chunk_index=r.chunk_index,
+                text=r.text,
+                vector=[0.1] * fake_embedder.dim,
+                file_hash=info.file_hash,
+                mtime=info.mtime,
+                ingested_at="2026-01-01T00:00:00+00:00",
+                parent_id=r.parent_id,
+                scheme_version=SCHEME_VERSION - 1,
+            )
+            for r in store.all_chunks(str(doc))
+        ],
+    )
+
+    async with Client(create_app(cfg, embedder=fake_embedder)) as c:
+        st = (await c.call_tool("status", {})).data
+        listed = (await c.call_tool("list_files", {})).data["files"]
+
+    assert st["staleChunkCount"] > 0 and "re-sync" in st["schemeWarning"].lower()
+    assert {f["source"]: f["state"] for f in listed}[str(doc)] == "stale_scheme"
+
+
+async def test_status_tells_the_user_to_re_sync_a_stale_index(tmp_path, fake_embedder):
+    """The migration has to be *detected*. A stale index still answers queries, so
+    nothing else would ever mention that its vectors describe truncated text."""
+    root = tmp_path / "docs"
+    root.mkdir()
+    cfg = load_config({"BASE_DIR": str(root)}, cwd=root)
+    store = Store(cfg.db_path, dim=fake_embedder.dim)
+    store.replace_source(
+        "/old.md",
+        [
+            ChunkRecord(
+                id="/old.md#0",
+                source="/old.md",
+                source_type="file",
+                title="Old",
+                chunk_index=0,
+                text="кусок, нарезанный старой схемой",
+                vector=[0.1] * fake_embedder.dim,
+                file_hash="h",
+                mtime=1.0,
+                ingested_at="2026-01-01T00:00:00+00:00",
+                parent_id="",
+                scheme_version=SCHEME_VERSION - 1,
+            )
+        ],
+    )
+    async with Client(create_app(cfg, embedder=fake_embedder)) as c:
+        st = (await c.call_tool("status", {})).data
+    assert st["staleChunkCount"] == 1
+    assert "re-sync" in st["schemeWarning"].lower()

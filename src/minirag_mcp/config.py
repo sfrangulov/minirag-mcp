@@ -9,9 +9,10 @@ from pathlib import Path
 
 import platformdirs
 
+from minirag_mcp.chunker import DEFAULT_TOKEN_BUDGET, MODEL_MAX_TOKENS
+
 DEFAULT_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 DEFAULT_MAX_FILE_SIZE = 104_857_600  # 100 MB
-DEFAULT_CHUNK_MIN_LENGTH = 50
 DEFAULT_HYBRID_WEIGHT = 0.6
 GROUPING_MODES = ("similar", "related")
 _TRUE = frozenset({"1", "true", "yes", "on"})
@@ -29,7 +30,7 @@ class Config:
     cache_dir: Path
     model_name: str
     max_file_size: int
-    chunk_min_length: int
+    token_budget: int
     hybrid_weight: float
     grouping: str | None
     max_distance: float | None
@@ -148,7 +149,13 @@ def load_config(
         cache_dir=cache_dir,
         model_name=model_name_flag or env.get("MODEL_NAME") or DEFAULT_MODEL,
         max_file_size=_int(env, "MAX_FILE_SIZE", DEFAULT_MAX_FILE_SIZE, 1),
-        chunk_min_length=_int(env, "CHUNK_MIN_LENGTH", DEFAULT_CHUNK_MIN_LENGTH, 1, 10_000),
+        # Capped at the model's trained sequence length: past it the encoder does not
+        # see the text at all, so a larger budget would only build chunks whose tails
+        # are silently discarded. The bound is inclusive, and that is only sound
+        # because `Embedder.count_tokens` counts with truncation disabled — a counter
+        # that saturated at the ceiling would make `count <= 128` true of every text
+        # and turn the documented maximum into "no budget at all".
+        token_budget=_int(env, "CHUNK_TOKEN_BUDGET", DEFAULT_TOKEN_BUDGET, 16, MODEL_MAX_TOKENS),
         hybrid_weight=hybrid_weight,
         grouping=grouping,
         max_distance=_opt_float(env, "RAG_MAX_DISTANCE", 0.0),

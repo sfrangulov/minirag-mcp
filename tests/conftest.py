@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import math
+import re
 import socket
 import threading
 from collections.abc import Sequence
@@ -23,13 +24,24 @@ BLOCKED_IP = "169.254.169.254"
 # Served by the stand-in metadata endpoint. Its absence is how a test proves the
 # fetch never happened, rather than merely that an exception was raised.
 SECRET_BODY = "SECRET-METADATA-TOKEN"
+_WORDS = re.compile(r"\w+|[^\w\s]")
 
 
 class FakeEmbedder:
-    """Deterministic 8-dim embeddings from sha256 — same text, same vector."""
+    """Deterministic 8-dim embeddings from sha256 — same text, same vector.
+
+    `count_tokens` stands in for the real tokenizer so chunking can be tested without
+    a 220 MB download. It is a word/punctuation tokenizer plus the two special tokens
+    every sentence-transformers model wraps a sequence in: not the model's own
+    segmentation, but the same *shape* — monotonic in length, and never zero — which is
+    all the packer's budget arithmetic depends on.
+    """
 
     dim = 8
     model_name = "fake"
+
+    def count_tokens(self, text: str) -> int:
+        return len(_WORDS.findall(text)) + 2
 
     def _vec(self, text: str) -> list[float]:
         h = hashlib.sha256(text.encode("utf-8")).digest()

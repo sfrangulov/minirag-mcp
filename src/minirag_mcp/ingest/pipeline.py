@@ -7,8 +7,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from minirag_mcp.chunker.semantic import MergedChunk, merge_blocks
-from minirag_mcp.chunker.structural import split_markdown
+from minirag_mcp.chunker import SCHEME_VERSION, chunk_markdown, estimate_tokens
 from minirag_mcp.config import Config
 from minirag_mcp.ingest import parser as _parser
 from minirag_mcp.ingest.parser import (
@@ -20,23 +19,7 @@ from minirag_mcp.ingest.parser import (
 from minirag_mcp.security import check_url
 from minirag_mcp.store import ChunkRecord, Store
 
-MAX_CHUNK_CHARS = 1500
 DATA_FORMATS = ("text", "markdown", "html")
-
-
-def _seed_title(text: str, title: str) -> str:
-    """Put the title in front of the first chunk's text, once.
-
-    Keyword search reads the title column directly, but the vector side only ever
-    sees chunk text — so without this a filename-derived title would be invisible to
-    semantic search. Applied after chunking (it can never move a chunk boundary) and
-    before embedding (the vector reflects it). A document that already opens with its
-    own title line is left alone, which is also what keeps re-ingest idempotent.
-    """
-    line = f"# {title}"
-    if not title.strip() or text == line or text.startswith(f"{line}\n"):
-        return text
-    return f"{line}\n\n{text}"
 
 
 class UnsupportedFormatError(Exception):
@@ -77,15 +60,14 @@ class Pipeline:
         self.embedder = embedder
         self.config = config
 
-    def _embed_missing(self, chunks: list[MergedChunk]) -> list[list[float]]:
-        """Vectors for every chunk, embedding only those that do not carry one.
+    @property
+    def _count_tokens(self):
+        """The embedding model's own tokenizer, or the character estimate without one.
 
-        Merging already embedded each block to decide the merges; re-embedding a chunk
-        that is still exactly one unaltered block would double the cost of an ingest.
+        The budget is in tokens because the model's ceiling is in tokens; an embedder
+        that cannot count them (a stub, an older wrapper) still has to be usable.
         """
-        pending = [c.text for c in chunks if c.vector is None]
-        fresh = iter(self.embedder.embed_documents(pending) if pending else [])
-        return [c.vector if c.vector is not None else next(fresh) for c in chunks]
+        return getattr(self.embedder, "count_tokens", None) or estimate_tokens
 
     def _chunk_and_store(
         self,
@@ -100,28 +82,22 @@ class Pipeline:
     ) -> IngestResult:
         """Chunk, embed and store, replacing whatever `source` held before.
 
-        `seed_title` says whether `title` is a real title and may therefore be written
-        into chunk 0's text. Only the caller knows: a data source with no title of its
-        own is titled after its source id, and a titleless page after its URL — neither
-        belongs in the embedded text.
+        `seed_title` says whether `title` is a real title and may therefore reach the
+        chunk text — as chunk 0's opening line, and as part of a transcript window's
+        label. Only the caller knows: a data source with no title of its own is titled
+        after its source id, and a titleless page after its URL, and neither an id nor
+        an address describes a document well enough to embed.
         """
-        blocks = split_markdown(markdown, max_chars=MAX_CHUNK_CHARS)
-        chunks = merge_blocks(
-            blocks,
-            self.embedder.embed_documents,
-            max_chars=MAX_CHUNK_CHARS,
-            min_length=self.config.chunk_min_length,
+        chunks = chunk_markdown(
+            markdown,
+            count_tokens=self._count_tokens,
+            title=title if seed_title else "",
+            budget=self.config.token_budget,
         )
         if not chunks:
             raise EmptyDocumentError(f"No text content extracted from {source}")
-        if seed_title:
-            seeded = _seed_title(chunks[0].text, title)
-            # Seeding rewrites the text, so the block vector merging computed for it no
-            # longer describes it — and chunk 0 is the chunk the title exists to reach.
-            if seeded != chunks[0].text:
-                chunks[0] = MergedChunk(seeded, None)
         texts = [c.text for c in chunks]
-        vectors = self._embed_missing(chunks)
+        vectors = self.embedder.embed_documents(texts)
         now = datetime.now(UTC).isoformat()
         records = [
             ChunkRecord(
@@ -130,13 +106,17 @@ class Pipeline:
                 source_type=source_type,
                 title=title,
                 chunk_index=i,
-                text=text,
+                text=chunk.text,
                 vector=vec,
                 file_hash=file_hash,
                 mtime=mtime,
                 ingested_at=now,
+                # Scoped to the source so a parent is addressable on its own, and so
+                # two documents can never share one.
+                parent_id=f"{source}#p{chunk.parent_index}",
+                scheme_version=SCHEME_VERSION,
             )
-            for i, (text, vec) in enumerate(zip(texts, vectors, strict=True))
+            for i, (chunk, vec) in enumerate(zip(chunks, vectors, strict=True))
         ]
         self.store.replace_source(source, records)
         return IngestResult(source=source, chunk_count=len(records), title=title)

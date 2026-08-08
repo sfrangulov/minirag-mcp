@@ -5,13 +5,14 @@ from __future__ import annotations
 import statistics
 import warnings
 from collections.abc import Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 import lancedb
 import pyarrow as pa
 from lancedb.index import FTS
 
+from minirag_mcp.chunker import SCHEME_VERSION, join_parent
 from minirag_mcp.scope import sql_clause, sql_str
 
 TABLE = "chunks"
@@ -40,6 +41,10 @@ class ChunkRecord:
     file_hash: str
     mtime: float
     ingested_at: str
+    # Chunks cut from the same parent section share this; the section's text is
+    # rebuilt from them rather than stored a second time.
+    parent_id: str = ""
+    scheme_version: int = SCHEME_VERSION
 
 
 @dataclass(frozen=True)
@@ -50,6 +55,11 @@ class SearchResult:
     chunk_index: int
     score: float
     distance: float | None
+    parent_id: str = ""
+    # The enclosing section, when one could be rebuilt. Additive on purpose: `text`
+    # keeps meaning "the chunk that matched", so a client already reading it is
+    # unaffected by the change.
+    parent_text: str | None = None
 
 
 @dataclass(frozen=True)
@@ -60,9 +70,20 @@ class SourceInfo:
     chunk_count: int
     file_hash: str
     mtime: float
+    # Oldest chunking scheme among this source's chunks. Below SCHEME_VERSION means
+    # the source needs re-ingesting even though its bytes on disk are unchanged.
+    scheme_version: int = SCHEME_VERSION
 
 
-_META_COLS = ["source", "source_type", "title", "chunk_index", "file_hash", "mtime"]
+_META_COLS = [
+    "source",
+    "source_type",
+    "title",
+    "chunk_index",
+    "file_hash",
+    "mtime",
+    "scheme_version",
+]
 
 
 def relevance_cutoff(distances: Sequence[float], mode: str) -> int:
@@ -134,6 +155,26 @@ class DimensionMismatchError(Exception):
     """An existing index was built with a different embedding dimension than requested."""
 
 
+# Columns added after the first release. An index created before them is migrated in
+# place on open; the SQL expression is the value every pre-existing row gets, and
+# scheme_version 0 is precisely the marker that says "cut by an older scheme".
+_ADDED_COLUMNS = {"parent_id": "''", "scheme_version": "CAST(0 AS INT)"}
+
+
+def _scheme_of(row: dict) -> int:
+    """A row's chunking scheme. A row with no such column predates every scheme."""
+    value = row.get("scheme_version")
+    return 0 if value is None else int(value)
+
+
+# Reads as the second half of "N chunk(s) predate the current chunking scheme."
+RESYNC_HINT = (
+    "Their boundaries follow the old rules and their vectors were computed over text "
+    "the embedding model truncated. Re-sync to rebuild them (sync_start, or "
+    "`minirag-mcp sync`)."
+)
+
+
 class Store:
     def __init__(self, db_path: Path, dim: int):
         db_path.mkdir(parents=True, exist_ok=True)
@@ -146,6 +187,9 @@ class Store:
         self.dim = dim
         # FTS columns this instance could not index (see _ensure_fts_indices)
         self.missing_fts_indices: tuple[str, ...] = ()
+        # False only when an older index is missing this version's columns and they
+        # could not be added (see _ensure_scheme_columns)
+        self.schema_migrated = True
         try:
             self._table = self._db.open_table(TABLE)
         except (FileNotFoundError, ValueError) as e:
@@ -166,13 +210,43 @@ class Store:
                     pa.field("file_hash", pa.string()),
                     pa.field("mtime", pa.float64()),
                     pa.field("ingested_at", pa.string()),
+                    pa.field("parent_id", pa.string()),
+                    pa.field("scheme_version", pa.int32()),
                 ]
             )
             self._table = self._db.create_table(TABLE, schema=schema)
             self._ensure_fts_indices(db_path)
         else:
             self._check_dim(db_path, dim)
+            self._ensure_scheme_columns(db_path)
             self._ensure_fts_indices(db_path)
+
+    def _ensure_scheme_columns(self, db_path: Path) -> None:
+        """Add the columns this version writes, if an older index lacks them.
+
+        Adding a column is a write, and opening a database must not require write
+        access — the same reasoning as `_ensure_fts_indices`. A failure is reported and
+        recorded rather than raised: `status` then still tells the user the index is
+        stale, which is the actionable half of the message either way.
+        """
+        present = set(self._table.schema.names)
+        missing = {n: expr for n, expr in _ADDED_COLUMNS.items() if n not in present}
+        if not missing:
+            self.schema_migrated = True
+            return
+        try:
+            self._table.add_columns(missing)
+            self.schema_migrated = True
+        except Exception as e:
+            self.schema_migrated = False
+            warnings.warn(
+                f"Could not add the {', '.join(sorted(missing))} column(s) to the index at "
+                f"{db_path}: {e}. This index predates the current chunking scheme, and it "
+                f"cannot be re-ingested until those columns exist — reopen it with write "
+                f"access and no concurrent writer. Searching it still works.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
 
     def _ensure_fts_indices(self, db_path: Path) -> None:
         """Create any FTS index the table is missing — best effort, never fatal.
@@ -259,6 +333,7 @@ class Store:
                 chunk_index=r["chunk_index"],
                 score=0.0,
                 distance=None,
+                parent_id=r.get("parent_id", ""),
             )
             for r in rows
         ]
@@ -275,12 +350,18 @@ class Store:
                 chunk_index=r["chunk_index"],
                 score=0.0,
                 distance=None,
+                parent_id=r.get("parent_id", ""),
             )
             for r in rows
         ]
 
+    def _meta_columns(self) -> list[str]:
+        """`_META_COLS`, minus anything an un-migrated older index does not have."""
+        present = set(self._table.schema.names)
+        return [c for c in _META_COLS if c in present]
+
     def _iter_meta(self, scopes: tuple[str, ...] = ()) -> list[dict]:
-        q = self._table.search().select(_META_COLS)
+        q = self._table.search().select(self._meta_columns())
         clause = sql_clause(scopes)
         if clause:
             q = q.where(clause)
@@ -289,9 +370,12 @@ class Store:
     def list_sources(self, scopes: tuple[str, ...] = ()) -> list[SourceInfo]:
         by_source: dict[str, dict] = {}
         counts: dict[str, int] = {}
+        schemes: dict[str, int] = {}
         for row in self._iter_meta(scopes):
             by_source.setdefault(row["source"], row)
             counts[row["source"]] = counts.get(row["source"], 0) + 1
+            scheme = _scheme_of(row)
+            schemes[row["source"]] = min(schemes.get(row["source"], scheme), scheme)
         return [
             SourceInfo(
                 source=src,
@@ -300,6 +384,7 @@ class Store:
                 chunk_count=counts[src],
                 file_hash=row["file_hash"],
                 mtime=row["mtime"],
+                scheme_version=schemes[src],
             )
             for src, row in sorted(by_source.items())
         ]
@@ -308,7 +393,7 @@ class Store:
         rows = (
             self._table.search()
             .where(f"source = '{sql_str(source)}'")
-            .select(_META_COLS)
+            .select(self._meta_columns())
             .limit(_LIST_LIMIT)
             .to_list()
         )
@@ -322,7 +407,52 @@ class Store:
             chunk_count=len(rows),
             file_hash=r["file_hash"],
             mtime=r["mtime"],
+            scheme_version=min(_scheme_of(row) for row in rows),
         )
+
+    def stale_chunk_count(self) -> int:
+        """Chunks written by an older chunking scheme. Detected, never assumed.
+
+        Their boundaries follow the old rules and their vectors were computed over
+        truncated text, so they are not comparable with chunks written now — but they
+        are still returned by search, which is why this has to be reported rather than
+        silently tolerated.
+        """
+        if not self.schema_migrated:
+            return self._table.count_rows()
+        return self._table.count_rows(filter=f"scheme_version < {SCHEME_VERSION}")
+
+    def parent_texts(self, parent_ids: Sequence[str]) -> dict[str, str]:
+        """The enclosing section of each chunk, rebuilt from its siblings.
+
+        A section is never stored twice: its text is exactly its chunks, in
+        `chunk_index` order, with the header they all repeat emitted once. Chunks from
+        an older scheme carry no parent_id and are skipped — grouping them all under
+        the empty string would fuse the whole index into one "section".
+        """
+        wanted = sorted({p for p in parent_ids if p})
+        if not wanted or not self.schema_migrated:
+            return {}
+        values = ", ".join(f"'{sql_str(p)}'" for p in wanted)
+        rows = (
+            self._table.search()
+            .where(f"parent_id IN ({values})")
+            .select(["parent_id", "chunk_index", "text"])
+            .limit(_LIST_LIMIT)
+            .to_list()
+        )
+        grouped: dict[str, list[dict]] = {}
+        for row in rows:
+            grouped.setdefault(row["parent_id"], []).append(row)
+        out: dict[str, str] = {}
+        for pid, group in grouped.items():
+            group.sort(key=lambda r: r["chunk_index"])
+            out[pid] = join_parent([r["text"] for r in group])
+        return out
+
+    def parent_text(self, parent_id: str) -> str | None:
+        """The enclosing section of one chunk, or None when there is none to rebuild."""
+        return self.parent_texts([parent_id]).get(parent_id)
 
     def chunk_count(self) -> int:
         return self._table.count_rows()
@@ -341,6 +471,7 @@ class Store:
         max_distance: float | None = None,
         grouping: str | None = None,
         max_files: int | None = None,
+        include_parents: bool = True,
     ) -> list[SearchResult]:
         """Hybrid search: vector + BM25 fused by weighted RRF, then filtered.
 
@@ -359,6 +490,10 @@ class Store:
 
         `max_files` then keeps only the first N distinct sources in rank order, and the
         list is truncated to `top_k` last.
+
+        With `include_parents`, each surviving result also carries `parent_text`: the
+        enclosing section, rebuilt from the chunk's siblings. Ranking is unaffected —
+        the retrieval unit is what was scored, and the section is only what is read.
         """
         fetch = max(top_k * 4, 50)
         clause = sql_clause(scopes)
@@ -414,6 +549,7 @@ class Store:
                     chunk_index=r["chunk_index"],
                     score=float(score),
                     distance=distance,
+                    parent_id=r.get("parent_id", ""),
                 )
             )
 
@@ -439,4 +575,13 @@ class Store:
                 keep.append(r)
             results = keep
 
-        return results[:top_k]
+        results = results[:top_k]
+        if include_parents and results:
+            # One batched lookup after truncation, so a large fetch window never turns
+            # into a large parent scan.
+            parents = self.parent_texts([r.parent_id for r in results])
+            results = [
+                replace(r, parent_text=parents.get(r.parent_id)) if r.parent_id else r
+                for r in results
+            ]
+        return results

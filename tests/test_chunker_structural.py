@@ -36,9 +36,14 @@ def test_tilde_fence():
     assert blocks == [Block(text="~~~\ncode here\n~~~", is_code=True)]
 
 
-def test_unterminated_fence_runs_to_eof():
+def test_unterminated_fence_runs_to_eof_but_is_marked_unclosed():
+    """CommonMark lets it run to the end, so it is still one code block — but callers
+    that grant code an exception (the packer's atomicity rule) have to be able to tell
+    it from a fence with a closing marker, or a stray ``` line claims the exception."""
     blocks = split_markdown("```\nno closing fence\nstill code")
     assert len(blocks) == 1 and blocks[0].is_code
+    assert not blocks[0].closed
+    assert split_markdown("```\nclosed\n```")[0].closed
 
 
 def test_long_code_fence_never_split():

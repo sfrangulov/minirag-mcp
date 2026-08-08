@@ -31,6 +31,10 @@ built on [fastmcp](https://github.com/jlowin/fastmcp),
   See [Titles and filenames](#titles-and-filenames).
 - **Multilingual by default** — the default embedding model covers 50+
   languages, so English and Russian corpora both work out of the box.
+- **Chunks sized in tokens, passages returned whole** — what gets ranked is a
+  small unit that fits the embedding model's 128-token ceiling; what comes back
+  is the section around it — a transcript time window, a heading section, a
+  slide, a table. See [Chunking](#chunking).
 - **12 file formats** ingested via `markitdown` (PDF, DOCX, PPTX, XLSX,
   HTML, CSV, EPUB, Jupyter notebooks, Markdown, and plain text), plus direct
   text/markdown/HTML ingestion and URL fetching.
@@ -160,6 +164,112 @@ Two more ways to get content in without a file on disk:
   `ALLOW_PRIVATE_URLS` says otherwise — see
   [Security and Operation](#security-and-operation).
 
+<a id="chunking"></a>
+## Chunking
+
+Two units, deliberately separated.
+
+**The retrieval unit** is what gets embedded and ranked, and it is sized in
+**tokens**, not characters, because the constraint is a token limit. The
+default model publishes `max_seq_length: 128` and that is its *trained*
+sequence length, not a misconfiguration — text past position 128 is not ranked
+badly, it is never seen. The budget is 110 tokens by default, counted with the
+model's own tokenizer, leaving margin for text that tokenizes worse than
+average. The counter runs that tokenizer with **truncation disabled**: the
+tokenizer fastembed hands out stops at 128, and a counter that cannot tell 128
+tokens from 900 is not a counter — compared against a budget of 128 it reports
+"within budget" for a text of any length.
+
+Why that matters, measured on a real 558-document Russian corpus with the
+tokenizer itself: prose runs at ~3.3 characters per token and markdown table
+rows at ~2.2. Under the previous character-based scheme, 14.7% of the 50,575
+chunks were over the ceiling and **22.8% of every token stored was discarded
+before it reached the model.** A character budget cannot fix that, because the
+ratio it would have to assume differs by 50% between prose and tables.
+
+**The parent section** is what a caller reads. `text` is the passage that
+matched and that `score` describes; `parentId` names the section it sits in,
+and `query_documents` returns a `parents` map from that id to the section's
+text. It is a map rather than a field on each hit because several hits of one
+query routinely land in the same section — that is what a good chunking scheme
+does — and repeating the section per hit made about a third of a response the
+same words resent. The section costs no extra storage either: chunks cut from
+one section share the `parentId`, and the section is rebuilt from them on
+demand.
+
+`read_file` reconstructs a document the same way rather than concatenating its
+chunks. Each chunk repeats whatever context its own vector needed — a heading
+breadcrumb, a table's header row — and printing that once per chunk inflated
+the document by 22% at the median and 2.64x at the tail, and put a header row
+in the middle of a table.
+
+Splitting is **structure-first**, and the category is read off the converted
+Markdown rather than the file extension, since one `.docx` covers transcripts,
+specifications and instructions alike:
+
+| Detected as | Section (returned) | Retrieval unit |
+|---|---|---|
+| Transcript — a regular timestamp line, with or without a speaker in front | 120-second window, labelled `[MM:SS–MM:SS]` plus the meeting title | successive turns packed to the budget |
+| Slides — `<!-- Slide number: N -->` markers | one slide | the slide, split only if over budget |
+| Headings — two or more ATX headings (specs, instructions, spreadsheets) | heading section | paragraphs and rows packed to the budget, each carrying the heading breadcrumb |
+| Anything else | one structural block | the block, packed to the budget |
+
+Detection **fails safe**: anything that does not clearly match falls to the
+generic path. The transcript pattern in particular was measured before being
+trusted — the 107 real transcripts in the corpus have 50.0%–51.7% of their
+non-blank lines matching it and all 452 other documents have exactly 0.0%, so
+the threshold sits in the middle of an empty gap rather than on a tuned edge.
+
+A breadcrumb never takes more than **a third of the budget**. On a deeply nested
+specification heading the full chain used to consume most of a chunk, leaving a
+stub of body — and chunks that are mostly the same prefix embed to nearly the
+same vector and compete for the same top-k slots. Past that share the breadcrumb
+is elided from the *middle*, keeping the outermost heading and the innermost
+ones: `1 Общие положения > … > 3.4.2 Порядок согласования`. A heading with no
+text of its own and no nested heading under it becomes a chunk of its own text,
+since nothing else would carry its words into the index.
+
+Sections are capped at **4,000 characters**, because a section is what comes back
+in a response: a section over the cap is cut at paragraph boundaries, or at row
+boundaries with the header row repeated when it is a table, or at sentence
+boundaries when it is one unbroken paragraph. The cap is soft in exactly one
+place — a single table row or sentence longer than 4,000 characters on its own is
+left whole rather than cut into something unreadable. Measured over the corpus:
+12,508 sections, median 1,182 characters, 99th percentile 3,967, and 32 sections
+(0.26%) over the cap, the largest of them a single 21 KB Word table cell.
+
+Two rules hold everywhere. **A markdown table breaks between rows, never inside
+one**, and its header row is repeated in every chunk built from it, so a row
+chunk still says what its columns mean; a single row longer than the whole
+budget is split at whitespace as a last resort, and even then the parent
+section holds it intact. A table header row with no data rows under it is the
+content, and is kept as an ordinary row rather than discarded as a header with
+nothing to head.
+
+And **a fenced code block is atomic** — the one thing allowed to exceed the
+budget, because code split mid-block is wrong rather than merely partial. That
+exception is bounded at both ends. It requires a genuine fence, with a closing
+marker, so one stray ``` line cannot make the rest of a document indivisible;
+and it stops at four budgets, past which the block is split at line boundaries
+after all and every piece carries `[code block split to fit the token budget]`.
+The encoder has seen the same first 128 tokens either way, so past that point
+keeping the block whole buys no retrieval quality and only inflates every
+response that returns it.
+
+Measured against the previous scheme on the same 558 documents: 64,697 chunks
+against 50,575, **none of them over the 128-token ceiling** (14.7% were), median
+chunk 94 tokens against 50, and ingest **1.7× faster** despite the extra chunks —
+the deleted semantic merge stage was one of two embedding passes per document. Of
+five benchmark queries, three keep their top-ranked document; the two that change
+now rank first the document whose *title* names the query subject, where the old
+index returned a transcript fragment.
+
+**Changing the scheme requires a re-sync**, and that is detected rather than
+assumed: every chunk records the scheme it was cut with, and `status` reports
+`staleChunkCount` plus a `schemeWarning` while any chunk from an older scheme
+remains. A stale index answers queries perfectly happily — nothing else would
+ever mention that its vectors describe truncated text.
+
 ## MCP Tools
 
 11 tools, all backed by the same index:
@@ -171,12 +281,12 @@ Two more ways to get content in without a file on disk:
 | `ingest_file` | Ingest or re-ingest one file, replacing any content already indexed for it. |
 | `ingest_data` | Ingest text/markdown/html content the client holds, under a source id you choose. |
 | `ingest_url` | Fetch an http(s) URL, convert it to Markdown, and index it. |
-| `query_documents` | Hybrid search: semantic similarity plus a keyword boost for exact terms. |
+| `query_documents` | Hybrid search: semantic similarity plus a keyword boost for exact terms. Each hit carries `text` (the passage that matched) and `parentId`; the enclosing sections come back once each in the response's `parents` map — see [Chunking](#chunking). |
 | `read_chunk_neighbors` | Read the chunks immediately before and after a search result, for context. |
-| `read_file` | Read a source's entire indexed content as Markdown (all chunks joined). |
+| `read_file` | Read a source's entire indexed content as Markdown, reconstructed from its chunks rather than concatenated from them. |
 | `list_files` | List files found on disk under the document roots, plus indexed data/url sources. |
 | `delete_file` | Delete an indexed file, data item, or url item from the index. |
-| `status` | Report configuration and index status. Works even when configuration is invalid. |
+| `status` | Report configuration and index status, including whether the index predates the current chunking scheme. Works even when configuration is invalid. |
 
 MCP tool file paths (`filePath`) must be absolute and inside a configured
 document root.
@@ -301,7 +411,9 @@ gives the title `И-112 ЗПС Хранение ТМЗ`.
 
 The title is also prepended as a `# Title` line to the first chunk's text
 before embedding, so it reaches semantic search too — later chunks are
-untouched, and chunk boundaries, ids and counts are unaffected. Data and URL
+untouched, and chunk boundaries, ids and counts are unaffected. A chunk that
+already carries the title is left alone, which keeps re-ingest idempotent and
+keeps chunk 0 looking like its siblings, so its section still reconstructs. Data and URL
 sources are seeded only when they have a title of their own (given explicitly
 or found in the content): a source id or a bare URL identifies a document
 without describing it, and injecting it would only add noise to the vector.
@@ -382,7 +494,7 @@ merges with them.
 | `CACHE_DIR` | platformdirs user cache dir, e.g. `~/Library/Caches/minirag-mcp/models` on macOS | Embedding model cache. Global by default so the ~220 MB model is downloaded once and shared across every corpus, not duplicated per project. |
 | `MODEL_NAME` | `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` | fastembed model id. **Changing this makes existing vectors incompatible with new queries** (different model, different embedding space — even a same-dimension model isn't comparable) — pair a `MODEL_NAME` change with a new `DB_PATH` or a full re-ingest. |
 | `MAX_FILE_SIZE` | `104857600` (100 MB) | Per-file size limit, enforced before parsing. |
-| `CHUNK_MIN_LENGTH` | `50` | Minimum chunk length in characters; shorter chunks merge into a neighbor instead of being dropped. |
+| `CHUNK_TOKEN_BUDGET` | `110` | Retrieval-unit size, in the embedding model's own tokens. Range 16–128; the upper bound is the model's trained sequence length, past which the encoder does not see the text at all. See [Chunking](#chunking). |
 | `RAG_HYBRID_WEIGHT` | `0.6` | See [Search Tuning](#search-tuning). |
 | `RAG_GROUPING` | unset | See [Search Tuning](#search-tuning). |
 | `RAG_MAX_DISTANCE` | unset | See [Search Tuning](#search-tuning). |
@@ -474,6 +586,16 @@ merges with them.
 Nothing has been indexed yet, or your query's `scope` excludes everything
 that matches. Run `sync_start` (or `minirag-mcp sync`) first, then confirm
 with `status` or `list_files` that `chunkCount`/`sourceCount` are non-zero.
+
+**`status` reports `staleChunkCount` above zero.**
+Those chunks were cut by an older chunking scheme: their boundaries follow the
+old rules and their vectors were computed over text the embedding model
+truncated, so they rank against today's queries as something other than what
+they say. Re-sync to rebuild them — `sync_start`, or `minirag-mcp sync`. A sync
+normally skips a file whose bytes are unchanged, but a source cut by an older
+scheme is re-ingested anyway: the file has not changed, what it was cut into
+has. Searching still works in the meantime; it is simply searching text the
+model only half saw.
 
 **Model download fails on first use.**
 The first ingestion downloads ~220 MB from Hugging Face via fastembed; a

@@ -11,12 +11,19 @@ from typing import Annotated
 from cyclopts import App, Parameter
 
 from minirag_mcp import __version__
+from minirag_mcp.chunker import SCHEME_VERSION
 from minirag_mcp.config import Config, ConfigError, load_config
 from minirag_mcp.embedder import Embedder, UnknownModelError
 from minirag_mcp.ingest.pipeline import IngestResult, Pipeline
 from minirag_mcp.ingest.scanner import compute_states, scan_roots
 from minirag_mcp.lock import SyncLockBusy
-from minirag_mcp.results import aggregate_sources, result_dict
+from minirag_mcp.results import (
+    aggregate_sources,
+    join_document,
+    parent_map,
+    result_dict,
+    scheme_status,
+)
 from minirag_mcp.scope import is_under
 from minirag_mcp.security import SecurityError, resolve_in_roots
 from minirag_mcp.store import MAX_TOP_K, DimensionMismatchError, SearchResult, Store
@@ -236,7 +243,11 @@ def query(
         max_files=cfg.max_files,
     )
     sources = aggregate_sources(results)
-    payload = {"results": [result_dict(r) for r in results], "sources": sources}
+    payload = {
+        "results": [result_dict(r) for r in results],
+        "sources": sources,
+        "parents": parent_map(results),
+    }
     if results:
         human = "\n".join(_result_line(r) for r in results)
         human += "\n\nSources:\n" + "\n".join(
@@ -292,7 +303,12 @@ def read(
     model_name: ModelNameOpt = None,
     json: JsonFlag = False,
 ):
-    """Print a source's full indexed content (all chunks, as Markdown)."""
+    """Print a source's full indexed content, as Markdown.
+
+    Reconstructed from its chunks rather than concatenated from them: the context each
+    chunk repeats to carry it into its own vector is emitted once, where the document
+    had it.
+    """
     cfg, store, _ = _load(base_dir, db_path, cache_dir, model_name)
     if path is not None:
         try:
@@ -307,7 +323,7 @@ def read(
     if not chunks:
         _fail(f"source not found in index: {key}")
     info = store.get_source(key)
-    text = "\n\n".join(ch.text for ch in chunks)
+    text = join_document(chunks)
     payload = {
         "source": key,
         "sourceType": info.source_type,
@@ -328,7 +344,12 @@ def list_cmd(
     model_name: ModelNameOpt = None,
     json: JsonFlag = False,
 ):
-    """List files on disk with ingestion state, plus indexed data/url sources."""
+    """List files on disk with ingestion state, plus indexed data/url sources.
+
+    States: ingested, stale (changed on disk), stale_scheme (unchanged on disk but
+    indexed under an older chunking scheme), not_ingested. Everything but ingested
+    needs a sync.
+    """
     cfg, store, _ = _load(base_dir, db_path, cache_dir, model_name)
     scopes = tuple(scope or ())
     entries = scan_roots(cfg.roots)
@@ -377,8 +398,10 @@ def status(
         "dbPath": str(cfg.db_path),
         "model": cfg.model_name,
         "hybridWeight": cfg.hybrid_weight,
+        "chunkScheme": SCHEME_VERSION,
         "chunkCount": store.chunk_count(),
         "sourceCount": store.source_count(),
+        **scheme_status(store),
     }
     human = "\n".join(f"{k}: {v}" for k, v in payload.items())
     _emit(payload, json, human)

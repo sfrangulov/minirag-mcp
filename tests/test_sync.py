@@ -1,13 +1,15 @@
 import threading
 import time
+from dataclasses import replace
 
 import pytest
 
 import minirag_mcp.sync as sync_mod
+from minirag_mcp.chunker import SCHEME_VERSION
 from minirag_mcp.config import load_config
 from minirag_mcp.ingest.pipeline import Pipeline
 from minirag_mcp.lock import SyncLock, SyncLockBusy, sync_lock
-from minirag_mcp.store import Store
+from minirag_mcp.store import ChunkRecord, Store
 from minirag_mcp.sync import SyncBusyError, SyncManager, run_sync
 
 
@@ -325,3 +327,56 @@ def test_finished_at_set_when_state_terminal(env):
     mgr.wait()
     job = mgr.status(job_id)
     assert job.state in ("succeeded", "failed") and job.finished_at is not None
+
+
+def test_sync_re_ingests_a_source_whose_chunking_scheme_is_stale(tmp_path, fake_embedder):
+    """`status` tells the user to re-sync a stale index; the re-sync has to comply.
+
+    A sync skips a file whose bytes are unchanged, and after a scheme change every
+    file's bytes are unchanged — so without this the advice would be a dead end."""
+    root = tmp_path / "docs"
+    root.mkdir()
+    doc = root / "spec.md"
+    doc.write_text("# 1 Хранение\n\n" + "Правило про хранение запасов. " * 40, encoding="utf-8")
+    cfg = load_config({"BASE_DIR": str(root)}, cwd=root)
+    store = Store(tmp_path / "db", dim=fake_embedder.dim)
+    pipeline = Pipeline(store, fake_embedder, cfg)
+
+    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    assert counts["ingested"] == 1
+    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    assert counts == {**counts, "ingested": 0, "skipped": 1}
+
+    # rewrite the source's chunks as an older scheme would have left them
+    old = [
+        replace(c, scheme_version=SCHEME_VERSION - 1, parent_id="")
+        for c in _records_of(store, str(doc))
+    ]
+    store.replace_source(str(doc), old)
+    assert store.stale_chunk_count() == len(old)
+
+    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    assert counts["ingested"] == 1 and counts["skipped"] == 0
+    assert store.stale_chunk_count() == 0
+
+
+def _records_of(store, source):
+    rows = store._table.search().where(f"source = '{source}'").limit(10_000).to_list()
+    rows.sort(key=lambda r: r["chunk_index"])
+    return [
+        ChunkRecord(
+            id=r["id"],
+            source=r["source"],
+            source_type=r["source_type"],
+            title=r["title"],
+            chunk_index=r["chunk_index"],
+            text=r["text"],
+            vector=list(r["vector"]),
+            file_hash=r["file_hash"],
+            mtime=r["mtime"],
+            ingested_at=r["ingested_at"],
+            parent_id=r["parent_id"],
+            scheme_version=r["scheme_version"],
+        )
+        for r in rows
+    ]

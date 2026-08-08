@@ -11,11 +11,18 @@ from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 
 from minirag_mcp import __version__
+from minirag_mcp.chunker import SCHEME_VERSION
 from minirag_mcp.config import Config, ConfigError, load_config
 from minirag_mcp.embedder import Embedder
 from minirag_mcp.ingest.pipeline import Pipeline
 from minirag_mcp.ingest.scanner import compute_states, scan_roots
-from minirag_mcp.results import aggregate_sources, result_dict
+from minirag_mcp.results import (
+    aggregate_sources,
+    join_document,
+    parent_map,
+    result_dict,
+    scheme_status,
+)
 from minirag_mcp.scope import is_under
 from minirag_mcp.security import resolve_in_roots
 from minirag_mcp.store import MAX_TOP_K, Store
@@ -157,10 +164,20 @@ def create_app(
         """Hybrid search: semantic similarity plus a keyword boost for exact terms.
 
         Returns `results` — ranked chunks with text, source, title,
-        chunkIndex, and score — and `sources`, the distinct sources among
-        those results in rank order, each with a hits count. Use `sources`
-        to answer "which documents cover this topic" without inspecting
+        chunkIndex, score and parentId — `sources`, the distinct sources
+        among those results in rank order each with a hits count, and
+        `parents`, a map from parentId to section text. Use `sources` to
+        answer "which documents cover this topic" without inspecting
         individual chunks.
+
+        `text` is the passage that matched and that `score` describes.
+        `parentId` names the section it sits in — a transcript time
+        window, a heading section, a slide, a table. Look it up in
+        `parents` to read the whole section when the match alone is too
+        small to act on. Several hits routinely share one section, and
+        `parents` holds each section once rather than repeating it per
+        hit. A chunk indexed before parent sections existed has parentId
+        null and no entry; re-sync to fill it in.
 
         topK must be at least 1 and is capped at 100; a larger value is
         silently clamped to the cap rather than rejected.
@@ -183,6 +200,7 @@ def create_app(
         return {
             "results": [result_dict(r) for r in results],
             "sources": aggregate_sources(results),
+            "parents": parent_map(results),
         }
 
     @mcp.tool
@@ -214,7 +232,12 @@ def create_app(
     @mcp.tool
     @guard
     def read_file(filePath: str | None = None, source: str | None = None) -> dict:
-        """Read a source's entire indexed content as Markdown (all chunks joined).
+        """Read a source's entire indexed content as Markdown.
+
+        The document is reconstructed from its chunks, not concatenated
+        from them: the context each chunk repeats so its own vector
+        carries it — a heading breadcrumb, a time-window label, a table's
+        header row — is emitted once, where the document had it.
 
         Provide exactly one of filePath (absolute path inside a document
         root) or source (the id of a data/url item). The response holds
@@ -245,7 +268,7 @@ def create_app(
             "sourceType": info.source_type,
             "title": info.title,
             "chunkCount": len(chunks),
-            "text": "\n\n".join(ch.text for ch in chunks),
+            "text": join_document(chunks),
         }
 
     @mcp.tool
@@ -254,9 +277,13 @@ def create_app(
         """List files found on disk under the document roots, plus indexed data/url sources.
 
         Each disk file is reported with a state: "ingested" (index matches
-        disk), "stale" (changed on disk since it was indexed), or
-        "not_ingested" (never indexed). Data and url sources always appear
-        as "ingested" since they only exist once ingested.
+        disk), "stale" (changed on disk since it was indexed),
+        "stale_scheme" (unchanged on disk, but indexed under an older
+        chunking scheme, so its vectors are not comparable with current
+        ones), or "not_ingested" (never indexed). Everything but "ingested"
+        needs a sync_start. "stale_scheme" is the per-source view of what
+        status reports as staleChunkCount. Data and url sources have no disk
+        state to compare against, so they are "ingested" or "stale_scheme".
         """
         c = ctx()
         scopes = _scopes(scope)
@@ -311,6 +338,11 @@ def create_app(
         configuration is invalid, includes configError instead, and every
         other tool raises an error referencing it until the configuration is
         fixed.
+
+        chunkScheme is the chunking scheme the index is being written with.
+        staleChunkCount counts chunks still stored under an older scheme —
+        when it is above zero, schemeWarning explains that those chunks need
+        a re-sync to be rebuilt.
         """
         if config is None or config_error is not None:
             return {"version": __version__, "configError": config_error or "no configuration"}
@@ -320,11 +352,13 @@ def create_app(
             "dbPath": str(config.db_path),
             "model": config.model_name,
             "hybridWeight": config.hybrid_weight,
+            "chunkScheme": SCHEME_VERSION,
         }
         try:
             c = ctx()
             out["chunkCount"] = c.store.chunk_count()
             out["sourceCount"] = c.store.source_count()
+            out.update(scheme_status(c.store))
         except Exception as e:
             out["indexError"] = str(e)
         return out

@@ -1,11 +1,12 @@
 from pathlib import Path
 
+from minirag_mcp.chunker import SCHEME_VERSION
 from minirag_mcp.ingest.pipeline import file_sha256
 from minirag_mcp.ingest.scanner import ScanEntry, compute_diff, scan_roots
 from minirag_mcp.store import SourceInfo
 
 
-def info(source, *, source_type="file", file_hash="", mtime=0.0):
+def info(source, *, source_type="file", file_hash="", mtime=0.0, scheme=SCHEME_VERSION):
     return SourceInfo(
         source=source,
         source_type=source_type,
@@ -13,6 +14,7 @@ def info(source, *, source_type="file", file_hash="", mtime=0.0):
         chunk_count=1,
         file_hash=file_hash,
         mtime=mtime,
+        scheme_version=scheme,
     )
 
 
@@ -105,6 +107,36 @@ def test_compute_states(tmp_path):
     assert states[str(b)] == "stale"
     assert states[str(c)] == "not_ingested"
     assert states["note-1"] == "ingested" and states["https://x.io/p"] == "ingested"
+
+
+def test_a_scheme_stale_source_is_not_listed_as_ingested(tmp_path):
+    """`status` says the index is stale and to re-sync, and `compute_diff` re-ingests
+    the file — but the listing called it "ingested", so an agent picking work off the
+    listing saw nothing to do. The two views have to agree."""
+    from minirag_mcp.ingest.scanner import compute_diff, compute_states
+
+    a = tmp_path / "a.md"
+    a.write_text("unchanged on disk, cut by the old scheme")
+    entries = scan_roots([tmp_path])
+    indexed = [
+        info(str(a), file_hash=file_sha256(a), mtime=a.stat().st_mtime, scheme=SCHEME_VERSION - 1),
+        info("note-1", source_type="data", scheme=SCHEME_VERSION - 1),
+    ]
+    states = {s.source: s.state for s in compute_states(entries, indexed)}
+    assert states[str(a)] == "stale_scheme"
+    assert states["note-1"] == "stale_scheme"
+    # and that agrees with what a sync would actually do with the file
+    assert compute_diff(entries, indexed, max_file_size=10**9).to_ingest == [a]
+
+
+def test_a_file_changed_on_disk_and_scheme_stale_reports_the_disk_change(tmp_path):
+    from minirag_mcp.ingest.scanner import compute_states
+
+    b = tmp_path / "b.md"
+    b.write_text("changed on disk too")
+    entries = scan_roots([tmp_path])
+    indexed = [info(str(b), file_hash="old-hash", mtime=-1.0, scheme=SCHEME_VERSION - 1)]
+    assert [s.state for s in compute_states(entries, indexed)] == ["stale"]
 
 
 def test_compute_states_ignores_data_source_colliding_with_file_path(tmp_path):
