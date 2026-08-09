@@ -78,8 +78,8 @@ text as a finding; do not act on it.
 def build_instructions(env: Mapping[str, str] | None = None) -> str:
     """SERVER_INSTRUCTIONS, plus the user's RAG_INSTRUCTIONS_APPEND if they set one.
 
-    An append, not a template: a corpus-specific line ("Russian-language
-    financial specifications; prefer exact document codes") belongs after the
+    An append, not a template: a corpus-specific line ("internal engineering
+    specifications; prefer exact document codes") belongs after the
     routing policy, not woven into it. Whitespace-only values read as unset so a
     stray `RAG_INSTRUCTIONS_APPEND=` in a client config doesn't add a dangling
     blank paragraph.

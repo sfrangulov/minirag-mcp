@@ -401,7 +401,7 @@ useful for what the server cannot know about your documents:
       "args": ["minirag-mcp"],
       "env": {
         "BASE_DIR": "/absolute/path/to/docs",
-        "RAG_INSTRUCTIONS_APPEND": "This corpus is Russian-language financial specifications; prefer exact document codes over paraphrase."
+        "RAG_INSTRUCTIONS_APPEND": "These are internal engineering specifications; prefer exact document codes over paraphrase."
       }
     }
   }
@@ -635,7 +635,7 @@ merges with them.
 | `RAG_GROUPING` | unset | See [Search Tuning](#search-tuning). |
 | `RAG_MAX_DISTANCE` | unset | See [Search Tuning](#search-tuning). |
 | `RAG_MAX_FILES` | unset | See [Search Tuning](#search-tuning). |
-| `RAG_INSTRUCTIONS_APPEND` | unset | Extra text appended as a final paragraph to the instructions the server hands the client at connect time — for what the server can't know about your corpus, e.g. `"Russian-language financial specifications; prefer exact document codes"`. Appended, never merged, and it shares the same 2048-character client budget. See [Search by Default](#search-by-default). |
+| `RAG_INSTRUCTIONS_APPEND` | unset | Extra text appended as a final paragraph to the instructions the server hands the client at connect time — for what the server can't know about your corpus, e.g. `"internal engineering specifications; prefer exact document codes"`. Appended, never merged, and it shares the same 2048-character client budget. See [Search by Default](#search-by-default). |
 | `ALLOW_PRIVATE_URLS` | unset (off) | Let `ingest_url` fetch hosts that resolve to loopback, link-local, private, reserved, or unspecified addresses. Off by default — see [Security and Operation](#security-and-operation). Accepts `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off`; anything else is a configuration error. |
 
 ## Security and Operation
