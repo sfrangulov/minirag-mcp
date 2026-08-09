@@ -1,9 +1,11 @@
 import os
 
 import lancedb.db
+import pyarrow as pa
 import pytest
 
-from minirag_mcp.store import ChunkRecord, DimensionMismatchError, Store
+from minirag_mcp.chunker import SCHEME_VERSION
+from minirag_mcp.store import TABLE, ChunkRecord, DimensionMismatchError, Store
 
 
 def rec(source, i, text, vec=None, source_type="file", title="T", ocr_engine=""):
@@ -237,6 +239,56 @@ def test_old_table_without_ocr_column_migrates():
     from minirag_mcp.store import _ADDED_COLUMNS
 
     assert _ADDED_COLUMNS["ocr_engine"] == "''"
+
+
+def test_reopening_a_table_missing_the_ocr_column_migrates_it(tmp_path):
+    """End-to-end proof, not just the map check above: builds a `chunks` table with the
+    create-table schema minus `ocr_engine` — a genuine pre-OCR index, the same shape
+    `_ensure_scheme_columns` already had to migrate for `parent_id`/`scheme_version` —
+    then opens it through `Store` and proves both the column and the two read paths
+    that depend on it survive."""
+    db_path = tmp_path / "db"
+    db = lancedb.connect(str(db_path))
+    schema = pa.schema(
+        [
+            pa.field("id", pa.string()),
+            pa.field("source", pa.string()),
+            pa.field("source_type", pa.string()),
+            pa.field("title", pa.string()),
+            pa.field("chunk_index", pa.int32()),
+            pa.field("text", pa.string()),
+            pa.field("vector", pa.list_(pa.float32(), 8)),
+            pa.field("file_hash", pa.string()),
+            pa.field("mtime", pa.float64()),
+            pa.field("ingested_at", pa.string()),
+            pa.field("parent_id", pa.string()),
+            pa.field("scheme_version", pa.int32()),
+        ]
+    )
+    table = db.create_table(TABLE, schema=schema)
+    table.add(
+        [
+            {
+                "id": "/a.md#0",
+                "source": "/a.md",
+                "source_type": "file",
+                "title": "T",
+                "chunk_index": 0,
+                "text": "x",
+                "vector": [0.1] * 8,
+                "file_hash": "h",
+                "mtime": 1.0,
+                "ingested_at": "2026-08-07T00:00:00+00:00",
+                "parent_id": "",
+                "scheme_version": SCHEME_VERSION,
+            }
+        ]
+    )
+
+    store = Store(db_path, dim=8)
+    assert "ocr_engine" in store._table.schema.names
+    assert store.get_source("/a.md").ocr_engine == ""
+    assert [s.ocr_engine for s in store.list_sources()] == [""]
 
 
 def test_open_failure_that_is_not_a_missing_table_propagates(tmp_path, monkeypatch):

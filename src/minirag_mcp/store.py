@@ -44,8 +44,9 @@ class ChunkRecord:
     # Chunks cut from the same parent section share this; the section's text is
     # rebuilt from them rather than stored a second time.
     parent_id: str = ""
-    # Which OCR backend produced this chunk's text, "" when none was used. Set by the
-    # pipeline (Task 7); this column only carries it through storage and listings.
+    # Which OCR backend produced this chunk's text, "" when none was used. Only the
+    # ingest pipeline sets this; the store's job is just to carry it through storage
+    # and listings unchanged.
     ocr_engine: str = ""
     scheme_version: int = SCHEME_VERSION
 
