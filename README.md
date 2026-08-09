@@ -383,8 +383,11 @@ EOF
 **Client support varies, and the field is optional.** The spec says a client
 *may* pass it to the model. Claude Code and VS Code / GitHub Copilot inject it
 verbatim; Claude Desktop, claude.ai, Codex and Cursor are not known to. Where
-it doesn't arrive, the tool descriptions still carry the essentials — so treat
-this as a strong nudge on some clients rather than a guarantee everywhere.
+it doesn't arrive, the tool descriptions still carry the essentials — the
+citation format, concretely, is stated on `query_documents` itself, because a
+client that drops `instructions` still hands the model every tool description.
+So treat this as a strong nudge on some clients rather than a guarantee
+everywhere.
 Claude Code also truncates each server's instructions at 2048 characters, which
 is the budget the text is written against. Roughly 1700 of those go to the
 built-in policy and the rest is held in reserve for your own line — see below.

@@ -180,13 +180,16 @@ def create_app(
         `parentId` names the section it sits in — a transcript time
         window, a heading section, a slide, a table. Look it up in
         `parents` to read the whole section when the match alone is too
-        small to act on. Several hits routinely share one section, and
-        `parents` holds each section once rather than repeating it per
-        hit. A chunk indexed before parent sections existed has parentId
-        null and no entry; re-sync to fill it in.
+        small to act on. A chunk indexed before parent sections existed
+        has parentId null and no entry; re-sync to fill it in.
 
         topK must be at least 1 and is capped at 100; a larger value is
         silently clamped to the cap rather than rejected.
+
+        Cite what you take, so the user can verify it: [1], [2] inline
+        plus a Sources list naming the document, not the chunk —
+        `title` and `source` verbatim, plain text, never a markdown
+        link or file://.
         """
         if not query.strip():
             raise ToolError("query must not be empty")

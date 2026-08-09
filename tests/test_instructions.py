@@ -1,4 +1,14 @@
-"""The server-level `instructions` string, and its trip through a real handshake."""
+"""The server-level `instructions` string, and its trip through a real handshake.
+
+Also the second channel the citation policy travels on. `instructions` is
+optional for a client and several drop it — Claude Desktop among them, which is
+where the policy was observed to have no effect at all — while tool descriptions
+are passed to the model by every client. So the minimum of the policy is stated
+again in `query_documents`'s description, and the last two tests here hold the
+two statements to the same rules: one asserts the description a client is
+actually handed carries the policy, the other fails if either text is edited
+into disagreeing with the other.
+"""
 
 from __future__ import annotations
 
@@ -23,6 +33,32 @@ APPEND_SEPARATOR_CHARS = 2
 # pytest-asyncio runs in auto mode (see pyproject) — bare `async def` tests are collected as-is.
 
 CORPUS_NOTE = "This corpus is Russian-language financial specifications."
+
+#: The parts of the citation policy that must read the same way wherever it is
+#: stated — the server `instructions`, which several clients drop, and the
+#: `query_documents` description, which every client passes to the model. Exact
+#: phrases rather than paraphrases: an assertion loose enough to survive a
+#: reworded copy would not catch the two texts drifting apart, which is the only
+#: failure worth a test here. Claude Code is handed both at once.
+CITATION_INVARIANTS = (
+    "so the user can verify it",  # verification, not a claim that the prose is true
+    "[1], [2]",  # the marker style,
+    "Sources list",  # ...and the end-of-answer list the markers point into
+    "the document, not the chunk",  # the granularity
+    "`title` and `source` verbatim",  # ...and the two fields that identify one
+    "never a markdown link or file://",  # both arrive broken in every client checked
+)
+
+
+def _flat(text: str) -> str:
+    """Collapse to one line, so a phrase broken across a docstring wrap still matches.
+
+    The instructions are written with backslash continuations and arrive
+    unwrapped; a tool description is a docstring and arrives with its source
+    line breaks intact. Normalising both means the tests pin the wording rather
+    than where the author happened to wrap it.
+    """
+    return " ".join(text.split())
 
 
 @pytest.fixture
@@ -101,6 +137,52 @@ async def test_the_citation_policy_reaches_the_client_through_the_handshake(app)
     # Citations are for the user's verification, not a claim that the prose is
     # true — measured support rates are far too low for the stronger reading.
     assert "verify" in citations
+
+
+async def test_the_citation_rule_reaches_the_client_in_the_query_tool_description(app):
+    """The channel that survives a client which drops `instructions`.
+
+    Asserted against `list_tools()` rather than against the function's
+    `__doc__`, because the docstring is only the input: FastMCP is what turns it
+    into the `description` field, and a policy that lived in the source but not
+    on the wire is exactly the failure this test exists to catch — the same one
+    the `instructions` field hit in Claude Desktop.
+    """
+    async with Client(app()) as c:
+        descriptions = {t.name: t.description or "" for t in await c.list_tools()}
+    desc = _flat(descriptions["query_documents"])
+
+    # The format, in the two halves an answer needs to be written in it.
+    assert "[1], [2]" in desc and "Sources list" in desc
+    # Keyed to the document: `chunkIndex`/`parentId` are internal identifiers,
+    # and this tool's own results are where a model would otherwise reach for one.
+    assert "the document, not the chunk" in desc
+    assert "`title` and `source` verbatim" in desc
+    # Plain paths. A `file://` URL or a scheme-less markdown link arrives broken
+    # in every client checked, and models emit both spontaneously.
+    assert "never a markdown link or file://" in desc
+    assert "](" not in desc, "the description contains a markdown link"
+    # For the user's verification, not as a claim that the answer is true.
+    assert "so the user can verify it" in desc
+
+
+async def test_the_two_statements_of_the_citation_policy_agree(app):
+    """One policy, two channels — Claude Code receives both at once.
+
+    Both texts are read off the wire, so this fails on a divergence introduced
+    at either end: trimming the instructions block, or rewording the tool
+    description. That is the point of pinning phrases rather than paraphrases —
+    a client handed a contradiction has no way to resolve it, and the two texts
+    are edited months apart.
+    """
+    async with Client(app()) as c:
+        instructions = _flat(c.initialize_result.instructions or "")
+        descriptions = {t.name: t.description or "" for t in await c.list_tools()}
+    description = _flat(descriptions["query_documents"])
+
+    for phrase in CITATION_INVARIANTS:
+        assert phrase in instructions, f"{phrase!r} left the server instructions"
+        assert phrase in description, f"{phrase!r} left the query_documents description"
 
 
 def test_instructions_stay_within_the_client_truncation_budget():
