@@ -73,6 +73,11 @@ The slow test downloads the model on first run and caches it; it is excluded by
 default via `addopts = "-m 'not slow'"`. Do not remove that marker to "make CI
 faster" — the point is that ordinary runs stay offline.
 
+`uv run --extra ocr ...` leaves the extra installed in `.venv`, and a later plain
+`uv run` does not remove it. "The suite is green without the extra" is therefore
+unverified until `uv sync --exact` has run — that is the command that takes the
+extra back out.
+
 ## Architecture Overview
 
 An MCP server and a CLI over one index. Both are thin shells around the same core

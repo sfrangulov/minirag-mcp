@@ -43,6 +43,9 @@ built on [fastmcp](https://github.com/jlowin/fastmcp),
 - **12 file formats** ingested via `markitdown` (PDF, DOCX, PPTX, XLSX,
   HTML, CSV, EPUB, Jupyter notebooks, Markdown, and plain text), plus direct
   text/markdown/HTML ingestion and URL fetching.
+- **Scans, with the optional `[ocr]` extra** — image-only PDFs are recognized
+  page by page and standalone images become documents, locally, on the CPU.
+  See [OCR for scanned documents](#ocr-for-scanned-documents).
 - **Searches without being asked** — the server ships a routing policy that
   clients put in front of the model, so a question your documents can answer
   goes to the index instead of to the model's memory. See [Search by
@@ -211,6 +214,10 @@ chunking and only its alt text is kept. Image links that point at a path or an
 http URL are references, not inlined pictures, and stay as written, as does a
 `data:` URI inside a fenced code block.
 
+A PDF that is a scan carries no text to convert, and image files are not in that
+list at all. Both need the optional `[ocr]` extra — see [OCR for scanned
+documents](#ocr-for-scanned-documents).
+
 Two more ways to get content in without a file on disk:
 
 - **`ingest_data`** — hand the server text, Markdown, or HTML content
@@ -221,6 +228,69 @@ Two more ways to get content in without a file on disk:
   the network. Private and local hosts are refused unless
   `ALLOW_PRIVATE_URLS` says otherwise — see
   [Security and Operation](#security-and-operation).
+
+## OCR for scanned documents
+
+A scanned PDF is a picture of a page. `markitdown` finds no text in it, so the
+document reaches the index empty — which is to say it does not reach the index at
+all. The optional `[ocr]` extra reads those pages locally, on the CPU
+([RapidOCR](https://github.com/RapidAI/RapidOCR) on the same ONNX runtime the
+embedding model already uses), and turns standalone image files into documents.
+
+It is an extra rather than a dependency because it adds roughly 160 MB of wheels
+that a corpus of Markdown and Office documents has no use for. Install it by
+asking for the extra instead of the bare package:
+
+```bash
+uv tool install 'minirag-mcp[ocr]'
+```
+
+or, in any client config on this page, replace `uvx minirag-mcp` with:
+
+```
+uvx --from 'minirag-mcp[ocr]' minirag-mcp
+```
+
+As an argument list, that is `["--from", "minirag-mcp[ocr]", "minirag-mcp"]`.
+
+The recognition models are downloaded once, into `CACHE_DIR` next to the embedding
+model, and every recognition after that is offline. A download that fails is a
+loud per-file error, not an empty document.
+
+What the extra changes:
+
+- **Scanned PDF pages are recognized page by page.** A page whose text layer
+  holds fewer than `RAG_OCR_MIN_CHARS_PER_PAGE` characters is treated as a scan
+  and OCRed; pages with a real text layer keep the text they already have. Per
+  page rather than per document, so a typed cover sheet in front of 50 scanned
+  pages cannot hide them. The recognized text is appended after the converted
+  document rather than woven back into page order — that keeps the text pages'
+  own tables and headings intact instead of flattening the whole file into raw
+  per-page text the moment one page needs OCR.
+- **Image files become documents.** `.png` `.jpg` `.jpeg` `.tiff` `.tif` `.bmp`
+  `.webp` join the scan whitelist, titled from the filename by the same rules as
+  everything else. A multi-page TIFF — what a scanner or a fax gateway writes —
+  is read as all of its pages, not just the first. These extensions are
+  recognized **only when the extra is installed**: without it images are not
+  scanned at all, since most images under a documents folder are illustrations,
+  and their absence is silence rather than an error.
+- **Without the extra, a scanned PDF fails loudly** — naming the install command
+  — instead of being indexed as an empty document. `sync` counts it as one failed
+  file and carries on with the rest. A PDF whose text layer is merely short (a
+  certificate, a title page) is kept as it is, exactly as before.
+
+How a document entered the index is visible in both shells: `list_files` reports
+an `ocrEngine` field per source (`"rapidocr"`, or `""` for text extracted
+normally), and `minirag-mcp list` prints `[ocr:rapidocr]` after the line for such
+a file.
+
+**OCR text is not authoritative over the source scan.** Measured on a real
+Russian scanned invoice against a checklist of 27 verbatim-searchable facts —
+names, tax ids, amounts, dates — this tier recovered 21. The six misses are
+recognition errors in low-contrast regions: `р`→`о` and `ц`→`и` confusions inside
+company names, Cyrillic `Б` read as Latin `6` or `E` inside codes, one dropped
+product name and one dropped total. Search over a scan finds the document; the
+document is what you read, and the scan is what settles a disputed figure.
 
 <a id="chunking"></a>
 ## Chunking
@@ -720,6 +790,8 @@ merges with them.
 | `RAG_GROUPING` | unset | See [Search Tuning](#search-tuning). |
 | `RAG_MAX_DISTANCE` | unset | See [Search Tuning](#search-tuning). |
 | `RAG_MAX_FILES` | unset | See [Search Tuning](#search-tuning). |
+| `RAG_OCR_LANG` | `eslav` | Recognition language for the `[ocr]` extra, as a `rapidocr` language id. The default is East Slavic because the stock `ch`/`en` model silently drops Cyrillic altogether, so a Cyrillic-capable model has to be the default rather than an opt-in. An unknown value is an error that names the valid ids. See [OCR](#ocr-for-scanned-documents). |
+| `RAG_OCR_MIN_CHARS_PER_PAGE` | `25` | A PDF page whose text layer holds fewer characters than this is treated as a scan and sent to OCR. `0` disables the check, so no page is ever OCRed and a PDF is only ever taken as converted. See [OCR](#ocr-for-scanned-documents). |
 | `RAG_INSTRUCTIONS_APPEND` | unset | Extra text appended as a final paragraph to the instructions the server hands the client at connect time — for what the server can't know about your corpus, e.g. `"internal engineering specifications; prefer exact document codes"`. Appended, never merged, and it shares the same 2048-character client budget. See [Search by Default](#search-by-default). |
 | `ALLOW_PRIVATE_URLS` | unset (off) | Let `ingest_url` fetch hosts that resolve to loopback, link-local, private, reserved, or unspecified addresses. Off by default — see [Security and Operation](#security-and-operation). Accepts `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off`; anything else is a configuration error. |
 
