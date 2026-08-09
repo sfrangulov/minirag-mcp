@@ -53,6 +53,31 @@ def test_unsupported_extension(pipe):
         p.ingest_file(f)
 
 
+def test_ingest_file_carries_ocr_engine(pipe, monkeypatch):
+    from minirag_mcp import ocr
+
+    p, store, root = pipe
+    monkeypatch.setattr(ocr, "available", lambda: True)
+    monkeypatch.setattr(ocr, "ocr_image", lambda path, config: "scanned contract text")
+    img = root / "scan.png"
+    img.write_bytes(b"...")
+    result = p.ingest_file(img)
+    assert result.chunk_count >= 1
+    info = store.get_source(str(img))
+    assert info.ocr_engine == ocr.ENGINE_RAPIDOCR
+
+
+def test_ingest_file_image_without_ocr_is_unsupported(pipe, monkeypatch):
+    from minirag_mcp import ocr
+
+    p, _, root = pipe
+    monkeypatch.setattr(ocr, "available", lambda: False)
+    img = root / "scan.png"
+    img.write_bytes(b"...")
+    with pytest.raises(UnsupportedFormatError):
+        p.ingest_file(img)
+
+
 def test_file_too_large(pipe, tmp_path, fake_embedder):
     from minirag_mcp.config import load_config
 
