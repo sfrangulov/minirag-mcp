@@ -273,7 +273,10 @@ What the extra changes:
   is read as all of its pages, not just the first. These extensions are
   recognized **only when the extra is installed**: without it images are not
   scanned at all, since most images under a documents folder are illustrations,
-  and their absence is silence rather than an error.
+  and their absence is silence rather than an error. Images already indexed are
+  kept rather than deleted when the extra is not there: `sync` counts them as
+  `unreadable` and names each one, and the listing gives them the state
+  `unreadable` instead of dropping them.
 - **Without the extra, a scanned PDF fails loudly** — naming the install command
   — instead of being indexed as an empty document. `sync` counts it as one failed
   file and carries on with the rest. A PDF whose text layer is merely short (a
@@ -283,6 +286,10 @@ How a document entered the index is visible in both shells: `list_files` reports
 an `ocrEngine` field per source (`"rapidocr"`, or `""` for text extracted
 normally), and `minirag-mcp list` prints `[ocr:rapidocr]` after the line for such
 a file.
+
+Whether this install can OCR at all is a `status` field in both shells: `ocr`
+names the engine (`"rapidocr"`) or reads `"unavailable"`, and when it is
+unavailable a second key, `ocrHint`, carries the install command.
 
 **OCR text is not authoritative over the source scan.** Measured on a real
 Russian scanned invoice against a checklist of 27 verbatim-searchable facts —
