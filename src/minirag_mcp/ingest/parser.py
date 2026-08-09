@@ -410,8 +410,8 @@ def parse_file(path: Path, config: Config | None = None) -> ParsedDoc:
             text = ocr.ocr_image(path, config)
         except ocr.OcrError as e:
             raise ParserError(str(e)) from e
-        # Not `_file_title`: OCR output carries no heading the author wrote, so its
-        # first line is whatever the scanner caught at the top of the page.
+        # Not `_file_title`: it prefers an authored ATX heading to the filename, and a
+        # recognized page has none — a `# ` line in OCR output is scanner noise.
         title = _stem_title(_strip_extension_suffix(path.stem))
         return ParsedDoc(markdown=text, title=title, ocr_engine=ocr.ENGINE_RAPIDOCR)
     try:
@@ -455,10 +455,12 @@ def _pdf_with_ocr_fallback(path: Path, markdown: str, config: Config) -> tuple[s
     if not needs:
         return markdown, ""
     if not ocr.available():
-        # Every page being under the threshold is not the same as the file having
-        # nothing: a certificate or a title page carries a few real characters, and
-        # refusing it would drop a document the default install indexed before.
-        if len(needs) == len(page_texts) and not markdown.strip():
+        # Reached only with an empty conversion: the short-circuit above has already
+        # returned every PDF markitdown got text out of, and that is what keeps a
+        # certificate or a title page — a few real characters, under the threshold on
+        # every page — from being refused. All that is left to tell apart here is a
+        # file pdfminer still reads from one with no text layer at all.
+        if len(needs) == len(page_texts):
             raise ParserError(
                 f"{path} looks like a scanned PDF (no text layer); {ocr.INSTALL_HINT}"
             )
