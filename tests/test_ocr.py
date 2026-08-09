@@ -38,11 +38,21 @@ def test_assemble_lines_reading_order():
         [[10, 100], [200, 100], [200, 120], [10, 120]],  # line 2
     ]
     txts = ["right", "left", "below"]
-    assert ocr.assemble_lines(boxes, txts) == "left right\nbelow"
+    assert ocr.assemble_lines(boxes, txts, Path("/docs/scan.png")) == "left right\nbelow"
 
 
 def test_assemble_lines_empty():
-    assert ocr.assemble_lines([], []) == ""
+    assert ocr.assemble_lines([], [], Path("/docs/scan.png")) == ""
+
+
+def test_assemble_lines_mismatched_engine_output_raises_ocr_error():
+    """One box short of its text is an engine-contract violation, and `strict=True`
+    reports it as a bare ValueError with no file and no counts in it."""
+    boxes = [[[0, 0], [10, 0], [10, 10], [0, 10]]]
+    with pytest.raises(ocr.OcrError) as e:
+        ocr.assemble_lines(boxes, ["a", "b"], Path("/docs/scan.png"))
+    assert "scan.png" in str(e.value)
+    assert "1" in str(e.value) and "2" in str(e.value)
 
 
 def test_ocr_image_without_extra_raises_loudly(tmp_path, monkeypatch):
@@ -145,7 +155,7 @@ def test_ocr_image_recognizes_every_frame_of_a_multi_page_image(tmp_path, monkey
 
     monkeypatch.setattr(ocr, "available", lambda: True)
     monkeypatch.setitem(sys.modules, "cv2", _FakeCv2(["page-a", "page-b", "page-c"]))
-    monkeypatch.setattr(ocr, "_recognize", lambda img, config: f"text of {img}")
+    monkeypatch.setattr(ocr, "_recognize", lambda img, config, path: f"text of {img}")
     # Orientation is pinned by the slow rotation test; here it would only reject the
     # stand-in frames, and only on a machine that happens to have the extra installed.
     monkeypatch.setattr(ocr, "_orient", lambda img: img)
@@ -166,6 +176,122 @@ def test_ocr_image_undecodable_bytes_still_raise(tmp_path, monkeypatch):
     img.write_bytes(b"not an image")
     with pytest.raises(ocr.OcrError, match="could not decode"):
         ocr.ocr_image(img, load_config({}, cwd=tmp_path))
+
+
+class _CrashingCv2:
+    """A decoder that raises instead of returning `ok=False`. cv2 does both."""
+
+    IMREAD_COLOR = 1
+
+    def imdecodemulti(self, buf, flags):
+        raise ValueError("cv2 error: unsupported depth")
+
+
+def test_ocr_image_decoder_crash_raises_ocr_error(tmp_path, monkeypatch):
+    import sys
+
+    from minirag_mcp.config import load_config
+
+    monkeypatch.setattr(ocr, "available", lambda: True)
+    monkeypatch.setitem(sys.modules, "cv2", _CrashingCv2())
+    img = tmp_path / "corrupt.tiff"
+    img.write_bytes(b"truncated scanner output")
+    with pytest.raises(ocr.OcrError, match=r"corrupt\.tiff.*unsupported depth"):
+        ocr.ocr_image(img, load_config({}, cwd=tmp_path))
+
+
+class _FakePage:
+    def __init__(self, error: Exception | None = None):
+        self._error = error
+
+    def render(self, scale):
+        if self._error is not None:
+            raise self._error
+        raise AssertionError("these tests only exercise the failing render path")
+
+
+class _FakeDoc:
+    def __init__(self, pages):
+        self._pages = list(pages)
+        self.closed = False
+
+    def __getitem__(self, index):
+        return self._pages[index]
+
+    def close(self):
+        self.closed = True
+
+
+class _FakePdfium:
+    """Just enough pypdfium2 to drive ocr_pdf's open/lookup/render path without the extra."""
+
+    def __init__(self, *, open_error: Exception | None = None, doc: _FakeDoc | None = None):
+        self._open_error = open_error
+        self._doc = doc
+
+    def PdfDocument(self, path):
+        if self._open_error is not None:
+            raise self._open_error
+        return self._doc
+
+
+def _install_pdfium(monkeypatch, fake: _FakePdfium) -> None:
+    import sys
+
+    monkeypatch.setattr(ocr, "available", lambda: True)
+    monkeypatch.setitem(sys.modules, "pypdfium2", fake)
+
+
+def _pdf(tmp_path: Path, name: str) -> Path:
+    p = tmp_path / name
+    p.write_bytes(b"%PDF-1.7 the renderer is faked; these bytes are never parsed")
+    return p
+
+
+def test_ocr_pdf_unopenable_file_raises_ocr_error(tmp_path, monkeypatch):
+    """An encrypted or malformed PDF markitdown already handled: pypdfium2 raises its own
+    exception type, which left the module unnamed, uncontextualised and not an OcrError."""
+    from minirag_mcp.config import load_config
+
+    _install_pdfium(monkeypatch, _FakePdfium(open_error=RuntimeError("password required")))
+    p = _pdf(tmp_path, "encrypted.pdf")
+    with pytest.raises(ocr.OcrError, match=r"encrypted\.pdf.*password required"):
+        ocr.ocr_pdf(p, load_config({}, cwd=tmp_path), [0])
+
+
+def test_ocr_pdf_page_the_renderer_does_not_have_raises_ocr_error(tmp_path, monkeypatch):
+    """pdfminer counts the pages OCR routing asks for and pypdfium2 supplies them. When
+    the two disagree on page count, `doc[index]` raised a bare IndexError."""
+    from minirag_mcp.config import load_config
+
+    doc = _FakeDoc([_FakePage()])
+    _install_pdfium(monkeypatch, _FakePdfium(doc=doc))
+    p = _pdf(tmp_path, "short.pdf")
+    with pytest.raises(ocr.OcrError, match=r"short\.pdf"):
+        ocr.ocr_pdf(p, load_config({}, cwd=tmp_path), [3])
+    assert doc.closed, "the document must still be closed when a page lookup fails"
+
+
+def test_ocr_pdf_unrenderable_page_raises_ocr_error(tmp_path, monkeypatch):
+    from minirag_mcp.config import load_config
+
+    doc = _FakeDoc([_FakePage(RuntimeError("bitmap allocation failed"))])
+    _install_pdfium(monkeypatch, _FakePdfium(doc=doc))
+    p = _pdf(tmp_path, "unrenderable.pdf")
+    with pytest.raises(ocr.OcrError, match=r"unrenderable\.pdf.*bitmap allocation failed"):
+        ocr.ocr_pdf(p, load_config({}, cwd=tmp_path), [0])
+    assert doc.closed
+
+
+def test_recognize_engine_failure_names_the_file(tmp_path, monkeypatch):
+    from minirag_mcp.config import load_config
+
+    def crash(img):
+        raise RuntimeError("onnxruntime session failed")
+
+    monkeypatch.setattr(ocr, "_engine", lambda config: crash)
+    with pytest.raises(ocr.OcrError, match=r"scan\.png.*onnxruntime session failed"):
+        ocr._recognize(object(), load_config({}, cwd=tmp_path), tmp_path / "scan.png")
 
 
 @pytest.mark.slow

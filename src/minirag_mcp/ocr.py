@@ -51,18 +51,27 @@ _engines: dict[tuple[str, str], object] = {}
 _RENDER_SCALE = 300 / 72
 
 
-def assemble_lines(boxes: list, txts: list) -> str:
+def assemble_lines(boxes: list, txts: list, source: Path | str) -> str:
     """Reading order for flat OCR line boxes: rows by y-overlap, then x.
 
     RapidOCR returns detection quads in image order, not reading order. Two
     boxes share a row when their vertical centers sit within half the median
     box height of each other — a threshold that tolerates slight skew without
     merging adjacent lines.
+
+    `source` is carried only to name the file if the engine breaks its own
+    contract and hands back one list longer than the other.
     """
     if not txts:
         return ""
+    try:
+        pairs = list(zip(boxes, txts, strict=True))
+    except ValueError as e:
+        raise OcrError(
+            f"OCR of {source} returned {len(boxes)} box(es) for {len(txts)} text(s)"
+        ) from e
     items = []
-    for box, txt in zip(boxes, txts, strict=True):
+    for box, txt in pairs:
         ys = [pt[1] for pt in box]
         xs = [pt[0] for pt in box]
         items.append(((min(ys) + max(ys)) / 2, min(xs), max(ys) - min(ys), txt))
@@ -89,7 +98,10 @@ def _import_error_as_ocr_error(e: ImportError) -> OcrError:
     a broken install (e.g. ABI mismatch) must surface as loud OcrError, not a
     raw ImportError.
     """
-    return OcrError(f"OCR dependencies are installed but failed to import: {e}; {INSTALL_HINT}")
+    return OcrError(
+        "an OCR dependency is present but failed to import — a broken or partial "
+        f"install: {e}; reinstall to repair it, {INSTALL_HINT}"
+    )
 
 
 def _engine(config: Config):
@@ -168,11 +180,15 @@ def _orientation_engine():
     return _orientation[0]
 
 
-def _recognize(img, config: Config) -> str:
-    result = _engine(config)(img)
+def _recognize(img, config: Config, path: Path) -> str:
+    engine = _engine(config)
+    try:
+        result = engine(img)
+    except Exception as e:
+        raise OcrError(f"OCR engine failed on {path}: {e}") from e
     if result.txts is None:
         return ""
-    return assemble_lines(list(result.boxes), list(result.txts))
+    return assemble_lines(list(result.boxes), list(result.txts), path)
 
 
 def ocr_pdf(path: Path, config: Config, pages: Sequence[int]) -> dict[int, str]:
@@ -184,12 +200,23 @@ def ocr_pdf(path: Path, config: Config, pages: Sequence[int]) -> dict[int, str]:
         raise _import_error_as_ocr_error(e) from e
 
     out: dict[int, str] = {}
-    doc = pdfium.PdfDocument(str(path))
+    try:
+        doc = pdfium.PdfDocument(str(path))
+    except Exception as e:
+        raise OcrError(f"could not open {path} for OCR: {e}") from e
     try:
         for index in pages:
-            bitmap = doc[index].render(scale=_RENDER_SCALE)
-            img = _orient(bitmap.to_numpy())
-            out[index] = _recognize(img, config)
+            try:
+                page = doc[index]
+            except Exception as e:
+                # The pages to OCR are chosen from pdfminer's page list; the renderer
+                # opening the same file is a second parser and can count differently.
+                raise OcrError(f"{path} has no page {index} to render for OCR: {e}") from e
+            try:
+                bitmap = page.render(scale=_RENDER_SCALE).to_numpy()
+            except Exception as e:
+                raise OcrError(f"could not render page {index} of {path} for OCR: {e}") from e
+            out[index] = _recognize(_orient(bitmap), config, path)
             logger.info("ocr: %s page %d -> %d chars", path, index, len(out[index]))
     finally:
         doc.close()
@@ -209,9 +236,14 @@ def ocr_image(path: Path, config: Config) -> str:
     # Russian. imdecodemulti over imdecode because imdecode returns the first frame
     # only, and multi-page TIFF is ordinary scanner and fax output here — a 20-page
     # scan would index as page 1 and report success.
-    data = np.fromfile(str(path), dtype=np.uint8)
-    ok, frames = cv2.imdecodemulti(data, cv2.IMREAD_COLOR)
+    try:
+        data = np.fromfile(str(path), dtype=np.uint8)
+        ok, frames = cv2.imdecodemulti(data, cv2.IMREAD_COLOR)
+    except Exception as e:
+        # cv2 reports a corrupt file either way: `ok=False` for some, its own
+        # exception type for others.
+        raise OcrError(f"could not decode image {path}: {e}") from e
     if not ok or not frames:
         raise OcrError(f"could not decode image {path}")
     logger.info("ocr: %s -> %d frame(s)", path, len(frames))
-    return "\n\n".join(text for f in frames if (text := _recognize(_orient(f), config)))
+    return "\n\n".join(text for f in frames if (text := _recognize(_orient(f), config, path)))
