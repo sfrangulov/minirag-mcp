@@ -402,7 +402,7 @@ def parse_file(path: Path, config: Config | None = None) -> ParsedDoc:
         except ocr.OcrError as e:
             raise ParserError(str(e)) from e
         stem = _strip_extension_suffix(path.stem)
-        title = _display_stem(stem) if _is_informative_stem(stem) else path.stem
+        title = _display_stem(stem) or stem
         return ParsedDoc(markdown=text, title=title, ocr_engine=ocr.ENGINE_RAPIDOCR)
     try:
         result = _md().convert(str(path))

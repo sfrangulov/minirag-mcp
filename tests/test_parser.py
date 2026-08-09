@@ -396,3 +396,34 @@ def test_parse_file_image_without_ocr_raises_hint(tmp_path, monkeypatch):
     img.write_bytes(b"...")
     with pytest.raises(parser.ParserError, match=r"minirag-mcp\[ocr\]"):
         parser.parse_file(img, load_config({}, cwd=tmp_path))
+
+
+def test_parse_file_image_title_strips_leftover_extension(tmp_path, monkeypatch):
+    """A non-informative image stem still goes through the same extension-stripping
+    as every other file's fallback title — "scan.png.png" must not surface "scan.png"
+    as the title, the exact leftover-extension case _EXTENSION_SUFFIX_RE exists for."""
+    from minirag_mcp import ocr
+    from minirag_mcp.config import load_config
+    from minirag_mcp.ingest import parser
+
+    monkeypatch.setattr(ocr, "available", lambda: True)
+    monkeypatch.setattr(ocr, "ocr_image", lambda path, config: "text")
+    img = tmp_path / "scan.png.png"
+    img.write_bytes(b"...")
+    doc = parser.parse_file(img, load_config({}, cwd=tmp_path))
+    assert doc.title == "scan"
+
+
+def test_parse_file_image_title_normalizes_underscores(tmp_path, monkeypatch):
+    """A non-informative image stem's underscores must become spaces, matching every
+    other file's fallback title (`_file_title`'s `_display_stem(stem) or stem`)."""
+    from minirag_mcp import ocr
+    from minirag_mcp.config import load_config
+    from minirag_mcp.ingest import parser
+
+    monkeypatch.setattr(ocr, "available", lambda: True)
+    monkeypatch.setattr(ocr, "ocr_image", lambda path, config: "text")
+    img = tmp_path / "IMG_20260807_123456.png"
+    img.write_bytes(b"...")
+    doc = parser.parse_file(img, load_config({}, cwd=tmp_path))
+    assert doc.title == "IMG 20260807 123456"
