@@ -311,6 +311,7 @@ def create_app(
                     "title": s.title,
                     "state": s.state,
                     "chunkCount": s.chunk_count,
+                    "ocrEngine": s.ocr_engine,
                 }
                 for s in states
             ]

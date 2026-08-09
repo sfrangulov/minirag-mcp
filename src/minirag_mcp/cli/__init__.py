@@ -364,11 +364,16 @@ def list_cmd(
                 "title": s.title,
                 "state": s.state,
                 "chunkCount": s.chunk_count,
+                "ocrEngine": s.ocr_engine,
             }
             for s in states
         ]
     }
-    human = "\n".join(f"[{s.state}] {s.source} ({s.chunk_count} chunks)" for s in states)
+    human = "\n".join(
+        f"[{s.state}] {s.source} ({s.chunk_count} chunks)"
+        + (f" [ocr:{s.ocr_engine}]" if s.ocr_engine else "")
+        for s in states
+    )
     _emit(payload, json, human or "no files found")
 
 

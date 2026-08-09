@@ -44,6 +44,9 @@ class ChunkRecord:
     # Chunks cut from the same parent section share this; the section's text is
     # rebuilt from them rather than stored a second time.
     parent_id: str = ""
+    # Which OCR backend produced this chunk's text, "" when none was used. Set by the
+    # pipeline (Task 7); this column only carries it through storage and listings.
+    ocr_engine: str = ""
     scheme_version: int = SCHEME_VERSION
 
 
@@ -73,6 +76,8 @@ class SourceInfo:
     # Oldest chunking scheme among this source's chunks. Below SCHEME_VERSION means
     # the source needs re-ingesting even though its bytes on disk are unchanged.
     scheme_version: int = SCHEME_VERSION
+    # First non-empty OCR engine among this source's chunks, "" when none used OCR.
+    ocr_engine: str = ""
 
 
 _META_COLS = [
@@ -83,6 +88,7 @@ _META_COLS = [
     "file_hash",
     "mtime",
     "scheme_version",
+    "ocr_engine",
 ]
 
 
@@ -158,7 +164,11 @@ class DimensionMismatchError(Exception):
 # Columns added after the first release. An index created before them is migrated in
 # place on open; the SQL expression is the value every pre-existing row gets, and
 # scheme_version 0 is precisely the marker that says "cut by an older scheme".
-_ADDED_COLUMNS = {"parent_id": "''", "scheme_version": "CAST(0 AS INT)"}
+_ADDED_COLUMNS = {
+    "parent_id": "''",
+    "scheme_version": "CAST(0 AS INT)",
+    "ocr_engine": "''",
+}
 
 
 def _scheme_of(row: dict) -> int:
@@ -211,6 +221,7 @@ class Store:
                     pa.field("mtime", pa.float64()),
                     pa.field("ingested_at", pa.string()),
                     pa.field("parent_id", pa.string()),
+                    pa.field("ocr_engine", pa.string()),
                     pa.field("scheme_version", pa.int32()),
                 ]
             )
@@ -371,11 +382,13 @@ class Store:
         by_source: dict[str, dict] = {}
         counts: dict[str, int] = {}
         schemes: dict[str, int] = {}
+        engines: dict[str, str] = {}
         for row in self._iter_meta(scopes):
             by_source.setdefault(row["source"], row)
             counts[row["source"]] = counts.get(row["source"], 0) + 1
             scheme = _scheme_of(row)
             schemes[row["source"]] = min(schemes.get(row["source"], scheme), scheme)
+            engines[row["source"]] = engines.get(row["source"]) or row.get("ocr_engine", "")
         return [
             SourceInfo(
                 source=src,
@@ -385,6 +398,7 @@ class Store:
                 file_hash=row["file_hash"],
                 mtime=row["mtime"],
                 scheme_version=schemes[src],
+                ocr_engine=engines[src] or "",
             )
             for src, row in sorted(by_source.items())
         ]
@@ -400,6 +414,7 @@ class Store:
         if not rows:
             return None
         r = rows[0]
+        engine = next((row.get("ocr_engine", "") for row in rows if row.get("ocr_engine")), "")
         return SourceInfo(
             source=r["source"],
             source_type=r["source_type"],
@@ -408,6 +423,7 @@ class Store:
             file_hash=r["file_hash"],
             mtime=r["mtime"],
             scheme_version=min(_scheme_of(row) for row in rows),
+            ocr_engine=engine,
         )
 
     def stale_chunk_count(self) -> int:

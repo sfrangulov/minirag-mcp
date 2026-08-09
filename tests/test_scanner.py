@@ -6,7 +6,9 @@ from minirag_mcp.ingest.scanner import ScanEntry, compute_diff, scan_roots
 from minirag_mcp.store import SourceInfo
 
 
-def info(source, *, source_type="file", file_hash="", mtime=0.0, scheme=SCHEME_VERSION):
+def info(
+    source, *, source_type="file", file_hash="", mtime=0.0, scheme=SCHEME_VERSION, ocr_engine=""
+):
     return SourceInfo(
         source=source,
         source_type=source_type,
@@ -15,6 +17,7 @@ def info(source, *, source_type="file", file_hash="", mtime=0.0, scheme=SCHEME_V
         file_hash=file_hash,
         mtime=mtime,
         scheme_version=scheme,
+        ocr_engine=ocr_engine,
     )
 
 
@@ -149,6 +152,27 @@ def test_compute_states_ignores_data_source_colliding_with_file_path(tmp_path):
     states = compute_states(entries, indexed)
     disk_rows = [s for s in states if s.source_type == "file"]
     assert [s.state for s in disk_rows] == ["not_ingested"]
+
+
+def test_compute_states_threads_ocr_engine(tmp_path):
+    """`FileState.ocr_engine` must come from the indexed `prior`, in every branch that
+    builds one: unchanged-on-disk, changed-on-disk, and the data/url tail loop."""
+    from minirag_mcp.ingest.scanner import compute_states
+
+    a = tmp_path / "a.md"
+    a.write_text("ocr'd content")
+    b = tmp_path / "b.md"
+    b.write_text("ocr'd content, changed on disk")
+    entries = scan_roots([tmp_path])
+    indexed = [
+        info(str(a), file_hash=file_sha256(a), mtime=a.stat().st_mtime, ocr_engine="rapidocr"),
+        info(str(b), file_hash="stale-hash", mtime=-1.0, ocr_engine="rapidocr"),
+        info("note-1", source_type="data", ocr_engine="rapidocr"),
+    ]
+    states = {s.source: s for s in compute_states(entries, indexed)}
+    assert states[str(a)].state == "ingested" and states[str(a)].ocr_engine == "rapidocr"
+    assert states[str(b)].state == "stale" and states[str(b)].ocr_engine == "rapidocr"
+    assert states["note-1"].ocr_engine == "rapidocr"
 
 
 def test_scan_roots_skips_symlink_escaping_root(tmp_path):

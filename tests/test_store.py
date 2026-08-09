@@ -6,7 +6,7 @@ import pytest
 from minirag_mcp.store import ChunkRecord, DimensionMismatchError, Store
 
 
-def rec(source, i, text, vec=None, source_type="file", title="T"):
+def rec(source, i, text, vec=None, source_type="file", title="T", ocr_engine=""):
     return ChunkRecord(
         id=f"{source}#{i}",
         source=source,
@@ -18,6 +18,7 @@ def rec(source, i, text, vec=None, source_type="file", title="T"):
         file_hash="h",
         mtime=1.0,
         ingested_at="2026-08-07T00:00:00+00:00",
+        ocr_engine=ocr_engine,
     )
 
 
@@ -215,6 +216,27 @@ def test_scope_prefix_with_like_wildcards_not_overmatching(store):
         store.replace_source(src, [rec(src, 0, "x")])
     assert [s.source for s in store.list_sources(scopes=("/docs_api",))] == ["/docs_api/f1.md"]
     assert [s.source for s in store.list_sources(scopes=("/100%done",))] == ["/100%done/f4.md"]
+
+
+def test_ocr_engine_round_trips_and_aggregates(store):
+    store.replace_source(
+        "/s.md",
+        [
+            rec("/s.md", 0, "alpha", ocr_engine="rapidocr"),
+            rec("/s.md", 1, "beta"),
+        ],
+    )
+    info = store.get_source("/s.md")
+    assert info.ocr_engine == "rapidocr"
+    assert [s.ocr_engine for s in store.list_sources()] == ["rapidocr"]
+
+
+def test_old_table_without_ocr_column_migrates():
+    """Guards the migration map itself: a pre-OCR index must gain this column on open,
+    the same way `_ensure_scheme_columns` already backfills `parent_id`/`scheme_version`."""
+    from minirag_mcp.store import _ADDED_COLUMNS
+
+    assert _ADDED_COLUMNS["ocr_engine"] == "''"
 
 
 def test_open_failure_that_is_not_a_missing_table_propagates(tmp_path, monkeypatch):

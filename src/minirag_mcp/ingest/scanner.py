@@ -167,6 +167,7 @@ class FileState:
     title: str
     state: str  # "ingested" | "not_ingested" | "stale" | "stale_scheme"
     chunk_count: int
+    ocr_engine: str = ""
 
 
 def _indexed_state(prior: SourceInfo) -> str:
@@ -211,13 +212,23 @@ def compute_states(entries: list[ScanEntry], indexed: list[SourceInfo]) -> list[
             states.append(FileState(str(e.path), "file", "", "not_ingested", 0))
         elif prior.mtime == e.mtime or prior.file_hash == file_sha256(e.path):
             state = _indexed_state(prior)
-            states.append(FileState(str(e.path), "file", prior.title, state, prior.chunk_count))
+            states.append(
+                FileState(
+                    str(e.path), "file", prior.title, state, prior.chunk_count, prior.ocr_engine
+                )
+            )
         else:
-            states.append(FileState(str(e.path), "file", prior.title, "stale", prior.chunk_count))
+            states.append(
+                FileState(
+                    str(e.path), "file", prior.title, "stale", prior.chunk_count, prior.ocr_engine
+                )
+            )
     for s in indexed:
         if s.source_type in ("data", "url"):
             states.append(
-                FileState(s.source, s.source_type, s.title, _indexed_state(s), s.chunk_count)
+                FileState(
+                    s.source, s.source_type, s.title, _indexed_state(s), s.chunk_count, s.ocr_engine
+                )
             )
     states.sort(key=lambda s: s.source)
     return states
