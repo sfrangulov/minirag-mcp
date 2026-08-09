@@ -21,6 +21,7 @@ from minirag_mcp.instructions import build_instructions
 from minirag_mcp.results import (
     aggregate_sources,
     join_document,
+    ocr_status,
     parent_map,
     result_dict,
     scheme_status,
@@ -355,6 +356,10 @@ def create_app(
         staleChunkCount counts chunks still stored under an older scheme —
         when it is above zero, schemeWarning explains that those chunks need
         a re-sync to be rebuilt.
+
+        ocr names the OCR engine this install can use, or is "unavailable"
+        when the optional extra is missing — scanned PDFs and images cannot
+        be indexed then, and ocrHint says what to install.
         """
         if config is None or config_error is not None:
             return {"version": __version__, "configError": config_error or "no configuration"}
@@ -365,6 +370,7 @@ def create_app(
             "model": config.model_name,
             "hybridWeight": config.hybrid_weight,
             "chunkScheme": SCHEME_VERSION,
+            **ocr_status(),
         }
         try:
             c = ctx()

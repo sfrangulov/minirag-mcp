@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 import minirag_mcp.cli as cli
+from minirag_mcp import ocr
 from minirag_mcp.chunker import SCHEME_VERSION
 from minirag_mcp.lock import sync_lock
 from minirag_mcp.store import MAX_TOP_K, Store
@@ -456,3 +457,21 @@ def test_cli_status_reports_the_chunking_scheme(corpus, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["chunkScheme"] == SCHEME_VERSION
     assert payload["staleChunkCount"] == 0
+
+
+def test_cli_status_names_the_ocr_engine_when_the_extra_is_installed(corpus, capsys, monkeypatch):
+    monkeypatch.setattr(ocr, "available", lambda: True)
+    run(["status", "--base-dir", str(corpus), "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ocr"] == ocr.ENGINE_RAPIDOCR
+    assert "ocrHint" not in payload
+
+
+def test_cli_status_says_ocr_is_unavailable_and_how_to_get_it(corpus, capsys, monkeypatch):
+    """The feature's whole failure mode is the extra being absent, and until now the one
+    command you run to diagnose an install said nothing at all about it."""
+    monkeypatch.setattr(ocr, "available", lambda: False)
+    run(["status", "--base-dir", str(corpus), "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ocr"] == "unavailable"
+    assert "minirag-mcp[ocr]" in payload["ocrHint"]

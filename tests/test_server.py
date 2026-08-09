@@ -5,6 +5,7 @@ import pytest
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
+from minirag_mcp import ocr
 from minirag_mcp.chunker import SCHEME_VERSION
 from minirag_mcp.config import load_config
 from minirag_mcp.lock import sync_lock
@@ -348,6 +349,26 @@ async def test_read_file_reconstructs_the_document_rather_than_concatenating_chu
         *rows,
     ]
     assert f"{delimiter}\n{rows[0]}" in text
+
+
+async def test_status_names_the_ocr_engine_when_the_extra_is_installed(app, monkeypatch):
+    mcp, _root = app
+    monkeypatch.setattr(ocr, "available", lambda: True)
+    async with Client(mcp) as c:
+        st = (await c.call_tool("status", {})).data
+    assert st["ocr"] == ocr.ENGINE_RAPIDOCR
+    assert "ocrHint" not in st
+
+
+async def test_status_says_ocr_is_unavailable_and_how_to_get_it(app, monkeypatch):
+    """An agent that meets "this file needs OCR" has no other way to learn whether this
+    install can ever read it, or what to tell the user to run."""
+    mcp, _root = app
+    monkeypatch.setattr(ocr, "available", lambda: False)
+    async with Client(mcp) as c:
+        st = (await c.call_tool("status", {})).data
+    assert st["ocr"] == "unavailable"
+    assert "minirag-mcp[ocr]" in st["ocrHint"]
 
 
 async def test_status_reports_the_chunking_scheme(app):

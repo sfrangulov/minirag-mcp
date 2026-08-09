@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Sequence
 from pathlib import Path
 
+from minirag_mcp import ocr
 from minirag_mcp.chunker import join_parent
 from minirag_mcp.store import RESYNC_HINT, SearchResult, Store
 
@@ -89,6 +90,21 @@ def scheme_status(store: Store) -> dict:
             f"{stale} chunk(s) predate the current chunking scheme. {RESYNC_HINT}"
         )
     return out
+
+
+def ocr_status() -> dict:
+    """The OCR half of `status`, identical for the server and the CLI.
+
+    Measured, not configured: the extra is either importable in this interpreter or it
+    is not, and the whole of the feature turns on that one answer. Nothing here reads
+    the index, so the server reports it alongside the fields that do not need one.
+    """
+    if ocr.available():
+        return {"ocr": ocr.ENGINE_RAPIDOCR}
+    return {
+        "ocr": "unavailable",
+        "ocrHint": f"scanned PDFs and images cannot be indexed; {ocr.INSTALL_HINT}",
+    }
 
 
 def display_path(source: str, roots: Sequence[Path] = ()) -> str:

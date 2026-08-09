@@ -20,6 +20,7 @@ from minirag_mcp.lock import SyncLockBusy
 from minirag_mcp.results import (
     aggregate_sources,
     join_document,
+    ocr_status,
     parent_map,
     result_dict,
     scheme_status,
@@ -404,6 +405,7 @@ def status(
         "model": cfg.model_name,
         "hybridWeight": cfg.hybrid_weight,
         "chunkScheme": SCHEME_VERSION,
+        **ocr_status(),
         "chunkCount": store.chunk_count(),
         "sourceCount": store.source_count(),
         **scheme_status(store),
