@@ -888,7 +888,9 @@ release simply sits there looking like a build that hung.
    everything so far is local and reversible. Add `--dry-run --verbose` to see
    exactly what it would do first.
 
-   `version` in `pyproject.toml` is the only place the number lives.
+   `version` in `pyproject.toml` is the number's one editable home; the bump
+   propagates it to `uv.lock` and to both `"version"` fields in
+   [`server.json`](server.json), so no copy is ever updated by hand.
    `__version__` — what the `status` tool and `minirag-mcp --version` report —
    is read from the installed distribution's metadata, so it cannot drift from
    what was packaged.

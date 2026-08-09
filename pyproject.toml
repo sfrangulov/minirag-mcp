@@ -79,6 +79,28 @@ regex = true
 search = 'name = "minirag-mcp"\nversion = "{current_version}"'
 replace = 'name = "minirag-mcp"\nversion = "{new_version}"'
 
+# server.json is the MCP Registry's copy of this release, and it spells the
+# version twice: once for the server entry and once for the PyPI package it
+# points at. Both must equal the tag — publish-mcp.yml refuses a tag that
+# disagrees with either, and the registry itself rejects a re-publish of a
+# version it already holds, so a stale server.json fails the publish of a tag
+# whose wheel is already on PyPI, and the only way out of that is another
+# release. The two lines differ only by indentation, so they get one entry
+# each, anchored to whole lines; a single unanchored search would rewrite
+# whichever bump-my-version happened to reach first and silently leave the
+# other behind. tests/test_scaffold.py asserts both against pyproject.toml.
+[[tool.bumpversion.files]]
+filename = "server.json"
+regex = true
+search = '^  "version": "{current_version}",$'
+replace = '  "version": "{new_version}",'
+
+[[tool.bumpversion.files]]
+filename = "server.json"
+regex = true
+search = '^      "version": "{current_version}",$'
+replace = '      "version": "{new_version}",'
+
 [tool.pytest.ini_options]
 addopts = "-m 'not slow'"
 markers = ["slow: needs the real embedding model (downloads ~220 MB)"]

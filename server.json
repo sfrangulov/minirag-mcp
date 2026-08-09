@@ -1,0 +1,124 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.sfrangulov/minirag-mcp",
+  "description": "Local-first RAG MCP server: hybrid search over a folder of your own documents",
+  "version": "0.4.0",
+  "websiteUrl": "https://github.com/sfrangulov/minirag-mcp#readme",
+  "repository": {
+    "url": "https://github.com/sfrangulov/minirag-mcp",
+    "source": "github",
+    "id": "1327083343"
+  },
+  "packages": [
+    {
+      "registryType": "pypi",
+      "registryBaseUrl": "https://pypi.org",
+      "identifier": "minirag-mcp",
+      "version": "0.4.0",
+      "runtimeHint": "uvx",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "BASE_DIR",
+          "description": "One document root; also the security boundary for file access. Defaults to the process working directory. Ignored when BASE_DIRS is set.",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "filepath"
+        },
+        {
+          "name": "BASE_DIRS",
+          "description": "JSON array of document roots, e.g. [\"/docs/a\", \"/docs/b\"]. Takes precedence over BASE_DIR. An invalid value is a hard configuration error.",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "string",
+          "placeholder": "[\"/docs/a\", \"/docs/b\"]"
+        },
+        {
+          "name": "DB_PATH",
+          "description": "LanceDB index directory. Defaults to <first root>/.minirag/lancedb, so each corpus gets its own index.",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "filepath"
+        },
+        {
+          "name": "CACHE_DIR",
+          "description": "Embedding model cache. Defaults to the platform user cache dir, so the ~220 MB model is downloaded once and shared.",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "filepath"
+        },
+        {
+          "name": "MODEL_NAME",
+          "description": "fastembed model id. Changing it makes existing vectors incompatible with new queries; pair with a new DB_PATH or a full re-ingest.",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "string",
+          "default": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+        },
+        {
+          "name": "MAX_FILE_SIZE",
+          "description": "Per-file size limit in bytes, enforced before parsing.",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "number",
+          "default": "104857600"
+        },
+        {
+          "name": "CHUNK_TOKEN_BUDGET",
+          "description": "Retrieval-unit size in the embedding model's own tokens. Range 16-128; the ceiling is the model's trained sequence length.",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "number",
+          "default": "110"
+        },
+        {
+          "name": "RAG_HYBRID_WEIGHT",
+          "description": "Keyword weight in the weighted RRF fusion, range 0.0-1.0. 0 is vector-only; higher values raise the BM25 contribution.",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "number",
+          "default": "0.6"
+        },
+        {
+          "name": "RAG_GROUPING",
+          "description": "Result grouping filter. 'similar' keeps only the closest group; 'related' also keeps the next one. Unset means no grouping filter.",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "string",
+          "choices": ["similar", "related"]
+        },
+        {
+          "name": "RAG_MAX_DISTANCE",
+          "description": "Drop results whose vector distance exceeds this value. Lower is stricter. Unset means no distance filter.",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "number"
+        },
+        {
+          "name": "RAG_MAX_FILES",
+          "description": "Keep chunks from at most this many best-scoring files. Unset means no per-file filter.",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "number"
+        },
+        {
+          "name": "RAG_INSTRUCTIONS_APPEND",
+          "description": "Extra paragraph appended to the instructions the server hands the client at connect time, for corpus-specific guidance.",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "string"
+        },
+        {
+          "name": "ALLOW_PRIVATE_URLS",
+          "description": "Let ingest_url fetch hosts resolving to loopback, link-local, private, reserved or unspecified addresses. Off by default.",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "boolean",
+          "default": "false"
+        }
+      ]
+    }
+  ]
+}
