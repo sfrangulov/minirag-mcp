@@ -206,6 +206,47 @@ def test_scan_roots_dedupes_overlapping_roots(tmp_path):
     assert [e.path for e in entries] == [inner / "i.md"]
 
 
+def test_diff_never_deletes_an_indexed_source_this_install_cannot_read(tmp_path, monkeypatch):
+    """A capability that went away is not a file that went away.
+
+    Without the [ocr] extra images leave the scan whitelist, so an indexed image is
+    absent from the scan for exactly the same reason a deleted file is — and the diff
+    used to propose deleting it, shrinking the corpus with nothing on disk having
+    changed."""
+    from minirag_mcp import ocr
+
+    doc = tmp_path / "doc.md"
+    doc.write_text("plain text")
+    img = tmp_path / "scan.png"
+    img.write_bytes(b"...")
+    indexed = [
+        info(str(doc), file_hash=file_sha256(doc), mtime=doc.stat().st_mtime),
+        info(str(img), file_hash=file_sha256(img), mtime=img.stat().st_mtime),
+    ]
+
+    monkeypatch.setattr(ocr, "available", lambda: False)
+    diff = compute_diff(scan_roots([tmp_path]), indexed, max_file_size=10**9)
+
+    assert diff.to_delete == []
+    assert diff.unreadable == [str(img)]
+    assert diff.unchanged == [doc]
+
+
+def test_diff_deletes_a_vanished_image_while_ocr_is_installed(tmp_path, monkeypatch):
+    """Retention is about the whitelist shrinking, not about images: with the extra in
+    place an image that really left the disk is still deleted."""
+    from minirag_mcp import ocr
+
+    monkeypatch.setattr(ocr, "available", lambda: True)
+    (tmp_path / "doc.md").write_text("plain text")
+    indexed = [info(str(tmp_path / "gone.png"))]
+
+    diff = compute_diff(scan_roots([tmp_path]), indexed, max_file_size=10**9)
+
+    assert diff.to_delete == [str(tmp_path / "gone.png")]
+    assert diff.unreadable == []
+
+
 def test_scan_roots_sees_images_only_with_ocr(tmp_path, monkeypatch):
     from minirag_mcp import ocr
 

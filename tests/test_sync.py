@@ -114,6 +114,30 @@ def test_sync_ingests_images_via_ocr(env, monkeypatch):
     assert counts2["skipped"] == 2 and counts2["ingested"] == 0
 
 
+def test_sync_keeps_indexed_images_when_the_ocr_extra_is_gone(env, monkeypatch):
+    """A sync from an install without [ocr] used to delete every indexed image.
+
+    The images are untouched on disk; only the scan whitelist shrank. Deleting them
+    reports `deleted: N` and a corpus that quietly halved, recoverable only by
+    re-syncing from an install that has the extra."""
+    from minirag_mcp import ocr
+
+    cfg, store, pipeline, root = env
+    monkeypatch.setattr(ocr, "available", lambda: True)
+    monkeypatch.setattr(ocr, "ocr_image", lambda path, config: "scanned text body")
+    (root / "note.md").write_text("# plain note\n\nbody")
+    (root / "scan.jpg").write_bytes(b"...")
+    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    assert counts["ingested"] == 2
+
+    monkeypatch.setattr(ocr, "available", lambda: False)
+    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+
+    assert counts["deleted"] == 0
+    assert store.get_source(str(root / "scan.jpg")) is not None
+    assert store.all_chunks(str(root / "scan.jpg"))
+
+
 def test_run_sync_scope_single_file(env):
     cfg, store, pipeline, root = env
     seed(root)

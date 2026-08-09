@@ -8,12 +8,16 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from minirag_mcp.chunker import SCHEME_VERSION
-from minirag_mcp.ingest.parser import supported_extensions
+from minirag_mcp.ingest.parser import IMAGE_EXTENSIONS, SUPPORTED_EXTENSIONS, supported_extensions
 from minirag_mcp.ingest.pipeline import file_sha256
 from minirag_mcp.scope import is_under
 from minirag_mcp.store import SourceInfo
 
 SKIP_DIRS = frozenset({"node_modules", "__pycache__", ".venv", "venv"})
+# Every extension any installation of this package can read. `supported_extensions()`
+# is a subset of this that shrinks when an optional extra is absent, so the difference
+# is what an install indexed before but cannot read now.
+KNOWN_EXTENSIONS = SUPPORTED_EXTENSIONS | IMAGE_EXTENSIONS
 
 
 @dataclass(frozen=True)
@@ -29,6 +33,10 @@ class SyncDiff:
     to_delete: list[str]
     unchanged: list[Path]
     oversized: list[Path]
+    # Indexed sources missing from the scan because their extension left the whitelist
+    # with an optional extra, not because the disk changed. Kept in the index, and
+    # separate from `to_delete` so a caller can say why nothing happened to them.
+    unreadable: list[str]
 
 
 def _contained(real: Path, real_roots: Sequence[Path]) -> bool:
@@ -119,6 +127,13 @@ def compute_diff(
     its bytes say. Its file has not changed; what it was cut into has. Without this,
     `status` would tell the user to re-sync and the re-sync would skip every file.
 
+    Deletion is proposed only for a source this installation could have scanned. An
+    extension in `KNOWN_EXTENSIONS` but not in the current whitelist is one an optional
+    extra reads (images need [ocr]), so a scan without that extra never looked for the
+    file and its absence is evidence about the installation, not about the disk —
+    reported as `unreadable`. Without the distinction, one sync from a light install
+    deletes every indexed image and reports only `deleted: N`.
+
     Args:
         entries: Scanned disk files.
         indexed: Files currently in the index (SourceInfo from Store).
@@ -126,7 +141,7 @@ def compute_diff(
         scope: If provided, limit processing to files under this path.
 
     Returns:
-        SyncDiff with to_ingest, to_delete, unchanged, and oversized lists.
+        SyncDiff with to_ingest, to_delete, unchanged, oversized, and unreadable lists.
     """
     indexed_files = {
         s.source: s for s in indexed if s.source_type == "file" and _in_scope(s.source, scope)
@@ -151,12 +166,22 @@ def compute_diff(
         else:
             to_ingest.append(e.path)
 
-    to_delete = [src for src in indexed_files if src not in seen]
+    needs_extra = KNOWN_EXTENSIONS - supported_extensions()
+    to_delete: list[str] = []
+    unreadable: list[str] = []
+    for src in indexed_files:
+        if src in seen:
+            continue
+        if Path(src).suffix.lower() in needs_extra:
+            unreadable.append(src)
+        else:
+            to_delete.append(src)
     return SyncDiff(
         to_ingest=to_ingest,
         to_delete=sorted(to_delete),
         unchanged=unchanged,
         oversized=oversized,
+        unreadable=sorted(unreadable),
     )
 
 
