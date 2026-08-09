@@ -140,7 +140,10 @@ def _orient(img):
     """
     if importlib.util.find_spec("rapid_orientation") is None:
         return img
-    import numpy as np
+    try:
+        import numpy as np
+    except ImportError as e:
+        raise _import_error_as_ocr_error(e) from e
 
     engine = _orientation_engine()
     label, _elapse = engine(img)
@@ -156,7 +159,10 @@ _orientation: list[object] = []
 
 def _orientation_engine():
     if not _orientation:
-        from rapid_orientation import RapidOrientation
+        try:
+            from rapid_orientation import RapidOrientation
+        except ImportError as e:
+            raise _import_error_as_ocr_error(e) from e
 
         _orientation.append(RapidOrientation())
     return _orientation[0]
@@ -198,10 +204,14 @@ def ocr_image(path: Path, config: Config) -> str:
     except ImportError as e:
         raise _import_error_as_ocr_error(e) from e
 
-    # np.fromfile + imdecode instead of cv2.imread: imread cannot open
-    # non-ASCII paths on Windows, and this corpus's filenames are Russian.
+    # np.fromfile + imdecodemulti instead of cv2.imread / cv2.imreadmulti: the imread
+    # family cannot open non-ASCII paths on Windows, and this corpus's filenames are
+    # Russian. imdecodemulti over imdecode because imdecode returns the first frame
+    # only, and multi-page TIFF is ordinary scanner and fax output here — a 20-page
+    # scan would index as page 1 and report success.
     data = np.fromfile(str(path), dtype=np.uint8)
-    img = cv2.imdecode(data, cv2.IMREAD_COLOR)
-    if img is None:
+    ok, frames = cv2.imdecodemulti(data, cv2.IMREAD_COLOR)
+    if not ok or not frames:
         raise OcrError(f"could not decode image {path}")
-    return _recognize(_orient(img), config)
+    logger.info("ocr: %s -> %d frame(s)", path, len(frames))
+    return "\n\n".join(text for f in frames if (text := _recognize(_orient(f), config)))

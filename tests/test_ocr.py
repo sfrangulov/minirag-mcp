@@ -5,9 +5,9 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from tests.pdf_builder import build_pdf
 
 from minirag_mcp import ocr
+from pdf_builder import build_pdf
 
 
 def _write(tmp_path: Path, pages: list[str]) -> Path:
@@ -101,6 +101,93 @@ def test_ocr_image_broken_cv2_install_raises_ocr_error(tmp_path, monkeypatch):
     cfg = load_config({}, cwd=tmp_path)
     with pytest.raises(ocr.OcrError, match=r"failed to import.*minirag-mcp\[ocr\]"):
         ocr.ocr_image(tmp_path / "missing.png", cfg)
+
+
+def test_orient_broken_numpy_install_raises_ocr_error(monkeypatch):
+    monkeypatch.setattr(ocr.importlib.util, "find_spec", lambda name: object())
+    monkeypatch.setattr(ocr, "_orientation", [])
+    _break_import(monkeypatch, "numpy")
+    with pytest.raises(ocr.OcrError, match=r"failed to import.*minirag-mcp\[ocr\]"):
+        ocr._orient(object())
+
+
+def test_orient_broken_rapid_orientation_install_raises_ocr_error(monkeypatch):
+    monkeypatch.setattr(ocr.importlib.util, "find_spec", lambda name: object())
+    monkeypatch.setattr(ocr, "_orientation", [])
+    _break_import(monkeypatch, "rapid_orientation")
+    with pytest.raises(ocr.OcrError, match=r"failed to import.*minirag-mcp\[ocr\]"):
+        ocr._orient(object())
+
+
+class _FakeCv2:
+    """Just enough cv2 to run ocr_image's decode step without the extra installed.
+
+    Pins only that every decoded frame reaches the recognizer, in order. That the
+    decoder really returns every frame of a multi-page TIFF is the separate claim, and
+    only the slow test below — real cv2, real file — can make it.
+    """
+
+    IMREAD_COLOR = 1
+
+    def __init__(self, frames):
+        self._frames = frames
+
+    def imdecodemulti(self, buf, flags):
+        return bool(self._frames), list(self._frames)
+
+
+def test_ocr_image_recognizes_every_frame_of_a_multi_page_image(tmp_path, monkeypatch):
+    """Multi-page TIFF is standard scanner and fax output. Reading frame 1 and calling
+    the document done would index page 1 of a 20-page scan as the whole of it."""
+    import sys
+
+    from minirag_mcp.config import load_config
+
+    monkeypatch.setattr(ocr, "available", lambda: True)
+    monkeypatch.setitem(sys.modules, "cv2", _FakeCv2(["page-a", "page-b", "page-c"]))
+    monkeypatch.setattr(ocr, "_recognize", lambda img, config: f"text of {img}")
+    # Orientation is pinned by the slow rotation test; here it would only reject the
+    # stand-in frames, and only on a machine that happens to have the extra installed.
+    monkeypatch.setattr(ocr, "_orient", lambda img: img)
+    img = tmp_path / "fax.tiff"
+    img.write_bytes(b"pretend tiff bytes; the decoder is faked")
+    text = ocr.ocr_image(img, load_config({}, cwd=tmp_path))
+    assert text == "text of page-a\n\ntext of page-b\n\ntext of page-c"
+
+
+def test_ocr_image_undecodable_bytes_still_raise(tmp_path, monkeypatch):
+    import sys
+
+    from minirag_mcp.config import load_config
+
+    monkeypatch.setattr(ocr, "available", lambda: True)
+    monkeypatch.setitem(sys.modules, "cv2", _FakeCv2([]))
+    img = tmp_path / "broken.png"
+    img.write_bytes(b"not an image")
+    with pytest.raises(ocr.OcrError, match="could not decode"):
+        ocr.ocr_image(img, load_config({}, cwd=tmp_path))
+
+
+@pytest.mark.slow
+def test_real_engine_reads_both_pages_of_a_two_frame_tiff(tmp_path):
+    """The claim the fake above cannot make: cv2 really hands back both frames of a
+    two-page TIFF written the way a scanner writes one, and both reach the index."""
+    pytest.importorskip("rapidocr")
+    import cv2
+    import numpy as np
+
+    from minirag_mcp.config import load_config
+
+    frames = []
+    for marker in ("FIRST PAGE 111", "SECOND PAGE 222"):
+        page = np.full((300, 1200, 3), 255, dtype=np.uint8)
+        for y in (80, 160, 240):
+            cv2.putText(page, marker, (30, y), cv2.FONT_HERSHEY_SIMPLEX, 1.6, 0, 3)
+        frames.append(page)
+    p = tmp_path / "scan.tiff"
+    assert cv2.imwritemulti(str(p), frames), "failed to write a two-frame TIFF"
+    text = ocr.ocr_image(p, load_config({}, cwd=tmp_path))
+    assert "111" in text and "222" in text
 
 
 @pytest.mark.slow
