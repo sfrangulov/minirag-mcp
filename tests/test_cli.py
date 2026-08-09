@@ -304,11 +304,17 @@ def test_query_reports_sources_like_the_server(corpus, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert {"results", "sources"} <= set(payload)
     assert payload["sources"], "expected an aggregated sources list"
-    assert all({"source", "title", "hits"} == set(s) for s in payload["sources"])
+    assert all({"source", "title", "hits", "displayPath"} == set(s) for s in payload["sources"])
     # sources are the distinct result sources, in rank order, with hit counts
     ranked = list(dict.fromkeys(r["source"] for r in payload["results"]))
     assert [s["source"] for s in payload["sources"]] == ranked
     assert sum(s["hits"] for s in payload["sources"]) == len(payload["results"])
+    # `displayPath` is the same source relative to the root that holds it — the
+    # string the citation policy asks an answer to copy. The CLI computes it from
+    # the same config the server does, so the two interfaces cannot disagree.
+    for s in payload["sources"]:
+        assert s["displayPath"] and not s["displayPath"].startswith("/")
+        assert s["source"] == f"{corpus}/{s['displayPath']}"
 
 
 def test_query_human_output_lists_sources(corpus, capsys):

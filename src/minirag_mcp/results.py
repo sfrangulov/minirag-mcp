@@ -8,6 +8,7 @@ shapes a SearchResult for output belongs in this module, imported by both sides.
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
+from pathlib import Path
 
 from minirag_mcp.chunker import join_parent
 from minirag_mcp.store import RESYNC_HINT, SearchResult, Store
@@ -90,14 +91,70 @@ def scheme_status(store: Store) -> dict:
     return out
 
 
-def aggregate_sources(results: Iterable[SearchResult]) -> list[dict]:
+def display_path(source: str, roots: Sequence[Path] = ()) -> str:
+    """`source` as the user would name the file: its path relative to the root holding it.
+
+    A display string, and only that. `source` remains the identity key — `read_file`,
+    `delete_file` and re-ingest all address a document by it — so the two live side by
+    side rather than one replacing the other.
+
+    The relative path rather than the `title`, because the title is derived: underscores
+    become spaces and the extension is dropped, so `И-112_ЗПС_Хранение ТМЗ.docx` reaches
+    the user as `И-112 ЗПС Хранение ТМЗ`, which names nothing on disk. What is wanted is
+    the filename exactly as it is, in enough of its directory to be unambiguous.
+
+    Computed by slicing the string, not by re-rendering a `Path`: the result must be a
+    byte-wise suffix of `source`, since a normaliser could change a separator or a
+    Unicode composition and still look right. The trailing separator on the prefix is
+    what keeps a root of `/data` from claiming `/data_archive/x.md`, and the longest
+    matching root wins so that nested roots do not make the answer depend on the order
+    they were configured in.
+
+    Not normalised, deliberately, even though it would raise a number. APFS stores these
+    filenames decomposed — the `й` in `…показателей…` is `и` plus a combining breve — and
+    a model reproduces them composed, so about one delivered entry in ten differs from
+    what was served by exactly that and nothing else. The two are canonically
+    equivalent: the same filename, opening the same file, identical on screen. Composing
+    here would make the strings compare equal at the cost of handing the user a name
+    that is not the one on disk, which is the trade this field exists to refuse.
+
+    Falls back to `source` itself — never to an empty string — when nothing matches: a
+    `data` or `url` item has no filesystem path at all (its `source` is the id it was
+    ingested under, which for a URL is the URL), and a file can outlive the root it was
+    indexed under. An absolute path is worse to read than a relative one and far better
+    than leaving the caller with nothing to print.
+    """
+    prefix = ""
+    for root in roots:
+        candidate = f"{str(root).rstrip('/')}/"
+        if source.startswith(candidate) and len(candidate) > len(prefix):
+            prefix = candidate
+    return source[len(prefix) :] if prefix else source
+
+
+def aggregate_sources(results: Iterable[SearchResult], roots: Sequence[Path] = ()) -> list[dict]:
     """Distinct sources among `results`, in rank order, each with a hit count.
 
     The first hit of a source fixes that source's position, so the list answers
     "which documents cover this topic" without inspecting individual chunks.
+
+    Each row also carries `displayPath`, the string an answer's Sources list is written
+    from. It hangs here rather than on a hit because a citation names a document, and
+    this deduplicated list is the document list already.
+
+    `roots` are the configured document roots; a caller with none gets `source` echoed
+    back, which is what an unrooted source would resolve to anyway.
     """
     sources: dict[str, dict] = {}
     for r in results:
-        agg = sources.setdefault(r.source, {"source": r.source, "title": r.title, "hits": 0})
+        agg = sources.setdefault(
+            r.source,
+            {
+                "source": r.source,
+                "title": r.title,
+                "hits": 0,
+                "displayPath": display_path(r.source, roots),
+            },
+        )
         agg["hits"] += 1
     return list(sources.values())

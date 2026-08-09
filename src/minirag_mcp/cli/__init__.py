@@ -242,7 +242,7 @@ def query(
         grouping=cfg.grouping,
         max_files=cfg.max_files,
     )
-    sources = aggregate_sources(results)
+    sources = aggregate_sources(results, cfg.roots)
     payload = {
         "results": [result_dict(r) for r in results],
         "sources": sources,

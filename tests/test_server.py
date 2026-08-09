@@ -90,8 +90,16 @@ async def test_sync_then_query_then_neighbors(app):
         top = res["results"][0]
         assert {"text", "source", "title", "chunkIndex", "score"} <= set(top)
         assert res["sources"], "expected aggregated sources"
-        assert {"source", "title", "hits"} <= set(res["sources"][0])
+        assert {"source", "title", "hits", "displayPath"} <= set(res["sources"][0])
         assert res["sources"][0]["source"] == top["source"]  # rank order preserved
+        # The citation policy tells the model to copy `displayPath`; this is the wire
+        # end of that promise. A rename on either side leaves the policy pointing at a
+        # field that isn't there, which no wording test would catch. And the file name
+        # has to arrive intact — "without any modification" is the requirement.
+        for s in res["sources"]:
+            assert s["displayPath"], "a source with nothing to print in a Sources list"
+            assert s["source"] == f"{root}/{s['displayPath']}"
+            assert s["displayPath"].rsplit("/", 1)[-1] == s["source"].rsplit("/", 1)[-1]
 
         nb = (
             await c.call_tool(
