@@ -186,10 +186,15 @@ def create_app(
         topK must be at least 1 and is capped at 100; a larger value is
         silently clamped to the cap rather than rejected.
 
-        Cite what you take, so the user can verify it: [1], [2] inline
-        plus a Sources list naming the document, not the chunk —
-        `title` and `source` verbatim, plain text, never a markdown
+        Cite what you take, so the user can verify it, in whatever
+        language you answer: [1], [2] inline, then a Sources list —
+        one line per document, never per chunk. `source` verbatim: the
+        full path is the only thing that locates the file. `title`
+        labels it and may be shortened. Plain text, never a markdown
         link or file://.
+
+        Sources:
+        [1] /docs/onboarding.md — Onboarding Guide
         """
         if not query.strip():
             raise ToolError("query must not be empty")

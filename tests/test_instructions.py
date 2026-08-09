@@ -44,8 +44,9 @@ CITATION_INVARIANTS = (
     "so the user can verify it",  # verification, not a claim that the prose is true
     "[1], [2]",  # the marker style,
     "Sources list",  # ...and the end-of-answer list the markers point into
-    "the document, not the chunk",  # the granularity
-    "`title` and `source` verbatim",  # ...and the two fields that identify one
+    "never per chunk",  # the granularity
+    "`source` verbatim",  # the path is the anchor: measured 7% -> 93% delivery
+    "`title` labels it and may be shortened",  # ...the label is not worth the budget
     "never a markdown link or file://",  # both arrive broken in every client checked
 )
 
@@ -128,12 +129,12 @@ async def test_the_citation_policy_reaches_the_client_through_the_handshake(app)
     # Plain paths. Claude Desktop denylists the `file:` scheme, Claude Code
     # hyperlinks only http/https, Cursor hands file:// to the system handler —
     # and a scheme-less markdown link renders as a broken relative URL.
-    assert "plain text" in citations
+    assert "Plain text" in citations
     assert "file://" in citations and "markdown link" in citations
     assert "](" not in citations, "the policy or its example contains a markdown link"
     # The worked example: marker, title, bare absolute path. Without a literal
     # instance the model emits the markers and drops the path from the list.
-    assert re.search(r"^\[1\] .+ /\S+$", citations, re.M), "no worked example of a Sources line"
+    assert re.search(r"^\[1\] /\S+ .+$", citations, re.M), "no worked example of a Sources line"
     # Citations are for the user's verification, not a claim that the prose is
     # true — measured support rates are far too low for the stronger reading.
     assert "verify" in citations
@@ -156,8 +157,8 @@ async def test_the_citation_rule_reaches_the_client_in_the_query_tool_descriptio
     assert "[1], [2]" in desc and "Sources list" in desc
     # Keyed to the document: `chunkIndex`/`parentId` are internal identifiers,
     # and this tool's own results are where a model would otherwise reach for one.
-    assert "the document, not the chunk" in desc
-    assert "`title` and `source` verbatim" in desc
+    assert "never per chunk" in desc
+    assert "`source` verbatim" in desc
     # Plain paths. A `file://` URL or a scheme-less markdown link arrives broken
     # in every client checked, and models emit both spontaneously.
     assert "never a markdown link or file://" in desc
