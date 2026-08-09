@@ -37,7 +37,7 @@ SUPPORTED_EXTENSIONS = frozenset(
     }
 )
 
-IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".webp"})
+IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".webp"})
 
 
 def supported_extensions() -> frozenset[str]:
@@ -442,7 +442,10 @@ def _pdf_with_ocr_fallback(path: Path, markdown: str, config) -> tuple[str, str]
     if not needs:
         return markdown, ""
     if not ocr.available():
-        if len(needs) == len(page_texts):
+        # Every page being under the threshold is not the same as the file having
+        # nothing: a certificate or a title page carries a few real characters, and
+        # refusing it would drop a document the default install indexed before.
+        if len(needs) == len(page_texts) and not markdown.strip():
             raise ParserError(
                 f"{path} looks like a scanned PDF (no text layer); {ocr.INSTALL_HINT}"
             )

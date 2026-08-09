@@ -1,5 +1,4 @@
 import pytest
-from tests.pdf_builder import build_pdf
 
 from conftest import SECRET_BODY
 from minirag_mcp.ingest.parser import (
@@ -16,6 +15,7 @@ from minirag_mcp.ingest.parser import (
     parse_url,
     strip_data_uri_images,
 )
+from pdf_builder import build_pdf
 
 
 def test_supported_extensions_frozen():
@@ -370,6 +370,8 @@ def test_supported_extensions_with_ocr(monkeypatch):
     monkeypatch.setattr(ocr, "available", lambda: True)
     exts = parser.supported_extensions()
     assert ".png" in exts and ".webp" in exts
+    # Both spellings are in the wild; scanners and fax gateways write either.
+    assert ".tiff" in exts and ".tif" in exts
 
 
 def test_parse_file_image_routes_through_ocr(tmp_path, monkeypatch):
@@ -433,6 +435,9 @@ def test_parse_file_image_title_normalizes_underscores(tmp_path, monkeypatch):
 # --- scanned PDFs fall back to OCR per page -------------------------------------------
 
 LONG = "long enough text line to clear the default per-page threshold easily"
+# A real text layer that is simply short: a certificate, a title page, a label sheet.
+# Under the 25-character default threshold, so it routes exactly like a blank page.
+SHORT = "Sertifikat No 123"
 
 
 def _pdf(tmp_path, pages):
@@ -466,9 +471,44 @@ def test_pdf_scanned_pages_get_ocr(tmp_path, monkeypatch):
     )
     doc = parser.parse_file(_pdf(tmp_path, [LONG, "", ""]), load_config({}, cwd=tmp_path))
     assert doc.ocr_engine == "rapidocr"
-    # page order preserved: text page first, then the two OCR'd pages
+    # Recognized text follows the whole converted document, and the OCR'd pages keep
+    # their order among themselves.
     body = doc.markdown
     assert body.index("long enough") < body.index("OCR PAGE 1") < body.index("OCR PAGE 2")
+
+
+def test_pdf_ocr_text_is_appended_after_the_converted_document(tmp_path, monkeypatch):
+    """The documented trade-off, shown where it is visible: the scanned page is first in
+    the file and its recognized text still lands last. Position is what is traded for
+    keeping the converted document's own structure intact."""
+    from minirag_mcp import ocr
+    from minirag_mcp.config import load_config
+    from minirag_mcp.ingest import parser
+
+    monkeypatch.setattr(ocr, "available", lambda: True)
+    monkeypatch.setattr(
+        ocr, "ocr_pdf", lambda path, config, pages: {i: f"OCR PAGE {i}" for i in pages}
+    )
+    doc = parser.parse_file(_pdf(tmp_path, ["", LONG]), load_config({}, cwd=tmp_path))
+    assert doc.ocr_engine == "rapidocr"
+    body = doc.markdown
+    assert body.index("long enough") < body.index("OCR PAGE 0")
+
+
+def test_pdf_page_with_a_short_text_layer_still_goes_to_ocr(tmp_path, monkeypatch):
+    """A page carrying a handful of characters is a scan with a stamped-on label, not a
+    page with content: below the threshold it routes to OCR exactly like a blank one."""
+    from minirag_mcp import ocr
+    from minirag_mcp.config import load_config
+    from minirag_mcp.ingest import parser
+
+    monkeypatch.setattr(ocr, "available", lambda: True)
+    monkeypatch.setattr(
+        ocr, "ocr_pdf", lambda path, config, pages: {i: f"OCR PAGE {i}" for i in pages}
+    )
+    doc = parser.parse_file(_pdf(tmp_path, [LONG, SHORT]), load_config({}, cwd=tmp_path))
+    assert doc.ocr_engine == "rapidocr"
+    assert "OCR PAGE 1" in doc.markdown and "OCR PAGE 0" not in doc.markdown
 
 
 def test_pdf_fully_scanned_without_ocr_raises_hint(tmp_path, monkeypatch):
@@ -479,6 +519,21 @@ def test_pdf_fully_scanned_without_ocr_raises_hint(tmp_path, monkeypatch):
     monkeypatch.setattr(ocr, "available", lambda: False)
     with pytest.raises(parser.ParserError, match=r"scanned.*minirag-mcp\[ocr\]"):
         parser.parse_file(_pdf(tmp_path, ["", ""]), load_config({}, cwd=tmp_path))
+
+
+def test_pdf_with_a_short_text_layer_without_ocr_keeps_it(tmp_path, monkeypatch):
+    """Every page being under the threshold is not the same as having no text layer. A
+    certificate whose whole content is a short line ingested fine before OCR existed,
+    and must keep doing so on the default install — the refusal is reserved for a file
+    that really has nothing to keep."""
+    from minirag_mcp import ocr
+    from minirag_mcp.config import load_config
+    from minirag_mcp.ingest import parser
+
+    monkeypatch.setattr(ocr, "available", lambda: False)
+    doc = parser.parse_file(_pdf(tmp_path, ["Short label"]), load_config({}, cwd=tmp_path))
+    assert doc.ocr_engine == ""
+    assert "Short label" in doc.markdown
 
 
 def test_pdf_mixed_without_ocr_keeps_partial_text(tmp_path, monkeypatch):
