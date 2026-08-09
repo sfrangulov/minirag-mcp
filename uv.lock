@@ -1267,6 +1267,7 @@ dependencies = [
     { name = "fastmcp" },
     { name = "lancedb" },
     { name = "markitdown", extra = ["docx", "pdf", "pptx", "xlsx"] },
+    { name = "pdfminer-six" },
     { name = "platformdirs" },
     { name = "requests" },
     { name = "tokenizers" },
@@ -1275,6 +1276,7 @@ dependencies = [
 [package.optional-dependencies]
 ocr = [
     { name = "onnxruntime" },
+    { name = "opencv-python" },
     { name = "pypdfium2" },
     { name = "rapid-orientation" },
     { name = "rapidocr" },
@@ -1296,6 +1298,8 @@ requires-dist = [
     { name = "lancedb", specifier = ">=0.36" },
     { name = "markitdown", extras = ["pdf", "docx", "pptx", "xlsx"], specifier = ">=0.1.7" },
     { name = "onnxruntime", marker = "extra == 'ocr'", specifier = ">=1.19" },
+    { name = "opencv-python", marker = "extra == 'ocr'", specifier = ">=4.5.5" },
+    { name = "pdfminer-six", specifier = ">=20251230" },
     { name = "platformdirs", specifier = ">=4.0" },
     { name = "pypdfium2", marker = "extra == 'ocr'", specifier = ">=5" },
     { name = "rapid-orientation", marker = "extra == 'ocr'", specifier = ">=0.0.11" },

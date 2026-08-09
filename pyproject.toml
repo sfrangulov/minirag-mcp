@@ -18,6 +18,11 @@ dependencies = [
     # fastembed already pulls this in, but we import it directly: the chunker's token
     # counter is built from a copy of the model's own tokenizer with truncation off.
     "tokenizers>=0.15",
+    # markitdown[pdf] already pulls this in, but we import it directly: OCR routing
+    # counts a PDF's text per page with pdfminer's own layout pass, and that import
+    # runs at startup on every install, extra or not. The bound matches the floor
+    # markitdown[pdf] already imposes, so declaring it can never move the resolution.
+    "pdfminer.six>=20251230",
 ]
 
 [project.scripts]
@@ -29,6 +34,10 @@ ocr = [
     "onnxruntime>=1.19",
     "pypdfium2>=5",
     "rapid-orientation>=0.0.11",
+    # rapidocr already pulls this in, but we import it directly to decode image files,
+    # and its floor (4.5.1.48) predates `imdecodemulti` — the call that keeps every
+    # frame of a multi-page TIFF. Added in 4.5.5.
+    "opencv-python>=4.5.5",
 ]
 
 [build-system]
@@ -114,7 +123,6 @@ addopts = "-m 'not slow'"
 markers = ["slow: needs the real embedding model (downloads ~220 MB)"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-pythonpath = ["."]
 
 [tool.ruff]
 line-length = 100
