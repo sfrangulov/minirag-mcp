@@ -351,6 +351,12 @@ def _display_stem(stem: str) -> str:
     return _SPACE_RE.sub(" ", stem.replace("_", " ")).strip()
 
 
+def _stem_title(stem: str) -> str:
+    """The last-resort title, from a stem `_strip_extension_suffix` has already been
+    applied to. The raw stem survives only when normalisation leaves nothing at all."""
+    return _display_stem(stem) or stem
+
+
 def find_title(markdown: str, explicit: str | None) -> str | None:
     """The title the caller gave or the document carries — None when it has neither.
 
@@ -386,7 +392,7 @@ def _file_title(markdown: str, explicit: str | None, stem: str) -> str:
         return _display_stem(stem)
     if h1:
         return h1
-    return _display_stem(stem) or stem
+    return _stem_title(stem)
 
 
 def _converted_markdown(result) -> str:
@@ -404,8 +410,9 @@ def parse_file(path: Path, config: Config | None = None) -> ParsedDoc:
             text = ocr.ocr_image(path, config)
         except ocr.OcrError as e:
             raise ParserError(str(e)) from e
-        stem = _strip_extension_suffix(path.stem)
-        title = _display_stem(stem) or stem
+        # Not `_file_title`: it prefers an authored ATX heading to the filename, and a
+        # recognized page has none — a `# ` line in OCR output is scanner noise.
+        title = _stem_title(_strip_extension_suffix(path.stem))
         return ParsedDoc(markdown=text, title=title, ocr_engine=ocr.ENGINE_RAPIDOCR)
     try:
         result = _md().convert(str(path))
@@ -422,7 +429,7 @@ def parse_file(path: Path, config: Config | None = None) -> ParsedDoc:
     )
 
 
-def _pdf_with_ocr_fallback(path: Path, markdown: str, config) -> tuple[str, str]:
+def _pdf_with_ocr_fallback(path: Path, markdown: str, config: Config) -> tuple[str, str]:
     """Route near-empty PDF pages through OCR; keep text-layer pages as they are.
 
     Per-page, not whole-document: a text cover page over scanned pages must
@@ -430,6 +437,12 @@ def _pdf_with_ocr_fallback(path: Path, markdown: str, config) -> tuple[str, str]
     """
     threshold = config.ocr_min_chars_per_page
     if threshold <= 0:
+        return markdown, ""
+    if not ocr.available() and markdown.strip():
+        # The per-page pass is a second full pdfminer parse of a file markitdown has
+        # already parsed. With no OCR to route pages to, its only remaining use is
+        # telling a file with no text at all from one with some, and a converter result
+        # that carries text has answered that.
         return markdown, ""
     try:
         page_texts = ocr.pdf_page_texts(path)
@@ -442,10 +455,12 @@ def _pdf_with_ocr_fallback(path: Path, markdown: str, config) -> tuple[str, str]
     if not needs:
         return markdown, ""
     if not ocr.available():
-        # Every page being under the threshold is not the same as the file having
-        # nothing: a certificate or a title page carries a few real characters, and
-        # refusing it would drop a document the default install indexed before.
-        if len(needs) == len(page_texts) and not markdown.strip():
+        # Reached only with an empty conversion: the short-circuit above has already
+        # returned every PDF markitdown got text out of, and that is what keeps a
+        # certificate or a title page — a few real characters, under the threshold on
+        # every page — from being refused. All that is left to tell apart here is a
+        # file pdfminer still reads from one with no text layer at all.
+        if len(needs) == len(page_texts):
             raise ParserError(
                 f"{path} looks like a scanned PDF (no text layer); {ocr.INSTALL_HINT}"
             )

@@ -2,7 +2,7 @@ from pathlib import Path
 
 from minirag_mcp.chunker import SCHEME_VERSION
 from minirag_mcp.ingest.pipeline import file_sha256
-from minirag_mcp.ingest.scanner import ScanEntry, compute_diff, scan_roots
+from minirag_mcp.ingest.scanner import ScanEntry, compute_diff, compute_states, scan_roots
 from minirag_mcp.store import SourceInfo
 
 
@@ -204,6 +204,100 @@ def test_scan_roots_dedupes_overlapping_roots(tmp_path):
     (inner / "i.md").write_text("x")
     entries = scan_roots([tmp_path, inner])
     assert [e.path for e in entries] == [inner / "i.md"]
+
+
+def test_diff_never_deletes_an_indexed_source_this_install_cannot_read(tmp_path, monkeypatch):
+    """A capability that went away is not a file that went away.
+
+    Without the [ocr] extra images leave the scan whitelist, so an indexed image is
+    absent from the scan for exactly the same reason a deleted file is — and the diff
+    used to propose deleting it, shrinking the corpus with nothing on disk having
+    changed."""
+    from minirag_mcp import ocr
+
+    doc = tmp_path / "doc.md"
+    doc.write_text("plain text")
+    img = tmp_path / "scan.png"
+    img.write_bytes(b"...")
+    indexed = [
+        info(str(doc), file_hash=file_sha256(doc), mtime=doc.stat().st_mtime),
+        info(str(img), file_hash=file_sha256(img), mtime=img.stat().st_mtime),
+    ]
+
+    monkeypatch.setattr(ocr, "available", lambda: False)
+    diff = compute_diff(scan_roots([tmp_path]), indexed, max_file_size=10**9)
+
+    assert diff.to_delete == []
+    assert diff.unreadable == [str(img)]
+    assert diff.unchanged == [doc]
+
+
+def test_diff_deletes_a_vanished_image_while_ocr_is_installed(tmp_path, monkeypatch):
+    """Retention is about the whitelist shrinking, not about images: with the extra in
+    place an image that really left the disk is still deleted."""
+    from minirag_mcp import ocr
+
+    monkeypatch.setattr(ocr, "available", lambda: True)
+    (tmp_path / "doc.md").write_text("plain text")
+    indexed = [info(str(tmp_path / "gone.png"))]
+
+    diff = compute_diff(scan_roots([tmp_path]), indexed, max_file_size=10**9)
+
+    assert diff.to_delete == [str(tmp_path / "gone.png")]
+    assert diff.unreadable == []
+
+
+def test_diff_deletes_an_image_that_left_the_disk_even_without_the_extra(tmp_path, monkeypatch):
+    """Retention answers "why did the scan not find it"; the disk answers "is it still
+    there". A file the user really deleted must not be kept forever behind a message
+    about the file *type*, which is true and beside the point."""
+    from minirag_mcp import ocr
+
+    (tmp_path / "doc.md").write_text("plain text")
+    indexed = [info(str(tmp_path / "gone.png"))]
+
+    monkeypatch.setattr(ocr, "available", lambda: False)
+    diff = compute_diff(scan_roots([tmp_path]), indexed, max_file_size=10**9)
+
+    assert diff.to_delete == [str(tmp_path / "gone.png")]
+    assert diff.unreadable == []
+
+
+def test_states_report_an_indexed_source_this_install_cannot_read(tmp_path, monkeypatch):
+    """`status` counts its chunks and `query_documents` returns them, so a listing that
+    omits the file entirely contradicts the rest of the tool."""
+    from minirag_mcp import ocr
+
+    doc = tmp_path / "doc.md"
+    doc.write_text("plain text")
+    img = tmp_path / "scan.png"
+    img.write_bytes(b"...")
+    indexed = [
+        info(str(doc), file_hash=file_sha256(doc), mtime=doc.stat().st_mtime),
+        info(str(img), ocr_engine="rapidocr"),
+    ]
+
+    monkeypatch.setattr(ocr, "available", lambda: False)
+    states = compute_states(scan_roots([tmp_path]), indexed)
+
+    by_source = {s.source: s for s in states}
+    assert by_source[str(img)].state == "unreadable"
+    assert by_source[str(img)].chunk_count == 1
+    assert by_source[str(img)].ocr_engine == "rapidocr"
+    assert by_source[str(doc)].state == "ingested"
+
+
+def test_states_omit_an_unreadable_source_whose_file_is_gone(tmp_path, monkeypatch):
+    """The same split the diff makes: with the file gone there is nothing to list, and
+    the next sync from any install deletes it."""
+    from minirag_mcp import ocr
+
+    (tmp_path / "doc.md").write_text("plain text")
+
+    monkeypatch.setattr(ocr, "available", lambda: False)
+    states = compute_states(scan_roots([tmp_path]), [info(str(tmp_path / "gone.png"))])
+
+    assert [s.source for s in states] == [str(tmp_path / "doc.md")]
 
 
 def test_scan_roots_sees_images_only_with_ocr(tmp_path, monkeypatch):

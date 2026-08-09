@@ -21,6 +21,7 @@ from minirag_mcp.instructions import build_instructions
 from minirag_mcp.results import (
     aggregate_sources,
     join_document,
+    ocr_status,
     parent_map,
     result_dict,
     scheme_status,
@@ -116,9 +117,14 @@ def create_app(
         """Poll a sync job started by sync_start.
 
         Returns state ('pending' | 'running' | 'succeeded' | 'failed'),
-        counts (scanned/ingested/skipped/deleted/failed), and any per-file
-        errors. Only the latest job is retained — an old jobId, or any
-        jobId from before a server restart, raises an error.
+        counts (scanned/ingested/skipped/deleted/unreadable/failed), and any
+        per-file errors. Only the latest job is retained — an old jobId, or
+        any jobId from before a server restart, raises an error.
+
+        unreadable counts indexed sources this installation cannot read
+        because an optional extra is absent (images need [ocr]); each one
+        appears in errors saying it was kept rather than deleted, but it is
+        not a failure and does not make the job fail.
         """
         return ctx().sync.status(jobId).to_dict()
 
@@ -291,10 +297,14 @@ def create_app(
         disk), "stale" (changed on disk since it was indexed),
         "stale_scheme" (unchanged on disk, but indexed under an older
         chunking scheme, so its vectors are not comparable with current
-        ones), or "not_ingested" (never indexed). Everything but "ingested"
-        needs a sync_start. "stale_scheme" is the per-source view of what
-        status reports as staleChunkCount. Data and url sources have no disk
-        state to compare against, so they are "ingested" or "stale_scheme".
+        ones), "not_ingested" (never indexed), or "unreadable" (indexed and
+        still on disk, but of a type this installation cannot read because
+        an optional extra is absent — images need [ocr]). Everything but
+        "ingested" and "unreadable" needs a sync_start; an "unreadable"
+        source is kept as indexed and no sync can refresh it here.
+        "stale_scheme" is the per-source view of what status reports as
+        staleChunkCount. Data and url sources have no disk state to compare
+        against, so they are "ingested" or "stale_scheme".
         """
         c = ctx()
         scopes = _scopes(scope)
@@ -355,6 +365,10 @@ def create_app(
         staleChunkCount counts chunks still stored under an older scheme —
         when it is above zero, schemeWarning explains that those chunks need
         a re-sync to be rebuilt.
+
+        ocr names the OCR engine this install can use, or is "unavailable"
+        when the optional extra is missing — scanned PDFs and images cannot
+        be indexed then, and ocrHint says what to install.
         """
         if config is None or config_error is not None:
             return {"version": __version__, "configError": config_error or "no configuration"}
@@ -365,6 +379,7 @@ def create_app(
             "model": config.model_name,
             "hybridWeight": config.hybrid_weight,
             "chunkScheme": SCHEME_VERSION,
+            **ocr_status(),
         }
         try:
             c = ctx()

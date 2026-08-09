@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 import minirag_mcp.cli as cli
+from minirag_mcp import ocr
 from minirag_mcp.chunker import SCHEME_VERSION
 from minirag_mcp.lock import sync_lock
 from minirag_mcp.store import MAX_TOP_K, Store
@@ -158,6 +159,23 @@ def test_list_reports_the_ocr_engine_in_json_and_in_the_human_listing(corpus, ca
     }
     assert lines[str(scan)].endswith(" [ocr:rapidocr]")
     assert "[ocr:" not in lines[str(corpus / "a.md")]
+
+
+def test_list_reports_an_indexed_source_this_install_cannot_read(corpus, capsys, monkeypatch):
+    """The CLI half of the same fact the MCP `list_files` state reports
+    (tests/test_server.py): a retained source the install cannot scan is still listed."""
+    monkeypatch.setattr(ocr, "available", lambda: True)
+    monkeypatch.setattr(ocr, "ocr_image", lambda path, config: "recognized invoice text")
+    scan = corpus / "scan.png"
+    scan.write_bytes(b"png bytes irrelevant, ocr is faked")
+    run(["ingest", str(scan), "--base-dir", str(corpus)])
+    capsys.readouterr()
+
+    monkeypatch.setattr(ocr, "available", lambda: False)
+    run(["list", "--base-dir", str(corpus), "--json"])
+    by_source = {f["source"]: f for f in json.loads(capsys.readouterr().out)["files"]}
+    assert by_source[str(scan)]["state"] == "unreadable"
+    assert by_source[str(scan)]["chunkCount"] > 0
 
 
 def test_list_scope_stops_at_a_path_component_boundary(tmp_path, capsys):
@@ -456,3 +474,21 @@ def test_cli_status_reports_the_chunking_scheme(corpus, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["chunkScheme"] == SCHEME_VERSION
     assert payload["staleChunkCount"] == 0
+
+
+def test_cli_status_names_the_ocr_engine_when_the_extra_is_installed(corpus, capsys, monkeypatch):
+    monkeypatch.setattr(ocr, "available", lambda: True)
+    run(["status", "--base-dir", str(corpus), "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ocr"] == ocr.ENGINE_RAPIDOCR
+    assert "ocrHint" not in payload
+
+
+def test_cli_status_says_ocr_is_unavailable_and_how_to_get_it(corpus, capsys, monkeypatch):
+    """The feature's whole failure mode is the extra being absent, and until now the one
+    command you run to diagnose an install said nothing at all about it."""
+    monkeypatch.setattr(ocr, "available", lambda: False)
+    run(["status", "--base-dir", str(corpus), "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ocr"] == "unavailable"
+    assert "minirag-mcp[ocr]" in payload["ocrHint"]

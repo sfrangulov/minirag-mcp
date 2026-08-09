@@ -35,9 +35,16 @@ ocr = [
     "pypdfium2>=5",
     "rapid-orientation>=0.0.11",
     # rapidocr already pulls this in, but we import it directly to decode image files,
-    # and its floor (4.5.1.48) predates `imdecodemulti` — the call that keeps every
-    # frame of a multi-page TIFF. Added in 4.5.5.
-    "opencv-python>=4.5.5",
+    # and its own floor (4.5.1.48) is below both of the floors that bind here. The API
+    # floor is 4.7.0.68: `imdecodemulti` — the call that keeps every frame of a
+    # multi-page TIFF — is absent from 4.5.5.62, 4.5.5.64 and 4.6.0.66, and no wheel
+    # sits between 4.6.0.66 and 4.7.0.68. The floor declared is higher because it is
+    # the numpy one: no wheel before 4.10.0.84 imports against numpy 2.x (4.7.0.68
+    # through 4.10.0.82 all raise "numpy.core.multiarray failed to import"), and
+    # nothing in this dependency graph permits numpy 1.x — fastembed, a core
+    # dependency, requires numpy>=2.1 on 3.13. All four components are spelled out
+    # because `>=4.10` would admit 4.10.0.82, which is one of the broken ones.
+    "opencv-python>=4.10.0.84",
 ]
 
 [build-system]

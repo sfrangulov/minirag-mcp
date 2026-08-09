@@ -54,17 +54,31 @@ def test_unsupported_extension(pipe):
 
 
 def test_ingest_file_carries_ocr_engine(pipe, monkeypatch):
+    """Every chunk of the document must carry the marker, not just one. The readers
+    take the first non-empty `ocr_engine` of a source, so a single marked chunk is
+    indistinguishable from all of them at the SourceInfo level — the rows are where a
+    partially-marked document shows up."""
     from minirag_mcp import ocr
 
     p, store, root = pipe
+    # Long enough to pass the chunker's token budget and split; a one-chunk document
+    # cannot tell "the marker is on every chunk" from "the marker is on chunk 0".
+    scanned = " ".join(
+        f"Postavshchik peredayot Pokupatelyu tovar po nakladnoy nomer {i} v srok "
+        f"ustanovlennyy nastoyashchim dogovorom i prilozheniyami k nemu."
+        for i in range(20)
+    )
     monkeypatch.setattr(ocr, "available", lambda: True)
-    monkeypatch.setattr(ocr, "ocr_image", lambda path, config: "scanned contract text")
+    monkeypatch.setattr(ocr, "ocr_image", lambda path, config: scanned)
     img = root / "scan.png"
     img.write_bytes(b"...")
     result = p.ingest_file(img)
-    assert result.chunk_count >= 1
+    assert result.chunk_count >= 2
     info = store.get_source(str(img))
     assert info.ocr_engine == ocr.ENGINE_RAPIDOCR
+    rows = store._table.search().where(f"source = '{img}'").limit(10_000).to_list()
+    assert len(rows) == result.chunk_count
+    assert [r["ocr_engine"] for r in rows] == [ocr.ENGINE_RAPIDOCR] * len(rows)
 
 
 def test_ingest_file_image_without_ocr_is_unsupported(pipe, monkeypatch):

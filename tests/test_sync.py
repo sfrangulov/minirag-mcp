@@ -114,6 +114,65 @@ def test_sync_ingests_images_via_ocr(env, monkeypatch):
     assert counts2["skipped"] == 2 and counts2["ingested"] == 0
 
 
+def test_sync_keeps_indexed_images_when_the_ocr_extra_is_gone(env, monkeypatch):
+    """A sync from an install without [ocr] used to delete every indexed image.
+
+    The images are untouched on disk; only the scan whitelist shrank. Deleting them
+    reports `deleted: N` and a corpus that quietly halved, recoverable only by
+    re-syncing from an install that has the extra."""
+    from minirag_mcp import ocr
+
+    cfg, store, pipeline, root = env
+    monkeypatch.setattr(ocr, "available", lambda: True)
+    monkeypatch.setattr(ocr, "ocr_image", lambda path, config: "scanned text body")
+    (root / "note.md").write_text("# plain note\n\nbody")
+    (root / "scan.jpg").write_bytes(b"...")
+    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    assert counts["ingested"] == 2
+
+    monkeypatch.setattr(ocr, "available", lambda: False)
+    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+
+    assert counts["deleted"] == 0
+    assert store.get_source(str(root / "scan.jpg")) is not None
+    assert store.all_chunks(str(root / "scan.jpg"))
+
+
+def test_sync_reports_the_sources_it_kept_but_cannot_read(env, monkeypatch):
+    """Keeping them silently fails the same way deleting them did: the user is never
+    told that part of the corpus is frozen, or which install would thaw it."""
+    from minirag_mcp import ocr
+
+    cfg, store, pipeline, root = env
+    monkeypatch.setattr(ocr, "available", lambda: True)
+    monkeypatch.setattr(ocr, "ocr_image", lambda path, config: "scanned text body")
+    (root / "note.md").write_text("# plain note\n\nbody")
+    (root / "scan.jpg").write_bytes(b"...")
+    run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+
+    monkeypatch.setattr(ocr, "available", lambda: False)
+    counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+
+    assert counts["unreadable"] == 1
+    assert counts["failed"] == 0  # a missing extra is not a failed run
+    assert [e["source"] for e in errors] == [str(root / "scan.jpg")]
+    assert "ocr" in errors[0]["error"]
+
+
+def test_a_pending_job_reports_the_counter_shape_a_finished_one_does(env):
+    """sync_status is polled from the moment start() returns, so a payload that grows a
+    counter only once the job finishes makes every earlier poll quietly incomplete."""
+    from minirag_mcp.sync import SyncJob
+
+    cfg, store, pipeline, root = env
+    seed(root)
+    pending = SyncJob(job_id="not-started")
+
+    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+
+    assert set(pending.to_dict()["counts"]) == set(counts)
+
+
 def test_run_sync_scope_single_file(env):
     cfg, store, pipeline, root = env
     seed(root)
