@@ -114,6 +114,7 @@ addopts = "-m 'not slow'"
 markers = ["slow: needs the real embedding model (downloads ~220 MB)"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+pythonpath = ["."]
 
 [tool.ruff]
 line-length = 100
