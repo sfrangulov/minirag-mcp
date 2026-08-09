@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from minirag_mcp.chunker import SCHEME_VERSION
-from minirag_mcp.ingest.parser import SUPPORTED_EXTENSIONS
+from minirag_mcp.ingest.parser import supported_extensions
 from minirag_mcp.ingest.pipeline import file_sha256
 from minirag_mcp.scope import is_under
 from minirag_mcp.store import SourceInfo
@@ -62,6 +62,7 @@ def scan_roots(roots: Sequence[Path]) -> list[ScanEntry]:
     Returns entries sorted by path.
     """
     real_roots = [Path(r).resolve() for r in roots]
+    exts = supported_extensions()
     entries: list[ScanEntry] = []
     seen: set[Path] = set()
     for root in roots:
@@ -73,7 +74,7 @@ def scan_roots(roots: Sequence[Path]) -> list[ScanEntry]:
                 if name.startswith("."):
                     continue
                 p = Path(dirpath) / name
-                if p.suffix.lower() not in SUPPORTED_EXTENSIONS:
+                if p.suffix.lower() not in exts:
                     continue
                 # Dedupe by resolved path to handle overlapping roots
                 resolved = p.resolve()

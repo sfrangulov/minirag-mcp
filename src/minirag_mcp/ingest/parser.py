@@ -13,6 +13,8 @@ import requests
 from markitdown import MarkItDown
 from requests.adapters import HTTPAdapter
 
+from minirag_mcp import ocr
+from minirag_mcp.config import Config
 from minirag_mcp.security import SecurityError, check_url
 
 SUPPORTED_EXTENSIONS = frozenset(
@@ -31,6 +33,18 @@ SUPPORTED_EXTENSIONS = frozenset(
         ".ipynb",
     }
 )
+
+IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".webp"})
+
+
+def supported_extensions() -> frozenset[str]:
+    """The scan whitelist. Images are documents only when OCR can read them —
+    without it they would ingest as nothing, and most images in a docs tree
+    are illustrations, so their absence is silence, not an error."""
+    if ocr.available():
+        return SUPPORTED_EXTENSIONS | IMAGE_EXTENSIONS
+    return SUPPORTED_EXTENSIONS
+
 
 _H1_RE = re.compile(r"^#\s+(.+?)\s*$")
 _FENCE_RE = re.compile(r"^(```+|~~~+)")
@@ -111,9 +125,13 @@ _IMAGE_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
 # The same, restricted to an inlined `data:` URI — the picture itself, not a link to
 # one — with the alt text captured so it can be kept.
 _DATA_URI_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(\s*data:[^)]*\)")
-# A leftover extension in a stem, as "report.pdf.pdf" leaves "report.pdf"
+# A leftover extension in a stem, as "report.pdf.pdf" leaves "report.pdf". Built from
+# the static union of both extension sets — not `supported_extensions()`, whose answer
+# depends on `ocr.available()` and can change between calls; this regex is compiled once.
 _EXTENSION_SUFFIX_RE = re.compile(
-    r"\.(?:" + "|".join(sorted(e.lstrip(".") for e in SUPPORTED_EXTENSIONS)) + r")$",
+    r"\.(?:"
+    + "|".join(sorted(e.lstrip(".") for e in SUPPORTED_EXTENSIONS | IMAGE_EXTENSIONS))
+    + r")$",
     re.IGNORECASE,
 )
 _SEPARATORS_RE = re.compile(r"[\s_\-.]+")
@@ -155,6 +173,8 @@ class ParsedDoc:
     # than a title the document or the caller actually supplied. Callers that put the
     # title into indexed text must not do so for a stand-in.
     has_title: bool = True
+    # Non-empty when OCR produced some or all of `markdown` (engine name).
+    ocr_engine: str = ""
 
 
 class _GuardedHTTPAdapter(HTTPAdapter):
@@ -371,7 +391,19 @@ def _converted_markdown(result) -> str:
     return strip_data_uri_images(result.markdown or "")
 
 
-def parse_file(path: Path) -> ParsedDoc:
+def parse_file(path: Path, config: Config | None = None) -> ParsedDoc:
+    if path.suffix.lower() in IMAGE_EXTENSIONS:
+        if not ocr.available():
+            raise ParserError(f"{path} is an image, which needs OCR; {ocr.INSTALL_HINT}")
+        if config is None:
+            raise ParserError(f"OCR for {path} needs a Config (internal error)")
+        try:
+            text = ocr.ocr_image(path, config)
+        except ocr.OcrError as e:
+            raise ParserError(str(e)) from e
+        stem = _strip_extension_suffix(path.stem)
+        title = _display_stem(stem) if _is_informative_stem(stem) else path.stem
+        return ParsedDoc(markdown=text, title=title, ocr_engine=ocr.ENGINE_RAPIDOCR)
     try:
         result = _md().convert(str(path))
     except Exception as e:  # markitdown may raise lib-specific errors too

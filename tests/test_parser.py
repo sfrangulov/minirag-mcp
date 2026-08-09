@@ -348,3 +348,51 @@ def test_every_entry_point_strips_placeholders(tmp_path):
     assert "base64" not in from_file and "Схема" in from_file
     from_html = parse_html(f'<h1>T</h1><p>body</p><img alt="Схема" src="{PNG}">').markdown
     assert "base64" not in from_html and from_html.endswith("Схема")
+
+
+# --- images become documents when the [ocr] extra is present -------------------------
+
+
+def test_supported_extensions_without_ocr(monkeypatch):
+    from minirag_mcp import ocr
+    from minirag_mcp.ingest import parser
+
+    monkeypatch.setattr(ocr, "available", lambda: False)
+    exts = parser.supported_extensions()
+    assert ".pdf" in exts and ".png" not in exts
+
+
+def test_supported_extensions_with_ocr(monkeypatch):
+    from minirag_mcp import ocr
+    from minirag_mcp.ingest import parser
+
+    monkeypatch.setattr(ocr, "available", lambda: True)
+    exts = parser.supported_extensions()
+    assert ".png" in exts and ".webp" in exts
+
+
+def test_parse_file_image_routes_through_ocr(tmp_path, monkeypatch):
+    from minirag_mcp import ocr
+    from minirag_mcp.config import load_config
+    from minirag_mcp.ingest import parser
+
+    monkeypatch.setattr(ocr, "available", lambda: True)
+    monkeypatch.setattr(ocr, "ocr_image", lambda path, config: "recognized scan text")
+    img = tmp_path / "Договор_поставки_2026.png"
+    img.write_bytes(b"png bytes irrelevant, ocr is faked")
+    doc = parser.parse_file(img, load_config({}, cwd=tmp_path))
+    assert doc.markdown == "recognized scan text"
+    assert doc.ocr_engine == "rapidocr"
+    assert doc.title == "Договор поставки 2026"
+
+
+def test_parse_file_image_without_ocr_raises_hint(tmp_path, monkeypatch):
+    from minirag_mcp import ocr
+    from minirag_mcp.config import load_config
+    from minirag_mcp.ingest import parser
+
+    monkeypatch.setattr(ocr, "available", lambda: False)
+    img = tmp_path / "scan.png"
+    img.write_bytes(b"...")
+    with pytest.raises(parser.ParserError, match=r"minirag-mcp\[ocr\]"):
+        parser.parse_file(img, load_config({}, cwd=tmp_path))

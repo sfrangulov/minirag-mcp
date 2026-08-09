@@ -180,3 +180,18 @@ def test_scan_roots_dedupes_overlapping_roots(tmp_path):
     (inner / "i.md").write_text("x")
     entries = scan_roots([tmp_path, inner])
     assert [e.path for e in entries] == [inner / "i.md"]
+
+
+def test_scan_roots_sees_images_only_with_ocr(tmp_path, monkeypatch):
+    from minirag_mcp import ocr
+
+    (tmp_path / "doc.md").write_text("# hi")
+    (tmp_path / "scan.png").write_bytes(b"...")
+
+    monkeypatch.setattr(ocr, "available", lambda: False)
+    names = {e.path.name for e in scan_roots([tmp_path])}
+    assert names == {"doc.md"}
+
+    monkeypatch.setattr(ocr, "available", lambda: True)
+    names = {e.path.name for e in scan_roots([tmp_path])}
+    assert names == {"doc.md", "scan.png"}
