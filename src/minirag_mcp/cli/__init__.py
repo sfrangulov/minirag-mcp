@@ -348,8 +348,10 @@ def list_cmd(
     """List files on disk with ingestion state, plus indexed data/url sources.
 
     States: ingested, stale (changed on disk), stale_scheme (unchanged on disk but
-    indexed under an older chunking scheme), not_ingested. Everything but ingested
-    needs a sync.
+    indexed under an older chunking scheme), not_ingested, unreadable (indexed and
+    still on disk, but of a type this install cannot read because an optional extra
+    is absent — images need [ocr]). Everything but ingested and unreadable needs a
+    sync; an unreadable source is kept as indexed and no sync can refresh it here.
     """
     cfg, store, _ = _load(base_dir, db_path, cache_dir, model_name)
     scopes = tuple(scope or ())

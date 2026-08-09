@@ -37,6 +37,10 @@ class SyncJob:
             "ingested": 0,
             "skipped": 0,
             "deleted": 0,
+            # Kept in step with the dict `_run_sync_unlocked` builds: a counter that
+            # only appears once the job finishes makes every earlier poll report a
+            # different shape.
+            "unreadable": 0,
             "failed": 0,
         }
     )

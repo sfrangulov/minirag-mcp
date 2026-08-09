@@ -34,8 +34,9 @@ class SyncDiff:
     unchanged: list[Path]
     oversized: list[Path]
     # Indexed sources missing from the scan because their extension left the whitelist
-    # with an optional extra, not because the disk changed. Kept in the index, and
-    # separate from `to_delete` so a caller can say why nothing happened to them.
+    # with an optional extra, not because the disk changed — their files are still
+    # there. Kept in the index, and separate from `to_delete` so a caller can say why
+    # nothing happened to them.
     unreadable: list[str]
 
 
@@ -97,6 +98,18 @@ def scan_roots(roots: Sequence[Path]) -> list[ScanEntry]:
     return entries
 
 
+def _kept_unreadable(source: str, needs_extra: set[str]) -> bool:
+    """Whether an indexed source absent from the scan is one to keep rather than delete.
+
+    Two facts, and both are needed. The extension says why the scan did not look for it
+    — an extra this install lacks reads that type. The file still being on disk says the
+    user did not delete it. With only the first, an image really removed from the
+    document root is retained forever and reported as a file type this installation
+    cannot read: true about the type, silent about the file being gone.
+    """
+    return Path(source).suffix.lower() in needs_extra and Path(source).exists()
+
+
 def _in_scope(path_str: str, scope: Path | None) -> bool:
     """Whether `path_str` is the scope path itself or sits under it.
 
@@ -127,12 +140,13 @@ def compute_diff(
     its bytes say. Its file has not changed; what it was cut into has. Without this,
     `status` would tell the user to re-sync and the re-sync would skip every file.
 
-    Deletion is proposed only for a source this installation could have scanned. An
-    extension in `KNOWN_EXTENSIONS` but not in the current whitelist is one an optional
-    extra reads (images need [ocr]), so a scan without that extra never looked for the
-    file and its absence is evidence about the installation, not about the disk —
-    reported as `unreadable`. Without the distinction, one sync from a light install
-    deletes every indexed image and reports only `deleted: N`.
+    Deletion is proposed only for a source this installation could have scanned, or one
+    whose file is gone. An extension in `KNOWN_EXTENSIONS` but not in the current
+    whitelist is one an optional extra reads (images need [ocr]), so a scan without that
+    extra never looked for the file, and if the file is still on disk its absence from
+    the scan is evidence about the installation rather than the disk — reported as
+    `unreadable`. Without the distinction, one sync from a light install deletes every
+    indexed image and reports only `deleted: N`.
 
     Args:
         entries: Scanned disk files.
@@ -172,7 +186,7 @@ def compute_diff(
     for src in indexed_files:
         if src in seen:
             continue
-        if Path(src).suffix.lower() in needs_extra:
+        if _kept_unreadable(src, needs_extra):
             unreadable.append(src)
         else:
             to_delete.append(src)
@@ -190,7 +204,7 @@ class FileState:
     source: str
     source_type: str
     title: str
-    state: str  # "ingested" | "not_ingested" | "stale" | "stale_scheme"
+    state: str  # "ingested" | "not_ingested" | "stale" | "stale_scheme" | "unreadable"
     chunk_count: int
     ocr_engine: str = ""
 
@@ -217,6 +231,11 @@ def compute_states(entries: list[ScanEntry], indexed: list[SourceInfo]) -> list[
       its vectors were computed over differently cut text and are not comparable with
       new ones, so it needs re-ingesting all the same.
     - "not_ingested": file not in index.
+    - "unreadable": indexed, still on disk, but of a type this installation cannot read
+      because an optional extra is absent (images need [ocr]). The scan never looked for
+      it, so it has no entry to compare against; `compute_diff` keeps it rather than
+      deleting it, and it is listed here because `status` still counts its chunks and
+      `query_documents` still returns them.
 
     A file that is both changed on disk and scheme-stale reports "stale": the bytes are
     the more surprising fact, and the remedy is identical either way.
@@ -248,6 +267,16 @@ def compute_states(entries: list[ScanEntry], indexed: list[SourceInfo]) -> list[
                     str(e.path), "file", prior.title, "stale", prior.chunk_count, prior.ocr_engine
                 )
             )
+    scanned = {str(e.path) for e in entries}
+    needs_extra = KNOWN_EXTENSIONS - supported_extensions()
+    for source, prior in by_source.items():
+        if source in scanned or not _kept_unreadable(source, needs_extra):
+            continue
+        states.append(
+            FileState(
+                source, "file", prior.title, "unreadable", prior.chunk_count, prior.ocr_engine
+            )
+        )
     for s in indexed:
         if s.source_type in ("data", "url"):
             states.append(

@@ -159,6 +159,20 @@ def test_sync_reports_the_sources_it_kept_but_cannot_read(env, monkeypatch):
     assert "ocr" in errors[0]["error"]
 
 
+def test_a_pending_job_reports_the_counter_shape_a_finished_one_does(env):
+    """sync_status is polled from the moment start() returns, so a payload that grows a
+    counter only once the job finishes makes every earlier poll quietly incomplete."""
+    from minirag_mcp.sync import SyncJob
+
+    cfg, store, pipeline, root = env
+    seed(root)
+    pending = SyncJob(job_id="not-started")
+
+    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+
+    assert set(pending.to_dict()["counts"]) == set(counts)
+
+
 def test_run_sync_scope_single_file(env):
     cfg, store, pipeline, root = env
     seed(root)

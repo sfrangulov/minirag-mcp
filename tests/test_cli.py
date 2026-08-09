@@ -161,6 +161,23 @@ def test_list_reports_the_ocr_engine_in_json_and_in_the_human_listing(corpus, ca
     assert "[ocr:" not in lines[str(corpus / "a.md")]
 
 
+def test_list_reports_an_indexed_source_this_install_cannot_read(corpus, capsys, monkeypatch):
+    """The CLI half of the same fact the MCP `list_files` state reports
+    (tests/test_server.py): a retained source the install cannot scan is still listed."""
+    monkeypatch.setattr(ocr, "available", lambda: True)
+    monkeypatch.setattr(ocr, "ocr_image", lambda path, config: "recognized invoice text")
+    scan = corpus / "scan.png"
+    scan.write_bytes(b"png bytes irrelevant, ocr is faked")
+    run(["ingest", str(scan), "--base-dir", str(corpus)])
+    capsys.readouterr()
+
+    monkeypatch.setattr(ocr, "available", lambda: False)
+    run(["list", "--base-dir", str(corpus), "--json"])
+    by_source = {f["source"]: f for f in json.loads(capsys.readouterr().out)["files"]}
+    assert by_source[str(scan)]["state"] == "unreadable"
+    assert by_source[str(scan)]["chunkCount"] > 0
+
+
 def test_list_scope_stops_at_a_path_component_boundary(tmp_path, capsys):
     (tmp_path / "proj").mkdir()
     (tmp_path / "project-secret").mkdir()
