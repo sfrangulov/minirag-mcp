@@ -524,3 +524,20 @@ def test_pdf_mixed_ocr_returns_nothing_keeps_text_page(tmp_path, monkeypatch):
     doc = parser.parse_file(_pdf(tmp_path, [LONG, ""]), load_config({}, cwd=tmp_path))
     assert doc.ocr_engine == ""
     assert "long enough" in doc.markdown
+
+
+def test_pdf_markitdown_content_survives_when_pdfminer_diverges(tmp_path, monkeypatch):
+    """markitdown (pdfplumber) and pdfminer's own per-page pass are separate
+    extractors that can disagree on an odd encoding or a degenerate text box.
+    pdfminer reporting every page empty must not discard content markitdown
+    already extracted for real."""
+    from minirag_mcp import ocr
+    from minirag_mcp.config import load_config
+    from minirag_mcp.ingest import parser
+
+    monkeypatch.setattr(ocr, "available", lambda: True)
+    monkeypatch.setattr(ocr, "pdf_page_texts", lambda path: [""])
+    monkeypatch.setattr(ocr, "ocr_pdf", lambda path, config, pages: {i: "" for i in pages})
+    doc = parser.parse_file(_pdf(tmp_path, [LONG]), load_config({}, cwd=tmp_path))
+    assert "long enough" in doc.markdown
+    assert doc.ocr_engine == ""

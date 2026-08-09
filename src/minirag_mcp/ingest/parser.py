@@ -458,9 +458,14 @@ def _pdf_with_ocr_fallback(path: Path, markdown: str, config) -> tuple[str, str]
     # to raw per-page text the moment any single page needs OCR.
     ocr_text = "\n\n".join(text for i in needs if (text := recognized.get(i, "").strip()))
     if not ocr_text:
-        if len(needs) == len(page_texts):
+        # OCR finding nothing is only fatal when the converter found nothing either:
+        # markitdown (pdfplumber) and pdfminer's per-page pass are separate
+        # extractors and can disagree on an odd encoding or a degenerate text box,
+        # so a markitdown result that already has content must survive even when
+        # every page fell below the per-page threshold and OCR added nothing.
+        if len(needs) == len(page_texts) and not markdown.strip():
             raise ParserError(f"{path}: OCR produced no text (page may be blank or unreadable)")
-        return markdown, ""  # OCR added nothing; the text pages already carried content
+        return markdown, ""  # OCR added nothing; the converter already carried content
     merged = "\n\n".join(part for part in (markdown.strip(), ocr_text) if part)
     return merged, ocr.ENGINE_RAPIDOCR
 
