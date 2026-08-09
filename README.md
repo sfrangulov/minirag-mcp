@@ -1,6 +1,11 @@
 # minirag-mcp
 
+<!-- mcp-name: io.github.sfrangulov/minirag-mcp -->
+
+[![PyPI](https://img.shields.io/pypi/v/minirag-mcp)](https://pypi.org/project/minirag-mcp/)
+[![License: MIT](https://img.shields.io/pypi/l/minirag-mcp)](LICENSE)
 [![CI](https://github.com/sfrangulov/minirag-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/sfrangulov/minirag-mcp/actions/workflows/ci.yml)
+[![Glama score](https://glama.ai/mcp/servers/sfrangulov/minirag-mcp/badges/score.svg)](https://glama.ai/mcp/servers/btvcl5o1wx)
 
 A local-first RAG (retrieval-augmented generation) MCP server. Point it at a
 folder of documents and it gives your MCP client (Claude Code, Cursor, Codex,
@@ -883,7 +888,9 @@ release simply sits there looking like a build that hung.
    everything so far is local and reversible. Add `--dry-run --verbose` to see
    exactly what it would do first.
 
-   `version` in `pyproject.toml` is the only place the number lives.
+   `version` in `pyproject.toml` is the number's one editable home; the bump
+   propagates it to `uv.lock` and to both `"version"` fields in
+   [`server.json`](server.json), so no copy is ever updated by hand.
    `__version__` — what the `status` tool and `minirag-mcp --version` report —
    is read from the installed distribution's metadata, so it cannot drift from
    what was packaged.
@@ -916,6 +923,26 @@ and only works when the ref you select is the tag — a dispatch from a branch i
 refused. Uploads are idempotent (`skip-existing: true`), so retrying after a
 partial upload finishes the remaining files instead of dying on "File already
 exists".
+
+### The MCP Registry entry
+
+Pushing the tag in step 2 also starts
+[`publish-mcp.yml`](.github/workflows/publish-mcp.yml), which registers this
+release with the [official MCP Registry](https://registry.modelcontextprotocol.io)
+as `io.github.sfrangulov/minirag-mcp`. It authenticates with GitHub OIDC, so
+there is no registry token in this repository either.
+
+That workflow starts *before* PyPI has the package — the tag push comes first,
+the GitHub release that triggers `release.yml` comes after — and the registry
+will not accept a server whose package it cannot find. So it waits, for up to
+30 minutes, for `minirag-mcp <version>` to appear on PyPI, and then checks that
+the description PyPI is serving for that version contains the
+`<!-- mcp-name: io.github.sfrangulov/minirag-mcp -->` marker at the top of this
+README. That marker is how the registry proves the PyPI package and the
+registry entry have the same owner, and a PyPI description is **immutable per
+version**: a release that ships without it cannot be registered at all, and no
+re-run fixes that — only the next release does. If the wait times out, publish
+the PyPI release and re-run the workflow.
 
 ## License
 

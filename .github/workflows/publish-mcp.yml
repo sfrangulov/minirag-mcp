@@ -1,0 +1,123 @@
+name: Publish to MCP Registry
+
+# Only a tag. There is deliberately no `branches:` key and no `pull_request`
+# trigger: a run on a branch has no version to check `server.json` against, and
+# publishing the registry entry for whatever `"version"` happened to say at that
+# commit would claim a version number under `io.github.sfrangulov/minirag-mcp`
+# that cannot be reused.
+on:
+  push:
+    tags: ["v*"]
+  # Re-running a publish that failed while waiting for PyPI. The ref guard below
+  # is what keeps this honest — a dispatch from a branch fails the run.
+  workflow_dispatch:
+
+# Nothing by default; the job opts into the one token it needs.
+permissions: {}
+
+# The registry rejects a re-publish of a version it already holds, so two runs
+# for the same tag racing each other means one of them fails with a confusing
+# error. Never cancel in flight.
+concurrency:
+  group: publish-mcp-registry
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # actions/checkout
+      id-token: write # OIDC, so no registry token is ever stored in this repo
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same guard as release.yml, for the same reason. `github.ref` is the
+      # unambiguous form — `refs/tags/v1.2.3` on a tag push or a tag dispatch,
+      # `refs/heads/<branch>` otherwise.
+      - name: Assert server.json agrees with the tag being published
+        env:
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          case "$REF" in
+          refs/tags/*) ;;
+          *)
+            echo "refusing to publish from non-tag ref '${REF}'." >&2
+            echo "a branch has no version to check server.json against, so publishing" >&2
+            echo "from one would claim whatever '\"version\"' happens to say at that" >&2
+            echo "commit — and a registry version number can never be reused." >&2
+            exit 1
+            ;;
+          esac
+          expected=${REF_NAME#v}
+          # Both the server entry and the PyPI package it points at carry a
+          # version, and the registry validates the second against PyPI. Check
+          # every one of them, not just the first.
+          mapfile -t found < <(jq -r '.version, .packages[].version' server.json)
+          for v in "${found[@]}"; do
+            if [ "$v" != "$expected" ]; then
+              echo "server.json version '$v' does not match tag '$REF_NAME'" >&2
+              echo "bump-my-version rewrites both version lines in server.json; if this" >&2
+              echo "fired, one of them was hand-edited. fix it and retag." >&2
+              exit 1
+            fi
+          done
+          echo "server.json versions: ${found[*]} — all match ${expected}"
+
+      # The registry proves PyPI ownership by looking for `mcp-name: <name>` in
+      # the package description, which is the README *as published to PyPI* —
+      # and a PyPI description is immutable per version. So this must be true of
+      # the release being tagged, not merely of the working tree.
+      #
+      # This step also sequences the two publishes. release.yml uploads to PyPI
+      # from the GitHub Release, which a human creates after pushing the tag, so
+      # this workflow can start minutes or hours before the package exists.
+      # Waiting turns that race into a wait, and a timeout into a re-runnable
+      # failure with an actionable message instead of an opaque registry error.
+      - name: Wait for the release on PyPI and check its ownership marker
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          version=${REF_NAME#v}
+          name=$(jq -r '.name' server.json)
+          deadline=$((SECONDS + 1800)) # 30 minutes
+          while :; do
+            body=$(curl -sS -f "https://pypi.org/pypi/minirag-mcp/${version}/json") && break
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "minirag-mcp ${version} is still not on PyPI after 30 minutes." >&2
+              echo "the MCP Registry verifies the package before accepting the server," >&2
+              echo "so publish the PyPI release first (release.yml, from the GitHub" >&2
+              echo "Release), then re-run this workflow." >&2
+              exit 1
+            fi
+            echo "waiting for minirag-mcp ${version} on PyPI..."
+            sleep 30
+          done
+          # `mcp-name:` must be followed by a boundary — newline, whitespace, an
+          # HTML tag or the comment close. Matching the whole comment is the
+          # simplest way to be sure we did not glue it to punctuation.
+          if ! printf '%s' "$body" | jq -e --arg m "<!-- mcp-name: ${name} -->" \
+               '.info.description | contains($m)' > /dev/null; then
+            echo "the README published to PyPI for ${version} has no '<!-- mcp-name: ${name} -->' marker." >&2
+            echo "the registry cannot verify package ownership without it, and a PyPI" >&2
+            echo "description is immutable per version — this needs a new release with" >&2
+            echo "the marker in README.md, not a re-run." >&2
+            exit 1
+          fi
+          echo "PyPI has minirag-mcp ${version} and its README carries the ownership marker"
+
+      # Pinned to the latest release, as the registry's own documented example
+      # does: the binary and the deployed registry are versioned together, and
+      # an "invalid audience" error is what an outdated publisher looks like.
+      - name: Install mcp-publisher
+        run: |
+          curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+
+      # GitHub OIDC. The `io.github.sfrangulov/*` namespace is granted from the
+      # workflow's own identity, so there is no secret in this repository to
+      # leak and nothing to rotate.
+      - name: Authenticate to the MCP Registry
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish server.json to the MCP Registry
+        run: ./mcp-publisher publish
