@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
+from minirag_mcp import ocr
 from minirag_mcp.config import Config
 from minirag_mcp.ingest.pipeline import Pipeline
 from minirag_mcp.ingest.scanner import compute_diff, scan_roots
@@ -102,6 +103,7 @@ def _run_sync_unlocked(
         "ingested": 0,
         "skipped": len(diff.unchanged),
         "deleted": 0,
+        "unreadable": len(diff.unreadable),
         "failed": 0,
     }
     errors: list[dict] = []
@@ -109,6 +111,17 @@ def _run_sync_unlocked(
     for path in diff.oversized:
         counts["failed"] += 1
         errors.append({"source": str(path), "error": f"exceeds MAX_FILE_SIZE ({max_file_size})"})
+
+    # Not counted as failures: the run did everything it could, and an install that
+    # deliberately omits the extra would otherwise exit 1 on every sync forever.
+    for source in diff.unreadable:
+        errors.append(
+            {
+                "source": source,
+                "error": "kept in the index: this installation cannot read this file type, "
+                f"so it was neither re-ingested nor deleted; {ocr.INSTALL_HINT}",
+            }
+        )
 
     for path in diff.to_ingest:
         try:

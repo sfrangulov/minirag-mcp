@@ -138,6 +138,27 @@ def test_sync_keeps_indexed_images_when_the_ocr_extra_is_gone(env, monkeypatch):
     assert store.all_chunks(str(root / "scan.jpg"))
 
 
+def test_sync_reports_the_sources_it_kept_but_cannot_read(env, monkeypatch):
+    """Keeping them silently fails the same way deleting them did: the user is never
+    told that part of the corpus is frozen, or which install would thaw it."""
+    from minirag_mcp import ocr
+
+    cfg, store, pipeline, root = env
+    monkeypatch.setattr(ocr, "available", lambda: True)
+    monkeypatch.setattr(ocr, "ocr_image", lambda path, config: "scanned text body")
+    (root / "note.md").write_text("# plain note\n\nbody")
+    (root / "scan.jpg").write_bytes(b"...")
+    run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+
+    monkeypatch.setattr(ocr, "available", lambda: False)
+    counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+
+    assert counts["unreadable"] == 1
+    assert counts["failed"] == 0  # a missing extra is not a failed run
+    assert [e["source"] for e in errors] == [str(root / "scan.jpg")]
+    assert "ocr" in errors[0]["error"]
+
+
 def test_run_sync_scope_single_file(env):
     cfg, store, pipeline, root = env
     seed(root)
