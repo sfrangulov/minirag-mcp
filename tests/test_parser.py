@@ -547,6 +547,44 @@ def test_pdf_mixed_without_ocr_keeps_partial_text(tmp_path, monkeypatch):
     assert "long enough" in doc.markdown
 
 
+def test_pdf_without_ocr_skips_the_second_pdfminer_pass(tmp_path, monkeypatch):
+    """markitdown already parses the PDF; the per-page pass parses the same file again.
+    Without the extra that pass can only choose between refusing a file with no text at
+    all and returning the markdown unchanged, so a PDF the converter read must not pay
+    for it — the common path on the default install."""
+    from minirag_mcp import ocr
+    from minirag_mcp.config import load_config
+    from minirag_mcp.ingest import parser
+
+    seen = []
+
+    def record(path):
+        seen.append(path)
+        return ["", ""]
+
+    monkeypatch.setattr(ocr, "available", lambda: False)
+    monkeypatch.setattr(ocr, "pdf_page_texts", record)
+    doc = parser.parse_file(_pdf(tmp_path, [LONG, LONG]), load_config({}, cwd=tmp_path))
+    assert seen == []
+    assert doc.ocr_engine == ""
+    assert "long enough" in doc.markdown
+
+
+def test_pdf_without_ocr_still_reads_pages_when_the_converter_found_nothing(tmp_path, monkeypatch):
+    """Where the short-circuit stops. With nothing converted, the per-page pass is the
+    only thing that can tell a file pdfminer still reads from one with no text layer at
+    all, and only the second of those is a refusal."""
+    from minirag_mcp import ocr
+    from minirag_mcp.config import load_config
+    from minirag_mcp.ingest import parser
+
+    monkeypatch.setattr(ocr, "available", lambda: False)
+    monkeypatch.setattr(ocr, "pdf_page_texts", lambda path: [LONG, ""])
+    doc = parser.parse_file(_pdf(tmp_path, ["", ""]), load_config({}, cwd=tmp_path))
+    assert doc.markdown.strip() == ""
+    assert doc.ocr_engine == ""
+
+
 def test_pdf_without_config_behaves_as_before(tmp_path):
     from minirag_mcp.ingest import parser
 

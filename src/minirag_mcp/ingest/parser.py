@@ -431,6 +431,12 @@ def _pdf_with_ocr_fallback(path: Path, markdown: str, config) -> tuple[str, str]
     threshold = config.ocr_min_chars_per_page
     if threshold <= 0:
         return markdown, ""
+    if not ocr.available() and markdown.strip():
+        # The per-page pass is a second full pdfminer parse of a file markitdown has
+        # already parsed. With no OCR to route pages to, its only remaining use is
+        # telling a file with no text at all from one with some, and a converter result
+        # that carries text has answered that.
+        return markdown, ""
     try:
         page_texts = ocr.pdf_page_texts(path)
     except Exception as e:
