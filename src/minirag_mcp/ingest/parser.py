@@ -351,6 +351,12 @@ def _display_stem(stem: str) -> str:
     return _SPACE_RE.sub(" ", stem.replace("_", " ")).strip()
 
 
+def _stem_title(stem: str) -> str:
+    """The last-resort title, from a stem `_strip_extension_suffix` has already been
+    applied to. The raw stem survives only when normalisation leaves nothing at all."""
+    return _display_stem(stem) or stem
+
+
 def find_title(markdown: str, explicit: str | None) -> str | None:
     """The title the caller gave or the document carries — None when it has neither.
 
@@ -386,7 +392,7 @@ def _file_title(markdown: str, explicit: str | None, stem: str) -> str:
         return _display_stem(stem)
     if h1:
         return h1
-    return _display_stem(stem) or stem
+    return _stem_title(stem)
 
 
 def _converted_markdown(result) -> str:
@@ -404,8 +410,9 @@ def parse_file(path: Path, config: Config | None = None) -> ParsedDoc:
             text = ocr.ocr_image(path, config)
         except ocr.OcrError as e:
             raise ParserError(str(e)) from e
-        stem = _strip_extension_suffix(path.stem)
-        title = _display_stem(stem) or stem
+        # Not `_file_title`: OCR output carries no heading the author wrote, so its
+        # first line is whatever the scanner caught at the top of the page.
+        title = _stem_title(_strip_extension_suffix(path.stem))
         return ParsedDoc(markdown=text, title=title, ocr_engine=ocr.ENGINE_RAPIDOCR)
     try:
         result = _md().convert(str(path))
@@ -422,7 +429,7 @@ def parse_file(path: Path, config: Config | None = None) -> ParsedDoc:
     )
 
 
-def _pdf_with_ocr_fallback(path: Path, markdown: str, config) -> tuple[str, str]:
+def _pdf_with_ocr_fallback(path: Path, markdown: str, config: Config) -> tuple[str, str]:
     """Route near-empty PDF pages through OCR; keep text-layer pages as they are.
 
     Per-page, not whole-document: a text cover page over scanned pages must
