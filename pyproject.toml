@@ -67,6 +67,18 @@ regex = true
 search = '^version = "{current_version}"$'
 replace = 'version = "{new_version}"'
 
+# uv.lock pins this project's own version alongside its dependencies. Left out,
+# it stays a release behind until the next `uv run` rewrites it — and that dirty
+# file then blocks the *following* bump, because allow_dirty is false. Bumping
+# it here keeps the lock in the release commit where it belongs. Anchored to the
+# minirag-mcp package block, since other packages in the lock have their own
+# `version = ` lines.
+[[tool.bumpversion.files]]
+filename = "uv.lock"
+regex = true
+search = 'name = "minirag-mcp"\nversion = "{current_version}"'
+replace = 'name = "minirag-mcp"\nversion = "{new_version}"'
+
 [tool.pytest.ini_options]
 addopts = "-m 'not slow'"
 markers = ["slow: needs the real embedding model (downloads ~220 MB)"]
