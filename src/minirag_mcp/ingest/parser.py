@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import logging
 import re
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -13,7 +14,11 @@ import requests
 from markitdown import MarkItDown
 from requests.adapters import HTTPAdapter
 
+from minirag_mcp import ocr
+from minirag_mcp.config import Config
 from minirag_mcp.security import SecurityError, check_url
+
+logger = logging.getLogger(__name__)
 
 SUPPORTED_EXTENSIONS = frozenset(
     {
@@ -31,6 +36,18 @@ SUPPORTED_EXTENSIONS = frozenset(
         ".ipynb",
     }
 )
+
+IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".webp"})
+
+
+def supported_extensions() -> frozenset[str]:
+    """The scan whitelist. Images are documents only when OCR can read them —
+    without it they would ingest as nothing, and most images in a docs tree
+    are illustrations, so their absence is silence, not an error."""
+    if ocr.available():
+        return SUPPORTED_EXTENSIONS | IMAGE_EXTENSIONS
+    return SUPPORTED_EXTENSIONS
+
 
 _H1_RE = re.compile(r"^#\s+(.+?)\s*$")
 _FENCE_RE = re.compile(r"^(```+|~~~+)")
@@ -111,9 +128,13 @@ _IMAGE_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
 # The same, restricted to an inlined `data:` URI — the picture itself, not a link to
 # one — with the alt text captured so it can be kept.
 _DATA_URI_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(\s*data:[^)]*\)")
-# A leftover extension in a stem, as "report.pdf.pdf" leaves "report.pdf"
+# A leftover extension in a stem, as "report.pdf.pdf" leaves "report.pdf". Built from
+# the static union of both extension sets — not `supported_extensions()`, whose answer
+# depends on `ocr.available()` and can change between calls; this regex is compiled once.
 _EXTENSION_SUFFIX_RE = re.compile(
-    r"\.(?:" + "|".join(sorted(e.lstrip(".") for e in SUPPORTED_EXTENSIONS)) + r")$",
+    r"\.(?:"
+    + "|".join(sorted(e.lstrip(".") for e in SUPPORTED_EXTENSIONS | IMAGE_EXTENSIONS))
+    + r")$",
     re.IGNORECASE,
 )
 _SEPARATORS_RE = re.compile(r"[\s_\-.]+")
@@ -155,6 +176,8 @@ class ParsedDoc:
     # than a title the document or the caller actually supplied. Callers that put the
     # title into indexed text must not do so for a stand-in.
     has_title: bool = True
+    # Non-empty when OCR produced some or all of `markdown` (engine name).
+    ocr_engine: str = ""
 
 
 class _GuardedHTTPAdapter(HTTPAdapter):
@@ -371,13 +394,83 @@ def _converted_markdown(result) -> str:
     return strip_data_uri_images(result.markdown or "")
 
 
-def parse_file(path: Path) -> ParsedDoc:
+def parse_file(path: Path, config: Config | None = None) -> ParsedDoc:
+    if path.suffix.lower() in IMAGE_EXTENSIONS:
+        if not ocr.available():
+            raise ParserError(f"{path} is an image, which needs OCR; {ocr.INSTALL_HINT}")
+        if config is None:
+            raise ParserError(f"OCR for {path} needs a Config (internal error)")
+        try:
+            text = ocr.ocr_image(path, config)
+        except ocr.OcrError as e:
+            raise ParserError(str(e)) from e
+        stem = _strip_extension_suffix(path.stem)
+        title = _display_stem(stem) or stem
+        return ParsedDoc(markdown=text, title=title, ocr_engine=ocr.ENGINE_RAPIDOCR)
     try:
         result = _md().convert(str(path))
     except Exception as e:  # markitdown may raise lib-specific errors too
         raise ParserError(f"Failed to convert {path}: {e}") from e
     markdown = _converted_markdown(result)
-    return ParsedDoc(markdown=markdown, title=_file_title(markdown, result.title, path.stem))
+    ocr_engine = ""
+    if config is not None and path.suffix.lower() == ".pdf":
+        markdown, ocr_engine = _pdf_with_ocr_fallback(path, markdown, config)
+    return ParsedDoc(
+        markdown=markdown,
+        title=_file_title(markdown, result.title, path.stem),
+        ocr_engine=ocr_engine,
+    )
+
+
+def _pdf_with_ocr_fallback(path: Path, markdown: str, config) -> tuple[str, str]:
+    """Route near-empty PDF pages through OCR; keep text-layer pages as they are.
+
+    Per-page, not whole-document: a text cover page over scanned pages must
+    not mask them. Threshold 0 disables the check entirely.
+    """
+    threshold = config.ocr_min_chars_per_page
+    if threshold <= 0:
+        return markdown, ""
+    try:
+        page_texts = ocr.pdf_page_texts(path)
+    except Exception as e:
+        # pdfminer failing on an exotic PDF must not break the markitdown result that
+        # already succeeded, but a silently disabled OCR path must still be visible.
+        logger.warning("pdf_page_texts failed for %s, OCR routing skipped: %s", path, e)
+        return markdown, ""
+    needs = [i for i, text in enumerate(page_texts) if len(text.strip()) < threshold]
+    if not needs:
+        return markdown, ""
+    if not ocr.available():
+        # Every page being under the threshold is not the same as the file having
+        # nothing: a certificate or a title page carries a few real characters, and
+        # refusing it would drop a document the default install indexed before.
+        if len(needs) == len(page_texts) and not markdown.strip():
+            raise ParserError(
+                f"{path} looks like a scanned PDF (no text layer); {ocr.INSTALL_HINT}"
+            )
+        return markdown, ""  # partial text beats refusal
+    try:
+        recognized = ocr.ocr_pdf(path, config, needs)
+    except ocr.OcrError as e:
+        raise ParserError(str(e)) from e
+    # markitdown's markdown has no page boundaries to splice into: a scanned page's
+    # recognized text is appended after the converted document rather than woven
+    # back into page order, trading position for keeping the good pages' own
+    # structure (tables, headings) intact instead of flattening the whole document
+    # to raw per-page text the moment any single page needs OCR.
+    ocr_text = "\n\n".join(text for i in needs if (text := recognized.get(i, "").strip()))
+    if not ocr_text:
+        # OCR finding nothing is only fatal when the converter found nothing either:
+        # markitdown (pdfplumber) and pdfminer's per-page pass are separate
+        # extractors and can disagree on an odd encoding or a degenerate text box,
+        # so a markitdown result that already has content must survive even when
+        # every page fell below the per-page threshold and OCR added nothing.
+        if len(needs) == len(page_texts) and not markdown.strip():
+            raise ParserError(f"{path}: OCR produced no text (page may be blank or unreadable)")
+        return markdown, ""  # OCR added nothing; the converter already carried content
+    merged = "\n\n".join(part for part in (markdown.strip(), ocr_text) if part)
+    return merged, ocr.ENGINE_RAPIDOCR
 
 
 def parse_html(html: str, title: str | None = None) -> ParsedDoc:

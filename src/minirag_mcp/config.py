@@ -36,6 +36,8 @@ class Config:
     max_distance: float | None
     max_files: int | None
     allow_private_urls: bool
+    ocr_lang: str = "eslav"
+    ocr_min_chars_per_page: int = 25
 
 
 def _resolve(p: str) -> Path:
@@ -143,6 +145,10 @@ def load_config(
     max_files_raw = env.get("RAG_MAX_FILES")
     max_files = _int(env, "RAG_MAX_FILES", 1, 1) if max_files_raw is not None else None
 
+    ocr_lang = env.get("RAG_OCR_LANG", "eslav").strip()
+    if not ocr_lang:
+        raise ConfigError("RAG_OCR_LANG must be a non-empty language code, e.g. 'eslav'")
+
     return Config(
         roots=roots,
         db_path=db_path,
@@ -161,4 +167,6 @@ def load_config(
         max_distance=_opt_float(env, "RAG_MAX_DISTANCE", 0.0),
         max_files=max_files,
         allow_private_urls=_bool(env, "ALLOW_PRIVATE_URLS"),
+        ocr_lang=ocr_lang,
+        ocr_min_chars_per_page=_int(env, "RAG_OCR_MIN_CHARS_PER_PAGE", 25, 0),
     )

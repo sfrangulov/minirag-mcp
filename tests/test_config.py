@@ -103,3 +103,26 @@ def test_config_is_frozen(tmp_path):
     cfg = load_config({}, cwd=tmp_path)
     with pytest.raises(dataclasses.FrozenInstanceError):
         cfg.model_name = "x"  # type: ignore[misc]
+
+
+def test_ocr_defaults():
+    cfg = load_config({}, cwd=Path("/tmp"))
+    assert cfg.ocr_lang == "eslav"
+    assert cfg.ocr_min_chars_per_page == 25
+
+
+def test_ocr_lang_override():
+    cfg = load_config({"RAG_OCR_LANG": "cyrillic"}, cwd=Path("/tmp"))
+    assert cfg.ocr_lang == "cyrillic"
+
+
+def test_ocr_min_chars_zero_allowed_and_negative_rejected():
+    cfg = load_config({"RAG_OCR_MIN_CHARS_PER_PAGE": "0"}, cwd=Path("/tmp"))
+    assert cfg.ocr_min_chars_per_page == 0
+    with pytest.raises(ConfigError):
+        load_config({"RAG_OCR_MIN_CHARS_PER_PAGE": "-1"}, cwd=Path("/tmp"))
+
+
+def test_ocr_lang_blank_rejected():
+    with pytest.raises(ConfigError):
+        load_config({"RAG_OCR_LANG": "  "}, cwd=Path("/tmp"))

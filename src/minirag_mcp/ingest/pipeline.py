@@ -11,10 +11,10 @@ from minirag_mcp.chunker import SCHEME_VERSION, chunk_markdown, estimate_tokens
 from minirag_mcp.config import Config
 from minirag_mcp.ingest import parser as _parser
 from minirag_mcp.ingest.parser import (
-    SUPPORTED_EXTENSIONS,
     find_title,
     parse_file,
     parse_html,
+    supported_extensions,
 )
 from minirag_mcp.security import check_url
 from minirag_mcp.store import ChunkRecord, Store
@@ -79,6 +79,7 @@ class Pipeline:
         seed_title: bool,
         file_hash: str = "",
         mtime: float = 0.0,
+        ocr_engine: str = "",
     ) -> IngestResult:
         """Chunk, embed and store, replacing whatever `source` held before.
 
@@ -114,6 +115,7 @@ class Pipeline:
                 # Scoped to the source so a parent is addressable on its own, and so
                 # two documents can never share one.
                 parent_id=f"{source}#p{chunk.parent_index}",
+                ocr_engine=ocr_engine,
                 scheme_version=SCHEME_VERSION,
             )
             for i, (chunk, vec) in enumerate(zip(chunks, vectors, strict=True))
@@ -122,10 +124,10 @@ class Pipeline:
         return IngestResult(source=source, chunk_count=len(records), title=title)
 
     def ingest_file(self, path: Path) -> IngestResult:
-        if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+        exts = supported_extensions()
+        if path.suffix.lower() not in exts:
             raise UnsupportedFormatError(
-                f"Unsupported file extension {path.suffix!r}; supported: "
-                + ", ".join(sorted(SUPPORTED_EXTENSIONS))
+                f"Unsupported file extension {path.suffix!r}; supported: " + ", ".join(sorted(exts))
             )
         # One stat for both checks: the recorded mtime must describe the same file
         # state whose size was accepted.
@@ -134,7 +136,7 @@ class Pipeline:
             raise FileTooLargeError(
                 f"{path} is {info.st_size} bytes; MAX_FILE_SIZE is {self.config.max_file_size}"
             )
-        doc = parse_file(path)
+        doc = parse_file(path, self.config)
         return self._chunk_and_store(
             doc.markdown,
             source=str(path),
@@ -144,6 +146,7 @@ class Pipeline:
             seed_title=True,
             file_hash=file_sha256(path),
             mtime=info.st_mtime,
+            ocr_engine=doc.ocr_engine,
         )
 
     def ingest_data(

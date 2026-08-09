@@ -99,6 +99,21 @@ def test_unknown_job_id(env):
         mgr.status("nope")
 
 
+def test_sync_ingests_images_via_ocr(env, monkeypatch):
+    from minirag_mcp import ocr
+
+    cfg, store, pipeline, root = env
+    monkeypatch.setattr(ocr, "available", lambda: True)
+    monkeypatch.setattr(ocr, "ocr_image", lambda path, config: "scanned text body")
+    (root / "note.md").write_text("# plain note\n\nbody")
+    (root / "scan.jpg").write_bytes(b"...")
+    counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    assert errors == []
+    assert counts["ingested"] == 2
+    counts2, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    assert counts2["skipped"] == 2 and counts2["ingested"] == 0
+
+
 def test_run_sync_scope_single_file(env):
     cfg, store, pipeline, root = env
     seed(root)

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from minirag_mcp.chunker import SCHEME_VERSION
-from minirag_mcp.ingest.parser import SUPPORTED_EXTENSIONS
+from minirag_mcp.ingest.parser import supported_extensions
 from minirag_mcp.ingest.pipeline import file_sha256
 from minirag_mcp.scope import is_under
 from minirag_mcp.store import SourceInfo
@@ -62,6 +62,7 @@ def scan_roots(roots: Sequence[Path]) -> list[ScanEntry]:
     Returns entries sorted by path.
     """
     real_roots = [Path(r).resolve() for r in roots]
+    exts = supported_extensions()
     entries: list[ScanEntry] = []
     seen: set[Path] = set()
     for root in roots:
@@ -73,7 +74,7 @@ def scan_roots(roots: Sequence[Path]) -> list[ScanEntry]:
                 if name.startswith("."):
                     continue
                 p = Path(dirpath) / name
-                if p.suffix.lower() not in SUPPORTED_EXTENSIONS:
+                if p.suffix.lower() not in exts:
                     continue
                 # Dedupe by resolved path to handle overlapping roots
                 resolved = p.resolve()
@@ -166,6 +167,7 @@ class FileState:
     title: str
     state: str  # "ingested" | "not_ingested" | "stale" | "stale_scheme"
     chunk_count: int
+    ocr_engine: str = ""
 
 
 def _indexed_state(prior: SourceInfo) -> str:
@@ -210,13 +212,23 @@ def compute_states(entries: list[ScanEntry], indexed: list[SourceInfo]) -> list[
             states.append(FileState(str(e.path), "file", "", "not_ingested", 0))
         elif prior.mtime == e.mtime or prior.file_hash == file_sha256(e.path):
             state = _indexed_state(prior)
-            states.append(FileState(str(e.path), "file", prior.title, state, prior.chunk_count))
+            states.append(
+                FileState(
+                    str(e.path), "file", prior.title, state, prior.chunk_count, prior.ocr_engine
+                )
+            )
         else:
-            states.append(FileState(str(e.path), "file", prior.title, "stale", prior.chunk_count))
+            states.append(
+                FileState(
+                    str(e.path), "file", prior.title, "stale", prior.chunk_count, prior.ocr_engine
+                )
+            )
     for s in indexed:
         if s.source_type in ("data", "url"):
             states.append(
-                FileState(s.source, s.source_type, s.title, _indexed_state(s), s.chunk_count)
+                FileState(
+                    s.source, s.source_type, s.title, _indexed_state(s), s.chunk_count, s.ocr_engine
+                )
             )
     states.sort(key=lambda s: s.source)
     return states

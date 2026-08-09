@@ -132,6 +132,34 @@ def test_ingest_url_mocked(corpus, capsys, monkeypatch, public_dns):
     assert "example.com" in capsys.readouterr().out
 
 
+def test_list_reports_the_ocr_engine_in_json_and_in_the_human_listing(corpus, capsys, monkeypatch):
+    """How a document entered the index is user-visible, so it has to survive on both
+    of the CLI's output paths — and match the MCP `list_files` field of the same name
+    (tests/test_server.py)."""
+    from minirag_mcp import ocr
+
+    monkeypatch.setattr(ocr, "available", lambda: True)
+    monkeypatch.setattr(ocr, "ocr_image", lambda path, config: "recognized invoice text")
+    scan = corpus / "scan.png"
+    scan.write_bytes(b"png bytes irrelevant, ocr is faked")
+    run(["ingest", str(scan), "--base-dir", str(corpus)])
+    capsys.readouterr()
+
+    run(["list", "--base-dir", str(corpus), "--json"])
+    by_source = {f["source"]: f for f in json.loads(capsys.readouterr().out)["files"]}
+    assert by_source[str(scan)]["ocrEngine"] == "rapidocr"
+    assert by_source[str(corpus / "a.md")]["ocrEngine"] == ""
+
+    run(["list", "--base-dir", str(corpus)])
+    lines = {
+        ln.split("] ", 1)[1].split(" (", 1)[0]: ln
+        for ln in capsys.readouterr().out.split("\n")
+        if "] " in ln
+    }
+    assert lines[str(scan)].endswith(" [ocr:rapidocr]")
+    assert "[ocr:" not in lines[str(corpus / "a.md")]
+
+
 def test_list_scope_stops_at_a_path_component_boundary(tmp_path, capsys):
     (tmp_path / "proj").mkdir()
     (tmp_path / "project-secret").mkdir()

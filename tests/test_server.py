@@ -191,6 +191,24 @@ async def test_ingest_data_and_url(app, monkeypatch, public_dns):
             await c.call_tool("ingest_url", {"url": "file:///etc/passwd"})
 
 
+async def test_list_files_reports_the_ocr_engine(app, monkeypatch):
+    """The MCP half of the same user-visible fact the CLI prints as `[ocr:<engine>]`
+    (tests/test_cli.py): how a document entered the index."""
+    from minirag_mcp import ocr
+
+    monkeypatch.setattr(ocr, "available", lambda: True)
+    monkeypatch.setattr(ocr, "ocr_image", lambda path, config: "recognized invoice text")
+    mcp, root = app
+    scan = root / "scan.png"
+    scan.write_bytes(b"png bytes irrelevant, ocr is faked")
+    async with Client(mcp) as c:
+        await c.call_tool("ingest_file", {"filePath": str(scan)})
+        await c.call_tool("ingest_file", {"filePath": str(root / "auth.md")})
+        by_source = {f["source"]: f for f in (await c.call_tool("list_files", {})).data["files"]}
+    assert by_source[str(scan)]["ocrEngine"] == "rapidocr"
+    assert by_source[str(root / "auth.md")]["ocrEngine"] == ""
+
+
 async def test_list_files_scope_stops_at_a_path_component_boundary(tmp_path, fake_embedder):
     """A scope of .../proj must not list .../project-secret, on disk or in the index."""
     root = tmp_path / "docs"
