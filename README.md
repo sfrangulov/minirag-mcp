@@ -1,6 +1,11 @@
 # minirag-mcp
 
+<!-- mcp-name: io.github.sfrangulov/minirag-mcp -->
+
+[![PyPI](https://img.shields.io/pypi/v/minirag-mcp)](https://pypi.org/project/minirag-mcp/)
+[![License: MIT](https://img.shields.io/pypi/l/minirag-mcp)](LICENSE)
 [![CI](https://github.com/sfrangulov/minirag-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/sfrangulov/minirag-mcp/actions/workflows/ci.yml)
+[![Glama score](https://glama.ai/mcp/servers/sfrangulov/minirag-mcp/badges/score.svg)](https://glama.ai/mcp/servers/btvcl5o1wx)
 
 A local-first RAG (retrieval-augmented generation) MCP server. Point it at a
 folder of documents and it gives your MCP client (Claude Code, Cursor, Codex,
