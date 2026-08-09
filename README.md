@@ -394,23 +394,56 @@ built-in policy and the rest is held in reserve for your own line — see below.
 
 ### Citing what it found
 
-Any answer built on `query_documents` is asked to say where it came from:
-inline `[1]`, `[2]` markers numbered in order of first use, then a Sources list
-at the end giving each document's `title` and `source` path verbatim.
+Any answer built on `query_documents` ends with a Sources list: one line per
+document the answer actually used, and each line is nothing but that document's
+path, relative to the root it lives under.
+
+That string is not something the answer composes. Every entry in the response's
+`sources` list arrives carrying it, in a `displayPath` field:
+
+```json
+"sources": [
+  {"source": "/home/ann/notes/specs/onboarding_v2.md",
+   "title": "onboarding v2", "hits": 3,
+   "displayPath": "specs/onboarding_v2.md"}
+]
+```
+
+The two path fields are separate on purpose and are not interchangeable.
+`source` is the identity key — `read_file`, `read_chunk_neighbors`,
+`delete_file` and re-ingest all address a document by it, and it stays the
+absolute path it has always been. `displayPath` is for showing a person, and is
+the only one the citation rule mentions.
+
+It is the path and not the `title` because the title is *derived*: underscores
+become spaces and the extension is dropped, so `И-112_ЗПС_Хранение ТМЗ.docx`
+would reach you as `И-112 ЗПС Хранение ТМЗ` — a name that matches no file you
+can open. The relative path carries the filename exactly as it is on disk. A
+source with no filesystem path at all — a `data` item, or a URL — has its
+ingest id here, which for a URL is the URL.
+
+No inline markers. An answer is typically built from two to six
+`query_documents` calls, each numbering its own `sources` from 1, so there is no
+numbering the model could copy rather than invent — and in a real Claude Desktop
+answer the model wrote an unnumbered list under the header, leaving every
+`[n]` in the prose pointing at nothing. A citation that resolves to nowhere is
+worse than no citation, so the markers are gone and the list carries the whole
+of it.
 
 Documents, not chunks. `chunkIndex` and `parentId` are internal identifiers
 that locate nothing for a person opening the file, and models are in any case
 much better at picking the right document than the right span inside it
 ([arXiv 2606.07130][fullcite]) — enforcing finer-grained citations has been
 measured to *degrade* attribution quality by 16–276% against the best
-granularity ([arXiv 2604.01432][granularity]).
+granularity ([arXiv 2604.01432][granularity]). `sources` is that document list
+already, which is why `displayPath` lives there.
 
-Plain text, not a link. A `file://` URL is refused or mishandled by every
-client checked: Claude Desktop denylists the scheme outright, Claude Code
+Plain text, not a link — the one thing a model can still get wrong about a
+string it is copying is to wrap it. A `file://` URL is refused or mishandled by
+every client checked: Claude Desktop denylists the scheme outright, Claude Code
 hyperlinks only `http`/`https`, and Cursor hands it to the operating system,
 which opens Xcode. A markdown link with a bare path — `[title](/abs/path)` —
-renders as a broken relative URL. A plain absolute path stays readable
-everywhere and is something Claude Desktop will linkify on its own.
+renders as a broken relative URL. A plain path stays readable everywhere.
 
 Only documents in the results may be cited, and where the results don't cover
 part of the question the answer is expected to say so rather than fill the gap
@@ -424,9 +457,9 @@ the sentence they were attached to ([arXiv 2304.09848][verifiability]); on
 ELI5, even the best models evaluated lack complete citation support half the
 time ([arXiv 2305.14627][alce]); commercial legal research tools sold as
 hallucination-free were measured hallucinating 17–33% of the time ([arXiv
-2405.20362][legal]). A marker next to a sentence means *this is the document I
-claim it came from* — nothing more. What it buys you is that the check is one
-step: the path is right there, and the file is yours.
+2405.20362][legal]). A listed document means *this is where I claim it came
+from* — nothing more. What it buys you is that the check is one step: the path
+is right there, under a root you chose, and the file is yours.
 
 [verifiability]: https://arxiv.org/abs/2304.09848
 [alce]: https://arxiv.org/abs/2305.14627

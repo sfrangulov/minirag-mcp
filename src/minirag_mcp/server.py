@@ -170,11 +170,12 @@ def create_app(
         """Hybrid search: semantic similarity plus a keyword boost for exact terms.
 
         Returns `results` — ranked chunks with text, source, title,
-        chunkIndex, score and parentId — `sources`, the distinct sources
-        among those results in rank order each with a hits count, and
-        `parents`, a map from parentId to section text. Use `sources` to
-        answer "which documents cover this topic" without inspecting
-        individual chunks.
+        chunkIndex, score and parentId — `sources`, the distinct
+        sources in rank order each with a hits count and a
+        `displayPath` to show the user (`source` stays absolute and is
+        what the other tools take), and `parents`, a map from parentId
+        to section text. Use `sources` to answer "which documents
+        cover this topic" without inspecting individual chunks.
 
         `text` is the passage that matched and that `score` describes.
         `parentId` names the section it sits in — a transcript time
@@ -187,14 +188,10 @@ def create_app(
         silently clamped to the cap rather than rejected.
 
         Cite what you take, so the user can verify it, in whatever
-        language you answer: [1], [2] inline, then a Sources list —
-        one line per document, never per chunk. `source` verbatim: the
-        full path is the only thing that locates the file. `title`
-        labels it and may be shortened. Plain text, never a markdown
-        link or file://.
-
-        Sources:
-        [1] /docs/onboarding.md — Onboarding Guide
+        language you answer: end with a Sources list, one line per
+        document you actually used, each line just that document's
+        `displayPath` copied verbatim — no [n] markers, nothing else
+        on the line. Plain text, never a markdown link or file://.
         """
         if not query.strip():
             raise ToolError("query must not be empty")
@@ -213,7 +210,7 @@ def create_app(
         )
         return {
             "results": [result_dict(r) for r in results],
-            "sources": aggregate_sources(results),
+            "sources": aggregate_sources(results, c.config.roots),
             "parents": parent_map(results),
         }
 

@@ -42,11 +42,10 @@ CORPUS_NOTE = "This corpus is Russian-language financial specifications."
 #: failure worth a test here. Claude Code is handed both at once.
 CITATION_INVARIANTS = (
     "so the user can verify it",  # verification, not a claim that the prose is true
-    "[1], [2]",  # the marker style,
-    "Sources list",  # ...and the end-of-answer list the markers point into
-    "never per chunk",  # the granularity
-    "`source` verbatim",  # the path is the anchor: measured 7% -> 93% delivery
-    "`title` labels it and may be shortened",  # ...the label is not worth the budget
+    "Sources list",  # the end-of-answer list, which is now the whole of the format
+    "one line per document you actually used",  # granularity, and the bound on length
+    "`displayPath` copied verbatim",  # the one field: "without any modification"
+    "no [n] markers",  # numbering the model would have had to invent across calls
     "never a markdown link or file://",  # both arrive broken in every client checked
 )
 
@@ -118,23 +117,29 @@ async def test_the_citation_policy_reaches_the_client_through_the_handshake(app)
         received = c.initialize_result.instructions
 
     assert "<citations>" in received, "no citation policy in the instructions"
-    citations = received.split("<citations>", 1)[1].split("</citations>", 1)[0]
+    citations = _flat(received.split("<citations>", 1)[1].split("</citations>", 1)[0])
 
-    # Inline markers plus an end-of-answer list — the two halves of the format.
-    assert "[1]" in citations and "Sources:" in citations
+    # One list, one field, copied. That is the whole of the format now.
+    assert "Sources list" in citations
+    assert "`displayPath` copied verbatim" in citations
     # Keyed to the document. `chunkIndex`/`parentId` are internal identifiers
     # that locate nothing for a human opening the file, so they are not citable.
-    assert "`title`" in citations and "`source`" in citations
+    assert "one line per document" in citations
     assert "chunkIndex" not in citations and "parentId" not in citations
+    # No numbering, anywhere. An answer spans several query_documents calls, each
+    # numbering its own `sources` from 1, so a marker the model did not invent is
+    # not on offer — and the ones it invents index into an unnumbered list.
+    assert "no [n] markers" in citations
+    assert not re.search(r"\[\d+\]", citations), "the policy still demonstrates a marker"
+    # Bounded to what the answer used: "copy this string" otherwise reads as an
+    # invitation to list every document the tools offered (measured 6.8 vs 3.9).
+    assert "you actually used" in citations
     # Plain paths. Claude Desktop denylists the `file:` scheme, Claude Code
     # hyperlinks only http/https, Cursor hands file:// to the system handler —
     # and a scheme-less markdown link renders as a broken relative URL.
     assert "Plain text" in citations
     assert "file://" in citations and "markdown link" in citations
-    assert "](" not in citations, "the policy or its example contains a markdown link"
-    # The worked example: marker, title, bare absolute path. Without a literal
-    # instance the model emits the markers and drops the path from the list.
-    assert re.search(r"^\[1\] /\S+ .+$", citations, re.M), "no worked example of a Sources line"
+    assert "](" not in citations, "the policy contains a markdown link"
     # Citations are for the user's verification, not a claim that the prose is
     # true — measured support rates are far too low for the stronger reading.
     assert "verify" in citations
@@ -153,12 +158,17 @@ async def test_the_citation_rule_reaches_the_client_in_the_query_tool_descriptio
         descriptions = {t.name: t.description or "" for t in await c.list_tools()}
     desc = _flat(descriptions["query_documents"])
 
-    # The format, in the two halves an answer needs to be written in it.
-    assert "[1], [2]" in desc and "Sources list" in desc
+    # The format: one list, one field per line, copied rather than composed.
+    assert "Sources list" in desc
+    assert "`displayPath` copied verbatim" in desc
     # Keyed to the document: `chunkIndex`/`parentId` are internal identifiers,
     # and this tool's own results are where a model would otherwise reach for one.
-    assert "never per chunk" in desc
-    assert "`source` verbatim" in desc
+    assert "one line per document you actually used" in desc
+    # And no numbering to reconcile across the several calls an answer is built from.
+    assert "no [n] markers" in desc
+    # The field the rule names has to be the field the tool documents returning,
+    # or the policy points at nothing. Renames are what this catches.
+    assert "`displayPath`" in _flat(descriptions["query_documents"].split("Cite what")[0])
     # Plain paths. A `file://` URL or a scheme-less markdown link arrives broken
     # in every client checked, and models emit both spontaneously.
     assert "never a markdown link or file://" in desc
