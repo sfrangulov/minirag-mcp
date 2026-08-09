@@ -118,7 +118,7 @@ def test_orient_broken_numpy_install_raises_ocr_error(monkeypatch):
     monkeypatch.setattr(ocr, "_orientation", [])
     _break_import(monkeypatch, "numpy")
     with pytest.raises(ocr.OcrError, match=r"failed to import.*minirag-mcp\[ocr\]"):
-        ocr._orient(object())
+        ocr._orient(object(), Path("/docs/scan.png"))
 
 
 def test_orient_broken_rapid_orientation_install_raises_ocr_error(monkeypatch):
@@ -126,7 +126,7 @@ def test_orient_broken_rapid_orientation_install_raises_ocr_error(monkeypatch):
     monkeypatch.setattr(ocr, "_orientation", [])
     _break_import(monkeypatch, "rapid_orientation")
     with pytest.raises(ocr.OcrError, match=r"failed to import.*minirag-mcp\[ocr\]"):
-        ocr._orient(object())
+        ocr._orient(object(), Path("/docs/scan.png"))
 
 
 class _FakeCv2:
@@ -158,7 +158,7 @@ def test_ocr_image_recognizes_every_frame_of_a_multi_page_image(tmp_path, monkey
     monkeypatch.setattr(ocr, "_recognize", lambda img, config, path: f"text of {img}")
     # Orientation is pinned by the slow rotation test; here it would only reject the
     # stand-in frames, and only on a machine that happens to have the extra installed.
-    monkeypatch.setattr(ocr, "_orient", lambda img: img)
+    monkeypatch.setattr(ocr, "_orient", lambda img, path: img)
     img = tmp_path / "fax.tiff"
     img.write_bytes(b"pretend tiff bytes; the decoder is faked")
     text = ocr.ocr_image(img, load_config({}, cwd=tmp_path))
@@ -176,6 +176,19 @@ def test_ocr_image_undecodable_bytes_still_raise(tmp_path, monkeypatch):
     img.write_bytes(b"not an image")
     with pytest.raises(ocr.OcrError, match="could not decode"):
         ocr.ocr_image(img, load_config({}, cwd=tmp_path))
+
+
+def test_ocr_image_unreadable_file_says_reading_failed(tmp_path, monkeypatch):
+    """Reading the bytes and decoding them share one guard, so a missing file or a
+    permission error was reported as an image that could not be decoded."""
+    import sys
+
+    from minirag_mcp.config import load_config
+
+    monkeypatch.setattr(ocr, "available", lambda: True)
+    monkeypatch.setitem(sys.modules, "cv2", _FakeCv2(["page-a"]))
+    with pytest.raises(ocr.OcrError, match=r"could not read.*gone\.png"):
+        ocr.ocr_image(tmp_path / "gone.png", load_config({}, cwd=tmp_path))
 
 
 class _CrashingCv2:
@@ -200,14 +213,25 @@ def test_ocr_image_decoder_crash_raises_ocr_error(tmp_path, monkeypatch):
         ocr.ocr_image(img, load_config({}, cwd=tmp_path))
 
 
+class _FakeBitmap:
+    def __init__(self, array):
+        self._array = array
+
+    def to_numpy(self):
+        return self._array
+
+
 class _FakePage:
-    def __init__(self, error: Exception | None = None):
+    def __init__(self, error: Exception | None = None, bitmap=None):
         self._error = error
+        self._bitmap = bitmap
 
     def render(self, scale):
         if self._error is not None:
             raise self._error
-        raise AssertionError("these tests only exercise the failing render path")
+        if self._bitmap is None:
+            raise AssertionError("this page was given neither an error nor a bitmap")
+        return _FakeBitmap(self._bitmap)
 
 
 class _FakeDoc:
@@ -267,9 +291,23 @@ def test_ocr_pdf_page_the_renderer_does_not_have_raises_ocr_error(tmp_path, monk
     doc = _FakeDoc([_FakePage()])
     _install_pdfium(monkeypatch, _FakePdfium(doc=doc))
     p = _pdf(tmp_path, "short.pdf")
-    with pytest.raises(ocr.OcrError, match=r"short\.pdf"):
+    with pytest.raises(ocr.OcrError, match=r"short\.pdf.*list index out of range"):
         ocr.ocr_pdf(p, load_config({}, cwd=tmp_path), [3])
     assert doc.closed, "the document must still be closed when a page lookup fails"
+
+
+def test_ocr_pdf_orientation_failure_raises_ocr_error(tmp_path, monkeypatch):
+    """The same escape on the PDF path, which reaches `_orient` through the renderer."""
+    from minirag_mcp.config import load_config
+
+    cfg = load_config({}, cwd=tmp_path)
+    doc = _FakeDoc([_FakePage(bitmap="rendered page")])
+    _install_pdfium(monkeypatch, _FakePdfium(doc=doc))
+    _install_orientation(monkeypatch, _crashing_orientation)
+    p = _pdf(tmp_path, "tilted.pdf")
+    with pytest.raises(ocr.OcrError, match=r"tilted\.pdf.*orientation model download failed"):
+        ocr.ocr_pdf(p, cfg, [0])
+    assert doc.closed
 
 
 def test_ocr_pdf_unrenderable_page_raises_ocr_error(tmp_path, monkeypatch):
@@ -281,6 +319,63 @@ def test_ocr_pdf_unrenderable_page_raises_ocr_error(tmp_path, monkeypatch):
     with pytest.raises(ocr.OcrError, match=r"unrenderable\.pdf.*bitmap allocation failed"):
         ocr.ocr_pdf(p, load_config({}, cwd=tmp_path), [0])
     assert doc.closed
+
+
+class _CrashingOrientationModule:
+    """rapid_orientation whose model init fails — an offline first use, a bad cache."""
+
+    @staticmethod
+    def RapidOrientation():
+        raise RuntimeError("failed to download the orientation model")
+
+
+def _install_orientation(monkeypatch, engine) -> None:
+    """Make `_orient` believe the optional orientation package is installed.
+
+    find_spec gates the whole step: without the extra it returns None and `_orient`
+    hands the image straight back, so a fake engine would never be reached.
+    """
+    monkeypatch.setattr(ocr.importlib.util, "find_spec", lambda name: object())
+    monkeypatch.setattr(ocr, "_orientation", [engine])
+
+
+def _crashing_orientation(img):
+    raise RuntimeError("orientation model download failed")
+
+
+def test_orient_engine_init_failure_raises_ocr_error_with_the_install_hint(monkeypatch):
+    import sys
+
+    monkeypatch.setattr(ocr.importlib.util, "find_spec", lambda name: object())
+    monkeypatch.setattr(ocr, "_orientation", [])
+    monkeypatch.setitem(sys.modules, "rapid_orientation", _CrashingOrientationModule())
+    with pytest.raises(ocr.OcrError, match=r"orientation.*download.*minirag-mcp\[ocr\]"):
+        ocr._orient(object(), Path("/docs/scan.png"))
+
+
+def test_orient_unreadable_label_raises_ocr_error(monkeypatch):
+    """The classifier's contract is an angle in a string; anything else is an engine
+    fault, and `int()` reported it as a bare ValueError naming neither engine nor file."""
+    _install_orientation(monkeypatch, lambda img: ("sideways", 0.01))
+    with pytest.raises(ocr.OcrError, match=r"sideways.*scan\.png"):
+        ocr._orient(object(), Path("/docs/scan.png"))
+
+
+def test_ocr_image_orientation_failure_raises_ocr_error(tmp_path, monkeypatch):
+    """A failing orientation engine left the module as a raw RuntimeError, which
+    `parse_file` never converts: no file name, no install hint, no ParserError."""
+    import sys
+
+    from minirag_mcp.config import load_config
+
+    cfg = load_config({}, cwd=tmp_path)
+    monkeypatch.setattr(ocr, "available", lambda: True)
+    monkeypatch.setitem(sys.modules, "cv2", _FakeCv2(["page-a"]))
+    _install_orientation(monkeypatch, _crashing_orientation)
+    img = tmp_path / "tilted.png"
+    img.write_bytes(b"pretend png bytes; the decoder is faked")
+    with pytest.raises(ocr.OcrError, match=r"tilted\.png.*orientation model download failed"):
+        ocr.ocr_image(img, cfg)
 
 
 def test_recognize_engine_failure_names_the_file(tmp_path, monkeypatch):

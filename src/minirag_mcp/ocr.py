@@ -100,7 +100,7 @@ def _import_error_as_ocr_error(e: ImportError) -> OcrError:
     """
     return OcrError(
         "an OCR dependency is present but failed to import — a broken or partial "
-        f"install: {e}; reinstall to repair it, {INSTALL_HINT}"
+        f"install: {e}; repair it with a reinstall — {INSTALL_HINT}"
     )
 
 
@@ -143,12 +143,14 @@ def _engine(config: Config):
     return engine
 
 
-def _orient(img):
+def _orient(img, path: Path):
     """Rotate a sideways/upside-down page upright, when the classifier says so.
 
     rapid-orientation returns only a label ('0'/'90'/'180'/'270'), no
     confidence, so the only gate is a non-zero label. Optional: skipped
     silently when the package is missing (it ships with the extra).
+
+    `path` is carried only to name the file in a failure.
     """
     if importlib.util.find_spec("rapid_orientation") is None:
         return img
@@ -158,8 +160,16 @@ def _orient(img):
         raise _import_error_as_ocr_error(e) from e
 
     engine = _orientation_engine()
-    label, _elapse = engine(img)
-    quarter_turns = int(label) // 90
+    try:
+        label, _elapse = engine(img)
+    except Exception as e:
+        raise OcrError(f"orientation detection failed on {path}: {e}") from e
+    try:
+        quarter_turns = int(label) // 90
+    except (TypeError, ValueError) as e:
+        raise OcrError(
+            f"the orientation classifier returned {label!r}, not an angle, for {path}"
+        ) from e
     if quarter_turns:
         # np.rot90 is counterclockwise; the slow rotation test pins this sign.
         img = np.rot90(img, k=quarter_turns).copy()
@@ -176,7 +186,12 @@ def _orientation_engine():
         except ImportError as e:
             raise _import_error_as_ocr_error(e) from e
 
-        _orientation.append(RapidOrientation())
+        try:
+            _orientation.append(RapidOrientation())
+        except Exception as e:  # model download / init failure must be loud
+            raise OcrError(
+                f"the OCR orientation model failed to initialize: {e}; {INSTALL_HINT}"
+            ) from e
     return _orientation[0]
 
 
@@ -216,7 +231,7 @@ def ocr_pdf(path: Path, config: Config, pages: Sequence[int]) -> dict[int, str]:
                 bitmap = page.render(scale=_RENDER_SCALE).to_numpy()
             except Exception as e:
                 raise OcrError(f"could not render page {index} of {path} for OCR: {e}") from e
-            out[index] = _recognize(_orient(bitmap), config, path)
+            out[index] = _recognize(_orient(bitmap, path), config, path)
             logger.info("ocr: %s page %d -> %d chars", path, index, len(out[index]))
     finally:
         doc.close()
@@ -240,10 +255,13 @@ def ocr_image(path: Path, config: Config) -> str:
         data = np.fromfile(str(path), dtype=np.uint8)
         ok, frames = cv2.imdecodemulti(data, cv2.IMREAD_COLOR)
     except Exception as e:
-        # cv2 reports a corrupt file either way: `ok=False` for some, its own
-        # exception type for others.
-        raise OcrError(f"could not decode image {path}: {e}") from e
+        # Reading and decoding share one guard because both must leave this module as
+        # OcrError; the message covers both because an OSError from the read (missing
+        # file, no permission) is not a statement about the image's encoding. cv2
+        # reports a corrupt file either way: `ok=False` for some, its own exception
+        # type for others.
+        raise OcrError(f"could not read or decode image {path}: {e}") from e
     if not ok or not frames:
         raise OcrError(f"could not decode image {path}")
     logger.info("ocr: %s -> %d frame(s)", path, len(frames))
-    return "\n\n".join(text for f in frames if (text := _recognize(_orient(f), config, path)))
+    return "\n\n".join(text for f in frames if (text := _recognize(_orient(f, path), config, path)))
