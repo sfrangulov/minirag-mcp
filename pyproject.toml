@@ -23,6 +23,14 @@ dependencies = [
 [project.scripts]
 minirag-mcp = "minirag_mcp.__main__:main"
 
+[project.optional-dependencies]
+ocr = [
+    "rapidocr>=3.9",
+    "onnxruntime>=1.19",
+    "pypdfium2>=5",
+    "rapid-orientation>=0.0.11",
+]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
