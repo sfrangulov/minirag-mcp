@@ -2,17 +2,23 @@
 
 from __future__ import annotations
 
+import re
+
 import pytest
 from fastmcp import Client
 
 from minirag_mcp.config import load_config
 from minirag_mcp.instructions import (
     APPEND_ENV_VAR,
+    MAX_BUILTIN_INSTRUCTIONS_CHARS,
     MAX_INSTRUCTIONS_CHARS,
     SERVER_INSTRUCTIONS,
     build_instructions,
 )
 from minirag_mcp.server import create_app
+
+#: `build_instructions` joins the built-in text and the append with a blank line.
+APPEND_SEPARATOR_CHARS = 2
 
 # pytest-asyncio runs in auto mode (see pyproject) — bare `async def` tests are collected as-is.
 
@@ -63,17 +69,80 @@ async def test_instructions_survive_a_broken_configuration(app, fake_embedder):
         assert c.initialize_result.instructions == SERVER_INSTRUCTIONS
 
 
+async def test_the_citation_policy_reaches_the_client_through_the_handshake(app):
+    """The citation block, checked at the far end of the connection.
+
+    Asserted against the string the client was handed rather than against
+    SERVER_INSTRUCTIONS, which would be the constant matched against itself and
+    would still pass with the policy deleted. The substrings are the parts the
+    policy would be useless without, not its phrasing.
+    """
+    async with Client(app()) as c:
+        received = c.initialize_result.instructions
+
+    assert "<citations>" in received, "no citation policy in the instructions"
+    citations = received.split("<citations>", 1)[1].split("</citations>", 1)[0]
+
+    # Inline markers plus an end-of-answer list — the two halves of the format.
+    assert "[1]" in citations and "Sources:" in citations
+    # Keyed to the document. `chunkIndex`/`parentId` are internal identifiers
+    # that locate nothing for a human opening the file, so they are not citable.
+    assert "`title`" in citations and "`source`" in citations
+    assert "chunkIndex" not in citations and "parentId" not in citations
+    # Plain paths. Claude Desktop denylists the `file:` scheme, Claude Code
+    # hyperlinks only http/https, Cursor hands file:// to the system handler —
+    # and a scheme-less markdown link renders as a broken relative URL.
+    assert "plain text" in citations
+    assert "file://" in citations and "markdown link" in citations
+    assert "](" not in citations, "the policy or its example contains a markdown link"
+    # The worked example: marker, title, bare absolute path. Without a literal
+    # instance the model emits the markers and drops the path from the list.
+    assert re.search(r"^\[1\] .+ /\S+$", citations, re.M), "no worked example of a Sources line"
+    # Citations are for the user's verification, not a claim that the prose is
+    # true — measured support rates are far too low for the stronger reading.
+    assert "verify" in citations
+
+
 def test_instructions_stay_within_the_client_truncation_budget():
     """Claude Code cuts each server's instructions at exactly 2048 characters.
 
     Past that the text is not ignored, it is amputated mid-sentence and stamped
-    `… [truncated]`. The built-in text is held well under the cap so a user's
-    append has somewhere to land inside the same budget; the headroom assertion
-    is what turns "we left room" from an intention into a fact.
+    `… [truncated]`. This is the hard fact about the client; the two tests below
+    are how the budget is actually divided up underneath it.
     """
     assert len(SERVER_INSTRUCTIONS) < MAX_INSTRUCTIONS_CHARS
-    headroom = MAX_INSTRUCTIONS_CHARS - len(SERVER_INSTRUCTIONS)
-    assert headroom >= 400, f"only {headroom} chars left for {APPEND_ENV_VAR}"
+
+
+def test_the_builtin_text_leaves_room_for_a_user_append():
+    """The built-in text gets 1700 of the 2048; the rest is the user's.
+
+    The 2048 cap alone cannot enforce this. The built-in text can grow to 2047
+    and still satisfy it while leaving a user's RAG_INSTRUCTIONS_APPEND nowhere
+    to land — the append would push the whole string past the cap and be cut
+    mid-sentence, which is worse than never offering the setting. So the
+    reserve needs a ceiling of its own, and this is it: every block added here
+    is paid for by tightening another. The citation policy was paid for that
+    way.
+    """
+    used = len(SERVER_INSTRUCTIONS)
+    assert used <= MAX_BUILTIN_INSTRUCTIONS_CHARS, (
+        f"built-in instructions are {used} chars, "
+        f"{used - MAX_BUILTIN_INSTRUCTIONS_CHARS} over the {MAX_BUILTIN_INSTRUCTIONS_CHARS} "
+        f"reserved for them; trim a block rather than raising the ceiling"
+    )
+
+
+def test_an_append_filling_the_reserve_still_fits_under_the_client_cap():
+    """The reserve is a real ~350 characters, end to end through build_instructions.
+
+    Checked with an append that spends all of it, because the failure being
+    guarded against is off-by-a-paragraph: the blank line the append is joined
+    with is part of what the client counts.
+    """
+    reserve = MAX_INSTRUCTIONS_CHARS - MAX_BUILTIN_INSTRUCTIONS_CHARS - APPEND_SEPARATOR_CHARS
+    assert reserve >= 340, f"only {reserve} chars reserved for {APPEND_ENV_VAR}"
+    built = build_instructions({APPEND_ENV_VAR: "x" * reserve})
+    assert len(built) <= MAX_INSTRUCTIONS_CHARS
 
 
 @pytest.mark.parametrize("raw", ["", "   ", "\n\n"])
