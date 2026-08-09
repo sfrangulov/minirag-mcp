@@ -206,6 +206,8 @@ class Store:
         self.dim = dim
         # FTS columns this instance could not index (see _ensure_fts_indices)
         self.missing_fts_indices: tuple[str, ...] = ()
+        # Columns this instance could not add to an older index (see _ensure_scheme_columns)
+        self.missing_columns: tuple[str, ...] = ()
         # False only when an older index is missing the chunking-scheme columns and they
         # could not be added (see _ensure_scheme_columns)
         self.schema_migrated = True
@@ -246,9 +248,11 @@ class Store:
 
         Adding a column is a write, and opening a database must not require write
         access — the same reasoning as `_ensure_fts_indices`. A failure is reported and
-        recorded rather than raised. Only a missing scheme column clears
-        `schema_migrated`, which readers take as "every chunk is stale and no section
-        can be rebuilt" — a verdict an additive column has no standing to pronounce.
+        recorded rather than raised: the columns are left in `missing_columns`, so what
+        failed is inspectable and not only a warning in a log. Only a missing scheme
+        column clears `schema_migrated`, which readers take as "every chunk is stale and
+        no section can be rebuilt" — a verdict an additive column has no standing to
+        pronounce.
         """
         present = set(self._table.schema.names)
         missing = {n: expr for n, expr in _ADDED_COLUMNS.items() if n not in present}
@@ -261,6 +265,7 @@ class Store:
             self.schema_migrated = True
         except Exception as e:
             self.schema_migrated = not scheme_missing
+            self.missing_columns = tuple(sorted(missing))
             consequence = (
                 "This index predates the current chunking scheme, and it cannot be "
                 "re-ingested until those columns exist"

@@ -233,21 +233,13 @@ def test_ocr_engine_round_trips_and_aggregates(store):
     assert [s.ocr_engine for s in store.list_sources()] == ["rapidocr"]
 
 
-_CURRENT_FIELDS = [
-    pa.field("id", pa.string()),
-    pa.field("source", pa.string()),
-    pa.field("source_type", pa.string()),
-    pa.field("title", pa.string()),
-    pa.field("chunk_index", pa.int32()),
-    pa.field("text", pa.string()),
-    pa.field("vector", pa.list_(pa.float32(), 8)),
-    pa.field("file_hash", pa.string()),
-    pa.field("mtime", pa.float64()),
-    pa.field("ingested_at", pa.string()),
-    pa.field("parent_id", pa.string()),
-    pa.field("ocr_engine", pa.string()),
-    pa.field("scheme_version", pa.int32()),
-]
+def _current_schema(tmp_path) -> pa.Schema:
+    """The create-table schema, read off a real Store rather than copied.
+
+    A hand-written copy of it goes on satisfying these tests after the real schema
+    gains a column, which is exactly when a migration test has something new to say.
+    """
+    return Store(tmp_path / "schema_probe", dim=8)._table.schema
 
 
 def _row(source, i, text, parent_id=""):
@@ -270,8 +262,12 @@ def _row(source, i, text, parent_id=""):
 
 def _older_table(db_path, missing: set[str], rows):
     """A `chunks` table as written by a version that predates the `missing` columns."""
+    current = _current_schema(db_path.parent / "probe")
+    assert all(set(row) == set(current.names) for row in rows), (
+        "`_row` no longer writes exactly the columns the store creates"
+    )
     db = lancedb.connect(str(db_path))
-    schema = pa.schema([f for f in _CURRENT_FIELDS if f.name not in missing])
+    schema = pa.schema([f for f in current if f.name not in missing])
     table = db.create_table(TABLE, schema=schema)
     table.add([{k: v for k, v in row.items() if k not in missing} for row in rows])
     return table
@@ -292,6 +288,7 @@ def test_reopening_a_table_missing_the_ocr_column_migrates_it(tmp_path):
 
     store = Store(db_path, dim=8)
     assert "ocr_engine" in store._table.schema.names
+    assert store.missing_columns == ()
     assert store.get_source("/a.md").ocr_engine == ""
     assert [s.ocr_engine for s in store.list_sources()] == [""]
 
@@ -311,6 +308,7 @@ def test_a_failed_ocr_migration_does_not_make_the_scheme_look_stale(tmp_path, mo
     assert not [w for w in caught if "predates the current chunking scheme" in str(w.message)]
 
     assert store.schema_migrated
+    assert store.missing_columns == ("ocr_engine",)
     assert store.stale_chunk_count() == 0
     assert store.parent_text("/a.md#p0") == "первый кусок\n\nвторой"
     assert [s.ocr_engine for s in store.list_sources()] == [""]
@@ -332,6 +330,7 @@ def test_a_failed_scheme_migration_still_reports_every_chunk_stale(tmp_path, mon
         store = Store(db_path, dim=8)
 
     assert not store.schema_migrated
+    assert store.missing_columns == ("ocr_engine", "parent_id", "scheme_version")
     assert store.stale_chunk_count() == 3
     assert store.parent_texts(["/a.md#p0"]) == {}
 
