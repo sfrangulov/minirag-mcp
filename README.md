@@ -196,8 +196,8 @@ up by `sync_start`/`sync` and `ingest_file`/`ingest`, converted to Markdown by
 `.epub` `.ipynb`
 
 Embedded pictures are not indexed. `markitdown` inlines each one as an
-`![alt](data:image/png;base64,…)` placeholder — 8.5% of chunks on a measured
-558-document corpus carried one — so the placeholder is removed before
+`![alt](data:image/png;base64,…)` placeholder — on one measured corpus of
+office documents that was 8.5% of all chunks — so the placeholder is removed before
 chunking and only its alt text is kept. Image links that point at a path or an
 http URL are references, not inlined pictures, and stay as written, as does a
 `data:` URI inside a fenced code block.
@@ -229,11 +229,11 @@ tokenizer fastembed hands out stops at 128, and a counter that cannot tell 128
 tokens from 900 is not a counter — compared against a budget of 128 it reports
 "within budget" for a text of any length.
 
-Why that matters, measured on a real 558-document Russian corpus with the
+Why that matters, measured on a real corpus of office documents with the
 tokenizer itself: prose runs at ~3.3 characters per token and markdown table
-rows at ~2.2. Under the previous character-based scheme, 14.7% of the 50,575
-chunks were over the ceiling and **22.8% of every token stored was discarded
-before it reached the model.** A character budget cannot fix that, because the
+rows at ~2.2. Under the previous character-based scheme, 14.7% of chunks were
+over the ceiling and **22.8% of every token stored was discarded before it
+reached the model.** A character budget cannot fix that, because the
 ratio it would have to assume differs by 50% between prose and tables.
 
 **The parent section** is what a caller reads. `text` is the passage that
@@ -274,7 +274,7 @@ specification heading the full chain used to consume most of a chunk, leaving a
 stub of body — and chunks that are mostly the same prefix embed to nearly the
 same vector and compete for the same top-k slots. Past that share the breadcrumb
 is elided from the *middle*, keeping the outermost heading and the innermost
-ones: `1 Общие положения > … > 3.4.2 Порядок согласования`. A heading with no
+ones: `1 General provisions > … > 3.4.2 Approval procedure`. A heading with no
 text of its own and no nested heading under it becomes a chunk of its own text,
 since nothing else would carry its words into the index.
 
@@ -305,8 +305,8 @@ The encoder has seen the same first 128 tokens either way, so past that point
 keeping the block whole buys no retrieval quality and only inflates every
 response that returns it.
 
-Measured against the previous scheme on the same 558 documents: 64,697 chunks
-against 50,575, **none of them over the 128-token ceiling** (14.7% were), median
+Measured against the previous scheme on the same corpus: 28% more chunks,
+**none of them over the 128-token ceiling** (14.7% were), median
 chunk 94 tokens against 50, and ingest **1.7× faster** despite the extra chunks —
 the deleted semantic merge stage was one of two embedding passes per document. Of
 five benchmark queries, three keep their top-ranked document; the two that change
@@ -446,17 +446,17 @@ first `# H1` → the stem.
 
 A heading the author wrote is the best title available, so it wins by default.
 It steps aside when it names a section rather than the document — office
-document sets share their opening section ("1. Общие положения", "Лист
-изменений", "Introduction", "Table of contents"), so that heading is identical
+document sets share their opening section ("1. General provisions", "Change
+log", "Introduction", "Table of contents"), so that heading is identical
 across the whole set — or when it holds no words at all, as a heading that is
 only a picture does. Then the filename takes over: a stem is informative
 unless it is shorter than 4 characters or, once pure-digit tokens are dropped,
 consists only of generic words (`untitled`, `document`, `new`, `copy`, `scan`,
-`img`, `dsc`, `screenshot`, `копия`, `документ`, …). That rejects the names
-machines hand out — `Untitled-1`, `IMG_20260807_123456`, `Копия документа
+`img`, `dsc`, `screenshot`, … in several languages). That rejects the names
+machines hand out — `Untitled-1`, `IMG_20260807_123456`, `Copy of document
 (2)` — while keeping real names that merely contain such a word. Underscores
-become spaces and the rest is kept as-is, so `И-112_ЗПС_Хранение ТМЗ.docx`
-gives the title `И-112 ЗПС Хранение ТМЗ`.
+become spaces and the rest is kept as-is, so `SPEC-112_Warehouse stock.docx`
+gives the title `SPEC-112 Warehouse stock`.
 
 The title is also prepended as a `# Title` line to the first chunk's text
 before embedding, so it reaches semantic search too — later chunks are
