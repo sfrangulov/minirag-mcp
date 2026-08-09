@@ -1,6 +1,6 @@
 [project]
 name = "minirag-mcp"
-version = "0.3.2"
+version = "0.4.0"
 description = "Local-first RAG MCP server: hybrid search over your documents, fully local"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -41,7 +41,7 @@ dev = ["pytest>=8", "pytest-asyncio>=1.0", "ruff>=0.6", "bump-my-version>=1.5.1"
 # `__version__` is derived from installed metadata, so `version` in [project]
 # is the only place a number lives and the only thing this has to rewrite.
 [tool.bumpversion]
-current_version = "0.3.2"
+current_version = "0.4.0"
 commit = true
 message = "chore: release v{new_version}"
 tag = true
