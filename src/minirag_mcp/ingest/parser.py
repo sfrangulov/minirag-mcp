@@ -409,7 +409,49 @@ def parse_file(path: Path, config: Config | None = None) -> ParsedDoc:
     except Exception as e:  # markitdown may raise lib-specific errors too
         raise ParserError(f"Failed to convert {path}: {e}") from e
     markdown = _converted_markdown(result)
-    return ParsedDoc(markdown=markdown, title=_file_title(markdown, result.title, path.stem))
+    ocr_engine = ""
+    if config is not None and path.suffix.lower() == ".pdf":
+        markdown, ocr_engine = _pdf_with_ocr_fallback(path, markdown, config)
+    return ParsedDoc(
+        markdown=markdown,
+        title=_file_title(markdown, result.title, path.stem),
+        ocr_engine=ocr_engine,
+    )
+
+
+def _pdf_with_ocr_fallback(path: Path, markdown: str, config) -> tuple[str, str]:
+    """Route near-empty PDF pages through OCR; keep text-layer pages as they are.
+
+    Per-page, not whole-document: a text cover page over scanned pages must
+    not mask them. Threshold 0 disables the check entirely.
+    """
+    threshold = config.ocr_min_chars_per_page
+    if threshold <= 0:
+        return markdown, ""
+    try:
+        page_texts = ocr.pdf_page_texts(path)
+    except Exception:
+        # pdfminer failing on an exotic PDF must not break the markitdown
+        # result that already succeeded.
+        return markdown, ""
+    needs = [i for i, text in enumerate(page_texts) if len(text.strip()) < threshold]
+    if not needs:
+        return markdown, ""
+    if not ocr.available():
+        if len(needs) == len(page_texts):
+            raise ParserError(
+                f"{path} looks like a scanned PDF (no text layer); {ocr.INSTALL_HINT}"
+            )
+        return markdown, ""  # partial text beats refusal
+    try:
+        recognized = ocr.ocr_pdf(path, config, needs)
+    except ocr.OcrError as e:
+        raise ParserError(str(e)) from e
+    parts = [
+        recognized.get(i, "") if i in recognized else text for i, text in enumerate(page_texts)
+    ]
+    merged = "\n\n".join(p.strip() for p in parts if p.strip())
+    return merged, ocr.ENGINE_RAPIDOCR
 
 
 def parse_html(html: str, title: str | None = None) -> ParsedDoc:

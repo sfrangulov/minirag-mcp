@@ -1,4 +1,5 @@
 import pytest
+from tests.pdf_builder import build_pdf
 
 from conftest import SECRET_BODY
 from minirag_mcp.ingest.parser import (
@@ -427,3 +428,72 @@ def test_parse_file_image_title_normalizes_underscores(tmp_path, monkeypatch):
     img.write_bytes(b"...")
     doc = parser.parse_file(img, load_config({}, cwd=tmp_path))
     assert doc.title == "IMG 20260807 123456"
+
+
+# --- scanned PDFs fall back to OCR per page -------------------------------------------
+
+LONG = "long enough text line to clear the default per-page threshold easily"
+
+
+def _pdf(tmp_path, pages):
+    p = tmp_path / "doc.pdf"
+    p.write_bytes(build_pdf(pages))
+    return p
+
+
+def test_pdf_all_text_pages_skip_ocr(tmp_path, monkeypatch):
+    from minirag_mcp import ocr
+    from minirag_mcp.config import load_config
+    from minirag_mcp.ingest import parser
+
+    monkeypatch.setattr(ocr, "available", lambda: True)
+    monkeypatch.setattr(
+        ocr, "ocr_pdf", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not OCR"))
+    )
+    doc = parser.parse_file(_pdf(tmp_path, [LONG, LONG]), load_config({}, cwd=tmp_path))
+    assert doc.ocr_engine == ""
+    assert "long enough text" in doc.markdown
+
+
+def test_pdf_scanned_pages_get_ocr(tmp_path, monkeypatch):
+    from minirag_mcp import ocr
+    from minirag_mcp.config import load_config
+    from minirag_mcp.ingest import parser
+
+    monkeypatch.setattr(ocr, "available", lambda: True)
+    monkeypatch.setattr(
+        ocr, "ocr_pdf", lambda path, config, pages: {i: f"OCR PAGE {i}" for i in pages}
+    )
+    doc = parser.parse_file(_pdf(tmp_path, [LONG, "", ""]), load_config({}, cwd=tmp_path))
+    assert doc.ocr_engine == "rapidocr"
+    # page order preserved: text page first, then the two OCR'd pages
+    body = doc.markdown
+    assert body.index("long enough") < body.index("OCR PAGE 1") < body.index("OCR PAGE 2")
+
+
+def test_pdf_fully_scanned_without_ocr_raises_hint(tmp_path, monkeypatch):
+    from minirag_mcp import ocr
+    from minirag_mcp.config import load_config
+    from minirag_mcp.ingest import parser
+
+    monkeypatch.setattr(ocr, "available", lambda: False)
+    with pytest.raises(parser.ParserError, match=r"scanned.*minirag-mcp\[ocr\]"):
+        parser.parse_file(_pdf(tmp_path, ["", ""]), load_config({}, cwd=tmp_path))
+
+
+def test_pdf_mixed_without_ocr_keeps_partial_text(tmp_path, monkeypatch):
+    from minirag_mcp import ocr
+    from minirag_mcp.config import load_config
+    from minirag_mcp.ingest import parser
+
+    monkeypatch.setattr(ocr, "available", lambda: False)
+    doc = parser.parse_file(_pdf(tmp_path, [LONG, ""]), load_config({}, cwd=tmp_path))
+    assert doc.ocr_engine == ""
+    assert "long enough" in doc.markdown
+
+
+def test_pdf_without_config_behaves_as_before(tmp_path):
+    from minirag_mcp.ingest import parser
+
+    doc = parser.parse_file(_pdf(tmp_path, ["", ""]))
+    assert doc.markdown.strip() == ""  # legacy path: empty conversion, no error
