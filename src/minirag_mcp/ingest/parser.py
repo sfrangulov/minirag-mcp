@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import logging
 import re
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -16,6 +17,8 @@ from requests.adapters import HTTPAdapter
 from minirag_mcp import ocr
 from minirag_mcp.config import Config
 from minirag_mcp.security import SecurityError, check_url
+
+logger = logging.getLogger(__name__)
 
 SUPPORTED_EXTENSIONS = frozenset(
     {
@@ -430,9 +433,10 @@ def _pdf_with_ocr_fallback(path: Path, markdown: str, config) -> tuple[str, str]
         return markdown, ""
     try:
         page_texts = ocr.pdf_page_texts(path)
-    except Exception:
-        # pdfminer failing on an exotic PDF must not break the markitdown
-        # result that already succeeded.
+    except Exception as e:
+        # pdfminer failing on an exotic PDF must not break the markitdown result that
+        # already succeeded, but a silently disabled OCR path must still be visible.
+        logger.warning("pdf_page_texts failed for %s, OCR routing skipped: %s", path, e)
         return markdown, ""
     needs = [i for i, text in enumerate(page_texts) if len(text.strip()) < threshold]
     if not needs:
@@ -447,10 +451,17 @@ def _pdf_with_ocr_fallback(path: Path, markdown: str, config) -> tuple[str, str]
         recognized = ocr.ocr_pdf(path, config, needs)
     except ocr.OcrError as e:
         raise ParserError(str(e)) from e
-    parts = [
-        recognized.get(i, "") if i in recognized else text for i, text in enumerate(page_texts)
-    ]
-    merged = "\n\n".join(p.strip() for p in parts if p.strip())
+    # markitdown's markdown has no page boundaries to splice into: a scanned page's
+    # recognized text is appended after the converted document rather than woven
+    # back into page order, trading position for keeping the good pages' own
+    # structure (tables, headings) intact instead of flattening the whole document
+    # to raw per-page text the moment any single page needs OCR.
+    ocr_text = "\n\n".join(text for i in needs if (text := recognized.get(i, "").strip()))
+    if not ocr_text:
+        if len(needs) == len(page_texts):
+            raise ParserError(f"{path}: OCR produced no text (page may be blank or unreadable)")
+        return markdown, ""  # OCR added nothing; the text pages already carried content
+    merged = "\n\n".join(part for part in (markdown.strip(), ocr_text) if part)
     return merged, ocr.ENGINE_RAPIDOCR
 
 

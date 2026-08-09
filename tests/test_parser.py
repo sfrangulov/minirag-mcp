@@ -497,3 +497,30 @@ def test_pdf_without_config_behaves_as_before(tmp_path):
 
     doc = parser.parse_file(_pdf(tmp_path, ["", ""]))
     assert doc.markdown.strip() == ""  # legacy path: empty conversion, no error
+
+
+def test_pdf_fully_scanned_ocr_returns_nothing_raises(tmp_path, monkeypatch):
+    """The blank-page guard: OCR ran over every page and still found nothing, which
+    must be a loud failure rather than an empty document tagged ocr_engine=rapidocr."""
+    from minirag_mcp import ocr
+    from minirag_mcp.config import load_config
+    from minirag_mcp.ingest import parser
+
+    monkeypatch.setattr(ocr, "available", lambda: True)
+    monkeypatch.setattr(ocr, "ocr_pdf", lambda path, config, pages: {i: "" for i in pages})
+    with pytest.raises(parser.ParserError, match=r"OCR produced no text"):
+        parser.parse_file(_pdf(tmp_path, ["", ""]), load_config({}, cwd=tmp_path))
+
+
+def test_pdf_mixed_ocr_returns_nothing_keeps_text_page(tmp_path, monkeypatch):
+    """OCR adding nothing must not erase a text page that already carried content,
+    and must not claim ocr_engine=rapidocr for a result OCR did not contribute to."""
+    from minirag_mcp import ocr
+    from minirag_mcp.config import load_config
+    from minirag_mcp.ingest import parser
+
+    monkeypatch.setattr(ocr, "available", lambda: True)
+    monkeypatch.setattr(ocr, "ocr_pdf", lambda path, config, pages: {i: "" for i in pages})
+    doc = parser.parse_file(_pdf(tmp_path, [LONG, ""]), load_config({}, cwd=tmp_path))
+    assert doc.ocr_engine == ""
+    assert "long enough" in doc.markdown
