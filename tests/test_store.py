@@ -233,16 +233,8 @@ def test_ocr_engine_round_trips_and_aggregates(store):
     assert [s.ocr_engine for s in store.list_sources()] == ["rapidocr"]
 
 
-def test_old_table_without_ocr_column_migrates():
-    """Guards the migration map itself: a pre-OCR index must gain this column on open,
-    the same way `_ensure_scheme_columns` already backfills `parent_id`/`scheme_version`."""
-    from minirag_mcp.store import _ADDED_COLUMNS
-
-    assert _ADDED_COLUMNS["ocr_engine"] == "''"
-
-
 def test_reopening_a_table_missing_the_ocr_column_migrates_it(tmp_path):
-    """End-to-end proof, not just the map check above: builds a `chunks` table with the
+    """A pre-OCR index must gain this column on open: builds a `chunks` table with the
     create-table schema minus `ocr_engine` — a genuine pre-OCR index, the same shape
     `_ensure_scheme_columns` already had to migrate for `parent_id`/`scheme_version` —
     then opens it through `Store` and proves both the column and the two read paths
