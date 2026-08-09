@@ -59,12 +59,15 @@ OCR is off). Every resolution is logged once, loudly, with the reason.
   that no server-size Cyrillic recognition model exists anywhere (HF 404,
   RapidOCR model list, PP-OCRv6 has zero Cyrillic), so mobile is the ceiling
   of this tier by construction.
-- Model files download into `<base_dir>/ocr-models/`, not site-packages
-  (uvx environments are cache-scoped and may be read-only). Download failure
-  is a loud per-file error, never a silent empty index.
-- CoreML execution provider auto-enabled on macOS (`use_coreml`; verified the
-  default onnxruntime wheel carries it). Speedup is measured before being
-  advertised.
+- Model files download into `<cache_dir>/ocr/` (the same `CACHE_DIR` the
+  embedder already uses — models are cache, not index), not site-packages
+  (uvx environments are cache-scoped and may be read-only); rapidocr's
+  `Global.model_root_dir` parameter points there (verified in its source).
+  Download failure is a loud per-file error, never a silent empty index.
+- CoreML execution provider on macOS (`use_coreml`; verified the default
+  onnxruntime wheel carries it) is a bench candidate, not a v1 default:
+  RapidOCR's tracker reports the GPU EP path can lose to CPU via per-node
+  fallback, so it ships only if the 11-page bench shows a real win.
 - PDF rendering to images via pypdfium2 (Apache/BSD; poppler-free;
   0.08 s/page at 300 dpi measured).
 
@@ -182,9 +185,11 @@ some of it actively harms.
   per text line; sideways pages are otherwise lost, and standalone images
   add the EXIF problem (cv2.imread ignores EXIF orientation).
   Implementation: `rapid-orientation` (Apache-2.0, 6.5 MB ONNX, the same
-  onnxruntime+opencv stack), confidence-gated so a misclassification cannot
-  rotate a correct page. Its accuracy on Russian office scans is unverified
-  — measured acceptance lives in the bench task.
+  onnxruntime+opencv stack). Its API returns only a label, no confidence
+  (verified this session: `('0', elapse)`), so the gate is: rotate only on
+  a non-zero label, and the rotation direction is pinned by a slow test
+  that OCRs a deliberately rotated page. Its accuracy on Russian office
+  scans is unverified — measured acceptance lives in the bench task.
 
 ### Candidate, decided by the bench
 
