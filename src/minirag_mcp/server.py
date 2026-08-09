@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
@@ -16,6 +17,7 @@ from minirag_mcp.config import Config, ConfigError, load_config
 from minirag_mcp.embedder import Embedder
 from minirag_mcp.ingest.pipeline import Pipeline
 from minirag_mcp.ingest.scanner import compute_states, scan_roots
+from minirag_mcp.instructions import build_instructions
 from minirag_mcp.results import (
     aggregate_sources,
     join_document,
@@ -51,8 +53,12 @@ def create_app(
     *,
     config_error: str | None = None,
     embedder: object | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> FastMCP:
-    mcp = FastMCP("minirag-mcp")
+    # Instructions come from the environment directly rather than from Config, so a
+    # server whose configuration failed to load still tells the client how to use it —
+    # same reason `status` keeps answering.
+    mcp = FastMCP("minirag-mcp", instructions=build_instructions(env))
     holder: dict[str, _Ctx | None] = {"ctx": None}
 
     def ctx() -> _Ctx:
@@ -372,4 +378,4 @@ def run_server() -> None:
         error = None
     except ConfigError as e:
         config, error = None, str(e)
-    create_app(config, config_error=error).run()
+    create_app(config, config_error=error, env=os.environ).run()
