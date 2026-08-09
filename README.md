@@ -66,6 +66,55 @@ claude mcp add minirag --scope user --env BASE_DIR=/absolute/path/to/docs \
   -- uvx minirag-mcp
 ```
 
+### Claude Desktop
+
+Edit the config file — create it if it does not exist:
+
+| | |
+|---|---|
+| macOS | `~/Library/Application Support/Claude/claude_desktop_config.json` |
+| Windows | `%APPDATA%\Claude\claude_desktop_config.json` |
+| Linux | `~/.config/Claude/claude_desktop_config.json` |
+
+```json
+{
+  "mcpServers": {
+    "minirag": {
+      "command": "/absolute/path/to/uvx",
+      "args": ["minirag-mcp"],
+      "env": {
+        "BASE_DIR": "/absolute/path/to/docs"
+      }
+    }
+  }
+}
+```
+
+Then quit Claude Desktop **completely** (`Cmd+Q` on macOS, not just closing the
+window) and reopen it. The config is read at launch; closing the window leaves
+the old process running with the old config.
+
+Two things that catch people out:
+
+**Give `command` an absolute path.** Desktop apps do not inherit your shell's
+`PATH`. `uvx` usually lives in `~/.local/bin`, which is not on the `PATH` a
+GUI-launched process sees, so a bare `"uvx"` fails with nothing useful in the
+UI. Run `which uvx` and paste the result. The other snippets on this page can
+use a bare `uvx` because a terminal-launched client has your `PATH`.
+
+**Merge, do not replace.** If the file already exists it holds your other
+servers and preferences under the same top-level object — add `minirag` inside
+the existing `mcpServers`, and leave everything else alone. Back the file up
+first; a malformed JSON file makes Desktop start with no servers at all and
+says little about why.
+
+To check the config before restarting, run the same command by hand — it should
+print your configuration and exit:
+
+```bash
+BASE_DIR=/absolute/path/to/docs /absolute/path/to/uvx minirag-mcp status
+```
+
 ### Cursor (`~/.cursor/mcp.json`)
 
 ```json
@@ -631,8 +680,11 @@ even with a broken `BASE_DIRS`; every other tool fails until it's fixed.
   terminal — it should hang silently, waiting on stdio (Ctrl-C to exit). If
   that fails, the client will fail the same way.
 - Restart the client after adding or editing the server config.
-- Confirm `uv`/`uvx` is on the `PATH` the client's process sees — GUI apps
-  sometimes launch with a different `PATH` than your shell.
+- Confirm `uv`/`uvx` is on the `PATH` the client's process sees. A GUI-launched
+  app does not inherit your shell's `PATH`, so a bare `"uvx"` fails there while
+  working fine in a terminal — give `command` the absolute path from
+  `which uvx`. This is the usual cause in Claude Desktop; see
+  [Claude Desktop](#claude-desktop).
 - Run `minirag-mcp status --base-dir <root>` from a terminal to confirm the
   configuration resolves the way you expect.
 
