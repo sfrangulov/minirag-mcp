@@ -233,6 +233,54 @@ def test_ocr_engine_round_trips_and_aggregates(store):
     assert [s.ocr_engine for s in store.list_sources()] == ["rapidocr"]
 
 
+_CURRENT_FIELDS = [
+    pa.field("id", pa.string()),
+    pa.field("source", pa.string()),
+    pa.field("source_type", pa.string()),
+    pa.field("title", pa.string()),
+    pa.field("chunk_index", pa.int32()),
+    pa.field("text", pa.string()),
+    pa.field("vector", pa.list_(pa.float32(), 8)),
+    pa.field("file_hash", pa.string()),
+    pa.field("mtime", pa.float64()),
+    pa.field("ingested_at", pa.string()),
+    pa.field("parent_id", pa.string()),
+    pa.field("ocr_engine", pa.string()),
+    pa.field("scheme_version", pa.int32()),
+]
+
+
+def _row(source, i, text, parent_id=""):
+    return {
+        "id": f"{source}#{i}",
+        "source": source,
+        "source_type": "file",
+        "title": "T",
+        "chunk_index": i,
+        "text": text,
+        "vector": [0.1] * 8,
+        "file_hash": "h",
+        "mtime": 1.0,
+        "ingested_at": "2026-08-07T00:00:00+00:00",
+        "parent_id": parent_id,
+        "ocr_engine": "",
+        "scheme_version": SCHEME_VERSION,
+    }
+
+
+def _older_table(db_path, missing: set[str], rows):
+    """A `chunks` table as written by a version that predates the `missing` columns."""
+    db = lancedb.connect(str(db_path))
+    schema = pa.schema([f for f in _CURRENT_FIELDS if f.name not in missing])
+    table = db.create_table(TABLE, schema=schema)
+    table.add([{k: v for k, v in row.items() if k not in missing} for row in rows])
+    return table
+
+
+def _raise_commit_conflict(*args, **kwargs):
+    raise RuntimeError("Retryable commit conflict for version 65")
+
+
 def test_reopening_a_table_missing_the_ocr_column_migrates_it(tmp_path):
     """A pre-OCR index must gain this column on open: builds a `chunks` table with the
     create-table schema minus `ocr_engine` — a genuine pre-OCR index, the same shape
@@ -240,47 +288,52 @@ def test_reopening_a_table_missing_the_ocr_column_migrates_it(tmp_path):
     then opens it through `Store` and proves both the column and the two read paths
     that depend on it survive."""
     db_path = tmp_path / "db"
-    db = lancedb.connect(str(db_path))
-    schema = pa.schema(
-        [
-            pa.field("id", pa.string()),
-            pa.field("source", pa.string()),
-            pa.field("source_type", pa.string()),
-            pa.field("title", pa.string()),
-            pa.field("chunk_index", pa.int32()),
-            pa.field("text", pa.string()),
-            pa.field("vector", pa.list_(pa.float32(), 8)),
-            pa.field("file_hash", pa.string()),
-            pa.field("mtime", pa.float64()),
-            pa.field("ingested_at", pa.string()),
-            pa.field("parent_id", pa.string()),
-            pa.field("scheme_version", pa.int32()),
-        ]
-    )
-    table = db.create_table(TABLE, schema=schema)
-    table.add(
-        [
-            {
-                "id": "/a.md#0",
-                "source": "/a.md",
-                "source_type": "file",
-                "title": "T",
-                "chunk_index": 0,
-                "text": "x",
-                "vector": [0.1] * 8,
-                "file_hash": "h",
-                "mtime": 1.0,
-                "ingested_at": "2026-08-07T00:00:00+00:00",
-                "parent_id": "",
-                "scheme_version": SCHEME_VERSION,
-            }
-        ]
-    )
+    _older_table(db_path, {"ocr_engine"}, [_row("/a.md", 0, "x")])
 
     store = Store(db_path, dim=8)
     assert "ocr_engine" in store._table.schema.names
     assert store.get_source("/a.md").ocr_engine == ""
     assert [s.ocr_engine for s in store.list_sources()] == [""]
+
+
+def test_a_failed_ocr_migration_does_not_make_the_scheme_look_stale(tmp_path, monkeypatch):
+    """`ocr_engine` is carried through storage and read by nothing that judges a chunk's
+    age. An index that cannot gain it — a read-only copy, or one with a concurrent
+    writer — must keep reporting scheme staleness from the chunks themselves and must
+    keep rebuilding parent sections."""
+    db_path = tmp_path / "db"
+    rows = [_row("/a.md", 0, "первый кусок", "/a.md#p0"), _row("/a.md", 1, "второй", "/a.md#p0")]
+    table = _older_table(db_path, {"ocr_engine"}, rows)
+    monkeypatch.setattr(type(table), "add_columns", _raise_commit_conflict)
+
+    with pytest.warns(RuntimeWarning, match="ocr_engine") as caught:
+        store = Store(db_path, dim=8)
+    assert not [w for w in caught if "predates the current chunking scheme" in str(w.message)]
+
+    assert store.schema_migrated
+    assert store.stale_chunk_count() == 0
+    assert store.parent_text("/a.md#p0") == "первый кусок\n\nвторой"
+    assert [s.ocr_engine for s in store.list_sources()] == [""]
+
+
+def test_a_failed_scheme_migration_still_reports_every_chunk_stale(tmp_path, monkeypatch):
+    """The converse: without `parent_id`/`scheme_version` there is nothing to tell an
+    old chunk from a new one and no section to rebuild, so the pessimistic reading is
+    the only honest one."""
+    db_path = tmp_path / "db"
+    table = _older_table(
+        db_path,
+        {"parent_id", "scheme_version", "ocr_engine"},
+        [_row("/a.md", i, f"кусок {i}") for i in range(3)],
+    )
+    monkeypatch.setattr(type(table), "add_columns", _raise_commit_conflict)
+
+    with pytest.warns(RuntimeWarning, match="predates the current chunking scheme"):
+        store = Store(db_path, dim=8)
+
+    assert not store.schema_migrated
+    assert store.stale_chunk_count() == 3
+    assert store.parent_texts(["/a.md#p0"]) == {}
 
 
 def test_open_failure_that_is_not_a_missing_table_propagates(tmp_path, monkeypatch):

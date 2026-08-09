@@ -165,11 +165,19 @@ class DimensionMismatchError(Exception):
 # Columns added after the first release. An index created before them is migrated in
 # place on open; the SQL expression is the value every pre-existing row gets, and
 # scheme_version 0 is precisely the marker that says "cut by an older scheme".
-_ADDED_COLUMNS = {
+#
+# The split is by what their absence costs. Without the scheme columns nothing can tell
+# an old chunk from a new one or name the section a chunk belongs to, so every reader
+# has to assume the worst; an additive column is carried through storage and read by
+# nobody who judges a chunk's age, so its absence costs only itself.
+_SCHEME_COLUMNS = {
     "parent_id": "''",
     "scheme_version": "CAST(0 AS INT)",
+}
+_ADDITIVE_COLUMNS = {
     "ocr_engine": "''",
 }
+_ADDED_COLUMNS = {**_SCHEME_COLUMNS, **_ADDITIVE_COLUMNS}
 
 
 def _scheme_of(row: dict) -> int:
@@ -198,7 +206,7 @@ class Store:
         self.dim = dim
         # FTS columns this instance could not index (see _ensure_fts_indices)
         self.missing_fts_indices: tuple[str, ...] = ()
-        # False only when an older index is missing this version's columns and they
+        # False only when an older index is missing the chunking-scheme columns and they
         # could not be added (see _ensure_scheme_columns)
         self.schema_migrated = True
         try:
@@ -238,24 +246,31 @@ class Store:
 
         Adding a column is a write, and opening a database must not require write
         access — the same reasoning as `_ensure_fts_indices`. A failure is reported and
-        recorded rather than raised: `status` then still tells the user the index is
-        stale, which is the actionable half of the message either way.
+        recorded rather than raised. Only a missing scheme column clears
+        `schema_migrated`, which readers take as "every chunk is stale and no section
+        can be rebuilt" — a verdict an additive column has no standing to pronounce.
         """
         present = set(self._table.schema.names)
         missing = {n: expr for n, expr in _ADDED_COLUMNS.items() if n not in present}
         if not missing:
             self.schema_migrated = True
             return
+        scheme_missing = bool(missing.keys() & _SCHEME_COLUMNS.keys())
         try:
             self._table.add_columns(missing)
             self.schema_migrated = True
         except Exception as e:
-            self.schema_migrated = False
+            self.schema_migrated = not scheme_missing
+            consequence = (
+                "This index predates the current chunking scheme, and it cannot be "
+                "re-ingested until those columns exist"
+                if scheme_missing
+                else "Those columns read as empty for every row; the chunking scheme is unaffected"
+            )
             warnings.warn(
                 f"Could not add the {', '.join(sorted(missing))} column(s) to the index at "
-                f"{db_path}: {e}. This index predates the current chunking scheme, and it "
-                f"cannot be re-ingested until those columns exist — reopen it with write "
-                f"access and no concurrent writer. Searching it still works.",
+                f"{db_path}: {e}. {consequence} — reopen it with write access and no "
+                f"concurrent writer. Searching it still works.",
                 RuntimeWarning,
                 stacklevel=3,
             )
