@@ -56,6 +56,53 @@ def test_ocr_image_without_extra_raises_loudly(tmp_path, monkeypatch):
         ocr.ocr_image(img, cfg)
 
 
+def _break_import(monkeypatch, name: str) -> None:
+    """Force `import <name>` to raise ImportError, simulating a broken
+    install (e.g. ABI mismatch) even where the module happens to be
+    resolvable by find_spec — or even actually importable in this test env.
+    """
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(mod_name, *args, **kwargs):
+        if mod_name == name:
+            raise ImportError(f"simulated broken install of {name!r}")
+        return real_import(mod_name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
+
+def test_engine_broken_rapidocr_install_raises_ocr_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(ocr, "available", lambda: True)
+    _break_import(monkeypatch, "rapidocr")
+    from minirag_mcp.config import load_config
+
+    cfg = load_config({}, cwd=tmp_path)
+    with pytest.raises(ocr.OcrError, match=r"failed to import.*minirag-mcp\[ocr\]"):
+        ocr._engine(cfg)
+
+
+def test_ocr_pdf_broken_pypdfium2_install_raises_ocr_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(ocr, "available", lambda: True)
+    _break_import(monkeypatch, "pypdfium2")
+    from minirag_mcp.config import load_config
+
+    cfg = load_config({}, cwd=tmp_path)
+    with pytest.raises(ocr.OcrError, match=r"failed to import.*minirag-mcp\[ocr\]"):
+        ocr.ocr_pdf(tmp_path / "missing.pdf", cfg, [0])
+
+
+def test_ocr_image_broken_cv2_install_raises_ocr_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(ocr, "available", lambda: True)
+    _break_import(monkeypatch, "cv2")
+    from minirag_mcp.config import load_config
+
+    cfg = load_config({}, cwd=tmp_path)
+    with pytest.raises(ocr.OcrError, match=r"failed to import.*minirag-mcp\[ocr\]"):
+        ocr.ocr_image(tmp_path / "missing.png", cfg)
+
+
 @pytest.mark.slow
 def test_real_engine_reads_generated_cyrillic_page(tmp_path):
     pytest.importorskip("rapidocr")
@@ -94,3 +141,26 @@ def test_real_engine_fixes_rotated_page(tmp_path):
     cv2.imwrite(str(p), rotated)
     cfg = load_config({}, cwd=tmp_path)
     assert "777" in ocr.ocr_image(p, cfg)
+
+
+@pytest.mark.slow
+def test_real_engine_reads_rendered_pdf_page(tmp_path):
+    """Pins the pypdfium2 render -> _orient -> _recognize path in ocr_pdf.
+
+    The ocr_image tests above never touch pypdfium2, so a channel-order or
+    shape mismatch in PdfBitmap.to_numpy() would go uncaught without this.
+
+    The marker is repeated to span most of the page width: a single short
+    line on an otherwise blank 612x792pt page (rendered at 300 dpi, ~2550px
+    wide) falls under RapidOCR's default detection confidence threshold —
+    confirmed by direct engine probing, not a bug in this module's render
+    path (the identical pixels crop correctly when isolated). A wider line
+    is closer to a real scanned page's text density and detects reliably.
+    """
+    pytest.importorskip("rapidocr")
+    from minirag_mcp.config import load_config
+
+    p = _write(tmp_path, ["OCR PDF CHECK 555 " * 5])
+    cfg = load_config({}, cwd=tmp_path)
+    texts = ocr.ocr_pdf(p, cfg, [0])
+    assert "555" in texts[0]

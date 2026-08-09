@@ -84,12 +84,23 @@ def _require_available() -> None:
         raise OcrError(f"this file needs OCR, which is not installed; {INSTALL_HINT}")
 
 
+def _import_error_as_ocr_error(e: ImportError) -> OcrError:
+    """find_spec (available()) proves a module is locatable, not importable —
+    a broken install (e.g. ABI mismatch) must surface as loud OcrError, not a
+    raw ImportError.
+    """
+    return OcrError(f"OCR dependencies are installed but failed to import: {e}; {INSTALL_HINT}")
+
+
 def _engine(config: Config):
     """One cached RapidOCR per (lang, cache_dir); models download on first use."""
     key = (config.ocr_lang, str(config.cache_dir))
     engine = _engines.get(key)
     if engine is None:
-        from rapidocr import LangRec, ModelType, OCRVersion, RapidOCR
+        try:
+            from rapidocr import LangRec, ModelType, OCRVersion, RapidOCR
+        except ImportError as e:
+            raise _import_error_as_ocr_error(e) from e
 
         try:
             lang = LangRec(config.ocr_lang)
@@ -114,8 +125,6 @@ def _engine(config: Config):
                     "Rec.model_type": ModelType.MOBILE,
                 }
             )
-        except OcrError:
-            raise
         except Exception as e:  # model download / init failure must be loud
             raise OcrError(f"OCR engine failed to initialize: {e}") from e
         _engines[key] = engine
@@ -163,7 +172,10 @@ def _recognize(img, config: Config) -> str:
 def ocr_pdf(path: Path, config: Config, pages: Sequence[int]) -> dict[int, str]:
     """OCR the given zero-based pages of a PDF, rendered at 300 dpi."""
     _require_available()
-    import pypdfium2 as pdfium
+    try:
+        import pypdfium2 as pdfium
+    except ImportError as e:
+        raise _import_error_as_ocr_error(e) from e
 
     out: dict[int, str] = {}
     doc = pdfium.PdfDocument(str(path))
@@ -180,8 +192,11 @@ def ocr_pdf(path: Path, config: Config, pages: Sequence[int]) -> dict[int, str]:
 
 def ocr_image(path: Path, config: Config) -> str:
     _require_available()
-    import cv2
-    import numpy as np
+    try:
+        import cv2
+        import numpy as np
+    except ImportError as e:
+        raise _import_error_as_ocr_error(e) from e
 
     # np.fromfile + imdecode instead of cv2.imread: imread cannot open
     # non-ASCII paths on Windows, and this corpus's filenames are Russian.
