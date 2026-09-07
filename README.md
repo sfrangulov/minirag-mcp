@@ -207,6 +207,12 @@ up by `sync_start`/`sync` and `ingest_file`/`ingest`, converted to Markdown by
 `.md` `.markdown` `.txt` `.pdf` `.docx` `.pptx` `.xlsx` `.html` `.htm` `.csv`
 `.epub` `.ipynb`
 
+A scan skips dot-prefixed names and the `~$…` lock files Word, Excel and
+PowerPoint keep beside every open document. Such a lock file carries the
+extension of the document it guards but holds none of its content, so before it
+was skipped a sync failed on it and `sync` exited 1 while somebody had a
+document open.
+
 Embedded pictures are not indexed. `markitdown` inlines each one as an
 `![alt](data:image/png;base64,…)` placeholder — on one measured corpus of
 office documents that was 8.5% of all chunks — so the placeholder is removed before
