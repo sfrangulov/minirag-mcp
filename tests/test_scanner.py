@@ -42,6 +42,16 @@ def test_scan_recursive_whitelist_and_skips(tmp_path):
     assert all(isinstance(e, ScanEntry) and e.size > 0 for e in entries)
 
 
+def test_scan_skips_office_lock_files(tmp_path):
+    """Word/Excel/PowerPoint lock files carry a real extension and no readable bytes."""
+    (tmp_path / "report.docx").write_bytes(b"PK\x03\x04fake")
+    (tmp_path / "~$report.docx").write_bytes(b"\x06\x00Sergei")
+    (tmp_path / "~$dget.xlsx").write_bytes(b"\x06\x00Sergei")
+    (tmp_path / "~$deck.pptx").write_bytes(b"\x06\x00Sergei")
+    names = [e.path.name for e in scan_roots([tmp_path])]
+    assert names == ["report.docx"]
+
+
 def test_diff_new_changed_unchanged_deleted(tmp_path):
     make_tree(tmp_path)
     entries = scan_roots([tmp_path])

@@ -14,6 +14,12 @@ from minirag_mcp.scope import is_under
 from minirag_mcp.store import SourceInfo
 
 SKIP_DIRS = frozenset({"node_modules", "__pycache__", ".venv", "venv"})
+# Word, Excel and PowerPoint write a lock file beside every open document, named after
+# it and so carrying its extension: `~$port.docx` for `report.docx`. It is a short
+# binary blob, not the ZIP the extension promises, so ingesting one can only fail —
+# and a whole sync exits 1 because somebody had a document open. LibreOffice needs no
+# entry here: its lock files start with a dot.
+OFFICE_LOCK_PREFIX = "~$"
 # Every extension any installation of this package can read. `supported_extensions()`
 # is a subset of this that shrinks when an optional extra is absent, so the difference
 # is what an install indexed before but cannot read now.
@@ -52,9 +58,10 @@ def _contained(real: Path, real_roots: Sequence[Path]) -> bool:
 def scan_roots(roots: Sequence[Path]) -> list[ScanEntry]:
     """Recursively scan roots for files with whitelisted extensions.
 
-    Skips hidden directories (dot-prefixed) and SKIP_DIRS. Prunes directory traversal
-    for SKIP_DIRS and hidden dirs. Symlinked directories are not traversed
-    (os.walk followlinks=False avoids cycles).
+    Skips hidden files and directories (dot-prefixed), Office lock files
+    (OFFICE_LOCK_PREFIX) and SKIP_DIRS. Prunes directory traversal for SKIP_DIRS and
+    hidden dirs. Symlinked directories are not traversed (os.walk followlinks=False
+    avoids cycles).
 
     Symlinked files are included **only when their target stays inside a configured
     root** — the same containment rule security.resolve_in_roots applies. A symlink
@@ -80,7 +87,7 @@ def scan_roots(roots: Sequence[Path]) -> list[ScanEntry]:
                 d for d in dirnames if not d.startswith(".") and d not in SKIP_DIRS
             )
             for name in sorted(filenames):
-                if name.startswith("."):
+                if name.startswith(".") or name.startswith(OFFICE_LOCK_PREFIX):
                     continue
                 p = Path(dirpath) / name
                 if p.suffix.lower() not in exts:
