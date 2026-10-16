@@ -1,4 +1,5 @@
 import os
+from dataclasses import asdict, replace
 
 import lancedb.db
 import pyarrow as pa
@@ -50,6 +51,39 @@ def test_replace_is_atomic_swap(store):
     assert store.get_source("/a.md").chunk_count == 1
 
 
+def test_replacing_a_source_never_leaves_a_version_without_it(store):
+    """Every table version is what some reader may see.
+
+    As a delete followed by an add, a re-ingest left one version in which the source
+    was gone: a concurrent reader saw it missing, and a second writer whose delete and
+    add interleaved with these left both copies, which no later sync repairs because
+    the hash and mtime match.
+    """
+    store.replace_source("/a.md", [rec("/a.md", i, f"old {i}") for i in range(3)])
+    before = store._table.version
+    store.replace_source("/a.md", [rec("/a.md", i, f"new {i}") for i in range(2)])
+    after = store._table.version
+
+    clause = "source = '/a.md'"
+    rows_per_version = {}
+    for version in range(before, after + 1):
+        store._table.checkout(version)
+        rows_per_version[version] = store._table.count_rows(filter=clause)
+    store._table.checkout_latest()
+
+    assert rows_per_version == {before: 3, after: 2}
+    texts = sorted(r.text for r in store.all_chunks("/a.md"))
+    assert texts == ["new 0", "new 1"]
+
+
+def test_replacing_one_source_leaves_the_others_alone(store):
+    store.replace_source("/a.md", [rec("/a.md", 0, "a")])
+    store.replace_source("/a.md#b.md", [rec("/a.md#b.md", 0, "b0"), rec("/a.md#b.md", 1, "b1")])
+    store.replace_source("/a.md", [rec("/a.md", 0, "a2")])
+    store.replace_source("/a.md", [])
+    assert [(s.source, s.chunk_count) for s in store.list_sources()] == [("/a.md#b.md", 2)]
+
+
 def test_delete_source_returns_count(store):
     store.replace_source("/a.md", [rec("/a.md", 0, "x")])
     assert store.delete_source("/a.md") == 1
@@ -99,6 +133,27 @@ def test_persistence_across_instances(tmp_path):
     s1.replace_source("/a.md", [rec("/a.md", 0, "x")])
     s2 = Store(tmp_path / "db", dim=8)  # reopen, no create conflict
     assert s2.chunk_count() == 1
+
+
+def test_an_open_handle_sees_what_another_handle_writes(tmp_path):
+    """The MCP server keeps one Store for its lifetime while a terminal `sync` writes.
+
+    A handle that read the table pinned that version: it went on listing, counting and
+    searching the old rows until it wrote something itself, and a sync planned from
+    that stale listing duplicated every re-pathed source.
+    """
+    resident = Store(tmp_path / "db", dim=8)
+    resident.replace_source("/old.md", [rec("/old.md", 0, "old text")])
+    assert resident.chunk_count() == 1
+
+    other = Store(tmp_path / "db", dim=8)
+    other.delete_source("/old.md")
+    other.replace_source("/new.md", [rec("/new.md", 0, "new text"), rec("/new.md", 1, "more")])
+
+    assert [s.source for s in resident.list_sources()] == ["/new.md"]
+    assert resident.chunk_count() == 2
+    hits = resident.search("new text", [0.1] * 8, top_k=5, include_parents=False)
+    assert {h.source for h in hits} == {"/new.md"}
 
 
 def test_reopening_with_a_different_dim_names_both_dimensions(tmp_path):
@@ -345,3 +400,66 @@ def test_open_failure_that_is_not_a_missing_table_propagates(tmp_path, monkeypat
     monkeypatch.setattr(lancedb.db.LanceDBConnection, "open_table", unreadable)
     with pytest.raises(RuntimeError, match="Permission denied"):
         Store(db_path, dim=8)
+
+
+@pytest.mark.parametrize(
+    "old, new",
+    [
+        ("/docs/a.md", "/docs/sub/a.md"),
+        ("/Документы/Счёт.pdf", "/Документы/Архив 2026/Счёт.pdf"),
+        # decomposed й, as macOS folder names often are: substring arithmetic in
+        # bytes rather than characters would cut the id in the wrong place
+        ("/docs/Пйсьмо.md", "/d/Пйсьмо.md"),
+        ("/it's/a#1.md", "/moved/it's/a#1.md"),
+    ],
+)
+def test_move_source_repaths_every_row_in_one_commit_and_keeps_the_vectors(store, old, new):
+    from dataclasses import replace as dc_replace
+
+    rows = [
+        dc_replace(rec(old, i, f"text {i}", vec=[0.1 * (i + 1)] * 8), parent_id=f"{old}#p{i // 2}")
+        for i in range(3)
+    ]
+    store.replace_source(old, rows)
+    store.replace_source("/other.md", [rec("/other.md", 0, "other")])
+    stored = sorted(
+        store._table.search().where(f"source = '{old.replace(chr(39), chr(39) * 2)}'").to_list(),
+        key=lambda r: r["chunk_index"],
+    )
+    version = store._table.version
+
+    assert store.move_source(old, new, mtime=42.5) == 3
+
+    assert store._table.version == version + 1
+    assert [s.source for s in store.list_sources()] == sorted([new, "/other.md"])
+    moved = store._table.search().where(f"source = '{new.replace(chr(39), chr(39) * 2)}'")
+    got = sorted(moved.limit(100).to_list(), key=lambda r: r["chunk_index"])
+    assert [r["id"] for r in got] == [f"{new}#0", f"{new}#1", f"{new}#2"]
+    assert [r["parent_id"] for r in got] == [f"{new}#p0", f"{new}#p0", f"{new}#p1"]
+    assert [r["text"] for r in got] == ["text 0", "text 1", "text 2"]
+    assert [list(r["vector"]) for r in got] == [list(r["vector"]) for r in stored]
+    assert {r["mtime"] for r in got} == {42.5}
+    assert store.get_source("/other.md").chunk_count == 1
+
+
+def test_move_source_of_an_unknown_source_moves_nothing(store):
+    store.replace_source("/a.md", [rec("/a.md", 0, "x")])
+    assert store.move_source("/nope.md", "/b.md", mtime=1.0) == 0
+    assert [s.source for s in store.list_sources()] == ["/a.md"]
+
+
+def test_replacing_a_source_clears_chunks_a_racing_first_ingest_stored_twice(store):
+    """Two first ingests of one new file both see it absent, so both insert.
+
+    A merge keyed on id alone updates both copies of every matched id, and the
+    document kept double weight in ranking and every chunk twice in its sections.
+    """
+    doubled = [rec("/a.md", i, f"old {i}") for i in range(3)]
+    store._table.add([asdict(r) for r in doubled + doubled])
+    assert store.chunk_count() == 6
+
+    store.replace_source(
+        "/a.md", [replace(rec("/a.md", i, f"new {i}"), ingested_at="later") for i in range(2)]
+    )
+
+    assert sorted(c.text for c in store.all_chunks("/a.md")) == ["new 0", "new 1"]

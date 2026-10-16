@@ -213,6 +213,13 @@ extension of the document it guards but holds none of its content, so before it
 was skipped a sync failed on it and `sync` exited 1 while somebody had a
 document open.
 
+Moving a file to another folder under the roots costs nothing to re-index: `sync`
+recognises it by its name and bytes and moves its chunks to the new path instead
+of reading it again, which for a scanned document saves the OCR. A file that was
+renamed or edited on the way is read again, since its title can come from its
+name, and so is one moved while a sync was scoped to its new folder only: such a
+sync never looks at the old place.
+
 Embedded pictures are not indexed. `markitdown` inlines each one as an
 `![alt](data:image/png;base64,…)` placeholder — on one measured corpus of
 office documents that was 8.5% of all chunks — so the placeholder is removed before
@@ -620,7 +627,8 @@ defaults to the current directory.
 minirag-mcp ingest ~/docs
 
 # Reconcile the index with what's on disk: ingest new/changed files,
-# skip unchanged ones, drop entries for files that were deleted
+# skip unchanged ones, follow files moved between folders, drop entries
+# for files that were deleted
 minirag-mcp sync
 
 # Fetch and index a web page
@@ -868,22 +876,23 @@ merges with them.
   one-time embedding-model download ever leave the machine.
 - Single local user, no authentication. Concurrent writers against one
   `DB_PATH` are safe — LanceDB commits optimistically and retries, so parallel
-  ingests lose no rows and the state they settle on is always correct. What a
-  reader can catch is a source *mid*-replacement: re-indexing deletes the old
-  chunks before writing the new ones, so a query timed badly enough may see that
-  one source with only some of its chunks, or none — one more reason two syncs
-  at once are undesirable. Two *syncs* are also simply wasteful, since both
-  re-walk and re-index the same corpus, so `sync`/`sync_start` takes an advisory
-  lock on `<DB_PATH>/.sync.lock` and a second one refuses immediately, naming
-  the process that holds it and how long it has been running. Single-file
+  ingests lose no rows. Re-indexing a source swaps its chunks in one commit, so
+  a reader sees the old set or the new one, never a mix or a gap, and two writers
+  re-indexing the same file cannot leave both copies behind. Two writers
+  indexing the same *new* file at the same moment (a sync and an `ingest_file`)
+  can each store it, and search then sees that document twice until the next
+  sync notices and reads it again. A server that stays running sees what a
+  terminal `sync` wrote on its next read. Two *syncs* at once are still
+  wasteful, since both re-walk and re-index the same corpus, so
+  `sync`/`sync_start` takes an advisory lock on `<DB_PATH>/.sync.lock` and a
+  second one refuses immediately, naming the process that holds it and how
+  long it has been running. Single-file
   ingests and reads are never blocked, and the lock is released by the kernel if
   a sync is killed, so it can't go stale.
-- Re-indexing a source replaces its chunks by deleting the old ones and
-  writing the new ones, so a sync interrupted mid-file (Ctrl-C, a crash, a
-  server restart) can leave that one source temporarily absent from the
-  index while its file is still on disk. This is self-healing: the next
-  `sync`/`sync_start` sees the file as not indexed and re-ingests it. Nothing
-  on disk is ever modified, and no other source is affected.
+- A sync interrupted mid-file (Ctrl-C, a crash, a server restart) leaves that
+  file's source as it was before, because the swap is one commit; the next
+  `sync`/`sync_start` re-ingests it. Nothing on disk is ever modified, and no
+  other source is affected.
 - Backup: copy the `DB_PATH` directory while no writer (an ingest or sync)
   is active.
 
@@ -893,6 +902,20 @@ merges with them.
 Nothing has been indexed yet, or your query's `scope` excludes everything
 that matches. Run `sync_start` (or `minirag-mcp sync`) first, then confirm
 with `status` or `list_files` that `chunkCount`/`sourceCount` are non-zero.
+
+**`sync` names a folder it "could not list", or a root that "is an empty folder".**
+Everything indexed under that folder was kept, not deleted: a missing or
+unmounted drive, a folder without read permission, and on macOS a background
+process with no access to `~/Documents` all look like this, and none of them
+means the files are gone. A root always counts as one failed item (exit status
+`1`); a subfolder does only when something indexed is under it, or when you
+asked to sync that folder. The message names the first few files kept. Restore
+access and sync again. Files moved out of an emptied root are followed to their
+new place as usual; a copy of a file behind a folder that cannot be listed is
+indexed as a file of its own, since the original may still be there. If you did
+remove the rest, delete their entries with
+`delete_file` (or `minirag-mcp delete`), or take the root out of `BASE_DIR` /
+`BASE_DIRS`.
 
 **`status` reports `staleChunkCount` above zero.**
 Those chunks were cut by an older chunking scheme: their boundaries follow the

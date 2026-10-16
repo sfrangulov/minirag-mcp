@@ -6,6 +6,7 @@ import statistics
 import warnings
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, replace
+from datetime import timedelta
 from pathlib import Path
 
 import lancedb
@@ -79,6 +80,9 @@ class SourceInfo:
     scheme_version: int = SCHEME_VERSION
     # First non-empty OCR engine among this source's chunks, "" when none used OCR.
     ocr_engine: str = ""
+    # More rows than distinct chunk indexes: two first ingests of the file raced and
+    # both inserted. Its bytes still match, so only this flag gets it re-read.
+    duplicated: bool = False
 
 
 _META_COLS = [
@@ -197,7 +201,12 @@ RESYNC_HINT = (
 class Store:
     def __init__(self, db_path: Path, dim: int):
         db_path.mkdir(parents=True, exist_ok=True)
-        self._db = lancedb.connect(str(db_path))
+        # Zero means every read checks for a newer table version first. LanceDB's default
+        # pins the version a handle opened with, and the MCP server holds one Store for
+        # its lifetime while a terminal `sync` writes the same table. The check grows
+        # with the versions the table has kept: about 0.1 ms a read at ten, 1 ms at
+        # 1,500, 5 ms at 10,000.
+        self._db = lancedb.connect(str(db_path), read_consistency_interval=timedelta(0))
         # The directory this index lives in. Exposed because the sync lock is a file
         # inside it, and both sync entry points must derive that path the same way —
         # deriving one from the Store and the other from Config would silently stop
@@ -339,9 +348,64 @@ class Store:
         )
 
     def replace_source(self, source: str, records: Sequence[ChunkRecord]) -> None:
-        self._table.delete(f"source = '{sql_str(source)}'")
-        if records:
-            self._table.add([asdict(r) for r in records])
+        """Swap a source's chunks for `records` in one commit.
+
+        A delete followed by an add is two versions, and the one between them has no
+        such source: a concurrent reader finds it missing, and a second writer whose
+        delete and add interleave with these leaves both copies. Single-file ingest
+        takes no lock, so that interleaving is reachable.
+
+        The merge key includes `ingested_at`, which every ingest stamps afresh, so no
+        prior row matches and all of them are deleted. A caller that reuses a stored
+        stamp gets the stored rows updated in place instead, duplicates included.
+        Keyed on `id` alone, a source holding an id twice kept both copies forever.
+        Two first ingests of one file racing each other still store it twice, since
+        both see no rows to match; `list_sources` flags such a source as duplicated.
+        """
+        clause = f"source = '{sql_str(source)}'"
+        if not records:
+            self._table.delete(clause)
+            return
+        (
+            self._table.merge_insert(["id", "ingested_at"])
+            .when_matched_update_all()
+            .when_not_matched_insert_all()
+            .when_not_matched_by_source_delete(clause)
+            .execute([asdict(r) for r in records])
+        )
+
+    def move_source(self, old: str, new: str, *, mtime: float) -> int:
+        """Re-path a source's chunks in one commit, keeping their text and vectors.
+
+        Chunk and section ids are prefixed with the source. Left as they were, they are
+        the ids the next file ingested at the old path gets, and that ingest would
+        overwrite these rows or fuse the two documents into one section. The ids are
+        rewritten here rather than in SQL: Lance's update accepts `substr` only in some
+        positions, and a regex replacement would have to escape arbitrary file names.
+        """
+        clause = f"source = '{sql_str(old)}'"
+        columns = self._table.schema.names
+        rows = self._table.search().where(clause).limit(_LIST_LIMIT).to_list()
+        if not rows:
+            return 0
+        cut = len(old)
+        moved = []
+        for row in rows:
+            row = {c: row[c] for c in columns}
+            row["source"] = new
+            row["id"] = new + row["id"][cut:]
+            if row.get("parent_id"):
+                row["parent_id"] = new + row["parent_id"][cut:]
+            row["mtime"] = mtime
+            moved.append(row)
+        (
+            self._table.merge_insert("id")
+            .when_matched_update_all()
+            .when_not_matched_insert_all()
+            .when_not_matched_by_source_delete(clause)
+            .execute(moved)
+        )
+        return len(moved)
 
     def delete_source(self, source: str) -> int:
         clause = f"source = '{sql_str(source)}'"
@@ -402,11 +466,13 @@ class Store:
     def list_sources(self, scopes: tuple[str, ...] = ()) -> list[SourceInfo]:
         by_source: dict[str, dict] = {}
         counts: dict[str, int] = {}
+        indexes: dict[str, set[int]] = {}
         schemes: dict[str, int] = {}
         engines: dict[str, str] = {}
         for row in self._iter_meta(scopes):
             by_source.setdefault(row["source"], row)
             counts[row["source"]] = counts.get(row["source"], 0) + 1
+            indexes.setdefault(row["source"], set()).add(row["chunk_index"])
             scheme = _scheme_of(row)
             schemes[row["source"]] = min(schemes.get(row["source"], scheme), scheme)
             engines[row["source"]] = engines.get(row["source"]) or row.get("ocr_engine", "")
@@ -420,6 +486,7 @@ class Store:
                 mtime=row["mtime"],
                 scheme_version=schemes[src],
                 ocr_engine=engines[src] or "",
+                duplicated=counts[src] > len(indexes[src]),
             )
             for src, row in sorted(by_source.items())
         ]
@@ -445,6 +512,7 @@ class Store:
             mtime=r["mtime"],
             scheme_version=min(_scheme_of(row) for row in rows),
             ocr_engine=engine,
+            duplicated=len(rows) > len({row["chunk_index"] for row in rows}),
         )
 
     def stale_chunk_count(self) -> int:

@@ -36,6 +36,7 @@ class SyncJob:
             "scanned": 0,
             "ingested": 0,
             "skipped": 0,
+            "moved": 0,
             "deleted": 0,
             # Kept in step with the dict `_run_sync_unlocked` builds: a counter that
             # only appears once the job finishes makes every earlier poll report a
@@ -100,17 +101,34 @@ def _run_sync_unlocked(
         if on_event:
             on_event(msg)
 
-    entries = scan_roots(list(roots))
-    diff = compute_diff(entries, store.list_sources(), max_file_size=max_file_size, scope=scope)
+    blind: list[tuple[Path, str | None]] = []
+    entries = scan_roots(list(roots), blind=blind)
+    diff = compute_diff(
+        entries,
+        store.list_sources(),
+        max_file_size=max_file_size,
+        scope=scope,
+        roots=roots,
+        blind=blind,
+    )
     counts = {
-        "scanned": len(diff.to_ingest) + len(diff.unchanged) + len(diff.oversized),
+        "scanned": len(diff.to_ingest)
+        + len(diff.moved)
+        + len(diff.unchanged)
+        + len(diff.oversized),
         "ingested": 0,
         "skipped": len(diff.unchanged),
+        "moved": 0,
         "deleted": 0,
         "unreadable": len(diff.unreadable),
         "failed": 0,
     }
     errors: list[dict] = []
+
+    for held in diff.held:
+        if held.fails:
+            counts["failed"] += 1
+        errors.append({"source": str(held.path), "error": held.message})
 
     for path in diff.oversized:
         counts["failed"] += 1
@@ -127,15 +145,37 @@ def _run_sync_unlocked(
             }
         )
 
-    for path in diff.to_ingest:
+    def ingest(path: Path) -> bool:
         try:
             pipeline.ingest_file(path)
-            counts["ingested"] += 1
-            emit(f"ingested {path}")
         except Exception as e:  # per-file failures never abort the job
             counts["failed"] += 1
             errors.append({"source": str(path), "error": str(e)})
             emit(f"failed {path}: {e}")
+            return False
+        counts["ingested"] += 1
+        emit(f"ingested {path}")
+        return True
+
+    # A re-path that moved nothing (the origin was deleted meanwhile; delete_file takes
+    # no lock) or raised falls back to reading the file and then dropping the origin,
+    # which ends where the re-path would have. If the read fails too, both stay as they
+    # were and the next sync pairs them again.
+    for move in diff.moved:
+        try:
+            rows = store.move_source(move.source, str(move.path), mtime=move.mtime)
+        except Exception as e:
+            rows = 0
+            emit(f"could not re-path {move.source}, reading {move.path} instead: {e}")
+        if rows:
+            counts["moved"] += 1
+            emit(f"moved {move.source} -> {move.path}")
+        elif ingest(move.path) and store.delete_source(move.source):
+            counts["deleted"] += 1
+            emit(f"deleted {move.source}")
+
+    for path in diff.to_ingest:
+        ingest(path)
 
     for source in diff.to_delete:
         store.delete_source(source)

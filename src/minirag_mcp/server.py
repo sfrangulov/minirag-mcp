@@ -95,7 +95,9 @@ def create_app(
 
         Returns a jobId immediately; poll sync_status until state is
         'succeeded' or 'failed'. New and changed files are ingested,
-        byte-identical files skipped, vanished files removed from the index.
+        byte-identical files skipped, vanished files removed from the index. A
+        file moved to another folder under the same name and with the same bytes
+        keeps its chunks under the new path instead of being read again.
         Only the latest sync job is retained — starting a new one, or a
         server restart, discards the previous job's record.
 
@@ -117,7 +119,7 @@ def create_app(
         """Poll a sync job started by sync_start.
 
         Returns state ('pending' | 'running' | 'succeeded' | 'failed'),
-        counts (scanned/ingested/skipped/deleted/unreadable/failed), and any
+        counts (scanned/ingested/skipped/moved/deleted/unreadable/failed), and any
         per-file errors. Only the latest job is retained — an old jobId, or
         any jobId from before a server restart, raises an error.
 
@@ -125,6 +127,12 @@ def create_app(
         because an optional extra is absent (images need [ocr]); each one
         appears in errors saying it was kept rather than deleted, but it is
         not a failure and does not make the job fail.
+
+        A folder the scan could not see into (a missing root, one without read
+        permission, an empty folder where a root was mounted) also appears in
+        errors, and nothing indexed under it is deleted. It counts as failed
+        when it is a root, when indexed files are under it, or when the sync
+        was started for it or for a path inside it.
         """
         return ctx().sync.status(jobId).to_dict()
 
