@@ -66,31 +66,45 @@ class HeldFolder:
     # empty folder while the index has something under it.
     error: str | None
     root: bool
+    # Indexed files under it that the sync kept, counted within the scope when there
+    # is one, and the names of the first few.
     kept: int
+    examples: tuple[str, ...] = ()
+    scoped: bool = False
+    # The sync was asked for this folder or something inside it, so none of what it
+    # was asked to do happened.
+    wanted: bool = False
 
     @property
     def fails(self) -> bool:
-        """A configured root is always the user's to fix; a subfolder only when it hid
-        something indexed. An unreadable folder holding nothing indexed would otherwise
-        fail every sync for as long as it exists."""
-        return self.root or self.kept > 0
+        """A configured root is always the user's to fix, and so is a folder the sync was
+        asked for; any other folder only when it hid something indexed. An unreadable
+        folder holding nothing indexed would otherwise fail every sync while it exists."""
+        return self.root or self.wanted or self.kept > 0
 
     @property
     def message(self) -> str:
         one = self.kept == 1
         files = f"{self.kept} indexed file{'' if one else 's'}"
+        if self.scoped:
+            files += " of the synced path"
+        names = ", ".join(self.examples)
+        if self.kept > len(self.examples):
+            names += f" and {self.kept - len(self.examples)} more"
+        it = "it" if one else "them"
         kept = f"{'it was' if one else 'they were'} kept, not deleted"
         if self.error is None:
             return (
-                f"this root is an empty folder, but the index holds {files} under it, and "
-                f"{kept}: an empty folder is also what an unmounted volume leaves behind. "
-                f"If you removed {'it' if one else 'them'} on purpose, delete "
-                f"{'it' if one else 'them'} with delete_file or `minirag-mcp delete`."
+                f"this root is an empty folder, but the index holds {files} under it "
+                f"({names}), and {kept}: an empty folder is also what an unmounted volume "
+                f"leaves behind. If you removed {it} on purpose, delete {it} with "
+                "delete_file or `minirag-mcp delete`, or take this root out of the "
+                "configuration."
             )
         unlisted = f"could not list this folder ({self.error})"
         if self.kept == 0:
             return f"{unlisted}; nothing under it was scanned"
-        return f"{unlisted}; {files} under it, and {kept}"
+        return f"{unlisted}; {files} under it ({names}), and {kept}"
 
 
 def _contained(real: Path, real_roots: Sequence[Path]) -> bool:
@@ -267,27 +281,41 @@ def compute_diff(
     needs_extra = KNOWN_EXTENSIONS - supported_extensions()
     to_delete: list[str] = []
     unreadable: list[str] = []
-    kept: dict[Path, int] = {path: 0 for path, _ in blind}
+    hidden: dict[str, Path] = {}
     for src in indexed_files:
         if src in seen:
             continue
         hidden_by = next((path for path, _ in blind if is_under(src, str(path))), None)
         if hidden_by is not None:
-            kept[hidden_by] += 1
+            hidden[src] = hidden_by
         elif _kept_unreadable(src, needs_extra):
             unreadable.append(src)
         else:
             to_delete.append(src)
 
-    moved = _pair_moves(to_delete, to_ingest, indexed_files, entries)
+    # A hidden source is a candidate too: the same name and bytes turning up elsewhere
+    # is evidence that it moved, which is all an empty folder left behind cannot give.
+    moved = _pair_moves(to_delete + sorted(hidden), to_ingest, indexed_files, entries)
     paired_sources = {m.source for m in moved}
     paired_paths = {m.path for m in moved}
     to_delete = [s for s in to_delete if s not in paired_sources]
     to_ingest = [p for p in to_ingest if p not in paired_paths]
+    kept: dict[Path, list[str]] = {path: [] for path, _ in blind}
+    for src, folder in sorted(hidden.items()):
+        if src not in paired_sources:
+            kept[folder].append(src)
 
     root_set = set(roots)
     held = [
-        HeldFolder(path=path, error=error, root=path in root_set, kept=kept[path])
+        HeldFolder(
+            path=path,
+            error=error,
+            root=path in root_set,
+            kept=len(kept[path]),
+            examples=tuple(Path(s).name for s in kept[path][:3]),
+            scoped=scope is not None,
+            wanted=scope is not None and _in_scope(str(scope), path),
+        )
         for path, error in sorted(blind, key=lambda b: str(b[0]))
         if (error is not None or kept[path])
         and (scope is None or _in_scope(str(path), scope) or _in_scope(str(scope), path))

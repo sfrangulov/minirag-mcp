@@ -746,3 +746,200 @@ def test_sync_repairs_a_source_a_racing_first_ingest_stored_twice(env):
     assert counts["ingested"] == 1
     indexes = [c.chunk_index for c in store.all_chunks(doc)]
     assert indexes == sorted(set(indexes))
+
+
+def test_files_moved_out_of_a_root_left_empty_are_followed_not_held(tmp_path, fake_embedder):
+    """Emptying a drop folder into the archive is a move, and the files prove it.
+
+    An empty root alone is held, in case a volume is unmounted. When every file it held
+    shows up elsewhere with the same name and bytes, that doubt is gone.
+    """
+    archive, inbox = tmp_path / "archive", tmp_path / "inbox"
+    archive.mkdir()
+    inbox.mkdir()
+    cfg = load_config({"BASE_DIRS": json.dumps([str(archive), str(inbox)])}, cwd=tmp_path)
+    store = Store(tmp_path / "index", dim=fake_embedder.dim)
+    pipeline = Pipeline(store, fake_embedder, cfg)
+    for name in ("a.md", "b.md"):
+        (inbox / name).write_text(f"# {name}\n\nBody of {name} for the corpus.")
+    run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    for name in ("a.md", "b.md"):
+        (inbox / name).rename(archive / name)
+
+    counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+
+    assert errors == []
+    assert counts["moved"] == 2 and counts["ingested"] == 0 and counts["failed"] == 0
+    assert _indexed(store) == [str(cfg.roots[0] / "a.md"), str(cfg.roots[0] / "b.md")]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a chmod 000 folder anyway")
+def test_syncing_exactly_a_folder_that_cannot_be_listed_fails(two_roots):
+    """Nothing indexed is at stake, but nothing the user asked for was done either."""
+    cfg, store, pipeline, docs, more = two_roots
+    (docs / "new").mkdir()
+    (docs / "new" / "n.md").write_text("# N\n\nNew body text for the corpus.")
+    os.chmod(docs / "new", 0)
+    try:
+        counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size, scope=docs / "new")
+    finally:
+        os.chmod(docs / "new", 0o755)
+
+    assert counts["failed"] == 1 and counts["ingested"] == 0
+    assert [e["source"] for e in errors] == [str(docs / "new")]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a chmod 000 folder anyway")
+def test_a_scoped_sync_reports_an_unlistable_folder_inside_its_scope(two_roots):
+    cfg, store, pipeline, docs, more = two_roots
+    os.chmod(docs / "sub", 0)
+    try:
+        counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size, scope=docs)
+    finally:
+        os.chmod(docs / "sub", 0o755)
+
+    assert counts["failed"] == 1 and counts["deleted"] == 0
+    assert [e["source"] for e in errors] == [str(docs / "sub")]
+    assert "b.md" in errors[0]["error"]
+
+
+def test_a_scoped_sync_inside_a_root_that_is_gone_keeps_it_and_fails(two_roots):
+    cfg, store, pipeline, docs, more = two_roots
+    before = _indexed(store)
+    shutil.rmtree(docs)
+
+    counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size, scope=docs / "sub")
+
+    assert _indexed(store) == before
+    assert counts["failed"] == 1 and counts["deleted"] == 0
+    assert [e["source"] for e in errors] == [str(docs)]
+
+
+def test_a_root_that_is_gone_fails_the_sync_even_with_nothing_indexed(tmp_path, fake_embedder):
+    """A configured root that does not exist is a typo or an unplugged drive, not a no-op."""
+    docs = tmp_path / "docs"
+    cfg = load_config({"BASE_DIR": str(docs)}, cwd=tmp_path)
+    store = Store(tmp_path / "index", dim=fake_embedder.dim)
+
+    counts, errors = run_sync(Pipeline(store, fake_embedder, cfg), store, cfg.roots, 10**9)
+
+    assert counts["failed"] == 1
+    assert [e["source"] for e in errors] == [str(cfg.roots[0])]
+
+
+def test_an_empty_root_with_nothing_indexed_is_simply_empty(tmp_path, fake_embedder):
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    cfg = load_config({"BASE_DIR": str(docs)}, cwd=tmp_path)
+    store = Store(tmp_path / "index", dim=fake_embedder.dim)
+
+    counts, errors = run_sync(Pipeline(store, fake_embedder, cfg), store, cfg.roots, 10**9)
+
+    assert counts["failed"] == 0 and errors == []
+
+
+def test_removing_the_last_file_of_a_subfolder_still_deletes_it(two_roots):
+    """Only an empty root is suspect; an emptied subfolder is just emptied."""
+    cfg, store, pipeline, docs, more = two_roots
+    (docs / "sub" / "b.md").unlink()
+
+    counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+
+    assert counts["deleted"] == 1 and counts["failed"] == 0 and errors == []
+    assert str(docs / "sub" / "b.md") not in _indexed(store)
+
+
+def test_a_root_that_is_gone_does_not_hold_a_sibling_whose_name_extends_it(tmp_path, fake_embedder):
+    docs, archive = tmp_path / "docs", tmp_path / "docs-archive"
+    docs.mkdir()
+    archive.mkdir()
+    cfg = load_config({"BASE_DIRS": json.dumps([str(docs), str(archive)])}, cwd=tmp_path)
+    store = Store(tmp_path / "index", dim=fake_embedder.dim)
+    pipeline = Pipeline(store, fake_embedder, cfg)
+    (docs / "a.md").write_text("# A\n\nAlpha body text for the corpus.")
+    (archive / "y.md").write_text("# Y\n\nYankee body text for the corpus.")
+    (archive / "z.md").write_text("# Z\n\nZulu body text for the corpus.")
+    run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    shutil.rmtree(docs)
+    (archive / "z.md").unlink()
+
+    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+
+    assert counts["deleted"] == 1
+    assert str(cfg.roots[1] / "z.md") not in _indexed(store)
+    assert str(cfg.roots[0] / "a.md") in _indexed(store)
+
+
+def test_a_file_moved_over_an_indexed_file_of_the_same_name_replaces_it(moving):
+    """The destination's own chunks must go: a re-path only removes the origin's."""
+    cfg, store, pipeline, root, parsed = moving
+    (root / "x.md").write_text("# X\n\n" + _body(1, "alpha"))
+    (root / "sub" / "x.md").write_text("# X\n\n" + _body(4, "omega"))
+    run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    (root / "x.md").rename(root / "sub" / "x.md")
+
+    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+
+    assert counts["deleted"] == 1 and counts["moved"] == 0
+    chunks = store.all_chunks(str(root / "sub" / "x.md"))
+    assert chunks and all("omega" not in c.text for c in chunks)
+
+
+def _paired_move(moving):
+    cfg, store, pipeline, root, parsed = moving
+    (root / "r.md").write_text("# R\n\n" + _body(1, "alpha"))
+    run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    (root / "r.md").rename(root / "sub" / "r.md")
+    return cfg, store, pipeline, root
+
+
+def test_a_move_whose_origin_vanished_meanwhile_is_read_instead(moving, monkeypatch):
+    """delete_file takes no lock, so the origin can go between planning and re-pathing."""
+    cfg, store, pipeline, root = _paired_move(moving)
+    real = store.move_source
+
+    def raced(old, new, *, mtime):
+        store.delete_source(old)
+        return real(old, new, mtime=mtime)
+
+    monkeypatch.setattr(store, "move_source", raced)
+    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+
+    assert counts["moved"] == 0 and counts["ingested"] == 1 and counts["failed"] == 0
+    assert _indexed(store) == [str(root / "sub" / "r.md")]
+
+
+def test_a_move_that_raises_is_read_instead_and_the_origin_goes_next_sync(moving, monkeypatch):
+    cfg, store, pipeline, root = _paired_move(moving)
+
+    def broken(old, new, *, mtime):
+        raise RuntimeError("commit conflict")
+
+    monkeypatch.setattr(store, "move_source", broken)
+    counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    assert counts["moved"] == 0 and counts["ingested"] == 1 and counts["failed"] == 0
+    assert str(root / "sub" / "r.md") in _indexed(store)
+
+    monkeypatch.undo()
+    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    assert counts["deleted"] == 1
+    assert _indexed(store) == [str(root / "sub" / "r.md")]
+
+
+def test_a_move_records_the_new_files_mtime(moving):
+    cfg, store, pipeline, root = _paired_move(moving)
+    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    new = root / "sub" / "r.md"
+    assert counts["moved"] == 1 and counts["scanned"] == 1
+    assert store.get_source(str(new)).mtime == new.stat().st_mtime
+
+
+def test_a_doubled_source_that_moved_is_read_again_rather_than_carried_over(moving):
+    cfg, store, pipeline, root = _paired_move(moving)
+    store._table.add([asdict(r) for r in _records_of(store, str(root / "r.md"))])
+
+    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+
+    assert counts["moved"] == 0 and counts["ingested"] == 1
+    indexes = [c.chunk_index for c in store.all_chunks(str(root / "sub" / "r.md"))]
+    assert indexes == sorted(set(indexes))

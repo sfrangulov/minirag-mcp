@@ -145,17 +145,24 @@ def _run_sync_unlocked(
             }
         )
 
+    # A re-path that moved nothing (the origin was deleted meanwhile; delete_file takes
+    # no lock) or raised falls back to reading the file, so the new path is indexed in
+    # this run either way. An origin left behind is gone from disk, and the next sync
+    # deletes it.
+    to_ingest = list(diff.to_ingest)
     for move in diff.moved:
         try:
-            store.move_source(move.source, str(move.path), mtime=move.mtime)
+            rows = store.move_source(move.source, str(move.path), mtime=move.mtime)
+        except Exception as e:
+            rows = 0
+            emit(f"could not re-path {move.source}, reading {move.path} instead: {e}")
+        if rows:
             counts["moved"] += 1
             emit(f"moved {move.source} -> {move.path}")
-        except Exception as e:  # per-file failures never abort the job
-            counts["failed"] += 1
-            errors.append({"source": str(move.path), "error": f"could not re-path: {e}"})
-            emit(f"failed {move.path}: {e}")
+        else:
+            to_ingest.append(move.path)
 
-    for path in diff.to_ingest:
+    for path in to_ingest:
         try:
             pipeline.ingest_file(path)
             counts["ingested"] += 1
