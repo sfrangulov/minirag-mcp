@@ -100,8 +100,16 @@ def _run_sync_unlocked(
         if on_event:
             on_event(msg)
 
-    entries = scan_roots(list(roots))
-    diff = compute_diff(entries, store.list_sources(), max_file_size=max_file_size, scope=scope)
+    blind: list[tuple[Path, str | None]] = []
+    entries = scan_roots(list(roots), blind=blind)
+    diff = compute_diff(
+        entries,
+        store.list_sources(),
+        max_file_size=max_file_size,
+        scope=scope,
+        roots=roots,
+        blind=blind,
+    )
     counts = {
         "scanned": len(diff.to_ingest) + len(diff.unchanged) + len(diff.oversized),
         "ingested": 0,
@@ -111,6 +119,11 @@ def _run_sync_unlocked(
         "failed": 0,
     }
     errors: list[dict] = []
+
+    for held in diff.held:
+        if held.fails:
+            counts["failed"] += 1
+        errors.append({"source": str(held.path), "error": held.message})
 
     for path in diff.oversized:
         counts["failed"] += 1

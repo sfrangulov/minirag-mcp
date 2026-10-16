@@ -893,6 +893,15 @@ Nothing has been indexed yet, or your query's `scope` excludes everything
 that matches. Run `sync_start` (or `minirag-mcp sync`) first, then confirm
 with `status` or `list_files` that `chunkCount`/`sourceCount` are non-zero.
 
+**`sync` names a folder it "could not list", or a root that "is an empty folder".**
+Everything indexed under that folder was kept, not deleted: a missing or
+unmounted drive, a folder without read permission, and on macOS a background
+process with no access to `~/Documents` all look like this, and none of them
+means the files are gone. A root always counts as one failed item (exit status
+`1`); a subfolder does only when something indexed is under it. Restore access
+and sync again. If you did remove those files, delete their entries with
+`delete_file` (or `minirag-mcp delete`).
+
 **`status` reports `staleChunkCount` above zero.**
 Those chunks were cut by an older chunking scheme: their boundaries follow the
 old rules and their vectors were computed over text the embedding model

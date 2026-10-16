@@ -1,3 +1,6 @@
+import json
+import os
+import shutil
 import threading
 import time
 from dataclasses import replace
@@ -157,6 +160,124 @@ def test_sync_reports_the_sources_it_kept_but_cannot_read(env, monkeypatch):
     assert counts["failed"] == 0  # a missing extra is not a failed run
     assert [e["source"] for e in errors] == [str(root / "scan.jpg")]
     assert "ocr" in errors[0]["error"]
+
+
+@pytest.fixture
+def two_roots(tmp_path, fake_embedder):
+    """Two document roots and an index outside both, so either root can vanish."""
+    docs, more = tmp_path / "docs", tmp_path / "more"
+    docs.mkdir()
+    more.mkdir()
+    cfg = load_config({"BASE_DIRS": json.dumps([str(docs), str(more)])}, cwd=tmp_path)
+    store = Store(tmp_path / "index", dim=fake_embedder.dim)
+    (docs / "sub").mkdir()
+    (docs / "a.md").write_text("# A\n\nAlpha body text for the corpus.")
+    (docs / "sub" / "b.md").write_text("# B\n\nBeta body text for the corpus.")
+    (more / "c.md").write_text("# C\n\nGamma body text for the corpus.")
+    pipeline = Pipeline(store, fake_embedder, cfg)
+    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    assert counts["ingested"] == 3
+    return cfg, store, pipeline, cfg.roots[0], cfg.roots[1]
+
+
+def _indexed(store) -> list[str]:
+    return [s.source for s in store.list_sources()]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a chmod 000 folder anyway")
+def test_sync_keeps_what_is_indexed_under_a_folder_it_cannot_list(two_roots):
+    """macOS refuses a launchd job the listing of ~/Documents the same way.
+
+    os.walk skipped the folder without a word, so every indexed file under it looked
+    deleted from disk, and sync deleted it from the index and reported success.
+    """
+    cfg, store, pipeline, docs, more = two_roots
+    before = _indexed(store)
+    os.chmod(docs / "sub", 0)
+    try:
+        counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    finally:
+        os.chmod(docs / "sub", 0o755)
+
+    assert _indexed(store) == before
+    assert counts["deleted"] == 0
+    assert counts["failed"] == 1
+    assert [e["source"] for e in errors] == [str(docs / "sub")]
+    assert "1 indexed file" in errors[0]["error"]
+
+
+def test_sync_keeps_what_is_indexed_under_a_root_that_is_gone(two_roots):
+    """An unmounted drive or a renamed folder is not the owner deleting every document.
+
+    The other root still syncs.
+    """
+    cfg, store, pipeline, docs, more = two_roots
+    before = _indexed(store)
+    docs.rename(docs.with_name("docs-elsewhere"))
+    (more / "d.md").write_text("# D\n\nDelta body text for the corpus.")
+
+    counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+
+    assert _indexed(store) == sorted([*before, str(more / "d.md")])
+    assert counts["deleted"] == 0 and counts["ingested"] == 1
+    assert counts["failed"] == 1
+    assert [e["source"] for e in errors] == [str(docs)]
+    assert "2 indexed files" in errors[0]["error"]
+
+
+def test_sync_keeps_what_is_indexed_under_a_root_that_lists_empty(two_roots):
+    """An empty folder left where a volume was mounted lists without any error."""
+    cfg, store, pipeline, docs, more = two_roots
+    before = _indexed(store)
+    shutil.rmtree(docs)
+    docs.mkdir()
+
+    counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+
+    assert _indexed(store) == before
+    assert counts["deleted"] == 0 and counts["failed"] == 1
+    assert [e["source"] for e in errors] == [str(docs)]
+    assert "2 indexed files" in errors[0]["error"]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a chmod 000 folder anyway")
+def test_an_unlistable_folder_with_nothing_indexed_is_reported_but_does_not_fail(two_roots):
+    """Nothing in the index depends on it, and failing would fail every sync forever."""
+    cfg, store, pipeline, docs, more = two_roots
+    (more / "private").mkdir()
+    os.chmod(more / "private", 0)
+    try:
+        counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    finally:
+        os.chmod(more / "private", 0o755)
+
+    assert counts["failed"] == 0
+    assert [e["source"] for e in errors] == [str(more / "private")]
+
+
+def test_a_scoped_sync_is_not_failed_by_a_root_outside_its_scope(two_roots):
+    cfg, store, pipeline, docs, more = two_roots
+    shutil.rmtree(docs)
+    (more / "d.md").write_text("# D\n\nDelta body text for the corpus.")
+
+    counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size, scope=more)
+
+    assert counts["failed"] == 0 and errors == []
+    assert counts["ingested"] == 1
+    assert str(docs / "a.md") in _indexed(store)
+
+
+def test_sync_still_deletes_a_file_removed_beside_a_kept_folder(two_roots):
+    cfg, store, pipeline, docs, more = two_roots
+    shutil.rmtree(docs)
+    (more / "d.md").write_text("# D\n\nDelta body text for the corpus.")
+    (more / "c.md").unlink()
+
+    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+
+    assert counts["deleted"] == 1
+    assert str(more / "c.md") not in _indexed(store)
+    assert str(docs / "a.md") in _indexed(store)
 
 
 def test_a_pending_job_reports_the_counter_shape_a_finished_one_does(env):
@@ -454,3 +575,25 @@ def _records_of(store, source):
         )
         for r in rows
     ]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a chmod 000 folder anyway")
+def test_an_unlistable_folder_inside_two_overlapping_roots_is_reported_once(
+    tmp_path, fake_embedder
+):
+    outer = tmp_path / "outer"
+    inner = outer / "inner"
+    inner.mkdir(parents=True)
+    (inner / "a.md").write_text("# A\n\nAlpha body text for the corpus.")
+    cfg = load_config({"BASE_DIRS": json.dumps([str(outer), str(inner)])}, cwd=tmp_path)
+    store = Store(tmp_path / "index", dim=fake_embedder.dim)
+    pipeline = Pipeline(store, fake_embedder, cfg)
+    run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    os.chmod(inner, 0)
+    try:
+        counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    finally:
+        os.chmod(inner, 0o755)
+
+    assert [e["source"] for e in errors] == [str(cfg.roots[1])]
+    assert counts["failed"] == 1 and counts["deleted"] == 0

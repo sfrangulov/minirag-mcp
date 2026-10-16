@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from minirag_mcp.chunker import SCHEME_VERSION
@@ -44,6 +44,43 @@ class SyncDiff:
     # there. Kept in the index, and separate from `to_delete` so a caller can say why
     # nothing happened to them.
     unreadable: list[str]
+    # Folders whose contents the scan could not see. What is indexed under them is
+    # unknown rather than absent, so none of it is in `to_delete`.
+    held: list[HeldFolder] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class HeldFolder:
+    path: Path
+    # Why the scan could not see inside: the OS error, or None for a root that is an
+    # empty folder while the index has something under it.
+    error: str | None
+    root: bool
+    kept: int
+
+    @property
+    def fails(self) -> bool:
+        """A configured root is always the user's to fix; a subfolder only when it hid
+        something indexed. An unreadable folder holding nothing indexed would otherwise
+        fail every sync for as long as it exists."""
+        return self.root or self.kept > 0
+
+    @property
+    def message(self) -> str:
+        one = self.kept == 1
+        files = f"{self.kept} indexed file{'' if one else 's'}"
+        kept = f"{'it was' if one else 'they were'} kept, not deleted"
+        if self.error is None:
+            return (
+                f"this root is an empty folder, but the index holds {files} under it, and "
+                f"{kept}: an empty folder is also what an unmounted volume leaves behind. "
+                f"If you removed {'it' if one else 'them'} on purpose, delete "
+                f"{'it' if one else 'them'} with delete_file or `minirag-mcp delete`."
+            )
+        unlisted = f"could not list this folder ({self.error})"
+        if self.kept == 0:
+            return f"{unlisted}; nothing under it was scanned"
+        return f"{unlisted}; {files} under it, and {kept}"
 
 
 def _contained(real: Path, real_roots: Sequence[Path]) -> bool:
@@ -55,7 +92,9 @@ def _contained(real: Path, real_roots: Sequence[Path]) -> bool:
     return any(real == r or r in real.parents for r in real_roots)
 
 
-def scan_roots(roots: Sequence[Path]) -> list[ScanEntry]:
+def scan_roots(
+    roots: Sequence[Path], blind: list[tuple[Path, str | None]] | None = None
+) -> list[ScanEntry]:
     """Recursively scan roots for files with whitelisted extensions.
 
     Skips hidden files and directories (dot-prefixed), Office lock files
@@ -75,14 +114,28 @@ def scan_roots(roots: Sequence[Path]) -> list[ScanEntry]:
     Overlapping roots are tolerated: each file is reported once (deduplicated by
     resolved path).
 
+    When `blind` is given, it collects the folders whose contents this result cannot
+    vouch for: each directory that could not be listed (a missing root, a folder without
+    read permission, a macOS privacy denial) with its OS error, and each root that is an
+    empty directory, with None — what an unmounted volume leaves behind on Linux. A
+    caller comparing the result with the index must not read the absence of files under
+    them as deletion.
+
     Returns entries sorted by path.
     """
     real_roots = [Path(r).resolve() for r in roots]
     exts = supported_extensions()
     entries: list[ScanEntry] = []
     seen: set[Path] = set()
+
+    def note(error: OSError) -> None:
+        if blind is not None:
+            blind.append((Path(error.filename), error.strerror or str(error)))
+
     for root in roots:
-        for dirpath, dirnames, filenames in os.walk(root):
+        for dirpath, dirnames, filenames in os.walk(root, onerror=note):
+            if blind is not None and dirpath == os.fspath(root) and not dirnames and not filenames:
+                blind.append((Path(root), None))
             dirnames[:] = sorted(
                 d for d in dirnames if not d.startswith(".") and d not in SKIP_DIRS
             )
@@ -135,6 +188,8 @@ def compute_diff(
     *,
     max_file_size: int,
     scope: Path | None = None,
+    roots: Sequence[Path] = (),
+    blind: Sequence[tuple[Path, str | None]] = (),
 ) -> SyncDiff:
     """Compute sync diff: files to ingest, delete, and unchanged status.
 
@@ -155,14 +210,22 @@ def compute_diff(
     `unreadable`. Without the distinction, one sync from a light install deletes every
     indexed image and reports only `deleted: N`.
 
+    Nor is deletion proposed for a source under a folder in `blind` (see `scan_roots`).
+    Missing from the scan says nothing about such a file, and treating it as deleted
+    emptied the index whenever a root was unmounted or unreadable. Those folders come
+    back in `held`, the ones that bear on `scope` only; an empty root is held only when
+    the index has something under it.
+
     Args:
         entries: Scanned disk files.
         indexed: Files currently in the index (SourceInfo from Store).
         max_file_size: Files larger than this are marked oversized (not ingested).
         scope: If provided, limit processing to files under this path.
+        roots: The roots `entries` was scanned from.
+        blind: Folders the scan could not see into, as `scan_roots` reports them.
 
     Returns:
-        SyncDiff with to_ingest, to_delete, unchanged, oversized, and unreadable lists.
+        SyncDiff with to_ingest, to_delete, unchanged, oversized, unreadable and held.
     """
     indexed_files = {
         s.source: s for s in indexed if s.source_type == "file" and _in_scope(s.source, scope)
@@ -187,22 +250,39 @@ def compute_diff(
         else:
             to_ingest.append(e.path)
 
+    # Overlapping roots walk an inner folder twice. Innermost first, so a source is
+    # credited to the folder nearest it.
+    blind = sorted(dict(blind).items(), key=lambda b: len(str(b[0])), reverse=True)
+
     needs_extra = KNOWN_EXTENSIONS - supported_extensions()
     to_delete: list[str] = []
     unreadable: list[str] = []
+    kept: dict[Path, int] = {path: 0 for path, _ in blind}
     for src in indexed_files:
         if src in seen:
             continue
-        if _kept_unreadable(src, needs_extra):
+        hidden_by = next((path for path, _ in blind if is_under(src, str(path))), None)
+        if hidden_by is not None:
+            kept[hidden_by] += 1
+        elif _kept_unreadable(src, needs_extra):
             unreadable.append(src)
         else:
             to_delete.append(src)
+
+    root_set = set(roots)
+    held = [
+        HeldFolder(path=path, error=error, root=path in root_set, kept=kept[path])
+        for path, error in sorted(blind, key=lambda b: str(b[0]))
+        if (error is not None or kept[path])
+        and (scope is None or _in_scope(str(path), scope) or _in_scope(str(scope), path))
+    ]
     return SyncDiff(
         to_ingest=to_ingest,
         to_delete=sorted(to_delete),
         unchanged=unchanged,
         oversized=oversized,
         unreadable=sorted(unreadable),
+        held=held,
     )
 
 

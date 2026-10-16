@@ -125,6 +125,11 @@ def create_app(
         because an optional extra is absent (images need [ocr]); each one
         appears in errors saying it was kept rather than deleted, but it is
         not a failure and does not make the job fail.
+
+        A folder the scan could not see into (a missing root, one without read
+        permission, an empty folder where a root was mounted) also appears in
+        errors, and nothing indexed under it is deleted. It counts as failed
+        when it is a root or when indexed files are under it.
         """
         return ctx().sync.status(jobId).to_dict()
 
