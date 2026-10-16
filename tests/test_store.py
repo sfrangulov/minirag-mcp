@@ -1,4 +1,5 @@
 import os
+from dataclasses import asdict, replace
 
 import lancedb.db
 import pyarrow as pa
@@ -445,3 +446,20 @@ def test_move_source_of_an_unknown_source_moves_nothing(store):
     store.replace_source("/a.md", [rec("/a.md", 0, "x")])
     assert store.move_source("/nope.md", "/b.md", mtime=1.0) == 0
     assert [s.source for s in store.list_sources()] == ["/a.md"]
+
+
+def test_replacing_a_source_clears_chunks_a_racing_first_ingest_stored_twice(store):
+    """Two first ingests of one new file both see it absent, so both insert.
+
+    A merge keyed on id alone updates both copies of every matched id, and the
+    document kept double weight in ranking and every chunk twice in its sections.
+    """
+    doubled = [rec("/a.md", i, f"old {i}") for i in range(3)]
+    store._table.add([asdict(r) for r in doubled + doubled])
+    assert store.chunk_count() == 6
+
+    store.replace_source(
+        "/a.md", [replace(rec("/a.md", i, f"new {i}"), ingested_at="later") for i in range(2)]
+    )
+
+    assert sorted(c.text for c in store.all_chunks("/a.md")) == ["new 0", "new 1"]

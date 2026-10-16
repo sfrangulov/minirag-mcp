@@ -253,7 +253,7 @@ def compute_diff(
             oversized.append(e.path)
             continue
         prior = indexed_files.get(str(e.path))
-        if prior is None or prior.scheme_version < SCHEME_VERSION:
+        if prior is None or prior.scheme_version < SCHEME_VERSION or prior.duplicated:
             to_ingest.append(e.path)
         elif prior.mtime == e.mtime or prior.file_hash == file_sha256(e.path):
             unchanged.append(e.path)
@@ -320,7 +320,7 @@ def _pair_moves(
     gone: dict[tuple[str, str], list[str]] = {}
     for source in to_delete:
         prior = indexed[source]
-        if prior.file_hash and prior.scheme_version >= SCHEME_VERSION:
+        if prior.file_hash and prior.scheme_version >= SCHEME_VERSION and not prior.duplicated:
             gone.setdefault((Path(source).name, prior.file_hash), []).append(source)
     if not gone:
         return []

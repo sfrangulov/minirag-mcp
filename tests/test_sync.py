@@ -3,7 +3,7 @@ import os
 import shutil
 import threading
 import time
-from dataclasses import replace
+from dataclasses import asdict, replace
 
 import pytest
 
@@ -730,3 +730,19 @@ def test_a_moved_file_cut_by_an_older_scheme_is_read_again(moving):
 
     assert counts["moved"] == 0 and counts["ingested"] == 1
     assert store.stale_chunk_count() == 0
+
+
+def test_sync_repairs_a_source_a_racing_first_ingest_stored_twice(env):
+    """Its bytes and mtime match the index, so nothing else would ever re-read it."""
+    cfg, store, pipeline, root = env
+    seed(root)
+    run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    doc = str(root / "a.md")
+    store._table.add([asdict(r) for r in _records_of(store, doc)])
+    assert len(store.all_chunks(doc)) == 2 * len({c.chunk_index for c in store.all_chunks(doc)})
+
+    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+
+    assert counts["ingested"] == 1
+    indexes = [c.chunk_index for c in store.all_chunks(doc)]
+    assert indexes == sorted(set(indexes))
