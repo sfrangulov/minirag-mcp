@@ -101,6 +101,27 @@ def test_persistence_across_instances(tmp_path):
     assert s2.chunk_count() == 1
 
 
+def test_an_open_handle_sees_what_another_handle_writes(tmp_path):
+    """The MCP server keeps one Store for its lifetime while a terminal `sync` writes.
+
+    A handle that read the table pinned that version: it went on listing, counting and
+    searching the old rows until it wrote something itself, and a sync planned from
+    that stale listing duplicated every re-pathed source.
+    """
+    resident = Store(tmp_path / "db", dim=8)
+    resident.replace_source("/old.md", [rec("/old.md", 0, "old text")])
+    assert resident.chunk_count() == 1
+
+    other = Store(tmp_path / "db", dim=8)
+    other.delete_source("/old.md")
+    other.replace_source("/new.md", [rec("/new.md", 0, "new text"), rec("/new.md", 1, "more")])
+
+    assert [s.source for s in resident.list_sources()] == ["/new.md"]
+    assert resident.chunk_count() == 2
+    hits = resident.search("new text", [0.1] * 8, top_k=5, include_parents=False)
+    assert {h.source for h in hits} == {"/new.md"}
+
+
 def test_reopening_with_a_different_dim_names_both_dimensions(tmp_path):
     """A MODEL_NAME change against an existing DB_PATH must say so, not blame the schema."""
     Store(tmp_path / "db", dim=8).replace_source("/a.md", [rec("/a.md", 0, "x")])
