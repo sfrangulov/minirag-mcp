@@ -131,7 +131,8 @@ def create_app(
         A folder the scan could not see into (a missing root, one without read
         permission, an empty folder where a root was mounted) also appears in
         errors, and nothing indexed under it is deleted. It counts as failed
-        when it is a root or when indexed files are under it.
+        when it is a root, when indexed files are under it, or when the sync
+        was started for it or for a path inside it.
         """
         return ctx().sync.status(jobId).to_dict()
 

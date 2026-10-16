@@ -217,7 +217,8 @@ Moving a file to another folder under the roots costs nothing to re-index: `sync
 recognises it by its name and bytes and moves its chunks to the new path instead
 of reading it again, which for a scanned document saves the OCR. A file that was
 renamed or edited on the way is read again, since its title can come from its
-name.
+name, and so is one moved while a sync was scoped to its new folder only: such a
+sync never looks at the old place.
 
 Embedded pictures are not indexed. `markitdown` inlines each one as an
 `![alt](data:image/png;base64,…)` placeholder — on one measured corpus of
@@ -905,9 +906,12 @@ Everything indexed under that folder was kept, not deleted: a missing or
 unmounted drive, a folder without read permission, and on macOS a background
 process with no access to `~/Documents` all look like this, and none of them
 means the files are gone. A root always counts as one failed item (exit status
-`1`); a subfolder does only when something indexed is under it. Restore access
-and sync again. If you did remove those files, delete their entries with
-`delete_file` (or `minirag-mcp delete`).
+`1`); a subfolder does only when something indexed is under it, or when you
+asked to sync that folder. The message names the first few files kept. Restore
+access and sync again. Files moved out of such a folder are followed to their
+new place as usual. If you did remove the rest, delete their entries with
+`delete_file` (or `minirag-mcp delete`), or take the root out of `BASE_DIR` /
+`BASE_DIRS`.
 
 **`status` reports `staleChunkCount` above zero.**
 Those chunks were cut by an older chunking scheme: their boundaries follow the

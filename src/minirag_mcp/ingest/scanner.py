@@ -236,9 +236,14 @@ def compute_diff(
 
     Nor is deletion proposed for a source under a folder in `blind` (see `scan_roots`).
     Missing from the scan says nothing about such a file, and treating it as deleted
-    emptied the index whenever a root was unmounted or unreadable. Those folders come
+    would empty the index whenever a root is unmounted or unreadable. Those folders come
     back in `held`, the ones that bear on `scope` only; an empty root is held only when
     the index has something under it.
+
+    A source that vanished, or is hidden in a held folder, and whose name and bytes
+    turn up at a new path is returned in `moved` rather than deleted and re-ingested.
+    A source whose chunks two racing first ingests stored twice is re-ingested even
+    though its bytes match.
 
     Args:
         entries: Scanned disk files.
@@ -249,7 +254,8 @@ def compute_diff(
         blind: Folders the scan could not see into, as `scan_roots` reports them.
 
     Returns:
-        SyncDiff with to_ingest, to_delete, unchanged, oversized, unreadable and held.
+        SyncDiff with to_ingest, to_delete, unchanged, oversized, unreadable, held
+        and moved.
     """
     indexed_files = {
         s.source: s for s in indexed if s.source_type == "file" and _in_scope(s.source, scope)

@@ -3,11 +3,11 @@
 Scope: sync, and only sync. This is not a mutex over the index. Concurrent
 writes to one LanceDB path are safe — LanceDB commits optimistically and
 retries, and measurements against this Store showed no loss and no partial
-state under parallel writers. What two simultaneous syncs cost is wasted work
-(both walk and re-index the same corpus), extra windows where a source is
-briefly absent mid-replace, and a user with no way to tell that it is
-happening. So single-file ingests and every read path stay unlocked; only the
-whole-corpus sync takes this.
+state under parallel writers, and a source's chunks are swapped in one commit.
+What two simultaneous syncs cost is wasted work (both walk and re-index the
+same corpus) and a user with no way to tell that it is happening. So
+single-file ingests and every read path stay unlocked; only the whole-corpus
+sync takes this.
 
 The lock is an exclusive, non-blocking `flock` on `<db_path>/.sync.lock`. While
 held, the file contains the holder's PID and start time as JSON, so a contender
