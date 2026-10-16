@@ -597,3 +597,136 @@ def test_an_unlistable_folder_inside_two_overlapping_roots_is_reported_once(
 
     assert [e["source"] for e in errors] == [str(cfg.roots[1])]
     assert counts["failed"] == 1 and counts["deleted"] == 0
+
+
+# --- a file moved by hand: same content, same name, new folder ---------------------
+
+
+@pytest.fixture
+def moving(tmp_path, fake_embedder):
+    root = tmp_path / "docs"
+    (root / "sub").mkdir(parents=True)
+    cfg = load_config({"BASE_DIR": str(root)}, cwd=root)
+    store = Store(tmp_path / "index", dim=fake_embedder.dim)
+    pipeline = Pipeline(store, fake_embedder, cfg)
+    parsed: list[str] = []
+    real = pipeline.ingest_file
+
+    def spy(path):
+        parsed.append(str(path))
+        return real(path)
+
+    pipeline.ingest_file = spy
+    return cfg, store, pipeline, cfg.roots[0], parsed
+
+
+def _body(n: int, word: str) -> str:
+    return "\n\n".join(f"## Part {i}\n\n" + f"{word} paragraph {i}. " * 60 for i in range(n))
+
+
+def test_sync_follows_a_file_moved_by_hand_without_reading_it_again(moving):
+    """Re-filing a document in Finder used to cost a full parse and embed, which for a
+    scan is OCR all over again."""
+    cfg, store, pipeline, root, parsed = moving
+    (root / "report.md").write_text("# Report\n\n" + _body(3, "alpha"))
+    run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    chunks_before = len(store.all_chunks(str(root / "report.md")))
+    parsed.clear()
+
+    (root / "report.md").rename(root / "sub" / "report.md")
+    counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+
+    assert errors == []
+    assert counts["moved"] == 1
+    assert counts["ingested"] == 0 and counts["deleted"] == 0
+    assert parsed == []
+    assert [s.source for s in store.list_sources()] == [str(root / "sub" / "report.md")]
+    assert len(store.all_chunks(str(root / "sub" / "report.md"))) == chunks_before
+    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    assert counts["skipped"] == 1 and counts["moved"] == 0
+
+
+def test_a_new_file_at_the_old_path_does_not_collide_with_the_moved_one(moving):
+    """Chunk and section ids carry the source path. Left behind by a move, they are
+    exactly the ids the next file at the old path gets, and its ingest would overwrite
+    the moved document's rows or merge the two into one section."""
+    cfg, store, pipeline, root, parsed = moving
+    (root / "notes.md").write_text("# Notes\n\n" + _body(2, "alpha"))
+    run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    (root / "notes.md").rename(root / "sub" / "notes.md")
+    run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+
+    (root / "notes.md").write_text("# Notes\n\n" + _body(2, "omega"))
+    run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+
+    moved = store.all_chunks(str(root / "sub" / "notes.md"))
+    fresh = store.all_chunks(str(root / "notes.md"))
+    assert moved and fresh
+    assert all("alpha" in c.text and "omega" not in c.text for c in moved)
+    assert all("omega" in c.text and "alpha" not in c.text for c in fresh)
+    for chunk in moved:
+        assert "omega" not in store.parent_text(chunk.parent_id)
+    for chunk in fresh:
+        assert "alpha" not in store.parent_text(chunk.parent_id)
+
+
+def test_a_renamed_file_is_read_again_because_its_title_can_come_from_its_name(moving):
+    cfg, store, pipeline, root, parsed = moving
+    (root / "draft_v1.md").write_text(_body(1, "alpha"))
+    run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    (root / "draft_v1.md").rename(root / "sub" / "final_contract.md")
+
+    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+
+    assert counts["moved"] == 0
+    assert counts["ingested"] == 1 and counts["deleted"] == 1
+    assert "final contract" in store.get_source(str(root / "sub" / "final_contract.md")).title
+
+
+def test_a_moved_file_that_was_also_edited_is_read_again(moving):
+    cfg, store, pipeline, root, parsed = moving
+    (root / "plan.md").write_text("# Plan\n\n" + _body(1, "alpha"))
+    run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    (root / "plan.md").rename(root / "sub" / "plan.md")
+    (root / "sub" / "plan.md").write_text("# Plan\n\n" + _body(1, "omega"))
+
+    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+
+    assert counts["moved"] == 0 and counts["ingested"] == 1 and counts["deleted"] == 1
+    assert all("omega" in c.text for c in store.all_chunks(str(root / "sub" / "plan.md")))
+
+
+def test_one_vanished_file_moves_to_one_of_its_two_new_copies(moving):
+    cfg, store, pipeline, root, parsed = moving
+    text = "# Memo\n\n" + _body(1, "alpha")
+    (root / "memo.md").write_text(text)
+    run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    (root / "memo.md").unlink()
+    (root / "a").mkdir()
+    (root / "b").mkdir()
+    (root / "a" / "memo.md").write_text(text)
+    (root / "b" / "memo.md").write_text(text)
+
+    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+
+    assert counts["moved"] == 1 and counts["ingested"] == 1 and counts["deleted"] == 0
+    assert [s.source for s in store.list_sources()] == [
+        str(root / "a" / "memo.md"),
+        str(root / "b" / "memo.md"),
+    ]
+
+
+def test_a_moved_file_cut_by_an_older_scheme_is_read_again(moving):
+    """Its chunks need re-cutting anyway; moving them would only delay that a sync."""
+    cfg, store, pipeline, root, parsed = moving
+    doc = root / "old.md"
+    doc.write_text("# Old\n\n" + _body(1, "alpha"))
+    run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    stale = [replace(c, scheme_version=SCHEME_VERSION - 1) for c in _records_of(store, str(doc))]
+    store.replace_source(str(doc), stale)
+    doc.rename(root / "sub" / "old.md")
+
+    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+
+    assert counts["moved"] == 0 and counts["ingested"] == 1
+    assert store.stale_chunk_count() == 0

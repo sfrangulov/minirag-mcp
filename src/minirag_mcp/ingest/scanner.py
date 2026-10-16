@@ -47,6 +47,16 @@ class SyncDiff:
     # Folders whose contents the scan could not see. What is indexed under them is
     # unknown rather than absent, so none of it is in `to_delete`.
     held: list[HeldFolder] = field(default_factory=list)
+    # Indexed sources whose file reappeared elsewhere with the same name and bytes.
+    # Neither side is in `to_delete` or `to_ingest`: the record is re-pathed instead.
+    moved: list[Move] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class Move:
+    source: str
+    path: Path
+    mtime: float
 
 
 @dataclass(frozen=True)
@@ -269,6 +279,12 @@ def compute_diff(
         else:
             to_delete.append(src)
 
+    moved = _pair_moves(to_delete, to_ingest, indexed_files, entries)
+    paired_sources = {m.source for m in moved}
+    paired_paths = {m.path for m in moved}
+    to_delete = [s for s in to_delete if s not in paired_sources]
+    to_ingest = [p for p in to_ingest if p not in paired_paths]
+
     root_set = set(roots)
     held = [
         HeldFolder(path=path, error=error, root=path in root_set, kept=kept[path])
@@ -283,7 +299,45 @@ def compute_diff(
         oversized=oversized,
         unreadable=sorted(unreadable),
         held=held,
+        moved=moved,
     )
+
+
+def _pair_moves(
+    to_delete: list[str],
+    to_ingest: list[Path],
+    indexed: dict[str, SourceInfo],
+    entries: list[ScanEntry],
+) -> list[Move]:
+    """Pair each vanished source with a new path holding the same bytes under the same name.
+
+    The name has to match because a title can come from it: a renamed file may need a
+    different title, and only a re-ingest computes one. A source cut by an older
+    chunking scheme is not paired, since it needs re-cutting anyway. Pairing is one to
+    one, in path order, so two identical copies of one vanished file move it to the
+    first and ingest the second.
+    """
+    gone: dict[tuple[str, str], list[str]] = {}
+    for source in to_delete:
+        prior = indexed[source]
+        if prior.file_hash and prior.scheme_version >= SCHEME_VERSION:
+            gone.setdefault((Path(source).name, prior.file_hash), []).append(source)
+    if not gone:
+        return []
+    names = {name for name, _ in gone}
+    mtimes = {e.path: e.mtime for e in entries}
+    moves: list[Move] = []
+    for path in to_ingest:
+        if path.name not in names or str(path) in indexed:
+            continue
+        try:
+            digest = file_sha256(path)
+        except OSError:
+            continue  # gone again, or unreadable: the ingest reports it
+        candidates = gone.get((path.name, digest))
+        if candidates:
+            moves.append(Move(source=candidates.pop(0), path=path, mtime=mtimes[path]))
+    return moves
 
 
 @dataclass(frozen=True)

@@ -213,6 +213,12 @@ extension of the document it guards but holds none of its content, so before it
 was skipped a sync failed on it and `sync` exited 1 while somebody had a
 document open.
 
+Moving a file to another folder under the roots costs nothing to re-index: `sync`
+recognises it by its name and bytes and moves its chunks to the new path instead
+of reading it again, which for a scanned document saves the OCR. A file that was
+renamed or edited on the way is read again, since its title can come from its
+name.
+
 Embedded pictures are not indexed. `markitdown` inlines each one as an
 `![alt](data:image/png;base64,…)` placeholder — on one measured corpus of
 office documents that was 8.5% of all chunks — so the placeholder is removed before
@@ -620,7 +626,8 @@ defaults to the current directory.
 minirag-mcp ingest ~/docs
 
 # Reconcile the index with what's on disk: ingest new/changed files,
-# skip unchanged ones, drop entries for files that were deleted
+# skip unchanged ones, follow files moved between folders, drop entries
+# for files that were deleted
 minirag-mcp sync
 
 # Fetch and index a web page

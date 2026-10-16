@@ -36,6 +36,7 @@ class SyncJob:
             "scanned": 0,
             "ingested": 0,
             "skipped": 0,
+            "moved": 0,
             "deleted": 0,
             # Kept in step with the dict `_run_sync_unlocked` builds: a counter that
             # only appears once the job finishes makes every earlier poll report a
@@ -111,9 +112,13 @@ def _run_sync_unlocked(
         blind=blind,
     )
     counts = {
-        "scanned": len(diff.to_ingest) + len(diff.unchanged) + len(diff.oversized),
+        "scanned": len(diff.to_ingest)
+        + len(diff.moved)
+        + len(diff.unchanged)
+        + len(diff.oversized),
         "ingested": 0,
         "skipped": len(diff.unchanged),
+        "moved": 0,
         "deleted": 0,
         "unreadable": len(diff.unreadable),
         "failed": 0,
@@ -139,6 +144,16 @@ def _run_sync_unlocked(
                 f"so it was neither re-ingested nor deleted; {ocr.INSTALL_HINT}",
             }
         )
+
+    for move in diff.moved:
+        try:
+            store.move_source(move.source, str(move.path), mtime=move.mtime)
+            counts["moved"] += 1
+            emit(f"moved {move.source} -> {move.path}")
+        except Exception as e:  # per-file failures never abort the job
+            counts["failed"] += 1
+            errors.append({"source": str(move.path), "error": f"could not re-path: {e}"})
+            emit(f"failed {move.path}: {e}")
 
     for path in diff.to_ingest:
         try:

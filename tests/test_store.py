@@ -399,3 +399,49 @@ def test_open_failure_that_is_not_a_missing_table_propagates(tmp_path, monkeypat
     monkeypatch.setattr(lancedb.db.LanceDBConnection, "open_table", unreadable)
     with pytest.raises(RuntimeError, match="Permission denied"):
         Store(db_path, dim=8)
+
+
+@pytest.mark.parametrize(
+    "old, new",
+    [
+        ("/docs/a.md", "/docs/sub/a.md"),
+        ("/Документы/Счёт.pdf", "/Документы/Архив 2026/Счёт.pdf"),
+        # decomposed й, as macOS folder names often are: substring arithmetic in
+        # bytes rather than characters would cut the id in the wrong place
+        ("/docs/Пйсьмо.md", "/d/Пйсьмо.md"),
+        ("/it's/a#1.md", "/moved/it's/a#1.md"),
+    ],
+)
+def test_move_source_repaths_every_row_in_one_commit_and_keeps_the_vectors(store, old, new):
+    from dataclasses import replace as dc_replace
+
+    rows = [
+        dc_replace(rec(old, i, f"text {i}", vec=[0.1 * (i + 1)] * 8), parent_id=f"{old}#p{i // 2}")
+        for i in range(3)
+    ]
+    store.replace_source(old, rows)
+    store.replace_source("/other.md", [rec("/other.md", 0, "other")])
+    stored = sorted(
+        store._table.search().where(f"source = '{old.replace(chr(39), chr(39) * 2)}'").to_list(),
+        key=lambda r: r["chunk_index"],
+    )
+    version = store._table.version
+
+    assert store.move_source(old, new, mtime=42.5) == 3
+
+    assert store._table.version == version + 1
+    assert [s.source for s in store.list_sources()] == sorted([new, "/other.md"])
+    moved = store._table.search().where(f"source = '{new.replace(chr(39), chr(39) * 2)}'")
+    got = sorted(moved.limit(100).to_list(), key=lambda r: r["chunk_index"])
+    assert [r["id"] for r in got] == [f"{new}#0", f"{new}#1", f"{new}#2"]
+    assert [r["parent_id"] for r in got] == [f"{new}#p0", f"{new}#p0", f"{new}#p1"]
+    assert [r["text"] for r in got] == ["text 0", "text 1", "text 2"]
+    assert [list(r["vector"]) for r in got] == [list(r["vector"]) for r in stored]
+    assert {r["mtime"] for r in got} == {42.5}
+    assert store.get_source("/other.md").chunk_count == 1
+
+
+def test_move_source_of_an_unknown_source_moves_nothing(store):
+    store.replace_source("/a.md", [rec("/a.md", 0, "x")])
+    assert store.move_source("/nope.md", "/b.md", mtime=1.0) == 0
+    assert [s.source for s in store.list_sources()] == ["/a.md"]

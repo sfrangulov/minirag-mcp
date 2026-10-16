@@ -363,6 +363,39 @@ class Store:
             .execute([asdict(r) for r in records])
         )
 
+    def move_source(self, old: str, new: str, *, mtime: float) -> int:
+        """Re-path a source's chunks in one commit, keeping their text and vectors.
+
+        Chunk and section ids are prefixed with the source. Left as they were, they are
+        the ids the next file ingested at the old path gets, and that ingest would
+        overwrite these rows or fuse the two documents into one section. The ids are
+        rewritten here rather than in SQL: Lance's update accepts `substr` only in some
+        positions, and a regex replacement would have to escape arbitrary file names.
+        """
+        clause = f"source = '{sql_str(old)}'"
+        columns = self._table.schema.names
+        rows = self._table.search().where(clause).limit(_LIST_LIMIT).to_list()
+        if not rows:
+            return 0
+        cut = len(old)
+        moved = []
+        for row in rows:
+            row = {c: row[c] for c in columns}
+            row["source"] = new
+            row["id"] = new + row["id"][cut:]
+            if row.get("parent_id"):
+                row["parent_id"] = new + row["parent_id"][cut:]
+            row["mtime"] = mtime
+            moved.append(row)
+        (
+            self._table.merge_insert("id")
+            .when_matched_update_all()
+            .when_not_matched_insert_all()
+            .when_not_matched_by_source_delete(clause)
+            .execute(moved)
+        )
+        return len(moved)
+
     def delete_source(self, source: str) -> int:
         clause = f"source = '{sql_str(source)}'"
         before = self._table.count_rows(filter=clause)
