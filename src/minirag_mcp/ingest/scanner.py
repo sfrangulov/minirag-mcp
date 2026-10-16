@@ -282,7 +282,8 @@ def compute_diff(
 
     # Overlapping roots walk an inner folder twice. Innermost first, so a source is
     # credited to the folder nearest it.
-    blind = sorted(dict(blind).items(), key=lambda b: len(str(b[0])), reverse=True)
+    reason = dict(blind)
+    blind = sorted(reason.items(), key=lambda b: len(str(b[0])), reverse=True)
 
     needs_extra = KNOWN_EXTENSIONS - supported_extensions()
     to_delete: list[str] = []
@@ -299,9 +300,12 @@ def compute_diff(
         else:
             to_delete.append(src)
 
-    # A hidden source is a candidate too: the same name and bytes turning up elsewhere
-    # is evidence that it moved, which is all an empty folder left behind cannot give.
-    moved = _pair_moves(to_delete + sorted(hidden), to_ingest, indexed_files, entries)
+    # A source hidden by an empty root is a candidate too: the same name and bytes
+    # turning up elsewhere is evidence that it moved, which is all an empty folder left
+    # behind cannot give. Behind a folder that cannot be listed the original may still
+    # be there, so a copy elsewhere proves nothing.
+    emptied = sorted(s for s, folder in hidden.items() if reason[folder] is None)
+    moved = _pair_moves(to_delete + emptied, to_ingest, indexed_files, entries)
     paired_sources = {m.source for m in moved}
     paired_paths = {m.path for m in moved}
     to_delete = [s for s in to_delete if s not in paired_sources]
@@ -320,7 +324,9 @@ def compute_diff(
             kept=len(kept[path]),
             examples=tuple(Path(s).name for s in kept[path][:3]),
             scoped=scope is not None,
-            wanted=scope is not None and _in_scope(str(scope), path),
+            wanted=scope is not None
+            and _in_scope(str(scope), path)
+            and not _reached_by_inner_root(scope, path, roots, reason),
         )
         for path, error in sorted(blind, key=lambda b: str(b[0]))
         if (error is not None or kept[path])
@@ -334,6 +340,23 @@ def compute_diff(
         unreadable=sorted(unreadable),
         held=held,
         moved=moved,
+    )
+
+
+def _reached_by_inner_root(
+    scope: Path, folder: Path, roots: Sequence[Path], blind: dict[Path, str | None]
+) -> bool:
+    """Whether a root nested in `folder`, and listed without trouble, holds `scope`.
+
+    A folder can be passed through without being listable, so a root below it is still
+    walked, and a sync scoped inside that root did what it was asked.
+    """
+    return any(
+        root != folder
+        and root not in blind
+        and is_under(str(root), str(folder))
+        and _in_scope(str(scope), root)
+        for root in roots
     )
 
 

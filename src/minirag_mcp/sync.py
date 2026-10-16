@@ -145,11 +145,22 @@ def _run_sync_unlocked(
             }
         )
 
+    def ingest(path: Path) -> bool:
+        try:
+            pipeline.ingest_file(path)
+        except Exception as e:  # per-file failures never abort the job
+            counts["failed"] += 1
+            errors.append({"source": str(path), "error": str(e)})
+            emit(f"failed {path}: {e}")
+            return False
+        counts["ingested"] += 1
+        emit(f"ingested {path}")
+        return True
+
     # A re-path that moved nothing (the origin was deleted meanwhile; delete_file takes
-    # no lock) or raised falls back to reading the file, so the new path is indexed in
-    # this run either way. An origin left behind is gone from disk, and the next sync
-    # deletes it.
-    to_ingest = list(diff.to_ingest)
+    # no lock) or raised falls back to reading the file and then dropping the origin,
+    # which ends where the re-path would have. If the read fails too, both stay as they
+    # were and the next sync pairs them again.
     for move in diff.moved:
         try:
             rows = store.move_source(move.source, str(move.path), mtime=move.mtime)
@@ -159,18 +170,12 @@ def _run_sync_unlocked(
         if rows:
             counts["moved"] += 1
             emit(f"moved {move.source} -> {move.path}")
-        else:
-            to_ingest.append(move.path)
+        elif ingest(move.path) and store.delete_source(move.source):
+            counts["deleted"] += 1
+            emit(f"deleted {move.source}")
 
-    for path in to_ingest:
-        try:
-            pipeline.ingest_file(path)
-            counts["ingested"] += 1
-            emit(f"ingested {path}")
-        except Exception as e:  # per-file failures never abort the job
-            counts["failed"] += 1
-            errors.append({"source": str(path), "error": str(e)})
-            emit(f"failed {path}: {e}")
+    for path in diff.to_ingest:
+        ingest(path)
 
     for source in diff.to_delete:
         store.delete_source(source)

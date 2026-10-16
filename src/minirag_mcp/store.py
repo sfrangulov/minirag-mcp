@@ -356,9 +356,11 @@ class Store:
         takes no lock, so that interleaving is reachable.
 
         The merge key includes `ingested_at`, which every ingest stamps afresh, so no
-        prior row matches and all of them are deleted. Keyed on `id` alone, a source
-        holding an id twice kept both copies forever, and two first ingests of one
-        file racing each other still store it twice: both see no rows to match.
+        prior row matches and all of them are deleted. A caller that reuses a stored
+        stamp gets the stored rows updated in place instead, duplicates included.
+        Keyed on `id` alone, a source holding an id twice kept both copies forever.
+        Two first ingests of one file racing each other still store it twice, since
+        both see no rows to match; `list_sources` flags such a source as duplicated.
         """
         clause = f"source = '{sql_str(source)}'"
         if not records:

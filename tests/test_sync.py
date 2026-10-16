@@ -909,7 +909,7 @@ def test_a_move_whose_origin_vanished_meanwhile_is_read_instead(moving, monkeypa
     assert _indexed(store) == [str(root / "sub" / "r.md")]
 
 
-def test_a_move_that_raises_is_read_instead_and_the_origin_goes_next_sync(moving, monkeypatch):
+def test_a_move_that_raises_is_read_instead_and_the_origin_goes(moving, monkeypatch):
     cfg, store, pipeline, root = _paired_move(moving)
 
     def broken(old, new, *, mtime):
@@ -917,12 +917,9 @@ def test_a_move_that_raises_is_read_instead_and_the_origin_goes_next_sync(moving
 
     monkeypatch.setattr(store, "move_source", broken)
     counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
-    assert counts["moved"] == 0 and counts["ingested"] == 1 and counts["failed"] == 0
-    assert str(root / "sub" / "r.md") in _indexed(store)
 
-    monkeypatch.undo()
-    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
-    assert counts["deleted"] == 1
+    assert counts["moved"] == 0 and counts["failed"] == 0
+    assert counts["ingested"] == 1 and counts["deleted"] == 1
     assert _indexed(store) == [str(root / "sub" / "r.md")]
 
 
@@ -943,3 +940,45 @@ def test_a_doubled_source_that_moved_is_read_again_rather_than_carried_over(movi
     assert counts["moved"] == 0 and counts["ingested"] == 1
     indexes = [c.chunk_index for c in store.all_chunks(str(root / "sub" / "r.md"))]
     assert indexes == sorted(set(indexes))
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a chmod 000 folder anyway")
+def test_a_copy_beside_a_folder_that_cannot_be_listed_does_not_take_its_entry(two_roots):
+    """Behind a folder that cannot be listed the original may well still be there.
+
+    Re-pathing it to the copy dropped its own path from the index, and deleting the
+    copy before access came back lost the document entirely.
+    """
+    cfg, store, pipeline, docs, more = two_roots
+    (more / "b.md").write_bytes((docs / "sub" / "b.md").read_bytes())
+    os.chmod(docs / "sub", 0)
+    try:
+        counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    finally:
+        os.chmod(docs / "sub", 0o755)
+
+    assert counts["moved"] == 0 and counts["ingested"] == 1
+    assert str(docs / "sub" / "b.md") in _indexed(store)
+    assert str(more / "b.md") in _indexed(store)
+    assert "b.md" in errors[0]["error"]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a chmod 000 folder anyway")
+def test_a_scoped_sync_reached_through_an_inner_root_is_not_failed_by_its_parent(
+    tmp_path, fake_embedder
+):
+    """docs/a can be passed through but not listed; docs/a/b is a root of its own."""
+    docs = tmp_path / "docs"
+    inner = docs / "a" / "b"
+    inner.mkdir(parents=True)
+    cfg = load_config({"BASE_DIRS": json.dumps([str(docs), str(inner)])}, cwd=tmp_path)
+    store = Store(tmp_path / "index", dim=fake_embedder.dim)
+    pipeline = Pipeline(store, fake_embedder, cfg)
+    (inner / "y.md").write_text("# Y\n\nYankee body text for the corpus.")
+    os.chmod(docs / "a", 0o311)
+    try:
+        counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size, scope=cfg.roots[1])
+    finally:
+        os.chmod(docs / "a", 0o755)
+
+    assert counts["ingested"] == 1 and counts["failed"] == 0

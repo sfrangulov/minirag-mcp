@@ -876,10 +876,12 @@ merges with them.
   one-time embedding-model download ever leave the machine.
 - Single local user, no authentication. Concurrent writers against one
   `DB_PATH` are safe — LanceDB commits optimistically and retries, so parallel
-  ingests lose no rows and the state they settle on is always correct.
-  Re-indexing a source swaps its chunks in one commit, so a reader sees the old
-  set or the new one, never a mix or a gap, and two writers re-indexing the same
-  file cannot leave both copies behind. A server that stays running sees what a
+  ingests lose no rows. Re-indexing a source swaps its chunks in one commit, so
+  a reader sees the old set or the new one, never a mix or a gap, and two writers
+  re-indexing the same file cannot leave both copies behind. Two writers
+  indexing the same *new* file at the same moment (a sync and an `ingest_file`)
+  can each store it, and search then sees that document twice until the next
+  sync notices and reads it again. A server that stays running sees what a
   terminal `sync` wrote on its next read. Two *syncs* at once are still
   wasteful, since both re-walk and re-index the same corpus, so
   `sync`/`sync_start` takes an advisory lock on `<DB_PATH>/.sync.lock` and a
@@ -908,8 +910,10 @@ process with no access to `~/Documents` all look like this, and none of them
 means the files are gone. A root always counts as one failed item (exit status
 `1`); a subfolder does only when something indexed is under it, or when you
 asked to sync that folder. The message names the first few files kept. Restore
-access and sync again. Files moved out of such a folder are followed to their
-new place as usual. If you did remove the rest, delete their entries with
+access and sync again. Files moved out of an emptied root are followed to their
+new place as usual; a copy of a file behind a folder that cannot be listed is
+indexed as a file of its own, since the original may still be there. If you did
+remove the rest, delete their entries with
 `delete_file` (or `minirag-mcp delete`), or take the root out of `BASE_DIR` /
 `BASE_DIRS`.
 
