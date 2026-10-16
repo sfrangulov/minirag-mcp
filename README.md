@@ -868,22 +868,21 @@ merges with them.
   one-time embedding-model download ever leave the machine.
 - Single local user, no authentication. Concurrent writers against one
   `DB_PATH` are safe — LanceDB commits optimistically and retries, so parallel
-  ingests lose no rows and the state they settle on is always correct. What a
-  reader can catch is a source *mid*-replacement: re-indexing deletes the old
-  chunks before writing the new ones, so a query timed badly enough may see that
-  one source with only some of its chunks, or none — one more reason two syncs
-  at once are undesirable. Two *syncs* are also simply wasteful, since both
-  re-walk and re-index the same corpus, so `sync`/`sync_start` takes an advisory
-  lock on `<DB_PATH>/.sync.lock` and a second one refuses immediately, naming
-  the process that holds it and how long it has been running. Single-file
+  ingests lose no rows and the state they settle on is always correct.
+  Re-indexing a source swaps its chunks in one commit, so a reader sees the old
+  set or the new one, never a mix or a gap, and two writers re-indexing the same
+  file cannot leave both copies behind. A server that stays running sees what a
+  terminal `sync` wrote on its next read. Two *syncs* at once are still
+  wasteful, since both re-walk and re-index the same corpus, so
+  `sync`/`sync_start` takes an advisory lock on `<DB_PATH>/.sync.lock` and a
+  second one refuses immediately, naming the process that holds it and how
+  long it has been running. Single-file
   ingests and reads are never blocked, and the lock is released by the kernel if
   a sync is killed, so it can't go stale.
-- Re-indexing a source replaces its chunks by deleting the old ones and
-  writing the new ones, so a sync interrupted mid-file (Ctrl-C, a crash, a
-  server restart) can leave that one source temporarily absent from the
-  index while its file is still on disk. This is self-healing: the next
-  `sync`/`sync_start` sees the file as not indexed and re-ingests it. Nothing
-  on disk is ever modified, and no other source is affected.
+- A sync interrupted mid-file (Ctrl-C, a crash, a server restart) leaves that
+  file's source as it was before, because the swap is one commit; the next
+  `sync`/`sync_start` re-ingests it. Nothing on disk is ever modified, and no
+  other source is affected.
 - Backup: copy the `DB_PATH` directory while no writer (an ingest or sync)
   is active.
 
