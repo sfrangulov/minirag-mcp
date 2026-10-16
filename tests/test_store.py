@@ -50,6 +50,39 @@ def test_replace_is_atomic_swap(store):
     assert store.get_source("/a.md").chunk_count == 1
 
 
+def test_replacing_a_source_never_leaves_a_version_without_it(store):
+    """Every table version is what some reader may see.
+
+    As a delete followed by an add, a re-ingest left one version in which the source
+    was gone: a concurrent reader saw it missing, and a second writer whose delete and
+    add interleaved with these left both copies, which no later sync repairs because
+    the hash and mtime match.
+    """
+    store.replace_source("/a.md", [rec("/a.md", i, f"old {i}") for i in range(3)])
+    before = store._table.version
+    store.replace_source("/a.md", [rec("/a.md", i, f"new {i}") for i in range(2)])
+    after = store._table.version
+
+    clause = "source = '/a.md'"
+    rows_per_version = {}
+    for version in range(before, after + 1):
+        store._table.checkout(version)
+        rows_per_version[version] = store._table.count_rows(filter=clause)
+    store._table.checkout_latest()
+
+    assert rows_per_version == {before: 3, after: 2}
+    texts = sorted(r.text for r in store.all_chunks("/a.md"))
+    assert texts == ["new 0", "new 1"]
+
+
+def test_replacing_one_source_leaves_the_others_alone(store):
+    store.replace_source("/a.md", [rec("/a.md", 0, "a")])
+    store.replace_source("/a.md#b.md", [rec("/a.md#b.md", 0, "b0"), rec("/a.md#b.md", 1, "b1")])
+    store.replace_source("/a.md", [rec("/a.md", 0, "a2")])
+    store.replace_source("/a.md", [])
+    assert [(s.source, s.chunk_count) for s in store.list_sources()] == [("/a.md#b.md", 2)]
+
+
 def test_delete_source_returns_count(store):
     store.replace_source("/a.md", [rec("/a.md", 0, "x")])
     assert store.delete_source("/a.md") == 1

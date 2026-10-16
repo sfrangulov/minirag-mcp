@@ -344,9 +344,24 @@ class Store:
         )
 
     def replace_source(self, source: str, records: Sequence[ChunkRecord]) -> None:
-        self._table.delete(f"source = '{sql_str(source)}'")
-        if records:
-            self._table.add([asdict(r) for r in records])
+        """Swap a source's chunks for `records` in one commit.
+
+        A delete followed by an add is two versions, and the one between them has no
+        such source: a concurrent reader finds it missing, and a second writer whose
+        delete and add interleave with these leaves both copies. Single-file ingest
+        takes no lock, so that interleaving is reachable.
+        """
+        clause = f"source = '{sql_str(source)}'"
+        if not records:
+            self._table.delete(clause)
+            return
+        (
+            self._table.merge_insert("id")
+            .when_matched_update_all()
+            .when_not_matched_insert_all()
+            .when_not_matched_by_source_delete(clause)
+            .execute([asdict(r) for r in records])
+        )
 
     def delete_source(self, source: str) -> int:
         clause = f"source = '{sql_str(source)}'"
