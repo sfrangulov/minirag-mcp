@@ -203,8 +203,9 @@ class Store:
         db_path.mkdir(parents=True, exist_ok=True)
         # Zero means every read checks for a newer table version first. LanceDB's default
         # pins the version a handle opened with, and the MCP server holds one Store for
-        # its lifetime while a terminal `sync` writes the same table. Costs under 1 ms a
-        # read.
+        # its lifetime while a terminal `sync` writes the same table. The check grows
+        # with the versions the table has kept: about 0.1 ms a read at ten, 1 ms at
+        # 1,500, 5 ms at 10,000.
         self._db = lancedb.connect(str(db_path), read_consistency_interval=timedelta(0))
         # The directory this index lives in. Exposed because the sync lock is a file
         # inside it, and both sync entry points must derive that path the same way —
