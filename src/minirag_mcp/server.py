@@ -16,19 +16,17 @@ from minirag_mcp.chunker import SCHEME_VERSION
 from minirag_mcp.config import Config, ConfigError, load_config
 from minirag_mcp.embedder import Embedder
 from minirag_mcp.ingest.pipeline import Pipeline
-from minirag_mcp.ingest.scanner import compute_states, scan_roots
 from minirag_mcp.instructions import build_instructions
 from minirag_mcp.results import (
-    aggregate_sources,
     join_document,
+    list_payload,
     ocr_status,
-    parent_map,
     result_dict,
+    run_query,
     scheme_status,
 )
-from minirag_mcp.scope import is_under
 from minirag_mcp.security import resolve_in_roots
-from minirag_mcp.store import MAX_TOP_K, Store
+from minirag_mcp.store import Store
 from minirag_mcp.sync import SyncManager
 
 
@@ -201,32 +199,17 @@ def create_app(
         topK must be at least 1 and is capped at 100; a larger value is
         silently clamped to the cap rather than rejected.
 
+        When nothing matches because nothing could — an empty index, or a
+        scope no indexed document is under — `notice` says which.
+
         Cite what you take, so the user can verify it, in whatever
         language you answer: end with a Sources list, one line per
         document you actually used, each line just that document's
         `displayPath` copied verbatim — no [n] markers, nothing else
         on the line. Plain text, never a markdown link or file://.
         """
-        if not query.strip():
-            raise ToolError("query must not be empty")
-        if topK < 1:
-            raise ToolError(f"topK must be at least 1, got {topK}")
         c = ctx()
-        results = c.store.search(
-            query,
-            c.embedder.embed_query(query),
-            top_k=min(topK, MAX_TOP_K),
-            hybrid_weight=c.config.hybrid_weight,
-            scopes=_scopes(scope),
-            max_distance=c.config.max_distance,
-            grouping=c.config.grouping,
-            max_files=c.config.max_files,
-        )
-        return {
-            "results": [result_dict(r) for r in results],
-            "sources": aggregate_sources(results, c.config.roots),
-            "parents": parent_map(results),
-        }
+        return run_query(c.store, c.embedder, c.config, query, top_k=topK, scopes=_scopes(scope))
 
     @mcp.tool
     @guard
@@ -313,27 +296,14 @@ def create_app(
         "stale_scheme" is the per-source view of what status reports as
         staleChunkCount. Data and url sources have no disk state to compare
         against, so they are "ingested" or "stale_scheme".
+
+        unlistedFolders names each folder the scan could not see into (no read
+        permission, a missing or unmounted drive), with what to do about it.
+        Indexed files under one are listed as "unlisted": still indexed and
+        searchable, not checked against the disk.
         """
         c = ctx()
-        scopes = _scopes(scope)
-        entries = scan_roots(c.config.roots)
-        if scopes:
-            entries = [e for e in entries if any(is_under(str(e.path), p) for p in scopes)]
-        indexed = c.store.list_sources(scopes=scopes)
-        states = compute_states(entries, indexed)
-        return {
-            "files": [
-                {
-                    "source": s.source,
-                    "sourceType": s.source_type,
-                    "title": s.title,
-                    "state": s.state,
-                    "chunkCount": s.chunk_count,
-                    "ocrEngine": s.ocr_engine,
-                }
-                for s in states
-            ]
-        }
+        return list_payload(c.store, c.config.roots, _scopes(scope))
 
     @mcp.tool
     @guard

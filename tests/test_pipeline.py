@@ -81,15 +81,36 @@ def test_ingest_file_carries_ocr_engine(pipe, monkeypatch):
     assert [r["ocr_engine"] for r in rows] == [ocr.ENGINE_RAPIDOCR] * len(rows)
 
 
-def test_ingest_file_image_without_ocr_is_unsupported(pipe, monkeypatch):
+def test_ingest_file_image_without_ocr_names_the_missing_extra(pipe, monkeypatch):
+    """Not "unsupported extension": an image is a document type this server reads, given
+    the extra. The two readings send the user opposite ways — give up on the file, or
+    install one package — so the message has to say which one this is."""
     from minirag_mcp import ocr
 
     p, _, root = pipe
     monkeypatch.setattr(ocr, "available", lambda: False)
     img = root / "scan.png"
     img.write_bytes(b"...")
-    with pytest.raises(UnsupportedFormatError):
+    with pytest.raises(UnsupportedFormatError) as raised:
         p.ingest_file(img)
+    message = str(raised.value)
+    assert "needs OCR" in message
+    assert ocr.INSTALL_HINT in message
+    assert "Unsupported file extension" not in message
+
+
+def test_ingest_file_on_a_folder_points_at_sync(pipe):
+    """A folder has no extension, and reporting it as the unsupported extension ''
+    leaves the caller to guess that the tool wanted a file."""
+    p, _, root = pipe
+    folder = root / "reports"
+    folder.mkdir()
+    with pytest.raises(UnsupportedFormatError) as raised:
+        p.ingest_file(folder)
+    message = str(raised.value)
+    assert "is a folder" in message
+    assert "sync_start" in message
+    assert "extension" not in message
 
 
 def test_file_too_large(pipe, tmp_path, fake_embedder):

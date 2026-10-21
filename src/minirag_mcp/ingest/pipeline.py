@@ -7,10 +7,12 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from minirag_mcp import ocr
 from minirag_mcp.chunker import SCHEME_VERSION, chunk_markdown, estimate_tokens
 from minirag_mcp.config import Config
 from minirag_mcp.ingest import parser as _parser
 from minirag_mcp.ingest.parser import (
+    IMAGE_EXTENSIONS,
     find_title,
     parse_file,
     parse_html,
@@ -124,7 +126,14 @@ class Pipeline:
         return IngestResult(source=source, chunk_count=len(records), title=title)
 
     def ingest_file(self, path: Path) -> IngestResult:
+        if path.is_dir():
+            raise UnsupportedFormatError(
+                f"{path} is a folder; this takes one file. To index a folder, sync it: "
+                "sync_start with this path, or `minirag-mcp sync <folder>`."
+            )
         exts = supported_extensions()
+        if path.suffix.lower() in IMAGE_EXTENSIONS and path.suffix.lower() not in exts:
+            raise UnsupportedFormatError(f"{path} is an image, which needs OCR; {ocr.INSTALL_HINT}")
         if path.suffix.lower() not in exts:
             raise UnsupportedFormatError(
                 f"Unsupported file extension {path.suffix!r}; supported: " + ", ".join(sorted(exts))

@@ -20,6 +20,10 @@ class UnknownModelError(Exception):
     pass
 
 
+class EmbedderUnavailableError(Exception):
+    """The embedding model could not be loaded, so nothing can be searched or ingested."""
+
+
 def cosine(a: Sequence[float], b: Sequence[float]) -> float:
     """Cosine similarity, 0.0 when either side is the zero vector."""
     dot = sum(x * y for x, y in zip(a, b, strict=True))
@@ -89,8 +93,19 @@ class Embedder:
 
     def _load(self) -> TextEmbedding:
         if self._model is None:
-            self.cache_dir.mkdir(parents=True, exist_ok=True)
-            self._model = TextEmbedding(model_name=self.model_name, cache_dir=str(self.cache_dir))
+            try:
+                self.cache_dir.mkdir(parents=True, exist_ok=True)
+                self._model = TextEmbedding(
+                    model_name=self.model_name, cache_dir=str(self.cache_dir)
+                )
+            except Exception as e:
+                raise EmbedderUnavailableError(
+                    f"The embedding model {self.model_name!r} could not be loaded ({e}). "
+                    "Every search and ingest needs it, so each one fails this way until it "
+                    "loads; this is not a problem with the query. It is downloaded once, "
+                    f"into {self.cache_dir}: the server needs to reach huggingface.co for "
+                    "that, or CACHE_DIR has to point at a folder that already holds it."
+                ) from e
         return self._model
 
     def count_tokens(self, text: str) -> int:
@@ -108,13 +123,18 @@ class Embedder:
         that silently stops counting tokens would produce a corpus of truncated vectors
         with nothing to show for it. So a failure degrades to the character estimate,
         loudly and once. It degrades *there* and never to `token_count`: the estimate is
-        rough but monotonic, and a saturating counter is not a counter at all.
+        rough but monotonic, and a saturating counter is not a counter at all. A model
+        that does not load at all is not that case: it raises EmbedderUnavailableError.
         """
         if self._tokenizer_broken:
             return estimate_tokens(text)
+        if self._count is None:
+            # Outside the fallback: a model that cannot load cannot embed what the
+            # estimate would size, and the fallback, once taken, is never undone.
+            model = self._load()
         try:
             if self._count is None:
-                self._count = _untruncated_counter(self._load())
+                self._count = _untruncated_counter(model)
             return int(self._count(text))
         except Exception as e:
             self._tokenizer_broken = True

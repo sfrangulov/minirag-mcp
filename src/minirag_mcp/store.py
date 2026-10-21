@@ -198,9 +198,20 @@ RESYNC_HINT = (
 )
 
 
+class IndexOpenError(Exception):
+    """The index folder cannot be created or opened."""
+
+
 class Store:
     def __init__(self, db_path: Path, dim: int):
-        db_path.mkdir(parents=True, exist_ok=True)
+        try:
+            db_path.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            raise IndexOpenError(
+                f"Cannot open the index at {db_path}: {e.strerror or e}. DB_PATH (or "
+                "--db-path) has to name a folder this user can create and write; set it "
+                "to one."
+            ) from e
         # Zero means every read checks for a newer table version first. LanceDB's default
         # pins the version a handle opened with, and the MCP server holds one Store for
         # its lifetime while a terminal `sync` writes the same table. The check grows

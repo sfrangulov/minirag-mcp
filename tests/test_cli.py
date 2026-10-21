@@ -308,10 +308,22 @@ def test_env_used_when_no_flags(corpus, capsys, monkeypatch):
 def test_unknown_model_name_is_clean_error(corpus, capsys, monkeypatch):
     monkeypatch.setattr(cli, "_make_embedder", _REAL_MAKE_EMBEDDER)  # use the real factory
     with pytest.raises(SystemExit) as exc:
-        run(["status", "--base-dir", str(corpus), "--model-name", "totally-bogus-model"])
+        run(["list", "--base-dir", str(corpus), "--model-name", "totally-bogus-model"])
     assert exc.value.code == 1
     err = capsys.readouterr().err
     assert "totally-bogus-model" in err and "Traceback" not in err
+
+
+def test_status_reports_an_unknown_model_as_an_index_error_like_the_server(
+    corpus, capsys, monkeypatch
+):
+    """`status` is the diagnosis command in both shells: the server's answers this with
+    indexError instead of the counts, so the CLI's does too, and exits 0."""
+    monkeypatch.setattr(cli, "_make_embedder", _REAL_MAKE_EMBEDDER)
+    run(["status", "--base-dir", str(corpus), "--model-name", "totally-bogus-model", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert "totally-bogus-model" in payload["indexError"]
+    assert "chunkCount" not in payload
 
 
 def test_ingest_partial_failure_reports_both(corpus, capsys):
@@ -492,3 +504,22 @@ def test_cli_status_says_ocr_is_unavailable_and_how_to_get_it(corpus, capsys, mo
     payload = json.loads(capsys.readouterr().out)
     assert payload["ocr"] == "unavailable"
     assert "minirag-mcp[ocr]" in payload["ocrHint"]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a chmod 000 folder anyway")
+def test_ingest_of_a_folder_with_an_unlistable_subfolder_fails_and_names_it(corpus, capsys):
+    """ "ingested 1 file(s)", exit 0, was the whole report, while everything under the
+    subfolder was silently left out of what the user asked to ingest."""
+    hidden = corpus / "sub"
+    os.chmod(hidden, 0)
+    try:
+        with pytest.raises(SystemExit) as exc:
+            run(["ingest", str(corpus), "--base-dir", str(corpus), "--json"])
+    finally:
+        os.chmod(hidden, 0o755)
+    assert exc.value.code == 1
+    captured = capsys.readouterr()
+    failed = json.loads(captured.out)["failed"]
+    assert [f["source"] for f in failed] == [str(hidden)]
+    assert "could not list this folder" in failed[0]["error"]
+    assert f"warn: {hidden}:" in captured.err

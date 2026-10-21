@@ -402,7 +402,8 @@ class FileState:
     source: str
     source_type: str
     title: str
-    state: str  # "ingested" | "not_ingested" | "stale" | "stale_scheme" | "unreadable"
+    # "ingested" | "not_ingested" | "stale" | "stale_scheme" | "unreadable" | "unlisted"
+    state: str
     chunk_count: int
     ocr_engine: str = ""
 
@@ -418,7 +419,11 @@ def _indexed_state(prior: SourceInfo) -> str:
     return "stale_scheme" if prior.scheme_version < SCHEME_VERSION else "ingested"
 
 
-def compute_states(entries: list[ScanEntry], indexed: list[SourceInfo]) -> list[FileState]:
+def compute_states(
+    entries: list[ScanEntry],
+    indexed: list[SourceInfo],
+    blind: Sequence[tuple[Path, str | None]] = (),
+) -> list[FileState]:
     """Compute file states for disk files plus indexed data/url sources.
 
     States for disk files (source_type="file"):
@@ -434,6 +439,8 @@ def compute_states(entries: list[ScanEntry], indexed: list[SourceInfo]) -> list[
       it, so it has no entry to compare against; `compute_diff` keeps it rather than
       deleting it, and it is listed here because `status` still counts its chunks and
       `query_documents` still returns them.
+    - "unlisted": indexed, under a folder in `blind` (see `scan_roots`), so whether it
+      is still on disk is unknown. Listed for the same reason as "unreadable".
 
     A file that is both changed on disk and scheme-stale reports "stale": the bytes are
     the more surprising fact, and the remedy is identical either way.
@@ -468,12 +475,16 @@ def compute_states(entries: list[ScanEntry], indexed: list[SourceInfo]) -> list[
     scanned = {str(e.path) for e in entries}
     needs_extra = KNOWN_EXTENSIONS - supported_extensions()
     for source, prior in by_source.items():
-        if source in scanned or not _kept_unreadable(source, needs_extra):
+        if source in scanned:
+            continue
+        if any(is_under(source, str(folder)) for folder, _ in blind):
+            state = "unlisted"
+        elif _kept_unreadable(source, needs_extra):
+            state = "unreadable"
+        else:
             continue
         states.append(
-            FileState(
-                source, "file", prior.title, "unreadable", prior.chunk_count, prior.ocr_engine
-            )
+            FileState(source, "file", prior.title, state, prior.chunk_count, prior.ocr_engine)
         )
     for s in indexed:
         if s.source_type in ("data", "url"):
