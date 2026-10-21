@@ -29,10 +29,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
@@ -87,6 +89,50 @@ def write_mcp_config(path: Path, server_bin: Path, db: Path) -> None:
     path.write_text(json.dumps({"mcpServers": {"minirag": server}}, indent=2), encoding="utf-8")
 
 
+# Claude Code gives a stdio server this long to answer `initialize`. A server binary's
+# first start in a fresh environment — no bytecode yet, every native library read and
+# scanned for the first time — can take longer than the default, and a run whose server
+# did not connect measures nothing.
+MCP_TIMEOUT_MS = "120000"
+
+
+def prewarm(server_bin: Path, db: Path, limit: float = 180.0) -> float:
+    """Start the server once and wait for its `initialize` answer, so the first real run
+    does not pay the cold start; fail loudly if it never answers."""
+    env = dict(os.environ, BASE_DIR=str(CORPUS), DB_PATH=str(db))
+    started = time.monotonic()
+    proc = subprocess.Popen(
+        [str(server_bin)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        env=env,
+        text=True,
+    )
+    hello = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "prewarm", "version": "0"},
+        },
+    }
+    try:
+        proc.stdin.write(json.dumps(hello) + "\n")
+        proc.stdin.flush()
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            line = pool.submit(proc.stdout.readline).result(timeout=limit)
+    except Exception as e:
+        raise SystemExit(f"{server_bin} did not answer initialize within {limit:g}s: {e}") from e
+    finally:
+        proc.kill()
+    if '"result"' not in line:
+        raise SystemExit(f"{server_bin} answered initialize with: {line[:300]}")
+    return time.monotonic() - started
+
+
 def build_index(server_bin: Path, db: Path) -> None:
     proc = subprocess.run(
         [str(server_bin), "sync", "--base-dir", str(CORPUS), "--db-path", str(db), "--json"],
@@ -134,6 +180,7 @@ def main() -> int:
             build_index(args.server_bin, db)
         configs[index] = work / f"mcp-{index}.json"
         write_mcp_config(configs[index], args.server_bin, db)
+    print(f"server answered initialize in {prewarm(args.server_bin, work / 'db-prewarm'):.1f}s")
     (out / "run.json").write_text(
         json.dumps(
             {
@@ -151,8 +198,14 @@ def main() -> int:
         encoding="utf-8",
     )
 
+    # A run whose server did not connect measures nothing; neither would the rest.
+    broken = threading.Event()
+
     def one(job):
         item, rep = job
+        if broken.is_set():
+            print(f"  {item.id}#{rep}: skipped, an earlier run had no server", flush=True)
+            return
         dest = out / "raw" / item.id / f"{rep}.jsonl"
         dest.parent.mkdir(exist_ok=True)
         started = time.monotonic()
@@ -164,6 +217,7 @@ def main() -> int:
                 text=True,
                 timeout=args.timeout,
                 stdin=subprocess.DEVNULL,
+                env=dict(os.environ, MCP_TIMEOUT=MCP_TIMEOUT_MS),
             )
             dest.write_text(proc.stdout, encoding="utf-8")
             if proc.stderr.strip():
@@ -172,6 +226,10 @@ def main() -> int:
         except subprocess.TimeoutExpired as e:
             dest.write_text(e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or ""))
             status = "TIMEOUT"
+        connected = '"name":"minirag","status":"connected"' in dest.read_text(encoding="utf-8")
+        if not connected:
+            status += ", minirag NOT connected"
+            broken.set()
         print(f"  {item.id}#{rep}: {status} in {time.monotonic() - started:.0f}s", flush=True)
 
     with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
