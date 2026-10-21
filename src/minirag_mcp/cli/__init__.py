@@ -13,21 +13,21 @@ from cyclopts import App, Parameter
 from minirag_mcp import __version__
 from minirag_mcp.chunker import SCHEME_VERSION
 from minirag_mcp.config import Config, ConfigError, load_config
-from minirag_mcp.embedder import Embedder, UnknownModelError
+from minirag_mcp.embedder import Embedder, EmbedderUnavailableError, UnknownModelError
 from minirag_mcp.ingest.pipeline import IngestResult, Pipeline
 from minirag_mcp.ingest.scanner import compute_states, scan_roots
 from minirag_mcp.lock import SyncLockBusy
 from minirag_mcp.results import (
-    aggregate_sources,
+    QueryError,
     join_document,
     ocr_status,
-    parent_map,
     result_dict,
+    run_query,
     scheme_status,
 )
 from minirag_mcp.scope import is_under
 from minirag_mcp.security import SecurityError, resolve_in_roots
-from minirag_mcp.store import MAX_TOP_K, DimensionMismatchError, SearchResult, Store
+from minirag_mcp.store import DimensionMismatchError, IndexOpenError, Store
 from minirag_mcp.sync import run_sync
 
 app = App(name="minirag-mcp", version=__version__)
@@ -91,7 +91,7 @@ def _load(
     except UnknownModelError as e:
         _fail(f"{e} — see fastembed's supported models")
         raise AssertionError from e  # unreachable
-    except DimensionMismatchError as e:
+    except (DimensionMismatchError, IndexOpenError) as e:
         _fail(str(e))
         raise AssertionError from e  # unreachable
 
@@ -100,8 +100,10 @@ def _emit(payload: dict, as_json: bool, human: str) -> None:
     print(jsonlib.dumps(payload, ensure_ascii=False, indent=2) if as_json else human)
 
 
-def _result_line(r: SearchResult) -> str:
-    return f"[{r.score:.3f}] {r.source}#{r.chunk_index} — {r.title}\n    {r.text[:160]}"
+def _result_line(r: dict) -> str:
+    return (
+        f"[{r['score']:.3f}] {r['source']}#{r['chunkIndex']} — {r['title']}\n    {r['text'][:160]}"
+    )
 
 
 @app.command
@@ -233,29 +235,21 @@ def query(
     if top_k < 1:
         _fail(f"--top-k must be at least 1, got {top_k}")
     cfg, store, pipeline = _load(base_dir, db_path, cache_dir, model_name)
-    results = store.search(
-        text,
-        pipeline.embedder.embed_query(text),
-        top_k=min(top_k, MAX_TOP_K),
-        hybrid_weight=cfg.hybrid_weight,
-        scopes=tuple(scope or ()),
-        max_distance=cfg.max_distance,
-        grouping=cfg.grouping,
-        max_files=cfg.max_files,
-    )
-    sources = aggregate_sources(results, cfg.roots)
-    payload = {
-        "results": [result_dict(r) for r in results],
-        "sources": sources,
-        "parents": parent_map(results),
-    }
-    if results:
-        human = "\n".join(_result_line(r) for r in results)
+    try:
+        payload = run_query(
+            store, pipeline.embedder, cfg, text, top_k=top_k, scopes=tuple(scope or ())
+        )
+    except (QueryError, EmbedderUnavailableError) as e:
+        _fail(str(e))
+        raise AssertionError from e  # unreachable
+    if payload["results"]:
+        human = "\n".join(_result_line(r) for r in payload["results"])
         human += "\n\nSources:\n" + "\n".join(
-            f"  {s['source']} ({s['hits']} hit{'s' if s['hits'] != 1 else ''})" for s in sources
+            f"  {s['source']} ({s['hits']} hit{'s' if s['hits'] != 1 else ''})"
+            for s in payload["sources"]
         )
     else:
-        human = "no results"
+        human = "no results" + (f" — {payload['notice']}" if "notice" in payload else "")
     _emit(payload, json, human)
 
 
@@ -399,7 +393,7 @@ def status(
         payload = {"version": __version__, "configError": str(e)}
         _emit(payload, json, "\n".join(f"{k}: {v}" for k, v in payload.items()))
         return
-    cfg, store, _ = _load(base_dir, db_path, cache_dir, model_name)
+    cfg = _load_cfg(base_dir, db_path, cache_dir, model_name)
     payload = {
         "version": __version__,
         "roots": [str(r) for r in cfg.roots],
@@ -408,10 +402,16 @@ def status(
         "hybridWeight": cfg.hybrid_weight,
         "chunkScheme": SCHEME_VERSION,
         **ocr_status(),
-        "chunkCount": store.chunk_count(),
-        "sourceCount": store.source_count(),
-        **scheme_status(store),
     }
+    # An index that cannot be opened is reported, not raised: the server's `status` does
+    # the same, and both are what a broken setup is diagnosed with.
+    try:
+        store = Store(cfg.db_path, dim=_make_embedder(cfg).dim)
+        payload["chunkCount"] = store.chunk_count()
+        payload["sourceCount"] = store.source_count()
+        payload.update(scheme_status(store))
+    except Exception as e:
+        payload["indexError"] = str(e)
     human = "\n".join(f"{k}: {v}" for k, v in payload.items())
     _emit(payload, json, human)
 

@@ -19,16 +19,15 @@ from minirag_mcp.ingest.pipeline import Pipeline
 from minirag_mcp.ingest.scanner import compute_states, scan_roots
 from minirag_mcp.instructions import build_instructions
 from minirag_mcp.results import (
-    aggregate_sources,
     join_document,
     ocr_status,
-    parent_map,
     result_dict,
+    run_query,
     scheme_status,
 )
 from minirag_mcp.scope import is_under
 from minirag_mcp.security import resolve_in_roots
-from minirag_mcp.store import MAX_TOP_K, Store
+from minirag_mcp.store import Store
 from minirag_mcp.sync import SyncManager
 
 
@@ -201,32 +200,17 @@ def create_app(
         topK must be at least 1 and is capped at 100; a larger value is
         silently clamped to the cap rather than rejected.
 
+        When nothing matches because nothing could — an empty index, or a
+        scope no indexed document is under — `notice` says which.
+
         Cite what you take, so the user can verify it, in whatever
         language you answer: end with a Sources list, one line per
         document you actually used, each line just that document's
         `displayPath` copied verbatim — no [n] markers, nothing else
         on the line. Plain text, never a markdown link or file://.
         """
-        if not query.strip():
-            raise ToolError("query must not be empty")
-        if topK < 1:
-            raise ToolError(f"topK must be at least 1, got {topK}")
         c = ctx()
-        results = c.store.search(
-            query,
-            c.embedder.embed_query(query),
-            top_k=min(topK, MAX_TOP_K),
-            hybrid_weight=c.config.hybrid_weight,
-            scopes=_scopes(scope),
-            max_distance=c.config.max_distance,
-            grouping=c.config.grouping,
-            max_files=c.config.max_files,
-        )
-        return {
-            "results": [result_dict(r) for r in results],
-            "sources": aggregate_sources(results, c.config.roots),
-            "parents": parent_map(results),
-        }
+        return run_query(c.store, c.embedder, c.config, query, top_k=topK, scopes=_scopes(scope))
 
     @mcp.tool
     @guard

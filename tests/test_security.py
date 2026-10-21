@@ -42,6 +42,25 @@ def test_outside_root_rejected(tmp_path):
         resolve_in_roots("/etc/passwd", [other])
 
 
+def test_outside_root_names_the_roots_and_the_one_way_in(tmp_path):
+    """ "Outside the roots" alone sends a caller hunting for which roots there are, and an
+    agent's usual next move is to retry with some other guess outside them."""
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    with pytest.raises(SecurityError) as raised:
+        resolve_in_roots("/etc/passwd", [a, b])
+    message = str(raised.value)
+    assert str(a.resolve()) in message and str(b.resolve()) in message
+    assert "BASE_DIRS" in message
+
+
+def test_relative_path_says_what_to_pass_instead(tmp_path):
+    with pytest.raises(SecurityError) as raised:
+        resolve_in_roots("relative/a.md", [tmp_path])
+    assert "`source`" in str(raised.value)
+
+
 def test_dotdot_traversal_rejected(tmp_path):
     root = tmp_path / "root"
     root.mkdir()

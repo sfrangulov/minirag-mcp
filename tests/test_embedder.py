@@ -7,7 +7,7 @@ from tokenizers.pre_tokenizers import Whitespace
 
 from minirag_mcp.chunker import MODEL_MAX_TOKENS, chunk_markdown
 from minirag_mcp.config import DEFAULT_MODEL, load_config
-from minirag_mcp.embedder import Embedder, UnknownModelError, _unit
+from minirag_mcp.embedder import Embedder, EmbedderUnavailableError, UnknownModelError, _unit
 
 
 def test_dim_from_registry_without_download(tmp_path):
@@ -104,3 +104,40 @@ def test_chunks_fit_the_encoder_at_the_documented_maximum_budget(tmp_path, monke
     assert len(chunks) > 1, "800 words cannot be one chunk of at most 128 tokens"
     for c in chunks:
         assert len(honest.encode(c.text).ids) <= MODEL_MAX_TOKENS, repr(c.text[:120])
+
+
+def _unloadable(*args, **kwargs):
+    # What fastembed raises with no network and nothing in the cache, measured.
+    raise ValueError(f"Could not load model {DEFAULT_MODEL} from any source.")
+
+
+def test_a_model_that_cannot_load_says_what_failed_and_what_unblocks_it(tmp_path, monkeypatch):
+    """fastembed's own text names neither the cache it looked in nor what would fix it,
+    and nothing in it tells a caller that a reworded query fails the same way."""
+    import minirag_mcp.embedder as mod
+
+    monkeypatch.setattr(mod, "TextEmbedding", _unloadable)
+    emb = Embedder(DEFAULT_MODEL, cache_dir=tmp_path)
+    with pytest.raises(EmbedderUnavailableError) as raised:
+        emb.embed_query("anything")
+    message = str(raised.value)
+    assert "from any source" in message  # the cause survives
+    assert str(tmp_path) in message
+    assert "huggingface.co" in message
+    assert "not a problem with the query" in message
+
+
+def test_a_failed_load_does_not_leave_the_token_counter_degraded(tmp_path, monkeypatch):
+    """A model that cannot load cannot embed either, so falling back to the character
+    estimate buys nothing — and the fallback is permanent, so once the download works
+    every later document would still be cut by the estimate."""
+    import minirag_mcp.embedder as mod
+
+    tokenizer = Tokenizer(WordLevel(vocab={"[UNK]": 0}, unk_token="[UNK]"))
+    tokenizer.pre_tokenizer = Whitespace()
+    monkeypatch.setattr(mod, "TextEmbedding", _unloadable)
+    emb = Embedder(DEFAULT_MODEL, cache_dir=tmp_path)
+    with pytest.raises(EmbedderUnavailableError):
+        emb.count_tokens("one two three")
+    monkeypatch.setattr(mod, "TextEmbedding", lambda **kw: _FakeTextEmbedding(tokenizer))
+    assert emb.count_tokens("one two three") == 3

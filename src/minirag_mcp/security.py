@@ -38,13 +38,20 @@ def resolve_in_roots(
 ) -> Path:
     p = Path(path_str).expanduser()
     if require_absolute and not p.is_absolute():
-        raise SecurityError(f"Path must be absolute: {path_str}")
+        raise SecurityError(
+            f"Path must be absolute: {path_str}. Pass the full path; the `source` of a "
+            "query_documents or list_files result is one."
+        )
     real = p.resolve()  # follows symlinks; the check below sees the true target
-    for root in roots:
-        real_root = root.resolve()
+    real_roots = [root.resolve() for root in roots]
+    for real_root in real_roots:
         if real == real_root or real_root in real.parents:
             return real
-    raise SecurityError(f"Path outside configured document roots: {path_str}")
+    raise SecurityError(
+        f"Path outside configured document roots: {path_str}. This server reads only "
+        f"under {', '.join(map(str, real_roots))}; a file elsewhere is out of reach until "
+        "its folder is added to BASE_DIRS and the server restarted."
+    )
 
 
 def _blocked_kind(ip: IPAddress) -> str | None:

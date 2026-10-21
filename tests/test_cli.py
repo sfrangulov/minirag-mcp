@@ -308,10 +308,22 @@ def test_env_used_when_no_flags(corpus, capsys, monkeypatch):
 def test_unknown_model_name_is_clean_error(corpus, capsys, monkeypatch):
     monkeypatch.setattr(cli, "_make_embedder", _REAL_MAKE_EMBEDDER)  # use the real factory
     with pytest.raises(SystemExit) as exc:
-        run(["status", "--base-dir", str(corpus), "--model-name", "totally-bogus-model"])
+        run(["list", "--base-dir", str(corpus), "--model-name", "totally-bogus-model"])
     assert exc.value.code == 1
     err = capsys.readouterr().err
     assert "totally-bogus-model" in err and "Traceback" not in err
+
+
+def test_status_reports_an_unknown_model_as_an_index_error_like_the_server(
+    corpus, capsys, monkeypatch
+):
+    """`status` is the diagnosis command in both shells: the server's answers this with
+    indexError instead of the counts, so the CLI's does too, and exits 0."""
+    monkeypatch.setattr(cli, "_make_embedder", _REAL_MAKE_EMBEDDER)
+    run(["status", "--base-dir", str(corpus), "--model-name", "totally-bogus-model", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert "totally-bogus-model" in payload["indexError"]
+    assert "chunkCount" not in payload
 
 
 def test_ingest_partial_failure_reports_both(corpus, capsys):
