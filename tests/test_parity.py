@@ -8,6 +8,7 @@ checks that the caller is told the same thing.
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 from fastmcp import Client
@@ -158,3 +159,40 @@ async def test_a_model_that_cannot_load_is_reported_by_both(root, tmp_path, caps
     code, _, err = run_cli(["query", "alpha", *_flags(env)], capsys)
     assert is_error and "could not be loaded" in text
     assert code == 1 and "could not be loaded" in err
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a chmod 000 folder anyway")
+async def test_a_folder_the_listing_cannot_see_into_is_reported_by_both(
+    root, tmp_path, capsys, monkeypatch, fake_embedder
+):
+    """minirag-mcp-k3w: the file under it stays indexed — `status` counts it and a search
+    returns it — so a listing that leaves it out without a word contradicts both."""
+    monkeypatch.setattr(cli, "_make_embedder", lambda cfg: fake_embedder)
+    env = {"BASE_DIR": str(root), "DB_PATH": str(tmp_path / "db")}
+    hidden = root / "sub"
+    async with Client(create_app(load_config(env), embedder=fake_embedder)) as c:
+        await c.call_tool("ingest_file", {"filePath": str(hidden / "a.md")})
+        os.chmod(hidden, 0)
+        try:
+            listed = (await c.call_tool("list_files", {})).data
+            code, out, err = run_cli(["list", *_flags(env), "--json"], capsys)
+        finally:
+            os.chmod(hidden, 0o755)
+
+    by_source = {f["source"]: f for f in listed["files"]}
+    assert by_source[str(hidden / "a.md")]["state"] == "unlisted"
+    [folder] = listed["unlistedFolders"]
+    assert folder["path"] == str(hidden)
+    assert folder["indexedCount"] == 1
+    assert "readable" in folder["message"]
+    assert code == 0
+    assert json.loads(out) == listed
+    assert f"warn: {hidden}: {folder['message']}" in err
+
+
+async def test_a_listing_with_nothing_hidden_reports_no_folders(root, tmp_path, fake_embedder):
+    env = {"BASE_DIR": str(root), "DB_PATH": str(tmp_path / "db")}
+    async with Client(create_app(load_config(env), embedder=fake_embedder)) as c:
+        listed = (await c.call_tool("list_files", {})).data
+    assert listed["unlistedFolders"] == []
+    assert [f["state"] for f in listed["files"]] == ["not_ingested"]

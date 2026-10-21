@@ -504,3 +504,22 @@ def test_cli_status_says_ocr_is_unavailable_and_how_to_get_it(corpus, capsys, mo
     payload = json.loads(capsys.readouterr().out)
     assert payload["ocr"] == "unavailable"
     assert "minirag-mcp[ocr]" in payload["ocrHint"]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a chmod 000 folder anyway")
+def test_ingest_of_a_folder_with_an_unlistable_subfolder_fails_and_names_it(corpus, capsys):
+    """ "ingested 1 file(s)", exit 0, was the whole report, while everything under the
+    subfolder was silently left out of what the user asked to ingest."""
+    hidden = corpus / "sub"
+    os.chmod(hidden, 0)
+    try:
+        with pytest.raises(SystemExit) as exc:
+            run(["ingest", str(corpus), "--base-dir", str(corpus), "--json"])
+    finally:
+        os.chmod(hidden, 0o755)
+    assert exc.value.code == 1
+    captured = capsys.readouterr()
+    failed = json.loads(captured.out)["failed"]
+    assert [f["source"] for f in failed] == [str(hidden)]
+    assert "could not list this folder" in failed[0]["error"]
+    assert f"warn: {hidden}:" in captured.err

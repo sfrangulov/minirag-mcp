@@ -13,6 +13,8 @@ from pathlib import Path
 from minirag_mcp import ocr
 from minirag_mcp.chunker import join_parent
 from minirag_mcp.config import Config
+from minirag_mcp.ingest.scanner import FileState, compute_states, scan_roots
+from minirag_mcp.scope import is_under
 from minirag_mcp.store import MAX_TOP_K, RESYNC_HINT, SearchResult, Store
 
 EMPTY_INDEX_NOTICE = (
@@ -243,3 +245,70 @@ def run_query(
     if not results and (notice := empty_result_notice(store, scopes)):
         payload["notice"] = notice
     return payload
+
+
+def _unlisted_message(error: str | None, indexed: int) -> str:
+    files = f"{indexed} indexed file{'' if indexed == 1 else 's'}"
+    reach = "Make it readable, or reconnect the drive it is on, to list it."
+    if error is None:
+        return (
+            f"this root is an empty folder, but the index holds {files} under it, listed "
+            'as "unlisted"; an unmounted volume looks like this. Mount it to list them, '
+            "or delete their entries if they are gone."
+        )
+    if indexed == 0:
+        return f"could not list this folder ({error}), so this listing is missing it. {reach}"
+    return (
+        f"could not list this folder ({error}); {files} under it listed as "
+        f'"unlisted": still indexed and searchable, not checked against the disk. {reach}'
+    )
+
+
+def list_payload(store: Store, roots: Sequence[Path], scopes: Sequence[str] = ()) -> dict:
+    """`list_files` and `minirag-mcp list`, as one implementation.
+
+    `unlistedFolders` names every folder the scan could not see into, because a listing
+    that silently leaves out what is under it contradicts `status` and search, which
+    still count and return what is indexed there.
+    """
+    blind: list[tuple[Path, str | None]] = []
+    entries = scan_roots(roots, blind=blind)
+    if scopes:
+        entries = [e for e in entries if any(is_under(str(e.path), p) for p in scopes)]
+        blind = [
+            (folder, error)
+            for folder, error in blind
+            if any(is_under(str(folder), p) or is_under(p, str(folder)) for p in scopes)
+        ]
+    states: list[FileState] = compute_states(
+        entries, store.list_sources(scopes=tuple(scopes)), blind
+    )
+    folders = []
+    for folder, error in blind:
+        indexed = sum(
+            1 for st in states if st.state == "unlisted" and is_under(st.source, str(folder))
+        )
+        if error is None and indexed == 0:
+            continue  # an empty root with nothing indexed under it is just empty
+        folders.append(
+            {
+                "path": str(folder),
+                "error": error,
+                "indexedCount": indexed,
+                "message": _unlisted_message(error, indexed),
+            }
+        )
+    return {
+        "files": [
+            {
+                "source": st.source,
+                "sourceType": st.source_type,
+                "title": st.title,
+                "state": st.state,
+                "chunkCount": st.chunk_count,
+                "ocrEngine": st.ocr_engine,
+            }
+            for st in states
+        ],
+        "unlistedFolders": folders,
+    }

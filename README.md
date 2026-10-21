@@ -918,7 +918,9 @@ new place as usual; a copy of a file behind a folder that cannot be listed is
 indexed as a file of its own, since the original may still be there. If you did
 remove the rest, delete their entries with
 `delete_file` (or `minirag-mcp delete`), or take the root out of `BASE_DIR` /
-`BASE_DIRS`.
+`BASE_DIRS`. `list_files` (and `minirag-mcp list`, as a warning) names the same
+folders under `unlistedFolders`, and lists what is indexed under them with the
+state `unlisted` rather than leaving it out.
 
 **`status` reports `staleChunkCount` above zero.**
 Those chunks were cut by an older chunking scheme: their boundaries follow the
