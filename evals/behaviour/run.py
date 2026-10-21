@@ -40,7 +40,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 
-from items import CORPUS, HERE, load_items, select
+from items import CORPUS, HERE, ITEMS_FILE, existing_index, load_items, select
 from score import score_dir
 
 REPO = HERE.parent.parent
@@ -79,12 +79,12 @@ def claude_command(prompt: str, mcp_config: Path, model: str | None) -> list[str
     return cmd
 
 
-def write_mcp_config(path: Path, server_bin: Path, db: Path) -> None:
+def write_mcp_config(path: Path, server_bin: Path, db: Path, base_dir: Path) -> None:
     server = {
         "type": "stdio",
         "command": str(server_bin),
         "args": [],
-        "env": {"BASE_DIR": str(CORPUS), "DB_PATH": str(db)},
+        "env": {"BASE_DIR": str(base_dir), "DB_PATH": str(db)},
     }
     path.write_text(json.dumps({"mcpServers": {"minirag": server}}, indent=2), encoding="utf-8")
 
@@ -96,10 +96,10 @@ def write_mcp_config(path: Path, server_bin: Path, db: Path) -> None:
 MCP_TIMEOUT_MS = "120000"
 
 
-def prewarm(server_bin: Path, db: Path, limit: float = 180.0) -> float:
+def prewarm(server_bin: Path, db: Path, base_dir: Path, limit: float = 180.0) -> float:
     """Start the server once and wait for its `initialize` answer, so the first real run
     does not pay the cold start; fail loudly if it never answers."""
-    env = dict(os.environ, BASE_DIR=str(CORPUS), DB_PATH=str(db))
+    env = dict(os.environ, BASE_DIR=str(base_dir), DB_PATH=str(db))
     started = time.monotonic()
     proc = subprocess.Popen(
         [str(server_bin)],
@@ -133,9 +133,9 @@ def prewarm(server_bin: Path, db: Path, limit: float = 180.0) -> float:
     return time.monotonic() - started
 
 
-def build_index(server_bin: Path, db: Path) -> None:
+def build_index(server_bin: Path, db: Path, base_dir: Path) -> None:
     proc = subprocess.run(
-        [str(server_bin), "sync", "--base-dir", str(CORPUS), "--db-path", str(db), "--json"],
+        [str(server_bin), "sync", "--base-dir", str(base_dir), "--db-path", str(db), "--json"],
         capture_output=True,
         text=True,
     )
@@ -152,10 +152,19 @@ def main() -> int:
     ap.add_argument("--out", type=Path)
     ap.add_argument("--jobs", type=int, default=1, help="parallel claude processes (default 1)")
     ap.add_argument("--timeout", type=int, default=300, help="seconds per run")
+    ap.add_argument("--items-file", type=Path, default=ITEMS_FILE)
+    ap.add_argument("--base-dir", type=Path, default=CORPUS, help="document root (BASE_DIR)")
+    ap.add_argument(
+        "--db",
+        type=Path,
+        help="an existing index to use as it is, instead of building one from --base-dir; "
+        "must not lie inside --base-dir",
+    )
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
-    items = select(load_items(), args.items)
+    items = select(load_items(args.items_file), args.items)
+    db_given = existing_index(args.db, args.base_dir) if args.db else None
     runs = [(item, rep) for item in items for rep in range(1, args.reps + 1)]
     print(f"{len(items)} item(s) x {args.reps} rep(s) = {len(runs)} `claude -p` run(s)")
     if args.dry_run:
@@ -177,10 +186,14 @@ def main() -> int:
     for index in sorted({i.index for i in items}):
         db = work / f"db-{index}"
         if index == "corpus":
-            build_index(args.server_bin, db)
+            if db_given:
+                db = db_given
+            else:
+                build_index(args.server_bin, db, args.base_dir)
         configs[index] = work / f"mcp-{index}.json"
-        write_mcp_config(configs[index], args.server_bin, db)
-    print(f"server answered initialize in {prewarm(args.server_bin, work / 'db-prewarm'):.1f}s")
+        write_mcp_config(configs[index], args.server_bin, db, args.base_dir)
+    warm = prewarm(args.server_bin, work / "db-prewarm", args.base_dir)
+    print(f"server answered initialize in {warm:.1f}s")
     (out / "run.json").write_text(
         json.dumps(
             {
@@ -189,6 +202,9 @@ def main() -> int:
                 "server_bin": str(args.server_bin),
                 "reps": args.reps,
                 "items": [i.id for i in items],
+                "items_file": str(args.items_file.resolve()),
+                "base_dir": str(args.base_dir.resolve()),
+                "db": str(db_given) if db_given else None,
                 "work": str(work),
                 "command": claude_command("<prompt>", Path("<config>"), args.model),
             },

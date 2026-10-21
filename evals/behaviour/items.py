@@ -59,3 +59,18 @@ def select(items: list[Item], ids: str | None) -> list[Item]:
     if unknown:
         raise SystemExit(f"unknown item id(s): {', '.join(sorted(unknown))}")
     return [i for i in items if i.id in wanted]
+
+
+def existing_index(db: Path, base_dir: Path) -> Path:
+    """An index to run against as it is, refused when it lies inside the document root.
+
+    Pointed at a real corpus, the eval must leave both the documents and their own
+    index untouched: opening an index can write to it (schema and FTS upgrades), so the
+    eval runs on a copy, and an index inside the root is the original by construction.
+    """
+    db, base_dir = db.resolve(), base_dir.resolve()
+    if db == base_dir or base_dir in db.parents:
+        raise SystemExit(f"refusing {db}: it is inside the document root; run on a copy")
+    if not db.is_dir():
+        raise SystemExit(f"no index at {db}")
+    return db

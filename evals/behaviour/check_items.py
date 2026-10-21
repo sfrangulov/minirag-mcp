@@ -24,7 +24,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from items import CORPUS, load_items, select
+from items import CORPUS, ITEMS_FILE, existing_index, load_items, select
 
 from minirag_mcp.config import load_config
 from minirag_mcp.embedder import Embedder
@@ -38,25 +38,32 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--top-k", type=int, default=8)
     ap.add_argument("--items")
+    ap.add_argument("--items-file", type=Path, default=ITEMS_FILE)
+    ap.add_argument("--base-dir", type=Path, default=CORPUS)
+    ap.add_argument("--db", type=Path, help="an existing index (not inside --base-dir); no sync")
     args = ap.parse_args()
 
-    tmp = Path(tempfile.mkdtemp(prefix="minirag-check-items-"))
-    cfg = load_config({"BASE_DIR": str(CORPUS), "DB_PATH": str(tmp / "db")})
+    if args.db:
+        db = existing_index(args.db, args.base_dir)
+    else:
+        db = Path(tempfile.mkdtemp(prefix="minirag-check-items-")) / "db"
+    cfg = load_config({"BASE_DIR": str(args.base_dir), "DB_PATH": str(db)})
     emb = Embedder(cfg.model_name, cfg.cache_dir)
     store = Store(cfg.db_path, dim=emb.dim)
     pipeline = Pipeline(store, emb, cfg)
-    counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
-    print(f"indexed: {counts}  chunks: {store.chunk_count()}")
-    if errors:
-        print(f"sync errors: {errors}")
-        return 1
+    if not args.db:
+        counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+        print(f"indexed: {counts}  chunks: {store.chunk_count()}")
+        if errors:
+            print(f"sync errors: {errors}")
+            return 1
 
     def search(q: str):
         payload = run_query(store, emb, cfg, q, top_k=args.top_k)
         return payload, [s["displayPath"] for s in payload["sources"]]
 
     failed = []
-    for item in select(load_items(), args.items):
+    for item in select(load_items(args.items_file), args.items):
         probes = item.probes
         if not probes:
             continue

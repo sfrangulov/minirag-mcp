@@ -8,7 +8,8 @@ from __future__ import annotations
 import json
 import unicodedata
 
-from items import Item, load_items
+import pytest
+from items import Item, existing_index, load_items
 from score import parse, score, sources_block
 
 TRIP = "Регламенты/П-14 Командировки.md"
@@ -328,3 +329,14 @@ def test_an_empty_result_explained_by_a_scope_notice_does_not_call_for_status():
         .answer("x")
     )
     assert score(_item(), t)["status_after_empty"] is None
+
+
+def test_an_existing_index_inside_the_document_root_is_refused(tmp_path):
+    """The original index of a real corpus lives inside its root; the eval runs on a copy."""
+    root = tmp_path / "docs"
+    (root / ".minirag" / "lancedb").mkdir(parents=True)
+    copy = tmp_path / "copy" / "lancedb"
+    copy.mkdir(parents=True)
+    with pytest.raises(SystemExit, match="inside the document root"):
+        existing_index(root / ".minirag" / "lancedb", root)
+    assert existing_index(copy, root) == copy.resolve()

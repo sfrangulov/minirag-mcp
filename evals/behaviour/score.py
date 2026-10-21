@@ -342,7 +342,9 @@ def summarize(rows: list[dict], items: list[Item]) -> str:
 
 
 def score_dir(run_dir: Path) -> tuple[list[dict], str]:
-    items = load_items()
+    meta = run_dir / "run.json"
+    items_file = json.loads(meta.read_text("utf-8")).get("items_file") if meta.exists() else None
+    items = load_items(Path(items_file)) if items_file else load_items()
     by_id = {i.id: i for i in items}
     rows = []
     for path in sorted((run_dir / "raw").glob("*/*.jsonl")):
