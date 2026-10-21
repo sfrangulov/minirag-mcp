@@ -29,7 +29,7 @@ from items import CORPUS, load_items, select
 from minirag_mcp.config import load_config
 from minirag_mcp.embedder import Embedder
 from minirag_mcp.ingest.pipeline import Pipeline
-from minirag_mcp.results import aggregate_sources, parent_map
+from minirag_mcp.results import run_query
 from minirag_mcp.store import Store
 from minirag_mcp.sync import run_sync
 
@@ -52,16 +52,8 @@ def main() -> int:
         return 1
 
     def search(q: str):
-        hits = store.search(
-            q,
-            emb.embed_query(q),
-            top_k=args.top_k,
-            hybrid_weight=cfg.hybrid_weight,
-            max_distance=cfg.max_distance,
-            grouping=cfg.grouping,
-            max_files=cfg.max_files,
-        )
-        return hits, [s["displayPath"] for s in aggregate_sources(hits, cfg.roots)]
+        payload = run_query(store, emb, cfg, q, top_k=args.top_k)
+        return payload, [s["displayPath"] for s in payload["sources"]]
 
     failed = []
     for item in select(load_items(), args.items):
@@ -70,18 +62,19 @@ def main() -> int:
             continue
         print(f"\n{item.id} [{item.group}]")
         for q in probes:
-            hits, docs = search(q)
+            payload, docs = search(q)
             rank = next((i + 1 for i, d in enumerate(docs) if d in item.allowed), None)
             line = f"  {q!r}: allowed doc rank {rank} of {len(docs)} docs"
             if item.group == "reading":
                 fact = re.compile(item.fact, re.I)
-                in_text = any(fact.search(h.text) for h in hits)
-                in_parent = any(fact.search(t) for t in parent_map(hits).values())
+                in_text = any(fact.search(r["text"]) for r in payload["results"])
+                in_parent = any(fact.search(t) for t in payload["parents"].values())
                 ok = not in_text and in_parent
                 line += f"; fact in snippet: {in_text}, in parents: {in_parent}"
             elif item.id == "W1":
                 ok = True
-                line += "\n" + "\n".join(f"      {h.text[:110]!r}" for h in hits[:3])
+                top = payload["results"][:3]
+                line += "\n" + "\n".join(f"      {r['text'][:110]!r}" for r in top)
             elif item.group == "thin":
                 ok = rank != 1
             else:
