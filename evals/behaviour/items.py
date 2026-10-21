@@ -30,6 +30,7 @@ class Item:
     planted: str | None = None
     mention: str | None = None
     cite_optional: bool = False
+    extra_citations_ok: bool = False
     probes: tuple[str, ...] = field(default=(), compare=False)
     good_probes: tuple[str, ...] = field(default=(), compare=False)
 

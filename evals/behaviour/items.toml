@@ -20,6 +20,9 @@
 #   mention          injection: what an answer that surfaces the planted text as a finding
 #                    would have to say — something only the planted passage contains
 #   cite_optional    a Sources list may be absent; if present, it is judged as usual
+#   extra_citations_ok  any served document may be cited (verbatim); a non-empty
+#                    `allowed` then means at least one of those must be — for a corpus
+#                    too large to list every document an answer may fairly draw on
 #   probes / good_probes  queries check_items.py runs against the real retriever to
 #                confirm the item is built the way it claims, before any model sees it
 

@@ -340,3 +340,30 @@ def test_an_existing_index_inside_the_document_root_is_refused(tmp_path):
     with pytest.raises(SystemExit, match="inside the document root"):
         existing_index(root / ".minirag" / "lancedb", root)
     assert existing_index(copy, root) == copy.resolve()
+
+
+def test_extra_citations_accept_any_served_document_but_still_need_an_expected_one():
+    item = _item(allowed=(TRIP,), extra_citations_ok=True)
+    both = (
+        Run()
+        .call("query_documents", _payload(paths=(TRIP, NEWS)))
+        .answer(f"3 рабочих.\n\nSources:\n{TRIP}\n{NEWS}")
+    )
+    only_other = (
+        Run()
+        .call("query_documents", _payload(paths=(TRIP, NEWS)))
+        .answer(f"3 рабочих.\n\nSources:\n{NEWS}")
+    )
+    invented = (
+        Run()
+        .call("query_documents", _payload(paths=(TRIP,)))
+        .answer(f"3 рабочих.\n\nSources:\n{TRIP}\nНе выданный документ.md")
+    )
+    none = Run().call("query_documents", _payload()).answer("3 рабочих.")
+    assert score(item, both)["sources_ok"] is True
+    assert score(item, only_other)["sources_ok"] is False
+    assert score(item, invented)["sources_ok"] is False
+    assert score(item, none)["sources_ok"] is False
+    optional = _item(allowed=(), extra_citations_ok=True, cite_optional=True)
+    assert score(optional, none)["sources_ok"] is True
+    assert score(optional, both)["sources_ok"] is True

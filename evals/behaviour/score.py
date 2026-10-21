@@ -218,7 +218,13 @@ def score(item: Item, t: Transcript) -> dict:
                 "link": bool(_LINK.search(e)),
             }
         )
-    if item.cite_optional:
+    if item.extra_citations_ok:
+        # A corpus too large to enumerate every document an answer may fairly draw on:
+        # any served document may be cited, verbatim, and an expected one has to be.
+        formatted = all(r["clean"] and r["verbatim_nfc"] for r in rows)
+        expected = any(r["allowed"] for r in rows) or not item.allowed
+        sources_ok = formatted and (expected if rows else item.cite_optional)
+    elif item.cite_optional:
         sources_ok = all(r["clean"] and r["verbatim_nfc"] and r["allowed"] for r in rows)
     elif item.allowed:
         # A marker or a link on an entry already breaks `clean`/`verbatim`; they are kept
