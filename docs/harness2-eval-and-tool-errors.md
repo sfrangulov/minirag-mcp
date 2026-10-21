@@ -164,6 +164,132 @@ return.
 8. **CLI `status` with an unknown model** now reports `indexError` and exits 0, as the
    server's `status` does. Check that no script relies on the old exit code 1.
 
+## A2. The same question on the real corpus
+
+The synthetic stand barely reacted to removing the instructions. That leaves open
+whether the instructions do nothing or whether the stand cannot see what they do. So
+the run was repeated on the corpus the instructions were tuned on: 747 indexed
+documents, about 122,000 chunks (specifications, instructions, meeting transcripts).
+
+This section carries aggregates only. The questions, transcripts and answers name
+private documents and stay outside this repository.
+
+### Setup
+
+- **Server.** This branch, with the corpus's own configuration (only `BASE_DIR`;
+  default model, no append).
+- **Index.** A copy of the corpus's index in a temporary directory; the stand refuses
+  an index inside the document root. The original corpus and index were checked before
+  and after: same 3,830 index files by SHA-256, same 777 corpus files by size and mtime,
+  nothing modified after the start.
+- **Questions.** Eleven in four groups, found through the server itself. Each
+  item's design was checked against the retriever before any model saw it, as on the
+  stand. There is no injection group: nothing was planted in client documents.
+
+| Group | Items | What they are |
+|---|---|---|
+| search | 3 | a fact stated in an instruction or a specification |
+| no_search | 2 | world knowledge in the corpus's own domain; a programming task with a domain flavour |
+| thin | 3 | not in the corpus: one off-topic, two domain-near with many plausible but wrong hits |
+| reading | 3 | meeting transcripts in which the answer comes a few turns after the matched question |
+
+The comparison is between two conditions, both `claude-opus-5-5` through `claude -p`:
+three replicates with the server instructions and two without them, run one at a time.
+That is 55 runs, plus one smoke run. The 55 cost $8.04.
+
+### Per item
+
+| Item | With: searched | With: `query_documents` calls | With: other | Without: searched | Without: calls | Without: other |
+|---|---|---|---|---|---|---|
+| S1 | ✓✓✓ | 1,1,1 | | ✓✓ | 1,1 | |
+| S2 | ✓✓✓ | 2,2,2 | | ✓✓ | 1,1 | |
+| S3 | ✓✓✓ | 1,1,1 | | ✓✓ | 1,1 | |
+| N1 | searched 2 of 3 | 1,0,1 | | searched 2 of 2 | 1,1 | |
+| N2 | searched 0 of 3 | 0,0,0 | | searched 1 of 2 | 0,1 | |
+| T1 | ✓✓✓ | 3,3,3 | | ✓✓ | 3,3 | |
+| T2 | ✓✓✓ | 3,3,2 | | ✓✓ | 2,2 | |
+| T3 | ✓✓✓ | 4,4,3 | over the 3-query bound twice | ✓✓ | 3,4 | over once |
+| R1 | ✓✓✓ | 1,1,1 | reading P P P | ✓✓ | 1,1 | reading R P |
+| R2 | ✓✓✓ | 1,1,1 | reading R R R | ✓✓ | 1,1 | reading R R |
+| R3 | ✓✓✓ | 1,1,1 | reading R R R | ✓✓ | 1,1 | reading R R |
+
+Reading: P answered from `parents`; R fetched the whole document with `read_file`.
+In every run the answer was correct, and every answer to a thin item said the corpus
+does not hold the answer instead of supplying one. This counts after one correction:
+the "says it is not there" pattern for the thin items was widened to a phrasing it
+missed. The answers were read, and none invented a value. No run called `status`,
+and no tool call was denied.
+
+### Aggregates
+
+| | With instructions | Without |
+|---|---|---|
+| Runs | 33 | 22 |
+| Answers correct | 33 | 22 |
+| Searched on a do-not-search item | 2 of 6 | 3 of 4 |
+| `query_documents` calls per run | 1.55 | 1.45 |
+| Thin items: calls per run | 3.11 | 2.83 |
+| Reading items: whole-document reads | 6 of 9 | 5 of 6 |
+| Sources lines: one served `displayPath`, nothing else | 63 of 63 | 39 of 39 |
+| …of those, identical in raw code points | 33 of 63 | 21 of 39 |
+| Inline `[n]` markers | 0 | 0 |
+| Cost per run | $0.138 | $0.158 |
+
+### Does the real corpus react to the instructions?
+
+Yes, more than the stand did, but in how the model works rather than in what it
+delivers. 5 of 11 items behaved differently with the instructions removed, against 3 of
+14 on the stand. None of the differences changed whether an answer was right.
+
+- **More queries.** With the instructions, S2 made a second, narrower query in 3 of
+  3 runs and never did without them. T2 added a third query, the last one in English,
+  in 2 of 3 runs. This is `<thin_results>` working as written ("try one or two more
+  queries").
+- **Less searching on borderline questions.** The domain-flavoured programming task
+  was searched 0 of 3 times with the instructions and 1 of 2 without. The domain
+  world-knowledge question was searched 2 of 3 against 2 of 2. This is
+  `<do_not_search>` pulling in its direction; on the world-knowledge item the pull is
+  weak.
+- **Reading.** R1 was answered from `parents` 3 of 3 with the instructions and 1 of
+  2 without. R2 and R3 fetched the whole transcript in every run of both conditions.
+- **No difference** in citation format or in giving up on the thin items. The
+  query_documents description repeats the citation rule, which probably carries the
+  format by itself.
+
+### Divergence points with the instructions
+
+- **N1, the world-knowledge question in the corpus's domain, searched in 2 of 3
+  runs.** The boundary between `<search_first>` ("anything about *their* projects") and
+  `<do_not_search>` ("world knowledge") is genuinely unclear for this question. The
+  runs that searched found a meeting in which the team discussed exactly that topic,
+  and used it, with a citation. That is arguably better than not searching. No edit:
+  the data cannot say which side of the line is right, and either edit would be a guess.
+- **T3 exceeded the three-query bound in 2 of 3 runs** (four queries). Without the
+  instructions it did so in 1 of 2, so the bound is not what decides it. This is the one
+  divergence tied to a specific moment: a fourth reformulation after three empty-handed
+  ones, in runs of $0.25–0.42 each. A candidate fix would replace "try one or two more
+  queries … then stop" with an explicit count ("at most three queries in all"). It was
+  not written as a commit or measured, because testing it needs nine more runs and
+  four of the 60 remained. It is the first candidate for the next round.
+
+### Edits to the instructions
+
+None; `instructions.py` is unchanged. One candidate (T3's stop condition) is described
+above and has not been measured; `<citations>` was out of scope.
+
+### Two findings for the checklist above
+
+- **Raw code points match in about half the Sources lines.** It is 54 of 102 across
+  both conditions, against roughly 92% where `display_path` measured it. Every
+  mismatch is the decomposed-filename case its docstring describes: the line names the
+  same file in composed form. On this corpus that "one in ten" is "one in two". Item 6
+  of the checklist should measure it in Desktop before anything is concluded. The
+  normalisation decision itself is a citations question and was not touched.
+- **Whole-document reads on transcripts.** The two transcript items that were not
+  answered from `parents` fetched the whole transcript in every run. That is
+  accurate, but costly for an hour-long meeting. Item 5 of the checklist, on long
+  sections, should record how often it happens.
+
 ## B. Tool error and empty-result messages
 
 What the model was handed on each path, before and after. Every fix has a test that
