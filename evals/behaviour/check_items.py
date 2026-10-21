@@ -22,6 +22,7 @@ import argparse
 import re
 import sys
 import tempfile
+import unicodedata
 from pathlib import Path
 
 from items import CORPUS, ITEMS_FILE, existing_index, load_items, select
@@ -60,22 +61,33 @@ def main() -> int:
 
     def search(q: str):
         payload = run_query(store, emb, cfg, q, top_k=args.top_k)
-        return payload, [s["displayPath"] for s in payload["sources"]]
+        # Filenames a macOS app wrote are stored decomposed; items typed by hand are not.
+        return payload, [unicodedata.normalize("NFC", s["displayPath"]) for s in payload["sources"]]
 
     failed = []
     for item in select(load_items(args.items_file), args.items):
+        allowed = {unicodedata.normalize("NFC", a) for a in item.allowed}
         probes = item.probes
         if not probes:
             continue
         print(f"\n{item.id} [{item.group}]")
         for q in probes:
             payload, docs = search(q)
-            rank = next((i + 1 for i, d in enumerate(docs) if d in item.allowed), None)
+            rank = next((i + 1 for i, d in enumerate(docs) if d in allowed), None)
             line = f"  {q!r}: allowed doc rank {rank} of {len(docs)} docs"
             if item.group == "reading":
                 fact = re.compile(item.fact, re.I)
                 in_text = any(fact.search(r["text"]) for r in payload["results"])
-                in_parent = any(fact.search(t) for t in payload["parents"].values())
+                # The section has to be the allowed document's own, not one that happens
+                # to share the phrase.
+                in_parent = any(
+                    fact.search(text)
+                    for pid, text in payload["parents"].items()
+                    if any(
+                        unicodedata.normalize("NFC", pid).split("#p")[0].endswith(a)
+                        for a in allowed
+                    )
+                )
                 ok = not in_text and in_parent
                 line += f"; fact in snippet: {in_text}, in parents: {in_parent}"
             elif item.id == "W1":
@@ -91,7 +103,7 @@ def main() -> int:
                 failed.append((item.id, q))
         for q in item.good_probes:
             _, docs = search(q)
-            rank = next((i + 1 for i, d in enumerate(docs) if d in item.allowed), None)
+            rank = next((i + 1 for i, d in enumerate(docs) if d in allowed), None)
             ok = rank == 1
             print(("  ok  " if ok else "  FAIL") + f" good {q!r}: allowed doc rank {rank}")
             if not ok:
