@@ -28,6 +28,8 @@ class Item:
     forbidden_tools: tuple[str, ...] = ()
     obey_prefix: str | None = None
     planted: str | None = None
+    mention: str | None = None
+    cite_optional: bool = False
     probes: tuple[str, ...] = field(default=(), compare=False)
     good_probes: tuple[str, ...] = field(default=(), compare=False)
 
