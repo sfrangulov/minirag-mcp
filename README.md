@@ -575,16 +575,26 @@ useful for what the server cannot know about your documents:
       "args": ["minirag-mcp"],
       "env": {
         "BASE_DIR": "/absolute/path/to/docs",
-        "RAG_INSTRUCTIONS_APPEND": "These are internal engineering specifications; prefer exact document codes over paraphrase."
+        "RAG_INSTRUCTIONS_APPEND": "When a question names a procedure, a form or a document code such as QP-7.2 or SOP-114, search before answering, even if the answer seems like common practice, and quote the code exactly as the documents write it."
       }
     }
   }
 }
 ```
 
+Make the trigger a situation the model can see in the message, not a topic it has
+to classify. "Search first for finance questions" asks the model to decide what
+counts as finance, and it will draw the line somewhere other than where your
+documents are: wide enough to search for a tax rate it already knows, narrow enough
+to answer a question about your own reimbursement form from memory. "When a question
+names a document code such as QP-7.2" fires on something literally present in the
+question, exactly where the corpus holds an answer the model cannot have — and the
+example above names the case the built-in text misses, a question that sounds like
+general practice but is governed by a local document.
+
 Keep it short: it shares the same 2048-character budget, of which roughly 350
-are reserved for it — a sentence or two. And it is appended, not merged: it can
-add to the policy above but cannot rewrite it.
+are reserved for it — a sentence or two; the example is 213. And it is appended,
+not merged: it can add to the policy above but cannot rewrite it.
 
 ### Per-project overrides
 
@@ -813,7 +823,7 @@ merges with them.
 | `RAG_MAX_FILES` | unset | See [Search Tuning](#search-tuning). |
 | `RAG_OCR_LANG` | `eslav` | Recognition language for the `[ocr]` extra, as a `rapidocr` language id. The default is East Slavic because the stock `ch`/`en` model silently drops Cyrillic altogether, so a Cyrillic-capable model has to be the default rather than an opt-in. An unknown value is an error that names the valid ids. See [OCR](#ocr-for-scanned-documents). |
 | `RAG_OCR_MIN_CHARS_PER_PAGE` | `25` | A PDF page whose text layer holds fewer characters than this is treated as a scan and sent to OCR. `0` disables the check, so no page is ever OCRed and a PDF is only ever taken as converted. See [OCR](#ocr-for-scanned-documents). |
-| `RAG_INSTRUCTIONS_APPEND` | unset | Extra text appended as a final paragraph to the instructions the server hands the client at connect time — for what the server can't know about your corpus, e.g. `"internal engineering specifications; prefer exact document codes"`. Appended, never merged, and it shares the same 2048-character client budget. See [Search by Default](#search-by-default). |
+| `RAG_INSTRUCTIONS_APPEND` | unset | Extra text appended as a final paragraph to the instructions the server hands the client at connect time — for what the server can't know about your corpus, best phrased as a situation the model can recognise, e.g. `"When a question names a document code such as QP-7.2, search before answering"`. Appended, never merged, and it shares the same 2048-character client budget. See [Search by Default](#search-by-default). |
 | `ALLOW_PRIVATE_URLS` | unset (off) | Let `ingest_url` fetch hosts that resolve to loopback, link-local, private, reserved, or unspecified addresses. Off by default — see [Security and Operation](#security-and-operation). Accepts `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off`; anything else is a configuration error. |
 
 ## Security and Operation
