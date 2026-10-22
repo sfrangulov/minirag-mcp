@@ -59,6 +59,7 @@ Everything runs through `uv`. There is no other supported invocation.
 uv sync                                   # install, including dev dependencies
 uv run pytest -q                          # fast suite; the gate for every change
 uv run pytest -m slow -q                  # real embedding model, ~220 MB download
+uv run --extra classify env MINIRAG_TEST_GGUF=<gguf> pytest -m classify -q  # real choice model
 uv run ruff check src tests               # lint
 uv run ruff format --check src tests      # formatting (src and tests only, see below)
 uv run minirag-mcp status --base-dir .    # smoke the CLI
@@ -86,7 +87,7 @@ anything user-visible must appear identically through both.
 
 ```
 src/minirag_mcp/
-  server.py      FastMCP app, 11 tools          cli/          9 subcommands
+  server.py      FastMCP app, 11 tools          cli/          10 subcommands
                           \                    /
                            pipeline / store / embedder        <- the core
   ingest/parser.py    markitdown: file, HTML, URL -> Markdown + title
@@ -99,6 +100,7 @@ src/minirag_mcp/
   scope.py            the single definition of "is this path inside that prefix"
   security.py         document-root containment, URL host rules
   sync.py             one background job, per-file failures never abort it
+  labels/             taxonomy, dates, facet resolution, in-process choice model, filters
 ```
 
 Retrieval is hybrid: a vector query and an FTS query run separately and are fused by

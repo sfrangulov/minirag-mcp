@@ -294,6 +294,19 @@ def test_a_pending_job_reports_the_counter_shape_a_finished_one_does(env):
     assert set(pending.to_dict()["counts"]) == set(counts)
 
 
+def test_sync_counts_include_relabelled_from_the_first_poll(env):
+    """With or without a classify.toml: the counter shape never depends on the corpus."""
+    from minirag_mcp.sync import SyncJob
+
+    cfg, store, pipeline, root = env
+    seed(root)
+
+    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+
+    assert SyncJob(job_id="x").counts["relabelled"] == 0
+    assert counts["relabelled"] == 0
+
+
 def test_run_sync_scope_single_file(env):
     cfg, store, pipeline, root = env
     seed(root)

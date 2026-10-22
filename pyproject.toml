@@ -51,6 +51,15 @@ ocr = [
     # because `>=4.10` would admit 4.10.0.82, which is one of the broken ones.
     "opencv-python>=4.10.0.84",
 ]
+classify = [
+    "llama-cpp-python>=0.3.36",
+    # llama-cpp-python already pulls this in, but we import it directly: the readout
+    # views llama.cpp's logits buffer as an array.
+    "numpy>=2.1",
+    # fastembed already pulls this in, but we import it directly: a pinned model file
+    # is fetched with hf_hub_download(repo, file, revision=, cache_dir=).
+    "huggingface-hub>=0.20",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -131,8 +140,11 @@ search = '^      "version": "{current_version}",$'
 replace = '      "version": "{new_version}",'
 
 [tool.pytest.ini_options]
-addopts = "-m 'not slow'"
-markers = ["slow: needs the real embedding model (downloads ~220 MB)"]
+addopts = "-m 'not slow and not classify'"
+markers = [
+    "slow: needs the real embedding model (downloads ~220 MB)",
+    "classify: needs the [classify] extra and a local GGUF named by MINIRAG_TEST_GGUF",
+]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 

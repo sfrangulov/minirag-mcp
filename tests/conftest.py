@@ -1,4 +1,4 @@
-"""Shared fixtures: deterministic fake embedder (no model download), offline DNS."""
+"""Shared fixtures: fake embedder and choice model (no model download), offline DNS."""
 
 from __future__ import annotations
 
@@ -8,13 +8,16 @@ import math
 import re
 import socket
 import threading
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import pytest
 
 from minirag_mcp import security
+from minirag_mcp.labels.model import ModelError
+from minirag_mcp.labels.taxonomy import ModelSpec
 
 PUBLIC_IP = "93.184.216.34"
 # The name the redirect guard must refuse, and the address it stands for. The address
@@ -59,6 +62,75 @@ class FakeEmbedder:
 @pytest.fixture
 def fake_embedder() -> FakeEmbedder:
     return FakeEmbedder()
+
+
+class FakeChoiceModel:
+    """Answers by substring of the evidence. Uncertain and wrong answers are configured on
+    purpose: a fake that is always confident hides the soft-filter and count paths.
+
+    The first key of `answers` found in the evidence picks the distribution, else
+    `default`, else a uniform one. It is restricted to the asked option ids and
+    renormalised, so one mapping can serve several facets.
+    """
+
+    def __init__(
+        self,
+        answers: Mapping[str, Mapping[str, float]],
+        default: Mapping[str, float] | None = None,
+        fail_on: str | None = None,
+    ):
+        self.answers = answers
+        self.default = default
+        self.fail_on = fail_on
+        self.calls: list[tuple[str, str]] = []
+        self.closed = False
+
+    def probabilities(
+        self, evidence: str, question: str, options: Sequence[tuple[str, str]]
+    ) -> dict[str, float]:
+        if self.closed:
+            raise AssertionError("probabilities() called on a closed model")
+        self.calls.append((question, evidence))
+        if self.fail_on is not None and self.fail_on in evidence:
+            raise ModelError(f"cannot read a document containing {self.fail_on}")
+        dist = next((d for key, d in self.answers.items() if key in evidence), self.default)
+        ids = [vid for vid, _ in options]
+        raw = {vid: float((dist or {}).get(vid, 0.0)) for vid in ids}
+        total = sum(raw.values())
+        if total <= 0:
+            return {vid: 1.0 / len(ids) for vid in ids}
+        return {vid: p / total for vid, p in raw.items()}
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class FakeModelFactory:
+    """Stands in for `default_model_factory`. Set `answers`, `default` and `fail_on` for
+    the models it makes, `error` to make every call raise instead, or `model_class` to
+    make a FakeChoiceModel subclass."""
+
+    def __init__(self) -> None:
+        self.answers: dict[str, dict[str, float]] = {}
+        self.default: dict[str, float] | None = None
+        self.fail_on: str | None = None
+        self.error: Exception | None = None
+        self.model_class: type[FakeChoiceModel] = FakeChoiceModel
+        self.calls: list[tuple[ModelSpec, Path]] = []
+        self.created: list[FakeChoiceModel] = []
+
+    def __call__(self, spec: ModelSpec, cache_dir: Path) -> FakeChoiceModel:
+        self.calls.append((spec, cache_dir))
+        if self.error is not None:
+            raise self.error
+        model = self.model_class(self.answers, self.default, self.fail_on)
+        self.created.append(model)
+        return model
+
+
+@pytest.fixture
+def model_factory() -> FakeModelFactory:
+    return FakeModelFactory()
 
 
 @pytest.fixture

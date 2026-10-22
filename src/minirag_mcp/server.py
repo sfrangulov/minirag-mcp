@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
@@ -17,8 +17,11 @@ from minirag_mcp.config import Config, ConfigError, load_config
 from minirag_mcp.embedder import Embedder
 from minirag_mcp.ingest.pipeline import Pipeline
 from minirag_mcp.instructions import build_instructions
+from minirag_mcp.labels import LabelerSource
+from minirag_mcp.labels.model import default_model_factory
 from minirag_mcp.results import (
     join_document,
+    labels_status,
     list_payload,
     ocr_status,
     result_dict,
@@ -37,6 +40,7 @@ class _Ctx:
     embedder: object
     pipeline: Pipeline
     sync: SyncManager
+    labels: LabelerSource
 
 
 def _scopes(scope: str | list[str] | None) -> tuple[str, ...]:
@@ -53,6 +57,7 @@ def create_app(
     config_error: str | None = None,
     embedder: object | None = None,
     env: Mapping[str, str] | None = None,
+    model_factory: Callable | None = None,
 ) -> FastMCP:
     # Instructions come from the environment directly rather than from Config, so a
     # server whose configuration failed to load still tells the client how to use it —
@@ -68,8 +73,13 @@ def create_app(
                 embedder if embedder is not None else Embedder(config.model_name, config.cache_dir)
             )
             store = Store(config.db_path, dim=emb.dim)
-            pipeline = Pipeline(store, emb, config)
-            holder["ctx"] = _Ctx(config, store, emb, pipeline, SyncManager(pipeline, store, config))
+            labels = LabelerSource(
+                config.roots, config.cache_dir, model_factory or default_model_factory
+            )
+            pipeline = Pipeline(store, emb, config, labels=labels)
+            holder["ctx"] = _Ctx(
+                config, store, emb, pipeline, SyncManager(pipeline, store, config), labels
+            )
         return holder["ctx"]
 
     def guard(fn):
@@ -117,9 +127,16 @@ def create_app(
         """Poll a sync job started by sync_start.
 
         Returns state ('pending' | 'running' | 'succeeded' | 'failed'),
-        counts (scanned/ingested/skipped/moved/deleted/unreadable/failed), and any
-        per-file errors. Only the latest job is retained — an old jobId, or
-        any jobId from before a server restart, raises an error.
+        counts (scanned/ingested/skipped/moved/deleted/relabelled/unreadable/
+        failed), and any per-file errors. Only the latest job is retained — an
+        old jobId, or any jobId from before a server restart, raises an error.
+
+        relabelled counts documents whose labels were rewritten from their
+        stored text, with nothing re-embedded: classify.toml changed, a move
+        put a file under other path rules, or the model answered after a model
+        problem had left a facet unanswered. It stays 0 without a classify.toml.
+        A labelling problem appears in errors with its message prefixed
+        "labels:"; it is not a failure.
 
         unreadable counts indexed sources this installation cannot read
         because an optional extra is absent (images need [ocr]); each one
@@ -178,7 +195,14 @@ def create_app(
 
     @mcp.tool
     @guard
-    def query_documents(query: str, topK: int = 8, scope: str | list[str] | None = None) -> dict:
+    def query_documents(
+        query: str,
+        topK: int = 8,
+        scope: str | list[str] | None = None,
+        labels: dict[str, str | list[str]] | None = None,
+        dateFrom: str | None = None,
+        dateTo: str | None = None,
+    ) -> dict:
         """Hybrid search: semantic similarity plus a keyword boost for exact terms.
 
         Returns `results` — ranked chunks with text, source, title,
@@ -207,9 +231,28 @@ def create_app(
         document you actually used, each line just that document's
         `displayPath` copied verbatim — no [n] markers, nothing else
         on the line. Plain text, never a markdown link or file://.
+
+        `labels` ({facet: value or [values]}) and `dateFrom`/`dateTo`
+        (YYYY-MM-DD, inclusive) narrow the search to labelled documents when
+        the corpus has a classify.toml; `status` lists its facets and values
+        under `labels` — map an approximate name to a value from there.
+        `filterCounts` then says how many documents in scope were left out
+        only for having no label or no date; each `sources` row carries its
+        `labels` and `date`.
         """
         c = ctx()
-        return run_query(c.store, c.embedder, c.config, query, top_k=topK, scopes=_scopes(scope))
+        return run_query(
+            c.store,
+            c.embedder,
+            c.config,
+            query,
+            top_k=topK,
+            scopes=_scopes(scope),
+            labels=labels,
+            date_from=dateFrom,
+            date_to=dateTo,
+            label_source=c.labels,
+        )
 
     @mcp.tool
     @guard
@@ -281,7 +324,13 @@ def create_app(
 
     @mcp.tool
     @guard
-    def list_files(scope: str | list[str] | None = None) -> dict:
+    def list_files(
+        scope: str | list[str] | None = None,
+        labels: dict[str, str | list[str]] | None = None,
+        dateFrom: str | None = None,
+        dateTo: str | None = None,
+        sort: str | None = None,
+    ) -> dict:
         """List files found on disk under the document roots, plus indexed data/url sources.
 
         Each disk file is reported with a state: "ingested" (index matches
@@ -301,9 +350,22 @@ def create_app(
         permission, a missing or unmounted drive), with what to do about it.
         Indexed files under one are listed as "unlisted": still indexed and
         searchable, not checked against the disk.
+
+        `labels`, `dateFrom` and `dateTo` filter as in query_documents;
+        sort="date" lists newest first, documents without a date last. Rows
+        carry `labels` and `date` when present.
         """
         c = ctx()
-        return list_payload(c.store, c.config.roots, _scopes(scope))
+        return list_payload(
+            c.store,
+            c.config.roots,
+            _scopes(scope),
+            labels=labels,
+            date_from=dateFrom,
+            date_to=dateTo,
+            sort=sort,
+            label_source=c.labels,
+        )
 
     @mcp.tool
     @guard
@@ -347,6 +409,10 @@ def create_app(
         ocr names the OCR engine this install can use, or is "unavailable"
         when the optional extra is missing — scanned PDFs and images cannot
         be indexed then, and ocrHint says what to install.
+
+        labels, present only when the corpus has a classify.toml: its facets,
+        value descriptions and document counts, unlabelled and uncertain
+        counts, and the model state — or the file's error.
         """
         if config is None or config_error is not None:
             return {"version": __version__, "configError": config_error or "no configuration"}
@@ -364,6 +430,7 @@ def create_app(
             out["chunkCount"] = c.store.chunk_count()
             out["sourceCount"] = c.store.source_count()
             out.update(scheme_status(c.store))
+            out.update(labels_status(c.labels, c.store))
         except Exception as e:
             out["indexError"] = str(e)
         return out

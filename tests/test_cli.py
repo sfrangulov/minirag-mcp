@@ -9,6 +9,7 @@ import pytest
 import minirag_mcp.cli as cli
 from minirag_mcp import ocr
 from minirag_mcp.chunker import SCHEME_VERSION
+from minirag_mcp.labels.model import INSTALL_HINT, ModelError
 from minirag_mcp.lock import sync_lock
 from minirag_mcp.store import MAX_TOP_K, Store
 
@@ -523,3 +524,255 @@ def test_ingest_of_a_folder_with_an_unlistable_subfolder_fails_and_names_it(corp
     assert [f["source"] for f in failed] == [str(hidden)]
     assert "could not list this folder" in failed[0]["error"]
     assert f"warn: {hidden}:" in captured.err
+
+
+CLASSIFY_TAXONOMY = """
+[model]
+path = "/models/fake.gguf"
+temperature = 1.0
+
+[facets.type]
+values.minutes = { description = "Minutes. Decisions." }
+values.report = { description = "Report. Findings." }
+"""
+
+
+def test_classify_try_prints_the_distribution_and_writes_nothing(
+    corpus, capsys, monkeypatch, model_factory, fake_embedder
+):
+    monkeypatch.setattr("minirag_mcp.labels.model.available", lambda: True)
+    monkeypatch.setattr(cli, "_make_model_factory", lambda: model_factory)
+    (corpus / ".minirag").mkdir()
+    (corpus / ".minirag" / "classify.toml").write_text(CLASSIFY_TAXONOMY)
+    (corpus / "m.md").write_text("# Minutes\n\nMinutes of the weekly sync.")
+    model_factory.answers = {"Minutes of": {"minutes": 0.8, "report": 0.2}}
+
+    run(["classify", "try", str(corpus / "m.md"), "--base-dir", str(corpus), "--json"])
+    out = json.loads(capsys.readouterr().out)
+
+    assert out["labels"]["type"]["value"] == "minutes"
+    assert out["distribution"]["type"] == {"minutes": 0.8, "report": 0.2}
+    assert Store(corpus / ".minirag" / "lancedb", dim=fake_embedder.dim).chunk_count() == 0
+    run(["classify", "try", str(corpus / "m.md"), "--base-dir", str(corpus)])
+    human = capsys.readouterr().out
+    assert "type: minutes" in human and "report" in human
+
+
+def test_classify_try_without_classify_toml_fails_loudly(
+    corpus, capsys, monkeypatch, model_factory
+):
+    monkeypatch.setattr(cli, "_make_model_factory", lambda: model_factory)
+    with pytest.raises(SystemExit) as e:
+        run(["classify", "try", str(corpus / "a.md"), "--base-dir", str(corpus)])
+    assert e.value.code == 1
+    assert "document labels are off" in capsys.readouterr().err
+
+
+def test_a_malformed_label_flag_names_the_expected_form(corpus, capsys):
+    with pytest.raises(SystemExit) as e:
+        run(["query", "alpha", "--label", "x", "--base-dir", str(corpus)])
+    assert e.value.code == 1
+    assert "--label takes facet=value, got 'x'" in capsys.readouterr().err
+
+
+def test_list_sorted_by_date_from_the_cli(corpus, capsys, monkeypatch, model_factory):
+    monkeypatch.setattr("minirag_mcp.labels.model.available", lambda: True)
+    monkeypatch.setattr(cli, "_make_model_factory", lambda: model_factory)
+    model_factory.default = {"report": 1.0}
+    (corpus / ".minirag").mkdir()
+    (corpus / ".minirag" / "classify.toml").write_text(CLASSIFY_TAXONOMY)
+    (corpus / "old.md").write_text("# Old\n\nDate: 1 January 2020.")
+    (corpus / "new.md").write_text("# New\n\nDate: 1 January 2026.")
+    # A document with no date in its text is dated by its file time.
+    for name in ("a.md", "sub/b.md"):
+        os.utime(corpus / name, (946684800, 946684800))  # 2000-01-01
+    run(["ingest", str(corpus), "--base-dir", str(corpus)])
+    (corpus / "fresh.md").write_text("# Fresh\n\nNever ingested, so it has no date.")
+    capsys.readouterr()
+    run(["list", "--sort", "date", "--base-dir", str(corpus), "--json"])
+    files = json.loads(capsys.readouterr().out)["files"]
+    names = [Path(f["source"]).name for f in files]
+    assert names[:2] == ["new.md", "old.md"]
+    assert sorted(names[2:4]) == ["a.md", "b.md"] and names[4] == "fresh.md"
+    with pytest.raises(SystemExit):
+        run(["list", "--sort", "size", "--base-dir", str(corpus)])
+    assert "sort must be 'date'" in capsys.readouterr().err
+
+
+def _with_taxonomy(corpus, monkeypatch, model_factory, text=CLASSIFY_TAXONOMY) -> Path:
+    monkeypatch.setattr("minirag_mcp.labels.model.available", lambda: True)
+    monkeypatch.setattr(cli, "_make_model_factory", lambda: model_factory)
+    (corpus / ".minirag").mkdir(exist_ok=True)
+    path = corpus / ".minirag" / "classify.toml"
+    path.write_text(text)
+    return path
+
+
+def test_a_filter_that_leaves_documents_out_says_so_in_human_output(
+    corpus, capsys, monkeypatch, model_factory, public_dns
+):
+    import minirag_mcp.ingest.pipeline as pmod
+    from minirag_mcp.ingest.parser import ParsedDoc
+
+    _with_taxonomy(corpus, monkeypatch, model_factory)
+    model_factory.error = ModelError("the classify model is not installed")
+    monkeypatch.setattr(pmod, "parse_url", lambda url, **kw: ParsedDoc("# R\n\nAuth notes.", "R"))
+    run(["ingest", str(corpus), "--base-dir", str(corpus)])
+    run(["ingest-url", "https://example.com/p", "--base-dir", str(corpus)])
+    capsys.readouterr()
+    monkeypatch.setattr("minirag_mcp.labels.model.available", lambda: False)
+    flags = ["--label", "type=minutes", "--date-from", "2000-01-01", "--base-dir", str(corpus)]
+    expected = [
+        "warn: 3 documents in scope were left out for having no label for a filtered facet",
+        "warn: 1 document in scope was left out for having no date",
+        "warn: labels for type come from the model, which this installation cannot run; "
+        + INSTALL_HINT,
+    ]
+
+    run(["list", *flags])
+    listed = capsys.readouterr()
+    run(["query", "auth", *flags])
+    queried = capsys.readouterr()
+
+    assert listed.out.strip() == "no files found"
+    assert listed.err.splitlines() == expected
+    assert queried.out.strip() == "no results"
+    assert queried.err.splitlines() == expected
+
+
+def test_human_list_and_query_rows_show_the_date_and_the_labels(
+    corpus, capsys, monkeypatch, model_factory
+):
+    _with_taxonomy(corpus, monkeypatch, model_factory)
+    model_factory.answers = {"Minutes of": {"minutes": 1.0}}
+    model_factory.default = {"report": 0.625, "minutes": 0.375}
+    old, new = corpus / "old.md", corpus / "new.md"
+    old.write_text("# Old\n\nMinutes of the kickoff. Date: 1 January 2020.")
+    new.write_text("# New\n\nStatus report on the kickoff. Date: 1 January 2026.")
+    run(["ingest", str(old), str(new), "--base-dir", str(corpus)])
+    capsys.readouterr()
+
+    run(["list", "--sort", "date", "--base-dir", str(corpus)])
+    listed = capsys.readouterr().out.splitlines()
+    run(["query", "kickoff", "--base-dir", str(corpus)])
+    queried = capsys.readouterr().out.splitlines()
+
+    assert listed[:2] == [
+        f"[ingested] {new} (1 chunks) 2026-01-01 (document) type=report (uncertain)",
+        f"[ingested] {old} (1 chunks) 2020-01-01 (document) type=minutes",
+    ]
+    assert f"  {old} (1 hit) 2020-01-01 (document) type=minutes" in queried
+    assert f"  {new} (1 hit) 2026-01-01 (document) type=report (uncertain)" in queried
+
+
+def test_ingest_loads_the_model_once_for_all_its_files(corpus, capsys, monkeypatch, model_factory):
+    _with_taxonomy(corpus, monkeypatch, model_factory)
+    model_factory.default = {"report": 1.0}
+    for i in range(2):
+        (corpus / f"n{i}.md").write_text(f"# N{i}\n\nStatus report {i}.")
+
+    run(["ingest", str(corpus), "--base-dir", str(corpus)])
+
+    assert capsys.readouterr().out.splitlines()[0] == "ingested 4 file(s):"
+    assert len(model_factory.created) == 1
+    assert len(model_factory.created[0].calls) == 4
+    assert model_factory.created[0].closed
+
+
+def test_ingest_warns_once_about_a_model_that_cannot_load_and_still_succeeds(
+    corpus, capsys, monkeypatch, model_factory
+):
+    path = _with_taxonomy(corpus, monkeypatch, model_factory)
+    model_factory.error = ModelError("the classify model is not installed")
+
+    run(["ingest", str(corpus), "--base-dir", str(corpus)])
+
+    captured = capsys.readouterr()
+    assert captured.out.splitlines()[0] == "ingested 2 file(s):"
+    assert captured.err.splitlines() == [
+        f"warn: {path}: labels: the classify model is not installed"
+    ]
+    assert len(model_factory.calls) == 1
+
+
+def test_ingest_url_warns_about_a_model_that_cannot_load_and_still_succeeds(
+    corpus, capsys, monkeypatch, model_factory, public_dns
+):
+    import minirag_mcp.ingest.pipeline as pmod
+    from minirag_mcp.ingest.parser import ParsedDoc
+
+    path = _with_taxonomy(corpus, monkeypatch, model_factory)
+    model_factory.error = ModelError("the classify model is not installed")
+    monkeypatch.setattr(pmod, "parse_url", lambda url, **kw: ParsedDoc("# R\n\nRemote body.", "R"))
+
+    run(["ingest-url", "https://example.com/p", "--base-dir", str(corpus)])
+
+    captured = capsys.readouterr()
+    assert "example.com" in captured.out
+    assert captured.err.splitlines() == [
+        f"warn: {path}: labels: the classify model is not installed"
+    ]
+
+
+def test_classify_try_fails_loudly_when_the_model_cannot_answer(
+    corpus, capsys, monkeypatch, model_factory
+):
+    path = _with_taxonomy(corpus, monkeypatch, model_factory)
+    model_factory.error = ModelError("the classify model is not installed")
+
+    with pytest.raises(SystemExit) as e:
+        run(["classify", "try", str(corpus / "a.md"), "--base-dir", str(corpus)])
+
+    assert e.value.code == 1
+    captured = capsys.readouterr()
+    assert "type: not set (the model did not answer)" in captured.out.splitlines()
+    assert captured.err.splitlines() == [
+        f"warn: {path}: labels: the classify model is not installed"
+    ]
+
+
+WITHIN_TAXONOMY = (
+    CLASSIFY_TAXONOMY
+    + """
+[facets.team]
+within = ["sub"]
+default = "core"
+values.core = { description = "The core team." }
+"""
+)
+
+
+def test_classify_try_prints_every_facet_even_one_without_a_label(
+    corpus, capsys, monkeypatch, model_factory
+):
+    _with_taxonomy(corpus, monkeypatch, model_factory, WITHIN_TAXONOMY)
+    model_factory.default = {"report": 1.0}
+
+    run(["classify", "try", str(corpus / "a.md"), "--base-dir", str(corpus)])
+    human = capsys.readouterr()
+    run(["classify", "try", str(corpus / "a.md"), "--base-dir", str(corpus), "--json"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert "type: report [model, 1.00]" in human.out.splitlines()
+    assert "team: not set (outside within: sub)" in human.out.splitlines()
+    assert human.err == ""
+    assert payload["unset"] == {"team": "outside within: sub"}
+    assert payload["problems"] == []
+
+
+@pytest.mark.parametrize(
+    ("name", "message"),
+    [("missing.md", "No such file"), ("notes.xyz", "Unsupported file extension")],
+)
+def test_classify_try_on_a_file_it_cannot_read_is_an_error_not_a_traceback(
+    corpus, capsys, monkeypatch, model_factory, name, message
+):
+    _with_taxonomy(corpus, monkeypatch, model_factory)
+    (corpus / "notes.xyz").write_text("not a supported format")
+
+    with pytest.raises(SystemExit) as e:
+        run(["classify", "try", str(corpus / name), "--base-dir", str(corpus)])
+
+    assert e.value.code == 1
+    err = capsys.readouterr().err
+    assert err.startswith("error: ") and message in err

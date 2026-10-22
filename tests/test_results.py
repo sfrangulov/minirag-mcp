@@ -17,12 +17,26 @@ degraded to a bare filename or a re-cased one.
 
 from __future__ import annotations
 
+import re
+import warnings
 from pathlib import Path
 
 import pytest
 
-from minirag_mcp.results import aggregate_sources, display_path
-from minirag_mcp.store import SearchResult
+from conftest import FakeModelFactory
+from label_helpers import L, record
+from minirag_mcp.config import Config
+from minirag_mcp.labels import LabelerSource
+from minirag_mcp.results import (
+    QueryError,
+    aggregate_sources,
+    display_path,
+    labels_status,
+    list_payload,
+    run_query,
+)
+from minirag_mcp.store import LABEL_COLUMNS, SearchResult, Store
+from store_helpers import _older_table, _raise_commit_conflict, _row
 
 ROOT = "/Users/x/Documents/solidcore_data"
 
@@ -156,3 +170,281 @@ def test_aggregation_still_dedupes_in_rank_order():
     assert [r["source"] for r in rows] == [f"{ROOT}/b.md", f"{ROOT}/a.md"]
     assert rows[0]["hits"] == 2
     assert set(rows[0]) == {"source", "title", "hits", "displayPath"}
+
+
+LABEL_TOML = """
+[model]
+path = "/models/fake.gguf"
+temperature = 1.0
+
+[facets.type]
+question = "What kind of document is this?"
+values.spec = { description = "Spec. Requirements.", paths = ["specs"] }
+values.minutes = { description = "Minutes. Decisions.", paths = ["minutes"] }
+
+[facets.stage]
+within = ["pilot"]
+values.draft = { description = "A draft." }
+values.final = { description = "A final version." }
+"""
+
+
+@pytest.fixture
+def root(tmp_path) -> Path:
+    root = (tmp_path / "docs").resolve()
+    root.mkdir()
+    return root
+
+
+@pytest.fixture
+def with_file(root):
+    (root / ".minirag").mkdir()
+    (root / ".minirag" / "classify.toml").write_text(LABEL_TOML)
+
+
+@pytest.fixture
+def label_source(root, tmp_path, with_file) -> LabelerSource:
+    return LabelerSource((root,), tmp_path / "cache", FakeModelFactory())
+
+
+def make_config(root, tmp_path) -> Config:
+    return Config(
+        roots=(root,),
+        db_path=tmp_path / "db",
+        cache_dir=tmp_path / "cache",
+        model_name="fake",
+        max_file_size=1_000_000,
+        token_budget=200,
+        hybrid_weight=0.6,
+        grouping=None,
+        max_distance=None,
+        max_files=None,
+        allow_private_urls=False,
+    )
+
+
+def index(store, embedder, root, name, labels, doc_date="", create=True):
+    path = root / name
+    if create:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("budget review")
+    store.replace_source(
+        str(path),
+        [
+            record(
+                str(path),
+                labels,
+                doc_date,
+                "header" if doc_date else "",
+                text="budget review",
+                vector=embedder.embed_documents(["budget review"])[0],
+                mtime=path.stat().st_mtime,
+            )
+        ],
+    )
+    return str(path)
+
+
+@pytest.fixture
+def store(tmp_path):
+    return Store(tmp_path / "db", dim=8)
+
+
+def test_a_filtered_query_returns_matching_sources_with_labels_and_counts(
+    tmp_path, root, store, fake_embedder, label_source, monkeypatch
+):
+    monkeypatch.setattr("minirag_mcp.labels.model.available", lambda: True)
+    a = index(store, fake_embedder, root, "minutes/a.md", {"type": L("minutes")}, "2026-10-14")
+    index(store, fake_embedder, root, "specs/b.md", {"type": L("spec")}, "2026-10-14")
+    index(store, fake_embedder, root, "c.md", {})
+
+    payload = run_query(
+        store,
+        fake_embedder,
+        make_config(root, tmp_path),
+        "budget review",
+        labels={"type": "minutes"},
+        label_source=label_source,
+    )
+
+    assert [s["source"] for s in payload["sources"]] == [a]
+    assert payload["sources"][0]["labels"]["type"]["value"] == "minutes"
+    assert payload["sources"][0]["date"] == {"value": "2026-10-14", "source": "header"}
+    assert payload["filterCounts"] == {"unlabelled": 1, "undated": 0}
+    assert "filterNotice" not in payload
+
+
+def test_an_unfiltered_query_has_exactly_the_old_keys(
+    tmp_path, root, store, fake_embedder, label_source
+):
+    index(store, fake_embedder, root, "minutes/a.md", {"type": L("minutes")}, "2026-10-14")
+    for source in (None, label_source):
+        payload = run_query(
+            store,
+            fake_embedder,
+            make_config(root, tmp_path),
+            "budget review",
+            label_source=source,
+        )
+        assert set(payload) == {"results", "sources", "parents"}
+    # Labels were stored, so the source row shows them; the shell keys stay unchanged.
+    assert "labels" in payload["sources"][0]
+
+
+def test_an_unlabelled_corpus_has_no_label_keys_on_a_source(tmp_path, root, store, fake_embedder):
+    index(store, fake_embedder, root, "a.md", {})
+    payload = run_query(store, fake_embedder, make_config(root, tmp_path), "budget review")
+    assert "labels" not in payload["sources"][0] and "date" not in payload["sources"][0]
+
+
+def test_a_filter_without_the_file_is_a_query_error(tmp_path, root, store, fake_embedder):
+    with pytest.raises(QueryError, match="document labels are off"):
+        run_query(
+            store,
+            fake_embedder,
+            make_config(root, tmp_path),
+            "budget review",
+            labels={"type": "spec"},
+            label_source=LabelerSource((root,), tmp_path / "cache", FakeModelFactory()),
+        )
+
+
+def test_list_sorted_by_date_puts_undated_last(tmp_path, root, store, fake_embedder):
+    index(store, fake_embedder, root, "a_undated.md", {})
+    index(store, fake_embedder, root, "b_old.md", {}, "2026-10-01")
+    index(store, fake_embedder, root, "c_new.md", {}, "2026-10-20")
+    index(store, fake_embedder, root, "d_tie.md", {}, "2026-10-01")
+
+    payload = list_payload(store, [root], sort="date")
+
+    assert [Path(f["source"]).name for f in payload["files"]] == [
+        "c_new.md",
+        "b_old.md",
+        "d_tie.md",
+        "a_undated.md",
+    ]
+    with pytest.raises(QueryError, match="sort"):
+        list_payload(store, [root], sort="size")
+
+
+def test_a_filtered_listing_keeps_matches_and_counts_unread_files_as_unlabelled(
+    tmp_path, root, store, fake_embedder, label_source, monkeypatch
+):
+    monkeypatch.setattr("minirag_mcp.labels.model.available", lambda: True)
+    a = index(store, fake_embedder, root, "minutes/a.md", {"type": L("minutes")})
+    index(store, fake_embedder, root, "specs/b.md", {"type": L("spec")})
+    index(store, fake_embedder, root, "c.md", {})
+    index(store, fake_embedder, root, "pilot/d.md", {}, create=True)
+    (root / "new.md").write_text("never ingested")
+
+    payload = list_payload(store, [root], labels={"type": "minutes"}, label_source=label_source)
+
+    assert [f["source"] for f in payload["files"]] == [a]
+    assert payload["files"][0]["labels"]["type"]["value"] == "minutes"
+    # c.md and pilot/d.md are indexed without a type; new.md is unread.
+    assert payload["filterCounts"]["unlabelled"] == 3
+    assert "filterNotice" not in payload
+
+
+def test_a_listing_without_a_filter_has_exactly_the_old_keys(tmp_path, root, store, fake_embedder):
+    index(store, fake_embedder, root, "a.md", {})
+    payload = list_payload(store, [root])
+    assert set(payload) == {"files", "unlistedFolders"}
+    assert set(payload["files"][0]) == {
+        "source",
+        "sourceType",
+        "title",
+        "state",
+        "chunkCount",
+        "ocrEngine",
+    }
+
+
+def test_a_filter_on_an_index_without_label_columns_is_refused(
+    tmp_path, root, fake_embedder, label_source, monkeypatch
+):
+    db_path = tmp_path / "old"
+    table = _older_table(db_path, set(LABEL_COLUMNS), [_row(str(root / "a.md"), 0, "x")])
+    monkeypatch.setattr(type(table), "add_columns", _raise_commit_conflict)
+    with pytest.warns(RuntimeWarning, match="labels_json"):
+        old = Store(db_path, dim=8)
+    assert set(old.missing_columns) == set(LABEL_COLUMNS)
+
+    with pytest.raises(QueryError, match="write access"):
+        run_query(
+            old,
+            fake_embedder,
+            make_config(root, tmp_path),
+            "x",
+            labels={"type": "spec"},
+            label_source=label_source,
+        )
+    with pytest.raises(QueryError, match="write access"):
+        list_payload(old, [root], date_from="2026-10-01", label_source=label_source)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert run_query(old, fake_embedder, make_config(root, tmp_path), "x")["results"]
+
+
+def test_labels_status_is_empty_without_the_file_and_names_an_invalid_one(tmp_path, root, store):
+    absent = LabelerSource((root,), tmp_path / "cache", FakeModelFactory())
+    assert labels_status(absent, store) == {}
+    assert labels_status(None, store) == {}
+
+    (root / ".minirag").mkdir()
+    (root / ".minirag" / "classify.toml").write_text("not = [valid")
+    status = labels_status(absent, store)
+    assert set(status) == {"labels"}
+    assert status["labels"]["file"] == str(root / ".minirag" / "classify.toml")
+    assert status["labels"]["error"]
+
+
+def test_labels_status_counts_values_unlabelled_and_uncertain(
+    tmp_path, root, store, fake_embedder, label_source, monkeypatch
+):
+    monkeypatch.setattr("minirag_mcp.labels.model.available", lambda: True)
+    index(store, fake_embedder, root, "minutes/a.md", {"type": L("minutes")}, "2026-10-14")
+    index(store, fake_embedder, root, "minutes/b.md", {"type": L("minutes")})
+    index(
+        store,
+        fake_embedder,
+        root,
+        "c.md",
+        {"type": L("spec", second="minutes", uncertain=True)},
+    )
+    index(store, fake_embedder, root, "d.md", {})
+    index(store, fake_embedder, root, "pilot/e.md", {"stage": L("draft")}, "2026-10-02")
+
+    labels = labels_status(label_source, store)["labels"]
+
+    assert labels["model"] == "on demand" and "modelHint" not in labels
+    type_ = labels["facets"]["type"]
+    assert type_["question"] == "What kind of document is this?"
+    assert type_["values"]["minutes"] == {"description": "Minutes. Decisions.", "count": 2}
+    assert type_["values"]["spec"]["count"] == 1
+    assert type_["unlabelled"] == 2  # d.md and pilot/e.md
+    assert type_["uncertain"] == 1
+    stage = labels["facets"]["stage"]
+    assert stage["values"]["draft"]["count"] == 1
+    assert stage["unlabelled"] == 0  # the other documents are outside `within`
+    assert labels["undated"] == 3
+
+
+def test_a_filter_on_a_model_facet_without_the_extra_says_what_to_install(
+    tmp_path, root, store, fake_embedder, label_source, monkeypatch
+):
+    monkeypatch.setattr("minirag_mcp.labels.model.available", lambda: False)
+    index(store, fake_embedder, root, "minutes/a.md", {"type": L("minutes")})
+
+    payload = run_query(
+        store,
+        fake_embedder,
+        make_config(root, tmp_path),
+        "budget review",
+        labels={"type": "minutes"},
+        label_source=label_source,
+    )
+    assert re.search(r"minirag-mcp\[classify\]", payload["filterNotice"])
+    assert "type" in payload["filterNotice"]
+    assert labels_status(label_source, store)["labels"]["model"] == "unavailable"
+    assert "modelHint" in labels_status(label_source, store)["labels"]
