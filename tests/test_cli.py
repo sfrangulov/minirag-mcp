@@ -574,14 +574,25 @@ def test_a_malformed_label_flag_names_the_expected_form(corpus, capsys):
     assert "--label takes facet=value, got 'x'" in capsys.readouterr().err
 
 
-def test_list_sorted_by_date_from_the_cli(corpus, capsys):
+def test_list_sorted_by_date_from_the_cli(corpus, capsys, monkeypatch, model_factory):
+    monkeypatch.setattr("minirag_mcp.labels.model.available", lambda: True)
+    monkeypatch.setattr(cli, "_make_model_factory", lambda: model_factory)
+    model_factory.default = {"report": 1.0}
+    (corpus / ".minirag").mkdir()
+    (corpus / ".minirag" / "classify.toml").write_text(CLASSIFY_TAXONOMY)
     (corpus / "old.md").write_text("# Old\n\nDate: 1 January 2020.")
     (corpus / "new.md").write_text("# New\n\nDate: 1 January 2026.")
+    # A document with no date in its text is dated by its file time.
+    for name in ("a.md", "sub/b.md"):
+        os.utime(corpus / name, (946684800, 946684800))  # 2000-01-01
     run(["ingest", str(corpus), "--base-dir", str(corpus)])
+    (corpus / "fresh.md").write_text("# Fresh\n\nNever ingested, so it has no date.")
     capsys.readouterr()
     run(["list", "--sort", "date", "--base-dir", str(corpus), "--json"])
     files = json.loads(capsys.readouterr().out)["files"]
-    assert len(files) == 4
+    names = [Path(f["source"]).name for f in files]
+    assert names[:2] == ["new.md", "old.md"]
+    assert sorted(names[2:4]) == ["a.md", "b.md"] and names[4] == "fresh.md"
     with pytest.raises(SystemExit):
         run(["list", "--sort", "size", "--base-dir", str(corpus)])
     assert "sort must be 'date'" in capsys.readouterr().err

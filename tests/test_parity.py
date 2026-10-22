@@ -204,10 +204,9 @@ LABEL_TAXONOMY = """
 path = "/models/fake.gguf"
 temperature = 1.0
 
-[facets.initiative]
-default = "general"
-values.general = { description = "Work outside any initiative." }
-values.alpha = { description = "The Alpha initiative.", paths = ["alpha"] }
+[facets.type]
+values.minutes = { description = "Minutes. Decisions." }
+values.report = { description = "Report. Findings." }
 """
 
 
@@ -217,56 +216,71 @@ def labelled_root(tmp_path):
     (root / "alpha").mkdir(parents=True)
     (root / ".minirag").mkdir()
     (root / ".minirag" / "classify.toml").write_text(LABEL_TAXONOMY)
-    (root / "alpha" / "plan.md").write_text("# Plan\n\nRollout plan for the quarter.")
-    (root / "notes.md").write_text("# Notes\n\nRollout notes for the quarter.")
+    (root / "alpha" / "plan.md").write_text(
+        "# Plan\n\nMinutes of the rollout plan. Date: 14 March 2026."
+    )
+    (root / "aaa-notes.md").write_text("# Notes\n\nReport on rollout notes. Date: 1 January 2026.")
     return root
 
 
 async def _ingest_both(env, embedder, model_factory):
+    """Label the corpus with the fake model, then forget that it was ever made, so a test
+    can assert on what happens afterwards alone."""
     root = Path(env["BASE_DIR"])
+    model_factory.answers = {"Minutes of": {"minutes": 1.0}}
+    model_factory.default = {"report": 1.0}
     async with Client(
         create_app(load_config(env), embedder=embedder, model_factory=model_factory)
     ) as c:
-        for rel in ("alpha/plan.md", "notes.md"):
+        for rel in ("alpha/plan.md", "aaa-notes.md"):
             await c.call_tool("ingest_file", {"filePath": str(root / rel)})
+    assert len(model_factory.created) >= 1
+    model_factory.calls.clear()
+    model_factory.created.clear()
 
 
 async def test_a_label_filter_returns_the_same_sources_and_counts_from_both(
     labelled_root, tmp_path, capsys, monkeypatch, fake_embedder, model_factory
 ):
+    monkeypatch.setattr("minirag_mcp.labels.model.available", lambda: True)
     monkeypatch.setattr(cli, "_make_embedder", lambda cfg: fake_embedder)
     monkeypatch.setattr(cli, "_make_model_factory", lambda: model_factory)
     env = {"BASE_DIR": str(labelled_root), "DB_PATH": str(tmp_path / "db")}
     await _ingest_both(env, fake_embedder, model_factory)
+    plan = str(labelled_root / "alpha" / "plan.md")
+    notes = str(labelled_root / "aaa-notes.md")
     async with Client(
         create_app(load_config(env), embedder=fake_embedder, model_factory=model_factory)
     ) as c:
         res = (
             await c.call_tool(
                 "query_documents",
-                {"query": "rollout", "labels": {"initiative": "alpha"}, "dateFrom": "2000-01-01"},
+                {"query": "rollout", "labels": {"type": "minutes"}, "dateFrom": "2026-03-01"},
             )
         ).data
         listed = (
-            await c.call_tool("list_files", {"labels": {"initiative": ["alpha"]}, "sort": "date"})
+            await c.call_tool(
+                "list_files", {"labels": {"type": ["minutes", "report"]}, "sort": "date"}
+            )
         ).data
     code, out, _ = run_cli(
-        ["query", "rollout", "--label", "initiative=alpha", "--date-from", "2000-01-01"]
+        ["query", "rollout", "--label", "type=minutes", "--date-from", "2026-03-01"]
         + [*_flags(env), "--json"],
         capsys,
     )
     code_l, out_l, _ = run_cli(
-        ["list", "--label", "initiative=alpha", "--sort", "date", *_flags(env), "--json"], capsys
+        ["list", "--label", "type=minutes", "--label", "type=report", "--sort", "date"]
+        + [*_flags(env), "--json"],
+        capsys,
     )
     assert code == 0 and code_l == 0
     cli_res, cli_listed = json.loads(out), json.loads(out_l)
-    assert [s["source"] for s in res["sources"]] == [str(labelled_root / "alpha" / "plan.md")] or (
-        res["sources"] == []
-    )
+    assert [s["source"] for s in res["sources"]] == [plan]
+    assert [s["source"] for s in cli_res["sources"]] == [plan]
     assert cli_res["sources"] == res["sources"]
     assert cli_res["filterCounts"] == res["filterCounts"]
     assert cli_listed == listed
-    assert [f["source"] for f in listed["files"]] == [str(labelled_root / "alpha" / "plan.md")]
+    assert [f["source"] for f in listed["files"]] == [plan, notes]  # newest first
 
 
 def _last_error(err: str) -> str:
@@ -306,7 +320,7 @@ async def test_status_reports_the_same_labels_block_in_both(
         st = (await c.call_tool("status", {})).data
     code, out, _ = run_cli(["status", *_flags(env), "--json"], capsys)
     assert code == 0
-    assert st["labels"]["facets"]["initiative"]["values"]["alpha"]["count"] == 1
+    assert st["labels"]["facets"]["type"]["values"]["minutes"]["count"] == 1
     assert json.loads(out)["labels"] == st["labels"]
 
 
@@ -321,16 +335,20 @@ async def test_status_has_no_labels_key_without_the_file(
 
 
 async def test_status_list_and_query_never_make_the_model(
-    labelled_root, tmp_path, fake_embedder, model_factory
+    labelled_root, tmp_path, monkeypatch, fake_embedder, model_factory
 ):
+    monkeypatch.setattr("minirag_mcp.labels.model.available", lambda: True)
     env = {"BASE_DIR": str(labelled_root), "DB_PATH": str(tmp_path / "db")}
     await _ingest_both(env, fake_embedder, model_factory)
     async with Client(
         create_app(load_config(env), embedder=fake_embedder, model_factory=model_factory)
     ) as c:
         await c.call_tool("status", {})
-        await c.call_tool("list_files", {"labels": {"initiative": "alpha"}})
-        await c.call_tool(
-            "query_documents", {"query": "rollout", "labels": {"initiative": "alpha"}}
-        )
+        listed = (await c.call_tool("list_files", {"labels": {"type": "minutes"}})).data
+        res = (
+            await c.call_tool(
+                "query_documents", {"query": "rollout", "labels": {"type": "minutes"}}
+            )
+        ).data
+    assert len(listed["files"]) == 1 and len(res["sources"]) == 1
     assert model_factory.calls == [] and model_factory.created == []
