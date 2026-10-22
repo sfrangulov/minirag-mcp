@@ -7,15 +7,35 @@ shapes a SearchResult for output belongs in this module, imported by both sides.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 
 from minirag_mcp import ocr
 from minirag_mcp.chunker import join_parent
 from minirag_mcp.config import Config
 from minirag_mcp.ingest.scanner import FileState, compute_states, scan_roots
+from minirag_mcp.labels.filters import (
+    LabelFilter,
+    LabelFilterError,
+    facet_applies,
+    filter_counts,
+    filter_notice,
+    parse_filter,
+    source_matches,
+    to_sql,
+)
+from minirag_mcp.labels.labeler import Labeler, LabelerSource
+from minirag_mcp.labels.model import INSTALL_HINT
+from minirag_mcp.labels.resolve import decode_labels, document_fields, root_relative
 from minirag_mcp.scope import is_under
-from minirag_mcp.store import MAX_TOP_K, RESYNC_HINT, SearchResult, Store
+from minirag_mcp.store import (
+    LABEL_COLUMNS,
+    MAX_TOP_K,
+    RESYNC_HINT,
+    SearchResult,
+    SourceInfo,
+    Store,
+)
 
 EMPTY_INDEX_NOTICE = (
     "Nothing is indexed yet, so no query can match. Index the document roots first: "
@@ -182,6 +202,7 @@ def aggregate_sources(results: Iterable[SearchResult], roots: Sequence[Path] = (
                 "title": r.title,
                 "hits": 0,
                 "displayPath": display_path(r.source, roots),
+                **document_fields(r.labels_json, r.doc_date, r.doc_date_source),
             },
         )
         agg["hits"] += 1
@@ -215,6 +236,10 @@ def run_query(
     *,
     top_k: int = 8,
     scopes: Sequence[str] = (),
+    labels: Mapping[str, str | Sequence[str]] | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    label_source: LabelerSource | None = None,
 ) -> dict:
     """`query_documents` and `minirag-mcp query`, as one implementation.
 
@@ -227,6 +252,7 @@ def run_query(
     if top_k < 1:
         raise QueryError(f"topK must be at least 1, got {top_k}")
     scopes = tuple(scopes)
+    label_filter, labeler = _parse_filter(store, labels, date_from, date_to, label_source)
     results = store.search(
         query,
         embedder.embed_query(query),
@@ -236,15 +262,100 @@ def run_query(
         max_distance=config.max_distance,
         grouping=config.grouping,
         max_files=config.max_files,
+        filter_sql=to_sql(label_filter) if label_filter else None,
     )
     payload = {
         "results": [result_dict(r) for r in results],
         "sources": aggregate_sources(results, config.roots),
         "parents": parent_map(results),
     }
+    if label_filter is not None and labeler is not None:
+        payload["filterCounts"] = filter_counts(
+            label_filter, store.list_sources(scopes=scopes), labeler.taxonomy, config.roots
+        )
+        if notice := filter_notice(label_filter, labeler):
+            payload["filterNotice"] = notice
     if not results and (notice := empty_result_notice(store, scopes)):
         payload["notice"] = notice
     return payload
+
+
+def _parse_filter(
+    store: Store,
+    labels: Mapping[str, str | Sequence[str]] | None,
+    date_from: str | None,
+    date_to: str | None,
+    label_source: LabelerSource | None,
+) -> tuple[LabelFilter | None, Labeler | None]:
+    """The filter a request asks for, as a QueryError when it cannot run.
+
+    Refused before the search because an older index opened without write access has no
+    label columns, and a filter over a column that is not there fails inside the SQL
+    engine with a message that names neither the cause nor the remedy.
+    """
+    labeler, error = label_source.get() if label_source else (None, None)
+    try:
+        label_filter = parse_filter(
+            labels,
+            date_from,
+            date_to,
+            labeler=labeler,
+            error=error,
+            taxonomy_file=label_source.path if label_source else None,
+        )
+    except LabelFilterError as e:
+        raise QueryError(str(e)) from e
+    if label_filter is not None and (set(store.missing_columns) & set(LABEL_COLUMNS)):
+        raise QueryError(
+            "this index has no label columns and they could not be added: it was opened "
+            "without write access. Reopen it with write access (run `minirag-mcp sync` "
+            "once) before filtering by label or date."
+        )
+    return label_filter, labeler
+
+
+def labels_status(source: LabelerSource | None, store: Store | None) -> dict:
+    """The labels half of `status`, identical for the server and the CLI.
+
+    Empty when the feature is off, so a corpus without a taxonomy file sees no new key.
+    """
+    if source is None:
+        return {}
+    labeler, error = source.get()
+    if error is not None:
+        return {"labels": {"file": str(source.path), "error": error}}
+    if labeler is None:
+        return {}
+    taxonomy = labeler.taxonomy
+    infos = store.list_sources() if store is not None else []
+    state = labeler.model_state()
+    out: dict = {"file": str(source.path), "model": state}
+    if state == "unavailable":
+        out["modelHint"] = INSTALL_HINT
+    facets: dict = {}
+    for facet in taxonomy.facets:
+        counts = dict.fromkeys(facet.value_ids, 0)
+        unlabelled = uncertain = 0
+        for info in infos:
+            lab = decode_labels(info.labels_json).get(facet.name)
+            if lab is None:
+                if facet_applies(facet, root_relative(info.source, labeler.roots)):
+                    unlabelled += 1
+                continue
+            if lab.value in counts:
+                counts[lab.value] += 1
+            uncertain += lab.uncertain
+        facets[facet.name] = {
+            "question": facet.question,
+            "values": {
+                v.id: {"description": v.description, "count": counts[v.id]} for v in facet.values
+            },
+            "unlabelled": unlabelled,
+            "uncertain": uncertain,
+        }
+    out["facets"] = facets
+    out["undated"] = sum(1 for info in infos if not info.doc_date)
+    return {"labels": out}
 
 
 def _unlisted_message(error: str | None, indexed: int) -> str:
@@ -264,13 +375,30 @@ def _unlisted_message(error: str | None, indexed: int) -> str:
     )
 
 
-def list_payload(store: Store, roots: Sequence[Path], scopes: Sequence[str] = ()) -> dict:
+def list_payload(
+    store: Store,
+    roots: Sequence[Path],
+    scopes: Sequence[str] = (),
+    *,
+    labels: Mapping[str, str | Sequence[str]] | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    sort: str | None = None,
+    label_source: LabelerSource | None = None,
+) -> dict:
     """`list_files` and `minirag-mcp list`, as one implementation.
 
     `unlistedFolders` names every folder the scan could not see into, because a listing
     that silently leaves out what is under it contradicts `status` and search, which
     still count and return what is indexed there.
+
+    A filter keeps only documents whose stored labels match. A file not yet ingested has
+    none, so it drops out, and is counted as unlabelled for the facets that reach it
+    rather than vanishing silently.
     """
+    if sort not in (None, "date"):
+        raise QueryError(f"sort must be 'date', got {sort!r}")
+    label_filter, labeler = _parse_filter(store, labels, date_from, date_to, label_source)
     blind: list[tuple[Path, str | None]] = []
     entries = scan_roots(roots, blind=blind)
     if scopes:
@@ -280,9 +408,9 @@ def list_payload(store: Store, roots: Sequence[Path], scopes: Sequence[str] = ()
             for folder, error in blind
             if any(is_under(str(folder), p) or is_under(p, str(folder)) for p in scopes)
         ]
-    states: list[FileState] = compute_states(
-        entries, store.list_sources(scopes=tuple(scopes)), blind
-    )
+    infos = store.list_sources(scopes=tuple(scopes))
+    by_source = {i.source: i for i in infos}
+    states: list[FileState] = compute_states(entries, infos, blind)
     folders = []
     for folder, error in blind:
         indexed = sum(
@@ -298,17 +426,50 @@ def list_payload(store: Store, roots: Sequence[Path], scopes: Sequence[str] = ()
                 "message": _unlisted_message(error, indexed),
             }
         )
-    return {
-        "files": [
-            {
-                "source": st.source,
-                "sourceType": st.source_type,
-                "title": st.title,
-                "state": st.state,
-                "chunkCount": st.chunk_count,
-                "ocrEngine": st.ocr_engine,
-            }
+    rows = [
+        {
+            "source": st.source,
+            "sourceType": st.source_type,
+            "title": st.title,
+            "state": st.state,
+            "chunkCount": st.chunk_count,
+            "ocrEngine": st.ocr_engine,
+            **_fields_of(by_source.get(st.source)),
+        }
+        for st in states
+    ]
+    payload: dict = {"files": rows, "unlistedFolders": folders}
+    if label_filter is not None and labeler is not None:
+        counts = filter_counts(label_filter, infos, labeler.taxonomy, roots)
+        pending = [
+            SourceInfo(st.source, st.source_type, "", 0, "", 0.0)
             for st in states
-        ],
-        "unlistedFolders": folders,
-    }
+            if st.state == "not_ingested"
+        ]
+        # Dates are not part of this count: a file never read has no date to be missing.
+        counts["unlabelled"] += filter_counts(
+            LabelFilter(label_filter.labels), pending, labeler.taxonomy, roots
+        )["unlabelled"]
+        payload["files"] = [
+            row
+            for row in rows
+            if (info := by_source.get(row["source"])) is not None
+            and source_matches(label_filter, info)
+        ]
+        payload["filterCounts"] = counts
+        if notice := filter_notice(label_filter, labeler):
+            payload["filterNotice"] = notice
+    if sort == "date":
+        payload["files"] = sorted(
+            payload["files"],
+            key=lambda row: row.get("date", {}).get("value", ""),
+            reverse=True,
+        )
+        # Stable under reverse=True, and "" sorts lowest, so undated rows come last.
+    return payload
+
+
+def _fields_of(info: SourceInfo | None) -> dict:
+    if info is None:
+        return {}
+    return document_fields(info.labels_json, info.doc_date, info.doc_date_source)

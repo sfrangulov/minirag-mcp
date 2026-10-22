@@ -86,6 +86,10 @@ class Labeler:
         self._model: ChoiceModel | None = None
         self._model_failed = False
 
+    @property
+    def roots(self) -> tuple[Path, ...]:
+        return self._roots
+
     @contextmanager
     def job(self) -> Iterator[JobReport]:
         with self._jobs:
