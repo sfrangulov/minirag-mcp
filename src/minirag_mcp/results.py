@@ -318,9 +318,18 @@ def labels_status(source: LabelerSource | None, store: Store | None) -> dict:
     """The labels half of `status`, identical for the server and the CLI.
 
     Empty when the feature is off, so a corpus without a taxonomy file sees no new key.
+    Whatever goes wrong in here is a labels error: both callers report an exception from
+    `status` as `indexError`, which would name an index that is fine.
     """
     if source is None:
         return {}
+    try:
+        return _labels_status(source, store)
+    except Exception as e:
+        return {"labels": {"file": str(source.path), "error": f"{type(e).__name__}: {e}"}}
+
+
+def _labels_status(source: LabelerSource, store: Store | None) -> dict:
     labeler, error = source.get()
     if error is not None:
         return {"labels": {"file": str(source.path), "error": error}}

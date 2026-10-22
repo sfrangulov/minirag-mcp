@@ -171,6 +171,8 @@ def _parse_facet(name: str, raw: Any) -> Facet:
         raise TaxonomyError(f"{key}.question: must be a non-empty string")
 
     default = table.get("default")
+    if default is not None and not isinstance(default, str):
+        raise TaxonomyError(f"{key}.default: must be a string naming one of the values")
     if default is not None and default not in {v.id for v in values}:
         raise TaxonomyError(f"{key}.default: {default!r} is not one of the facet's values")
 
@@ -233,9 +235,16 @@ def _parse_model(raw: Any) -> ModelSpec:
         if not 0 < uncertain_below < 1:
             raise TaxonomyError("model.uncertain_below: must be in (0, 1)")
 
+    path = None
+    if has_path:
+        try:
+            path = Path(table["path"]).expanduser()
+        except RuntimeError as e:  # `~user` naming no user, or no home folder at all
+            raise TaxonomyError(f"model.path: cannot expand {table['path']!r}: {e}") from e
+
     return ModelSpec(
         temperature=temperature,
-        path=Path(table["path"]).expanduser() if has_path else None,
+        path=path,
         repo=table.get("repo"),
         file=table.get("file"),
         revision=table.get("revision"),
@@ -269,4 +278,8 @@ def load_taxonomy(path: Path) -> Taxonomy:
             )
     except TaxonomyError as e:
         raise TaxonomyError(f"{path}: {e}") from e
+    # Validation has missed a case before, and anything but a TaxonomyError escapes every
+    # tool that reads this file, unfiltered queries and `status` included.
+    except Exception as e:
+        raise TaxonomyError(f"{path}: {type(e).__name__}: {e}") from e
     return Taxonomy(facets=facets, model=model, source=path)

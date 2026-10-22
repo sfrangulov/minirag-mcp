@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from minirag_mcp.labels import taxonomy
 from minirag_mcp.labels.taxonomy import TaxonomyError, load_taxonomy, taxonomy_path
 
 MINIMAL = """
@@ -99,6 +100,12 @@ def test_default_must_be_one_of_the_values(tmp_path):
     fails(tmp_path, text, r"facets\.project\.default: 'gamma' is not one of")
 
 
+@pytest.mark.parametrize("raw", ['["alpha"]', '{ id = "alpha" }', "1", "true"])
+def test_default_must_be_a_string(tmp_path, raw):
+    text = PATH_ONLY.replace('default = "alpha"', f"default = {raw}")
+    fails(tmp_path, text, r"facets\.project\.default: must be a string naming one of the values")
+
+
 def test_model_section_is_required_only_when_a_facet_needs_the_model(tmp_path):
     t = load_taxonomy(write(tmp_path, PATH_ONLY))
     assert t.model is None
@@ -144,6 +151,23 @@ def test_model_is_a_path_or_a_fully_pinned_repo(tmp_path):
 def test_model_path_is_expanded(tmp_path):
     text = MINIMAL.replace("/models/plumb.gguf", "~/plumb.gguf")
     assert load_taxonomy(write(tmp_path, text)).model.path == Path("~/plumb.gguf").expanduser()
+
+
+def test_a_model_path_whose_home_folder_cannot_be_found_is_named(tmp_path):
+    text = MINIMAL.replace("/models/plumb.gguf", "~nosuchuser_zz/plumb.gguf")
+    fails(tmp_path, text, r"model\.path: cannot expand '~nosuchuser_zz/plumb\.gguf'")
+
+
+def test_an_unforeseen_validation_failure_is_a_taxonomy_error_naming_the_file(
+    tmp_path, monkeypatch
+):
+    """Any exception escaping validation would take down every tool that reads the file."""
+
+    def gap(raw):
+        raise ValueError("a case validation does not cover")
+
+    monkeypatch.setattr(taxonomy, "_parse_model", gap)
+    fails(tmp_path, MINIMAL, r"ValueError: a case validation does not cover$")
 
 
 @pytest.mark.parametrize(

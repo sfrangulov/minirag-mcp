@@ -536,3 +536,25 @@ def test_source_notices_a_change_in_either_mtime_or_size(root, model_factory):
     set_mtime(path, 1_700_000_001)
     by_size, _ = source.get()
     assert by_size is not by_mtime
+
+
+# Each once raised something other than a TaxonomyError out of validation.
+FAILS_VALIDATION = {
+    "default-is-a-list": (PATH_ONLY.replace('default = "core"', 'default = ["core"]'), "default"),
+    "home-of-an-unknown-user": (
+        TAXONOMY.replace("/models/fake.gguf", "~nosuchuser_zz/fake.gguf"),
+        "model.path",
+    ),
+}
+
+
+@pytest.mark.parametrize(("text", "key"), FAILS_VALIDATION.values(), ids=FAILS_VALIDATION.keys())
+def test_source_reports_a_file_that_fails_validation_as_an_error(root, model_factory, text, key):
+    source = LabelerSource([root], root.parent / "cache", model_factory)
+    path = write_taxonomy(root, text)
+
+    labeler, error = source.get()
+
+    assert labeler is None
+    assert error is not None and error.startswith(f"{path}: ")
+    assert key in error

@@ -525,6 +525,34 @@ def test_an_invalid_taxonomy_is_one_error_and_not_a_failure(corpus, model_factor
         assert all(row[name] == "" for name in FIELDS)
 
 
+# Each once raised something other than a TaxonomyError out of validation, and so out of
+# every tool that reads the file.
+FAILS_VALIDATION = {
+    "default-is-a-list": TAXONOMY.replace('default = "general"', 'default = ["general"]'),
+    "home-of-an-unknown-user": TAXONOMY.replace("/models/fake.gguf", "~nosuchuser_zz/fake.gguf"),
+}
+
+
+@pytest.mark.parametrize("text", FAILS_VALIDATION.values(), ids=FAILS_VALIDATION.keys())
+def test_a_taxonomy_that_fails_validation_is_one_error_for_sync_and_ingest_data(
+    corpus, model_factory, text
+):
+    path = corpus.taxonomy(text)
+    corpus.doc("alpha/a.md", "Quarterly report A.")
+
+    counts, errors = corpus.sync()
+
+    assert counts["failed"] == 0 and counts["ingested"] == 1 and counts["relabelled"] == 0
+    assert len(errors) == 1
+    assert errors[0]["source"] == str(path)
+    assert errors[0]["error"].startswith(f"labels: {path} is invalid: {path}: ")
+    with corpus.pipeline.job() as report:
+        corpus.pipeline.ingest_data("Minutes of the board.", source="note-1")
+    assert corpus.store.get_source("note-1").label_hash == ""
+    assert [p.split(" is invalid: ")[0] for p in report.problems] == [str(path)]
+    assert model_factory.calls == []
+
+
 def test_a_taxonomy_that_is_not_utf8_is_one_error_and_not_a_failure(corpus, model_factory):
     path = corpus.taxonomy_file
     path.parent.mkdir(parents=True)

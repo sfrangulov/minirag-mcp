@@ -18,6 +18,7 @@ import minirag_mcp.cli as cli
 import minirag_mcp.embedder as embedder_mod
 from minirag_mcp.config import load_config
 from minirag_mcp.embedder import Embedder
+from minirag_mcp.labels import Labeler
 from minirag_mcp.server import create_app
 
 
@@ -352,3 +353,72 @@ async def test_status_list_and_query_never_make_the_model(
         ).data
     assert len(listed["files"]) == 1 and len(res["sources"]) == 1
     assert model_factory.calls == [] and model_factory.created == []
+
+
+BROKEN_TAXONOMIES = {
+    "default-is-a-list": "[facets.type]\n"
+    'default = ["minutes"]\n'
+    'values.minutes = { description = "Minutes." }\n',
+    "home-of-an-unknown-user": LABEL_TAXONOMY.replace(
+        "/models/fake.gguf", "~nosuchuser_zz/fake.gguf"
+    ),
+}
+
+
+@pytest.mark.parametrize("text", BROKEN_TAXONOMIES.values(), ids=BROKEN_TAXONOMIES.keys())
+async def test_a_taxonomy_that_fails_validation_breaks_no_tool_in_either_shell(
+    labelled_root, tmp_path, capsys, monkeypatch, fake_embedder, model_factory, text
+):
+    monkeypatch.setattr(cli, "_make_embedder", lambda cfg: fake_embedder)
+    monkeypatch.setattr(cli, "_make_model_factory", lambda: model_factory)
+    taxonomy = labelled_root / ".minirag" / "classify.toml"
+    taxonomy.write_text(text)
+    env = {"BASE_DIR": str(labelled_root), "DB_PATH": str(tmp_path / "db")}
+    async with Client(
+        create_app(load_config(env), embedder=fake_embedder, model_factory=model_factory)
+    ) as c:
+        await c.call_tool("ingest_data", {"data": "Rollout notes.", "source": "note-1"})
+        st = (await c.call_tool("status", {})).data
+        res = (await c.call_tool("query_documents", {"query": "rollout"})).data
+        listed = (await c.call_tool("list_files", {})).data
+    code, out, _ = run_cli(["status", *_flags(env), "--json"], capsys)
+    code_q, out_q, _ = run_cli(["query", "rollout", *_flags(env), "--json"], capsys)
+    code_l, out_l, _ = run_cli(["list", *_flags(env), "--json"], capsys)
+
+    assert code == code_q == code_l == 0
+    cli_st = json.loads(out)
+    for status in (st, cli_st):
+        assert "indexError" not in status
+        assert status["labels"]["file"] == str(taxonomy)
+        assert status["labels"]["error"].startswith(f"{taxonomy}: ")
+    assert cli_st["labels"] == st["labels"]
+    assert [s["source"] for s in res["sources"]] == ["note-1"]
+    assert json.loads(out_q)["sources"] == res["sources"]
+    assert json.loads(out_l)["files"] == listed["files"]
+    assert model_factory.calls == []
+
+
+async def test_a_labels_failure_in_status_is_a_labels_error_not_an_index_error(
+    labelled_root, tmp_path, capsys, monkeypatch, fake_embedder, model_factory
+):
+    """The index is fine; saying otherwise sends the user to the wrong problem."""
+    monkeypatch.setattr(cli, "_make_embedder", lambda cfg: fake_embedder)
+    monkeypatch.setattr(cli, "_make_model_factory", lambda: model_factory)
+
+    def broken(self):
+        raise RuntimeError("cannot tell the model state")
+
+    monkeypatch.setattr(Labeler, "model_state", broken)
+    env = {"BASE_DIR": str(labelled_root), "DB_PATH": str(tmp_path / "db")}
+    _, st = await call_mcp(env, "status", {}, fake_embedder)
+    code, out, _ = run_cli(["status", *_flags(env), "--json"], capsys)
+
+    assert code == 0
+    cli_st = json.loads(out)
+    for status in (st, cli_st):
+        assert "indexError" not in status
+        assert status["chunkCount"] == 0
+        assert status["labels"] == {
+            "file": str(labelled_root / ".minirag" / "classify.toml"),
+            "error": "RuntimeError: cannot tell the model state",
+        }
