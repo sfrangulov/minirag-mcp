@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from datetime import date, datetime
 
 HEADER_CHARS = 1500
+# A longer first line is body prose, not a title; its dates may belong to cited documents.
+FIRST_LINE_CHARS = 200
 
 _EN_MONTHS = (
     "January February March April May June July August September October November December"
@@ -130,6 +132,8 @@ def date_from_header(text: str) -> str | None:
             return found
 
     first = next((line for line in head.splitlines() if line.strip()), "")
+    if len(first) > FIRST_LINE_CHARS:
+        return None
     return _first_date(first)
 
 
@@ -148,7 +152,7 @@ def _name_dmy_dash(stem: str) -> str | None:
 
 
 def _name_dotted(stem: str) -> str | None:
-    for m in re.finditer(r"(?<!\d)(\d{1,2})\.(\d{1,2})\.(\d{4}|\d{2})(?!\d)", stem):
+    for m in re.finditer(r"(?<!\d)(\d{2})\.(\d{2})\.(\d{4}|\d{2})(?!\d)", stem):
         year = _year(m[3])
         if year and (v := _valid(year, int(m[2]), int(m[1]))):
             return v

@@ -21,6 +21,7 @@ from minirag_mcp.labels.dates import (
         ("27-03-2025 Rates", "2025-03-27"),
         ("25-02-12 Purchasing part 2", "2025-02-12"),
         ("(1297) D_60 Report of 28.08.25", "2025-08-28"),
+        ("api_v1.2.25", None),
         ("FS D_639 access_26.08_2", None),
         ("31022026 impossible", None),
     ],
@@ -47,6 +48,17 @@ def test_date_from_name(stem, expected):
             "2026-10-14",
         ),
         ("Исх. № 12/3 от 12.08.2026\nTo the bank", "2026-08-12"),
+        ("Notes\nИсх. № 5 от 12.08.2026\nTo the bank", "2026-08-12"),
+        (
+            "Notes\n**Workshop-Meeting Recording** August 5, 2026, 10:32AM 50m",
+            "2026-08-05",
+        ),
+        (
+            "Notes\nDate: Date: "
+            + "From: someone about the workshop agenda " * 2
+            + "\nDate: 21 August 2026",
+            "2026-08-21",
+        ),
         # the trap: a cover letter whose only dates belong to the contract it cites
         (
             "To the currency control department\n"
@@ -77,3 +89,9 @@ def test_file_time_is_the_last_resort_and_says_so():
 
 def test_no_date_anywhere_is_none():
     assert document_date(None, "text", None) == DocDate("", "none")
+
+
+def test_a_long_first_line_is_body_prose_not_a_title():
+    line = "Please amend the contract dated 23.07.2025 " + "x" * 260
+    assert len(line) > 200
+    assert date_from_header(line) is None
