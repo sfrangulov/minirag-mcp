@@ -127,9 +127,16 @@ def create_app(
         """Poll a sync job started by sync_start.
 
         Returns state ('pending' | 'running' | 'succeeded' | 'failed'),
-        counts (scanned/ingested/skipped/moved/deleted/unreadable/failed), and any
-        per-file errors. Only the latest job is retained — an old jobId, or
-        any jobId from before a server restart, raises an error.
+        counts (scanned/ingested/skipped/moved/deleted/relabelled/unreadable/
+        failed), and any per-file errors. Only the latest job is retained — an
+        old jobId, or any jobId from before a server restart, raises an error.
+
+        relabelled counts documents whose labels were rewritten from their
+        stored text, with nothing re-embedded: classify.toml changed, a move
+        put a file under other path rules, or the model answered after a model
+        problem had left a facet unanswered. It stays 0 without a classify.toml.
+        A labelling problem appears in errors with its message prefixed
+        "labels:"; it is not a failure.
 
         unreadable counts indexed sources this installation cannot read
         because an optional extra is absent (images need [ocr]); each one

@@ -330,8 +330,10 @@ specs for project X": the index knows a document's text, title and path, and
 nothing about what kind of document it is or when it was written. Document
 labels add both. Each document can carry one value per **facet** you define —
 a project, a kind of document — and a **document date**. `query_documents` and
-`list_files` then filter on them, and every result shows what it was labelled
-and how sure the label is.
+`list_files` then filter on them. Each document they return — a `sources` row of a
+search, a `files` row of a listing — carries its labels, how sure each one is, and
+its date with where the date came from; the CLI's human output shows the same on
+every row.
 
 The feature is **off unless the corpus has a taxonomy file**. Without it nothing
 changes: no new key in any tool, CLI or `status` output, no new dependency, no
@@ -360,10 +362,14 @@ source distribution, so you need a C/C++ toolchain (on macOS, the Xcode
 command-line tools: `xcode-select --install`). It took about 40 seconds on an
 Apple M-series laptop. The base install gains no dependency and no compile step.
 
-If the file is present and the extra is missing, nothing is silently skipped:
-`status` reports `labels.model: "unavailable"` with the install command in
-`labels.modelHint`, `sync` says why model-answered facets stayed unset, and a
-filter on such a facet carries a `filterNotice`.
+If the file is present and the extra is missing, model-answered facets stay unset,
+and that is reported rather than skipped silently: `status` reports
+`labels.model: "unavailable"` with the install command in `labels.modelHint` and
+counts the documents under `unlabelled`; `sync` lists the reason in its errors;
+`minirag-mcp ingest` and `ingest-url` print it as a `warn:` line; `classify try`
+exits 1; and a filter on such a facet carries a `filterNotice`. The MCP ingest
+tools (`ingest_file`, `ingest_data`, `ingest_url`) store the document and do not
+repeat the reason in their reply: `status` is where it shows.
 
 The file is re-read when it changes, so a long-running server picks up an edit
 without a restart. A file that cannot be parsed is reported by `status` under
@@ -424,8 +430,12 @@ with a non-empty `description`. Keys of a facet:
 A facet therefore needs the model unless it has a `default` and no
 `override_at`. A facet the model answers takes at most 16 values, and any such facet makes
 `[model]` required. Paths are compared after Unicode NFC normalization of both sides, so a
-rule typed in an editor matches a decomposed file name as macOS stores it. A text
-or URL document has no root, so path rules and `default` do not apply to it.
+rule typed in an editor matches a decomposed file name as macOS stores it.
+
+A text or URL document (`ingest_data`, `ingest_url`) has no root, so path rules,
+`default` and `within` cannot place it: a facet answered only by a `default` stays
+unset for it, a facet with `within` is absent, and only a facet the model answers
+gets a value.
 
 **`[model]`** names either a local file or a pinned download, never both:
 
@@ -456,12 +466,16 @@ offline and nothing leaves the machine. The model is **never loaded or downloade
 at server start, by `status`, by `list_files` or by a query**. The first document
 in a job that needs it loads it, and the job releases it when it ends.
 
-Every ingest path labels: `sync`, `minirag-mcp ingest`, and `ingest_file`. When
-the file changes, the next `sync` re-labels every document whose taxonomy differs,
-from the stored chunk text — nothing is re-parsed or re-embedded — and reports
-how many it re-labelled. A labelling failure (no extra, no model file, a failed
-download) never aborts a sync or counts as a failed file: the facet is left
-unset and the reason is added to the job's report.
+Every ingest path labels: `sync`, `minirag-mcp ingest` and `ingest-url`, and the
+`ingest_file`, `ingest_data` and `ingest_url` tools. When the file changes, the
+next `sync` re-labels every document whose taxonomy differs, from the stored chunk
+text — nothing is re-parsed or re-embedded — and reports how many it re-labelled
+in the `relabelled` count. A document a model problem left without an answer is
+re-labelled the same way by the first sync after the model works, and so is a
+moved file, whose new folder's path rules may give other values. A labelling
+failure (no extra, no model file, a failed download) never aborts a sync or
+counts as a failed file: the facet is left unset and the reason is added to the
+job's report.
 
 ### Writing descriptions: judge by form, not topic
 
@@ -509,7 +523,10 @@ undated last.
 
 The CLI takes the same filters as flags on `query` and `list`: `--label
 facet=value` (repeatable; repeating a facet matches any of its values),
-`--date-from`, `--date-to`, and `--sort date` on `list`.
+`--date-from`, `--date-to`, and `--sort date` on `list`. Without `--json`, each
+listed file and each `Sources:` line shows the document's date, its source in
+parentheses, and its labels, and non-zero `filterCounts` and the `filterNotice`
+are printed to stderr as `warn:` lines.
 
 ### Document dates
 
@@ -541,17 +558,21 @@ minirag-mcp classify try notes/2026-08-05-weekly-sync.md --json
 Labels one file the way an ingest would, and prints for each facet the value, its
 confidence and source, whether it is uncertain, and — for facets the model
 answered — the full probability distribution over the values, then the date and
-its source. Nothing is embedded or stored. It loads the model, so the first run
-downloads it.
+its source. A facet without a value is printed as `not set` with the reason. When
+the model could not answer a facet it was asked, the reason goes to stderr and
+the command exits 1. Nothing is embedded or stored. It loads the model, so the
+first run downloads it.
 
 ### How well it works
 
 On the maintainer's own 746-document corpus (one person's labels, tuned on the same
 documents they were measured on), the final value list gave 727 of 746 (97%) correct
 document types; at a confidence of 0.9 or more, 612 documents with 3 wrong; 29
-documents (4%) fell under 0.7. The first wording of the descriptions scored 91%,
-which is what "judge by form, not topic" fixed. Treat these as tuning-set numbers,
-not a promise for your corpus: run `classify try` on your own documents.
+documents (4%) fell under 0.7. The first wording of the descriptions scored 91%; with
+the question reworded to judge by form, not topic, and one kind of document moved to
+another value, the same documents scored 98% before the final value list. Treat these
+as tuning-set numbers, not a promise for your corpus: run `classify try` on your own
+documents.
 
 <a id="chunking"></a>
 ## Chunking
@@ -666,7 +687,7 @@ ever mention that its vectors describe truncated text.
 | Tool | Purpose |
 |---|---|
 | `sync_start` | Reconcile the index with the document roots (or one path inside them). Returns a `jobId`; the work runs in a background thread. |
-| `sync_status` | Poll a sync job started by `sync_start`. |
+| `sync_status` | Poll a sync job started by `sync_start`: its state, per-file errors and `counts` (`scanned`, `ingested`, `skipped`, `moved`, `deleted`, `relabelled`, `unreadable`, `failed`). `relabelled` counts documents whose [labels](#document-labels-optional) were rewritten from their stored text; it stays 0 without a `classify.toml`. |
 | `ingest_file` | Ingest or re-ingest one file, replacing any content already indexed for it. |
 | `ingest_data` | Ingest text/markdown/html content the client holds, under a source id you choose. |
 | `ingest_url` | Fetch an http(s) URL, convert it to Markdown, and index it. |
