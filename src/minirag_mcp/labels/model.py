@@ -7,10 +7,12 @@ is the MCP stdio channel; llama.cpp logs go to stderr.
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import importlib.util
 import json
 import math
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Protocol
@@ -37,6 +39,38 @@ CHAT_TEMPLATE = (
     "<|im_start|>user\n{user}<|im_end|>\n"
     "<|im_start|>assistant\n<think>\n\n</think>\n\n"
 )
+
+
+# ggml_log_level values.
+_LOG_ERROR = 3
+_LOG_CONT = 5
+
+# llama.cpp keeps only a raw pointer to its log callback, so the ctypes object must stay
+# referenced for as long as the library may log: a collected one crashes the next line.
+_log_callback: tuple[object, object] | None = None  # (the llama_cpp module, its callback)
+
+
+def _route_llama_logs(llama_cpp) -> None:
+    """Pass llama.cpp's own log lines to stderr, errors only.
+
+    The library is built with verbose=True because verbose=False points fds 1 and 2 at
+    /dev/null around the load, process wide, losing whatever the MCP server writes to
+    stdout meanwhile. verbose=True, left alone, prints every load and context line.
+    """
+    global _log_callback
+    if _log_callback is None or _log_callback[0] is not llama_cpp:
+        last = [0]
+
+        @llama_cpp.llama_log_callback
+        def forward(level: int, text: bytes, user_data) -> None:
+            if level != _LOG_CONT:
+                last[0] = level
+            if last[0] == _LOG_ERROR and text:
+                sys.stderr.write(text.decode("utf-8", "replace"))
+                sys.stderr.flush()
+
+        _log_callback = (llama_cpp, forward)
+    llama_cpp.llama_log_set(_log_callback[1], ctypes.c_void_p(0))
 
 
 class ModelError(Exception):
@@ -115,6 +149,7 @@ def resolve_model_file(spec: ModelSpec, cache_dir: Path) -> Path:
 class LlamaChoiceModel:
     def __init__(self, path: Path, temperature: float):
         try:
+            import llama_cpp
             import numpy  # noqa: F401
             from llama_cpp import Llama
         except ImportError as e:
@@ -122,6 +157,8 @@ class LlamaChoiceModel:
                 f"a classify dependency is present but failed to import: {e}; {INSTALL_HINT}"
             ) from e
 
+        # After the import: importing Llama installs the library's own, noisy callback.
+        _route_llama_logs(llama_cpp)
         self._temperature = temperature
         try:
             self._llm = Llama(
@@ -129,7 +166,7 @@ class LlamaChoiceModel:
                 n_ctx=N_CTX,
                 n_gpu_layers=-1,
                 n_batch=2048,
-                verbose=False,
+                verbose=True,
             )
         except Exception as e:
             raise ModelError(f"could not load the classify model {path}: {e}") from e

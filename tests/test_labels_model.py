@@ -1,7 +1,11 @@
+import gc
 import hashlib
 import importlib.util
 import json
 import math
+import sys
+import types
+import weakref
 from pathlib import Path
 
 import pytest
@@ -111,3 +115,83 @@ def test_the_default_factory_without_the_extra_says_what_to_install(tmp_path, mo
     monkeypatch.setattr(model, "available", lambda: False)
     with pytest.raises(ModelError, match=r"minirag-mcp\[classify\]"):
         default_model_factory(ModelSpec(temperature=1.0, path=tmp_path / "x.gguf"), tmp_path)
+
+
+class _FakeLlama:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.closed = False
+
+    def tokenize(self, text: bytes, add_bos: bool, special: bool) -> list[int]:
+        return [text[0]]
+
+    def close(self) -> None:
+        self.closed = True
+
+
+@pytest.fixture
+def fake_llama_cpp(monkeypatch):
+    """Stands in for the [classify] extra, which the base environment does not have."""
+    mod = types.ModuleType("llama_cpp")
+    mod.made = []
+    mod.callbacks = []
+
+    def make(**kwargs):
+        llm = _FakeLlama(**kwargs)
+        mod.made.append(llm)
+        return llm
+
+    mod.Llama = make
+    # A ctypes CFUNCTYPE instance wraps a Python function; the fake keeps it callable as is.
+    mod.llama_log_callback = lambda fn: fn
+    mod.llama_log_set = lambda callback, user_data: mod.callbacks.append(callback)
+    monkeypatch.setitem(sys.modules, "llama_cpp", mod)
+    return mod
+
+
+def test_the_model_is_built_so_that_the_library_never_redirects_stdout(
+    fake_llama_cpp, tmp_path, capfd
+):
+    """verbose=False makes llama-cpp-python point fds 1 and 2 at /dev/null around the
+    load, process wide, which loses whatever the MCP server writes to stdout meanwhile."""
+    model.LlamaChoiceModel(tmp_path / "m.gguf", 2.07)
+
+    [llm] = fake_llama_cpp.made
+    assert llm.kwargs["verbose"] is True
+    assert len(fake_llama_cpp.callbacks) == 1
+    assert capfd.readouterr().out == ""
+
+
+def test_the_installed_log_callback_forwards_errors_to_stderr_and_drops_the_rest(
+    fake_llama_cpp, tmp_path, capfd
+):
+    model.LlamaChoiceModel(tmp_path / "m.gguf", 2.07)
+    [callback] = fake_llama_cpp.callbacks
+
+    for level, text in [
+        (1, b"llama_model_loader: loaded meta data\n"),
+        (5, b"more of the same\n"),
+        (2, b"n_ctx_per_seq < n_ctx_train\n"),
+        (4, b"debug detail\n"),
+        (3, b"error loading model: "),
+        (5, b"truncated file\n"),
+    ]:
+        callback(level, text, None)
+
+    captured = capfd.readouterr()
+    assert captured.out == ""
+    assert captured.err == "error loading model: truncated file\n"
+
+
+def test_the_log_callback_stays_referenced_while_the_library_can_call_it(fake_llama_cpp, tmp_path):
+    """llama.cpp keeps only a raw pointer: a collected ctypes callback crashes the next log."""
+    model.LlamaChoiceModel(tmp_path / "a.gguf", 2.07)
+    model.LlamaChoiceModel(tmp_path / "b.gguf", 2.07)
+
+    first, second = fake_llama_cpp.callbacks
+    assert first is second
+    ref = weakref.ref(first)
+    del first, second
+    fake_llama_cpp.callbacks.clear()
+    gc.collect()
+    assert ref() is not None
