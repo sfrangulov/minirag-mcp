@@ -629,8 +629,11 @@ def test_preview_labels_writes_nothing(corpus, model_factory):
     model_factory.answers = {"Minutes of": {"minutes": 0.6, "report": 0.4}}
     doc = corpus.doc("alpha/weekly.md", "Minutes of the weekly sync. Date: 14 March 2026.", 3)
 
-    labels, trace = corpus.pipeline.preview_labels(doc)
+    preview = corpus.pipeline.preview_labels(doc)
+    labels, trace = preview.labels, preview.distribution
 
+    assert preview.facets == ("initiative", "type")
+    assert preview.unset == {} and preview.problems == []
     assert labels.labels == {
         "initiative": Label("alpha", 1.0, "path"),
         "type": Label("minutes", 0.6, "model", second="report", uncertain=True),
@@ -646,6 +649,24 @@ def test_preview_labels_writes_nothing(corpus, model_factory):
     corpus.pipeline.ingest_file(doc)
     previewed, ingested = (m.calls[0][1] for m in model_factory.created)
     assert previewed == ingested
+
+
+def test_preview_labels_says_why_a_facet_has_no_label_and_what_went_wrong(corpus, model_factory):
+    corpus.taxonomy(TAXONOMY + 'within = ["alpha"]\n')
+    model_factory.error = ModelError("the classify model is not installed")
+    inside = corpus.doc("alpha/weekly.md", "Minutes of the weekly sync.")
+    outside = corpus.doc("beta/notes.md", "Minutes of the weekly sync.")
+
+    asked = corpus.pipeline.preview_labels(inside)
+    not_asked = corpus.pipeline.preview_labels(outside)
+
+    assert asked.labels.labels == {"initiative": Label("alpha", 1.0, "path")}
+    assert asked.labels.unanswered == {"type"}
+    assert asked.unset == {"type": "the model did not answer"}
+    assert asked.problems == ["the classify model is not installed"]
+    assert not_asked.labels.unanswered == frozenset()
+    assert not_asked.unset == {"type": "outside within: alpha"}
+    assert not_asked.problems == []
 
 
 def test_preview_labels_without_classify_toml_is_refused(corpus, model_factory):

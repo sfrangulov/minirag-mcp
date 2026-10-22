@@ -27,6 +27,8 @@ class DocLabels:
     labels: Mapping[str, Label]
     date: DocDate
     taxonomy_hash: str
+    # Facets the model was asked for and did not answer because of a model problem.
+    unanswered: frozenset[str] = frozenset()
 
     def labels_json(self) -> str:
         if not self.labels:

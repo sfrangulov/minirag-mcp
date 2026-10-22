@@ -18,7 +18,6 @@ from minirag_mcp.embedder import Embedder, EmbedderUnavailableError, UnknownMode
 from minirag_mcp.ingest.pipeline import IngestResult, Pipeline
 from minirag_mcp.ingest.scanner import scan_roots
 from minirag_mcp.labels import LabelerSource
-from minirag_mcp.labels.filters import LabelFilterError
 from minirag_mcp.labels.model import default_model_factory
 from minirag_mcp.lock import SyncLockBusy
 from minirag_mcp.results import (
@@ -146,6 +145,41 @@ def _result_line(r: dict) -> str:
     )
 
 
+def _document_suffix(row: dict) -> str:
+    """A `sources` or `files` row's date and labels, so `--sort date` order is visible."""
+    parts = []
+    if "date" in row:
+        parts.append(f"{row['date']['value']} ({row['date']['source']})")
+    for facet, lab in row.get("labels", {}).items():
+        parts.append(f"{facet}={lab['value']}" + (" (uncertain)" if lab["uncertain"] else ""))
+    return "".join(f" {p}" for p in parts)
+
+
+def _documents(n: int) -> str:
+    return f"{n} document{'' if n == 1 else 's'} in scope {'was' if n == 1 else 'were'}"
+
+
+def _warn_filter(payload: dict) -> None:
+    """What a filter left out, which a human reader would otherwise only see as silence."""
+    counts = payload.get("filterCounts", {})
+    if n := counts.get("unlabelled"):
+        print(
+            f"warn: {_documents(n)} left out for having no label for a filtered facet",
+            file=sys.stderr,
+        )
+    if n := counts.get("undated"):
+        print(f"warn: {_documents(n)} left out for having no date", file=sys.stderr)
+    if "filterNotice" in payload:
+        print(f"warn: {payload['filterNotice']}", file=sys.stderr)
+
+
+def _warn_labelling(pipeline: Pipeline, problems: list[str]) -> None:
+    """A job's labelling problems, in the shape `sync` reports them. Not failures."""
+    taxonomy = pipeline.labels.path if pipeline.labels else ""
+    for problem in problems:
+        print(f"warn: {taxonomy}: labels: {problem}", file=sys.stderr)
+
+
 @app.command
 def ingest(
     paths: list[str],
@@ -182,11 +216,13 @@ def ingest(
     except Exception as e:  # SecurityError or a scan-time filesystem error
         _fail(str(e))
     done: list[IngestResult] = []
-    for f in files:
-        try:
-            done.append(pipeline.ingest_file(f))
-        except Exception as e:  # per-file failures never abort the batch
-            failures.append({"source": str(f), "error": str(e)})
+    # One job, so the model is loaded once for the whole run, not once per file.
+    with pipeline.job() as report:
+        for f in files:
+            try:
+                done.append(pipeline.ingest_file(f))
+            except Exception as e:  # per-file failures never abort the batch
+                failures.append({"source": str(f), "error": str(e)})
     payload = {
         "ingested": [{"source": r.source, "chunkCount": r.chunk_count} for r in done],
         "failed": failures,
@@ -195,6 +231,7 @@ def ingest(
     _emit(payload, json, human)
     for fail in failures:
         print(f"warn: {fail['source']}: {fail['error']}", file=sys.stderr)
+    _warn_labelling(pipeline, report.problems)
     if failures:
         raise SystemExit(1)
 
@@ -214,7 +251,8 @@ def ingest_url(
     """Fetch an http(s) URL and index it."""
     _, _, pipeline = _load(base_dir, db_path, cache_dir, model_name)
     try:
-        r = pipeline.ingest_url(url, source=source, title=title)
+        with pipeline.job() as report:
+            r = pipeline.ingest_url(url, source=source, title=title)
     except Exception as e:
         _fail(str(e))
     _emit(
@@ -222,6 +260,7 @@ def ingest_url(
         json,
         f"ingested {r.source} ({r.chunk_count} chunks)",
     )
+    _warn_labelling(pipeline, report.problems)
 
 
 @app.command
@@ -308,11 +347,13 @@ def query(
         human = "\n".join(_result_line(r) for r in payload["results"])
         human += "\n\nSources:\n" + "\n".join(
             f"  {s['source']} ({s['hits']} hit{'s' if s['hits'] != 1 else ''})"
+            + _document_suffix(s)
             for s in payload["sources"]
         )
     else:
         human = "no results" + (f" — {payload['notice']}" if "notice" in payload else "")
     _emit(payload, json, human)
+    _warn_filter(payload)
 
 
 @app.command(name="read-neighbors")
@@ -436,11 +477,13 @@ def list_cmd(
     human = "\n".join(
         f"[{f['state']}] {f['source']} ({f['chunkCount']} chunks)"
         + (f" [ocr:{f['ocrEngine']}]" if f["ocrEngine"] else "")
+        + _document_suffix(f)
         for f in payload["files"]
     )
     _emit(payload, json, human or "no files found")
     for folder in payload["unlistedFolders"]:
         print(f"warn: {folder['path']}: {folder['message']}", file=sys.stderr)
+    _warn_filter(payload)
 
 
 @app.command
@@ -535,10 +578,11 @@ def classify_try(
     cfg, _, pipeline = _load(base_dir, db_path, cache_dir, model_name)
     try:
         target = resolve_in_roots(path, cfg.roots, require_absolute=False)
-        doc, trace = pipeline.preview_labels(target)
-    except (SecurityError, LabelFilterError) as e:
+        preview = pipeline.preview_labels(target)
+    except Exception as e:  # labels off, a path outside the roots, a file it cannot read
         _fail(str(e))
         raise AssertionError from e  # unreachable
+    doc, trace = preview.labels, preview.distribution
     payload = {
         "source": str(target),
         "labels": {
@@ -551,12 +595,21 @@ def classify_try(
             }
             for facet, lab in doc.labels.items()
         },
+        "unset": preview.unset,
+        "unanswered": sorted(doc.unanswered),
         "date": {"value": doc.date.value, "source": doc.date.source},
         "distribution": trace,
+        "problems": preview.problems,
     }
     lines = [str(target)]
-    for facet, lab in doc.labels.items():
+    for facet in preview.facets:
+        lab = doc.labels.get(facet)
+        if lab is None:
+            lines.append(f"{facet}: not set ({preview.unset[facet]})")
+            continue
         flag = " (uncertain)" if lab.uncertain else ""
+        if facet in doc.unanswered:
+            flag += " (the model did not answer)"
         lines.append(f"{facet}: {lab.value} [{lab.source}, {lab.confidence:.2f}]{flag}")
         for value, p in sorted(trace.get(facet, {}).items(), key=lambda kv: -kv[1]):
             lines.append(f"    {p:.3f}  {value}")
@@ -564,3 +617,7 @@ def classify_try(
         f"date: {doc.date.value or 'none'}" + (f" [{doc.date.source}]" if doc.date.value else "")
     )
     _emit(payload, json, "\n".join(lines))
+    _warn_labelling(pipeline, preview.problems)
+    # The preview exists to show the model's answers; one it could not give is a failure.
+    if doc.unanswered:
+        raise SystemExit(1)

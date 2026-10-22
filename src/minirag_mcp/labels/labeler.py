@@ -152,7 +152,12 @@ class Labeler:
         # so the next re-label pass tries again. One the path resolved after the model
         # failed to override it is complete.
         complete = not (doc.unanswered - labels.keys())
-        return DocLabels(labels=labels, date=date, taxonomy_hash=self._hash if complete else "")
+        return DocLabels(
+            labels=labels,
+            date=date,
+            taxonomy_hash=self._hash if complete else "",
+            unanswered=frozenset(doc.unanswered),
+        )
 
     def _ask(self, report: JobReport, doc: _Document, facet: Facet) -> Mapping[str, float]:
         spec = self.taxonomy.model

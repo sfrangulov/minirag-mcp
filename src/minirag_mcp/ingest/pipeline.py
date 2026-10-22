@@ -23,8 +23,8 @@ from minirag_mcp.ingest.parser import (
     supported_extensions,
 )
 from minirag_mcp.labels import JobReport, Labeler, LabelerSource
-from minirag_mcp.labels.filters import LabelFilterError
-from minirag_mcp.labels.resolve import DocLabels
+from minirag_mcp.labels.filters import LabelFilterError, facet_applies
+from minirag_mcp.labels.resolve import DocLabels, root_relative
 from minirag_mcp.security import check_url
 from minirag_mcp.store import LABEL_COLUMNS, ChunkRecord, SourceInfo, Store
 
@@ -89,6 +89,20 @@ def _already_stored(info: SourceInfo, columns: dict[str, str]) -> bool:
         columns["doc_date"],
         columns["doc_date_source"],
     )
+
+
+@dataclass(frozen=True)
+class LabelPreview:
+    """One file labelled as an ingest would label it; nothing embedded or stored."""
+
+    labels: DocLabels
+    distribution: dict[str, dict[str, float]]
+    # Every facet of the taxonomy, in its order.
+    facets: tuple[str, ...]
+    # Why each facet without a label has none.
+    unset: dict[str, str]
+    # The job's labelling problems, read once it ended.
+    problems: list[str]
 
 
 @dataclass(frozen=True)
@@ -403,12 +417,12 @@ class Pipeline:
                     on_event(f"relabelled {info.source}")
             return relabelled, errors
 
-    def preview_labels(self, path: Path) -> tuple[DocLabels, dict[str, dict[str, float]]]:
+    def preview_labels(self, path: Path) -> LabelPreview:
         """Label one file as an ingest would, with each model answer's full distribution.
 
         Nothing is embedded or stored.
         """
-        with self.job():
+        with self.job() as report:
             job = self._active()
             if job is None or job.labeler is None:
                 if self.labels is None:
@@ -422,7 +436,8 @@ class Pipeline:
             doc = parse_file(path, self.config)
             chunks = self._chunk(doc.markdown, source=str(path), title=doc.title, seed_title=True)
             trace: dict[str, dict[str, float]] = {}
-            labels = job.labeler.label(
+            labeler = job.labeler
+            labels = labeler.label(
                 source=str(path),
                 source_type="file",
                 title=doc.title,
@@ -430,4 +445,21 @@ class Pipeline:
                 file_time=_file_time(info),
                 trace=trace,
             )
-            return labels, trace
+        rel = root_relative(str(path), labeler.roots)
+        unset: dict[str, str] = {}
+        for facet in labeler.taxonomy.facets:
+            if facet.name in labels.labels:
+                continue
+            if facet.name in labels.unanswered:
+                unset[facet.name] = "the model did not answer"
+            elif not facet_applies(facet, rel):
+                unset[facet.name] = f"outside within: {', '.join(facet.within)}"
+            else:
+                unset[facet.name] = "no path rule, default or model answer gave it a value"
+        return LabelPreview(
+            labels=labels,
+            distribution=trace,
+            facets=tuple(f.name for f in labeler.taxonomy.facets),
+            unset=unset,
+            problems=list(report.problems),
+        )
