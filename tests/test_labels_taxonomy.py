@@ -1,3 +1,4 @@
+import re
 import unicodedata
 from pathlib import Path
 
@@ -43,6 +44,20 @@ def write(tmp_path: Path, text: str) -> Path:
     return p
 
 
+def fails(tmp_path: Path, text: str, pattern: str) -> None:
+    """Assert load_taxonomy rejects `text` with a message that starts with `pattern`.
+
+    The message is matched with the file path stripped: tmp_path embeds the test name.
+    """
+    path = write(tmp_path, text)
+    with pytest.raises(TaxonomyError) as exc:
+        load_taxonomy(path)
+    message = str(exc.value)
+    prefix = f"{path}: "
+    assert message.startswith(prefix), message
+    assert re.match(pattern, message[len(prefix) :]), message
+
+
 def test_minimal_file_loads(tmp_path):
     t = load_taxonomy(write(tmp_path, MINIMAL))
     assert [f.name for f in t.facets] == ["type"]
@@ -76,14 +91,12 @@ def test_unknown_facet_raises_key_error(tmp_path):
     ],
 )
 def test_an_unknown_key_is_named(tmp_path, text, key):
-    with pytest.raises(TaxonomyError, match=key):
-        load_taxonomy(write(tmp_path, text))
+    fails(tmp_path, text, rf"{key}: unknown key")
 
 
 def test_default_must_be_one_of_the_values(tmp_path):
     text = PATH_ONLY.replace('default = "alpha"', 'default = "gamma"')
-    with pytest.raises(TaxonomyError, match=r"facets\.project\.default"):
-        load_taxonomy(write(tmp_path, text))
+    fails(tmp_path, text, r"facets\.project\.default: 'gamma' is not one of")
 
 
 def test_model_section_is_required_only_when_a_facet_needs_the_model(tmp_path):
@@ -91,14 +104,12 @@ def test_model_section_is_required_only_when_a_facet_needs_the_model(tmp_path):
     assert t.model is None
     assert not t.facet("project").needs_model
     needs = PATH_ONLY.replace('default = "alpha"\n', "")
-    with pytest.raises(TaxonomyError, match=r"\[model\]"):
-        load_taxonomy(write(tmp_path, needs))
+    fails(tmp_path, needs, r"\[model\] is required: facets project are answered")
 
 
 def test_override_at_makes_a_defaulted_facet_need_the_model(tmp_path):
     text = PATH_ONLY.replace('default = "alpha"', 'default = "alpha"\noverride_at = 0.9')
-    with pytest.raises(TaxonomyError, match=r"\[model\]"):
-        load_taxonomy(write(tmp_path, text))
+    fails(tmp_path, text, r"\[model\] is required: facets project are answered")
     t = load_taxonomy(write(tmp_path, text + MINIMAL.split("[facets.type]")[0]))
     assert t.facet("project").needs_model
 
@@ -106,22 +117,22 @@ def test_override_at_makes_a_defaulted_facet_need_the_model(tmp_path):
 @pytest.mark.parametrize("bad", ["0", "1.5", "-0.1"])
 def test_override_at_is_in_zero_exclusive_to_one(tmp_path, bad):
     text = PATH_ONLY.replace('default = "alpha"', f'default = "alpha"\noverride_at = {bad}')
-    with pytest.raises(TaxonomyError, match=r"facets\.project\.override_at"):
-        load_taxonomy(write(tmp_path, text + MINIMAL.split("[facets.type]")[0]))
+    fails(
+        tmp_path,
+        text + MINIMAL.split("[facets.type]")[0],
+        r"facets\.project\.override_at: must be in",
+    )
 
 
 def test_model_is_a_path_or_a_fully_pinned_repo(tmp_path):
     both = MINIMAL.replace('path = "/models/plumb.gguf"', 'path = "/m.gguf"\nrepo = "o/r"')
-    with pytest.raises(TaxonomyError, match=r"model"):
-        load_taxonomy(write(tmp_path, both))
+    fails(tmp_path, both, r"model: give either path or repo/file/revision/sha256, not both")
     no_sha = MINIMAL.replace(
         'path = "/models/plumb.gguf"', 'repo = "o/r"\nfile = "f.gguf"\nrevision = "abc"'
     )
-    with pytest.raises(TaxonomyError, match="sha256"):
-        load_taxonomy(write(tmp_path, no_sha))
+    fails(tmp_path, no_sha, r"model\.sha256: a pinned download needs")
     neither = MINIMAL.replace('path = "/models/plumb.gguf"\n', "")
-    with pytest.raises(TaxonomyError, match=r"model"):
-        load_taxonomy(write(tmp_path, neither))
+    fails(tmp_path, neither, r"model: give either path or repo/file/revision/sha256$")
     pinned = MINIMAL.replace(
         'path = "/models/plumb.gguf"',
         'repo = "o/r"\nfile = "f.gguf"\nrevision = "abc"\nsha256 = "def"',
@@ -148,8 +159,7 @@ def test_model_numbers_are_range_checked(tmp_path, field, value):
     text = MINIMAL.replace("temperature = 2.07", "temperature = 2.07\n" + f"{field} = {value}")
     if field == "temperature":
         text = MINIMAL.replace("2.07", value)
-    with pytest.raises(TaxonomyError, match=field):
-        load_taxonomy(write(tmp_path, text))
+    fails(tmp_path, text, rf"model\.{field}: must be")
 
 
 def _facet_with(n: int) -> str:
@@ -159,8 +169,7 @@ def _facet_with(n: int) -> str:
 
 def test_a_model_facet_takes_at_most_16_values(tmp_path):
     assert len(load_taxonomy(write(tmp_path, _facet_with(16))).facet("type").values) == 16
-    with pytest.raises(TaxonomyError, match="16"):
-        load_taxonomy(write(tmp_path, _facet_with(17)))
+    fails(tmp_path, _facet_with(17), r"facets\.type\.values: .*at most 16 values")
 
 
 def test_a_path_only_facet_may_exceed_16_values(tmp_path):
@@ -170,35 +179,51 @@ def test_a_path_only_facet_may_exceed_16_values(tmp_path):
 
 
 def test_a_facet_needs_at_least_one_value(tmp_path):
-    with pytest.raises(TaxonomyError, match=r"facets\.p"):
-        load_taxonomy(write(tmp_path, '[facets.p]\ndefault = "x"\n'))
+    fails(tmp_path, '[facets.p]\ndefault = "x"\n', r"facets\.p\.values: at least one value")
 
 
 def test_descriptions_are_non_empty(tmp_path):
-    with pytest.raises(TaxonomyError, match=r"facets\.type\.values\.mail\.description"):
-        load_taxonomy(write(tmp_path, MINIMAL.replace("Mail. Project correspondence.", "  ")))
+    fails(
+        tmp_path,
+        MINIMAL.replace("Mail. Project correspondence.", "  "),
+        r"facets\.type\.values\.mail\.description: must be a non-empty",
+    )
     missing = MINIMAL.replace('{ description = "Mail. Project correspondence." }', "{ paths = [] }")
-    with pytest.raises(TaxonomyError, match=r"facets\.type\.values\.mail\.description"):
-        load_taxonomy(write(tmp_path, missing))
+    fails(tmp_path, missing, r"facets\.type\.values\.mail\.description: must be a non-empty")
 
 
 def test_ids_are_lowercase_slugs(tmp_path):
-    with pytest.raises(TaxonomyError, match=r"Mail"):
-        load_taxonomy(write(tmp_path, MINIMAL.replace("values.mail", "values.Mail")))
-    with pytest.raises(TaxonomyError, match=r"facets"):
-        load_taxonomy(write(tmp_path, MINIMAL.replace("facets.type", "facets.Type")))
-    with pytest.raises(TaxonomyError, match=r"a=b"):
-        load_taxonomy(write(tmp_path, MINIMAL.replace("values.mail", 'values."a=b"')))
+    fails(
+        tmp_path,
+        MINIMAL.replace("values.mail", "values.Mail"),
+        r"facets\.type\.values\.Mail: 'Mail' is not a lowercase slug",
+    )
+    fails(
+        tmp_path,
+        MINIMAL.replace("facets.type", "facets.Type"),
+        r"facets\.Type: 'Type' is not a lowercase slug",
+    )
+    fails(
+        tmp_path,
+        MINIMAL.replace("values.mail", 'values."a=b"'),
+        r"facets\.type\.values\.a=b: 'a=b' is not a lowercase slug",
+    )
     ok = MINIMAL.replace("facets.type", "facets.client-data")
     assert load_taxonomy(write(tmp_path, ok)).facets[0].name == "client-data"
 
 
 def test_paths_are_relative_and_normalised(tmp_path):
     base = PATH_ONLY.replace('paths = ["beta"]', 'paths = ["{p}"]')
-    with pytest.raises(TaxonomyError, match=r"facets\.project\.values\.beta\.paths"):
-        load_taxonomy(write(tmp_path, base.replace("{p}", "/abs")))
-    with pytest.raises(TaxonomyError, match=r"facets\.project\.values\.beta\.paths"):
-        load_taxonomy(write(tmp_path, base.replace("{p}", "")))
+    fails(
+        tmp_path,
+        base.replace("{p}", "/abs"),
+        r"facets\.project\.values\.beta\.paths: .*non-empty relative path",
+    )
+    fails(
+        tmp_path,
+        base.replace("{p}", ""),
+        r"facets\.project\.values\.beta\.paths: .*non-empty relative path",
+    )
     t = load_taxonomy(write(tmp_path, base.replace("{p}", "a/b/")))
     assert t.facet("project").values[1].paths == ("a/b",)
     nfd = unicodedata.normalize("NFD", "й")
@@ -211,13 +236,11 @@ def test_within_is_validated_and_normalised(tmp_path):
     text = PATH_ONLY.replace('default = "alpha"', 'default = "alpha"\nwithin = ["x/y/"]')
     assert load_taxonomy(write(tmp_path, text)).facet("project").within == ("x/y",)
     bad = PATH_ONLY.replace('default = "alpha"', 'default = "alpha"\nwithin = ["/x"]')
-    with pytest.raises(TaxonomyError, match=r"facets\.project\.within"):
-        load_taxonomy(write(tmp_path, bad))
+    fails(tmp_path, bad, r"facets\.project\.within: '/x' must be a non-empty relative path")
 
 
 def test_invalid_toml_is_a_taxonomy_error(tmp_path):
-    with pytest.raises(TaxonomyError, match="classify.toml"):
-        load_taxonomy(write(tmp_path, "[model\n"))
+    fails(tmp_path, "[model\n", r"(Invalid|Unclosed|Expected)")
 
 
 def test_hash_ignores_formatting_but_not_content(tmp_path):
