@@ -200,12 +200,20 @@ model — see [Requirements](#requirements).
 
 ## Supported Content
 
-Files under the document root(s) with one of these 12 extensions are picked
-up by `sync_start`/`sync` and `ingest_file`/`ingest`, converted to Markdown by
-`markitdown`:
+Files under the document root(s) with one of these 13 extensions are picked
+up by `sync_start`/`sync` and `ingest_file`/`ingest` and converted to Markdown,
+all but `.vtt` by `markitdown`:
 
 `.md` `.markdown` `.txt` `.pdf` `.docx` `.pptx` `.xlsx` `.html` `.htm` `.csv`
-`.epub` `.ipynb`
+`.epub` `.ipynb` `.vtt`
+
+A `.vtt` is a WebVTT transcript, the format Teams and Zoom export a call in. Each
+turn becomes a `**Speaker** MM:SS` line followed by what was said, with the
+segments Teams cuts one utterance into joined back together, so a call is chunked
+as a [transcript](#chunking). It is read by a parser of its own: `markitdown`
+has no WebVTT converter and would index the raw cue ids and timings as plain
+text. A `.vtt` that cannot be parsed, or whose encoding cannot be told (save it
+as UTF-8), fails instead.
 
 A scan skips dot-prefixed names and the `~$…` lock files Word, Excel and
 PowerPoint keep beside every open document. Such a lock file carries the
@@ -357,7 +365,7 @@ specifications and instructions alike:
 
 | Detected as | Section (returned) | Retrieval unit |
 |---|---|---|
-| Transcript — a regular timestamp line, with or without a speaker in front | 120-second window, labelled `[MM:SS–MM:SS]` plus the meeting title | successive turns packed to the budget |
+| Transcript — a regular timestamp line, with or without a speaker in front; a `.vtt` is converted into this shape | 120-second window, labelled `[MM:SS–MM:SS]` plus the meeting title | successive turns packed to the budget |
 | Slides — `<!-- Slide number: N -->` markers | one slide | the slide, split only if over budget |
 | Headings — two or more ATX headings (specs, instructions, spreadsheets) | heading section | paragraphs and rows packed to the budget, each carrying the heading breadcrumb |
 | Anything else | one structural block | the block, packed to the budget |
@@ -1071,4 +1079,7 @@ the PyPI release and re-run the workflow.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE). `src/minirag_mcp/ingest/vtt.py` is adapted from
+[webvtt-to-markdown](https://github.com/GreenJesterAt/webvtt-to-markdown) and
+remains under the Apache License 2.0 — see
+[LICENSES/webvtt-to-markdown.txt](LICENSES/webvtt-to-markdown.txt).

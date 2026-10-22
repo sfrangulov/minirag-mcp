@@ -90,6 +90,7 @@ src/minirag_mcp/
                           \                    /
                            pipeline / store / embedder        <- the core
   ingest/parser.py    markitdown: file, HTML, URL -> Markdown + title
+  ingest/vtt.py       WebVTT -> transcript turns, bypassing markitdown
   ingest/pipeline.py  parse -> chunk -> embed -> store (replace by source)
   ingest/scanner.py   recursive walk, extension whitelist, sha256 sync diff
   chunker/            structural split (code fences atomic) then semantic merge
