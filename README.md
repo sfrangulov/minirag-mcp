@@ -46,6 +46,9 @@ built on [fastmcp](https://github.com/jlowin/fastmcp),
 - **Scans, with the optional `[ocr]` extra** — image-only PDFs are recognized
   page by page and standalone images become documents, locally, on the CPU.
   See [OCR for scanned documents](#ocr-for-scanned-documents).
+- **Document labels, with the optional `[classify]` extra** — filter by kind of
+  document, project and date, labelled locally. See [Document labels
+  (optional)](#document-labels-optional).
 - **Searches without being asked** — the server ships a routing policy that
   clients put in front of the model, so a question your documents can answer
   goes to the index instead of to the model's memory. See [Search by
@@ -319,6 +322,236 @@ recognition errors in low-contrast regions: `р`→`о` and `ц`→`и` confusio
 company names, Cyrillic `Б` read as Latin `6` or `E` inside codes, one dropped
 product name and one dropped total. Search over a scan finds the document; the
 document is what you read, and the scan is what settles a disputed figure.
+
+## Document labels (optional)
+
+A search over chunks cannot answer "show me the minutes from last week" or "the
+specs for project X": the index knows a document's text, title and path, and
+nothing about what kind of document it is or when it was written. Document
+labels add both. Each document can carry one value per **facet** you define —
+a project, a kind of document — and a **document date**. `query_documents` and
+`list_files` then filter on them, and every result shows what it was labelled
+and how sure the label is.
+
+The feature is **off unless the corpus has a taxonomy file**. Without it nothing
+changes: no new key in any tool, CLI or `status` output, no new dependency, no
+model ever loaded.
+
+### Enabling it
+
+Create `<root>/.minirag/classify.toml`, where `<root>` is the first document root
+(the first `BASE_DIR` / `--base-dir`). The file lives with the corpus rather than
+in environment variables because it describes the corpus, and the MCP server and
+the CLI must read the same thing. Its presence turns the feature on.
+
+Facets answered by paths or defaults need nothing else. A facet answered by the
+model needs the optional `[classify]` extra, which runs a small local model
+in-process through [llama.cpp](https://github.com/ggml-org/llama.cpp):
+
+```bash
+uv tool install 'minirag-mcp[classify]'
+```
+
+or, in any client config on this page, replace `uvx minirag-mcp` with
+`uvx --from 'minirag-mcp[classify]' minirag-mcp`.
+
+**Installing the extra compiles llama.cpp**: `llama-cpp-python` ships only a
+source distribution, so you need a C/C++ toolchain (on macOS, the Xcode
+command-line tools: `xcode-select --install`). It took about 40 seconds on an
+Apple M-series laptop. The base install gains no dependency and no compile step.
+
+If the file is present and the extra is missing, nothing is silently skipped:
+`status` reports `labels.model: "unavailable"` with the install command in
+`labels.modelHint`, `sync` says why model-answered facets stayed unset, and a
+filter on such a facet carries a `filterNotice`.
+
+The file is re-read when it changes, so a long-running server picks up an edit
+without a restart. A file that cannot be parsed is reported by `status` under
+`labels.error`, and tools that filter by label refuse with the same message.
+
+### The file format
+
+A synthetic example for a documents folder with two projects:
+
+```toml
+[model]
+repo = "crh225/plumb-4b-GGUF"
+file = "plumb-4b-v5-Q8_0.gguf"
+revision = "71c1c57e523219124f7be9c486d475d19891185f"
+sha256 = "a0d2974e04541b79e167d8acabfb7a7e4b4f93f3b47ac4a006d196d240f68177"
+temperature = 2.07       # the model's calibration temperature, from its model card
+uncertain_below = 0.7    # a top probability under this marks a label uncertain
+
+[facets.project]
+default = "main"         # no path rule matched: this value, with no model call
+values.main = { description = "The main product." }
+values.pilots = { description = "Pilot projects.", paths = ["pilots"] }
+
+[facets.type]
+question = "What kind of document is this? Judge by its form, not by the topic it discusses."
+override_at = 0.9        # a path rule is the default; the model replaces it only at p >= 0.9
+values.minutes = { description = "Minutes. Date, participants, questions discussed, decisions and actions." }
+values.mail = { description = "Mail. A message with sender, recipients and a subject line." }
+values.report = { description = "Report. A status or analysis document with sections and findings." }
+values.transcript = { description = "Transcript. Verbatim record of a call: spoken turns with timestamps, whatever the topic.", paths = ["recordings"] }
+values.other = { description = "Other. Notes, READMEs, anything that fits no other kind." }
+```
+
+`[model]` and `[facets.*]` are the only top-level tables; anything else, and any
+unknown key, is an error that names the key.
+
+**Facets.** A facet name and each value id are lowercase slugs (`a-z`, `0-9`,
+`_`, `-`), because they appear in filters. Every facet needs at least one value
+with a non-empty `description`. Keys of a facet:
+
+| Key | Meaning |
+|---|---|
+| `values.<id>` | `description` (required) and `paths` (optional list of folders, relative to the root). |
+| `question` | The question put to the model. Defaults to `"What kind of document is this?"`. |
+| `within` | Folders the facet applies to. Outside them the facet is not set at all. |
+| `default` | A value id used when no path rule matches, with no model call. |
+| `override_at` | A number in `(0, 1]`. A path rule still gets the model's opinion, which replaces it only at this confidence or above. |
+
+**How one facet is resolved for one document**, in order:
+
+1. `within` is set and the document is outside it: the facet is absent.
+2. The longest matching `paths` prefix gives the value (confidence 1, source
+   `path`). With `override_at`, the model is still asked and wins only at or
+   above that confidence.
+3. `default` is set: that value (source `default`), no model call.
+4. Otherwise the model answers (source `model`).
+
+A facet therefore needs the model unless it has a `default` and no
+`override_at`. A facet the model answers takes at most 16 values, and any such facet makes
+`[model]` required. Paths are compared after Unicode NFC normalization of both sides, so a
+rule typed in an editor matches a decomposed file name as macOS stores it. A text
+or URL document has no root, so path rules and `default` do not apply to it.
+
+**`[model]`** names either a local file or a pinned download, never both:
+
+| Key | Meaning |
+|---|---|
+| `path` | A local GGUF file (`~` is expanded). |
+| `repo`, `file`, `revision`, `sha256` | A Hugging Face file; all four are required together. |
+| `temperature` | Required, greater than 0: the model's calibration temperature. |
+| `uncertain_below` | In `(0, 1)`, default `0.7`. |
+| `file_name_label` | How the model is told the file name; default `"File name"`. Set it to the corpus language. |
+
+### The model
+
+The example pins [`crh225/plumb-4b-GGUF`](https://huggingface.co/crh225/plumb-4b-GGUF),
+a Qwen3.5-4B fine-tune that answers a closed question by reading out the
+probability of each option letter. The pin above is the revision and file this
+feature was built against:
+
+- file `plumb-4b-v5-Q8_0.gguf` (about 4.5 GB), revision
+  `71c1c57e523219124f7be9c486d475d19891185f`;
+- sha256 `a0d2974e04541b79e167d8acabfb7a7e4b4f93f3b47ac4a006d196d240f68177`,
+  checked after the download — a mismatch is a loud error;
+- `temperature = 2.07`, the calibration value from the model card;
+- licence: Apache-2.0.
+
+The file is downloaded once into `CACHE_DIR/classify`; after that everything is
+offline and nothing leaves the machine. The model is **never loaded or downloaded
+at server start, by `status`, by `list_files` or by a query**. The first document
+in a job that needs it loads it, and the job releases it when it ends.
+
+Every ingest path labels: `sync`, `minirag-mcp ingest`, and `ingest_file`. When
+the file changes, the next `sync` re-labels every document whose taxonomy differs,
+from the stored chunk text — nothing is re-parsed or re-embedded — and reports
+how many it re-labelled. A labelling failure (no extra, no model file, a failed
+download) never aborts a sync or counts as a failed file: the facet is left
+unset and the reason is added to the job's report.
+
+### Writing descriptions: judge by form, not topic
+
+The model decides from the first part of the document and its file name, and a
+small model is pulled toward the subject. A status deck about invoice approval
+reads as an invoice; a meeting about requirements reads as a specification. Write
+each description to say what the document *looks like* — its structure and the
+parts it always has — rather than what it is about, and put "Judge by its form,
+not by the topic it discusses" in `question`. Where a folder already tells you
+the answer, give it as a `paths` rule and let the model only override it at high
+confidence.
+
+Use `minirag-mcp classify try` (below) on a handful of documents, edit the file,
+and run it again before a full sync.
+
+### Uncertain labels and filter counts
+
+A label stores its value, its confidence, its source (`path`, `default` or
+`model`) and the runner-up. When a model label's top probability is under
+`uncertain_below`, the label is **uncertain**. Uncertain labels filter softly:
+a document matches a requested value if that is its label, or if its label is
+uncertain and the requested value is its runner-up. `status` counts uncertain
+documents per facet, so you can see how much of the corpus rests on a weak call.
+
+`query_documents` and `list_files` accept `labels` (`{facet: value}` or
+`{facet: [values]}`: values of one facet are alternatives, facets combine),
+`dateFrom` and `dateTo` (`YYYY-MM-DD`, inclusive). An unknown facet, an unknown
+value or a malformed date is refused with the list of what is valid. When a
+filter is set, the payload carries `filterCounts`:
+
+- `unlabelled` — documents in scope that were left out only because they have no
+  label for a filtered facet (not yet labelled, or the model is unavailable);
+- `undated` — documents in scope left out only because they have no date.
+
+A document with a confident, different label is excluded legitimately and is not
+counted, and neither is a document outside a facet's `within`. So a non-zero
+count means "the answer may be incomplete", never "the filter works".
+
+`status` carries a `labels` block — present only when the corpus has a taxonomy
+file: each facet with its question, its values with descriptions and document
+counts, `unlabelled` and `uncertain` counts, the `undated` total and the model
+state (`on demand`, `loaded` or `unavailable`). An agent reads it to map an
+approximate name to a value. `list_files` accepts `sort: "date"`, newest first and
+undated last.
+
+The CLI takes the same filters as flags on `query` and `list`: `--label
+facet=value` (repeatable; repeating a facet matches any of its values),
+`--date-from`, `--date-to`, and `--sort date` on `list`.
+
+### Document dates
+
+No model is involved. The first source that yields a date wins, and its name is
+stored and shown beside the date:
+
+1. **`document`** — a date in the header, within the first 1500 characters:
+   a `Date:` / `Sent:` field (also `Дата:`, `Отправлено:`), a Teams recording
+   header such as "August 5, 2026, 10:32AM", a printed weekday line such as
+   "Friday, 21 August 2026", a Russian outgoing-number line ("Исх. № … от
+   12.08.2026"), or a date in the first line when that line is at most 200
+   characters (a longer one is prose, whose dates may belong to cited documents).
+2. **`name`** — a date in the file name: `YYYY-MM-DD`, `YYYYMMDD`, `DDMMYYYY`,
+   `DD-MM-YYYY`, `DD.MM.YY(YY)`, `YY-MM-DD`, or a leading `DDMMYY`.
+3. **`file`** — the file's time. After a bulk copy every file has the same time,
+   so a `file` date can be meaningless; the source mark shows it.
+
+A date is never taken from the body: a cover letter cites the dates of the
+contracts it refers to. A document without any of these has no date and is left
+out of date filters (counted in `undated`).
+
+### Trying it: `classify try`
+
+```bash
+minirag-mcp classify try notes/2026-08-05-weekly-sync.md
+minirag-mcp classify try notes/2026-08-05-weekly-sync.md --json
+```
+
+Labels one file the way an ingest would, and prints for each facet the value, its
+confidence and source, whether it is uncertain, and — for facets the model
+answered — the full probability distribution over the values, then the date and
+its source. Nothing is embedded or stored. It loads the model, so the first run
+downloads it.
+
+### How well it works
+
+On the maintainer's own 746-document corpus (one person's labels, tuned on the same
+documents they were measured on), the final value list gave 727 of 746 (97%) correct
+document types; at a confidence of 0.9 or more, 612 documents with 3 wrong; 29
+documents (4%) fell under 0.7. The first wording of the descriptions scored 91%,
+which is what "judge by form, not topic" fixed. Treat these as tuning-set numbers,
+not a promise for your corpus: run `classify try` on your own documents.
 
 <a id="chunking"></a>
 ## Chunking
@@ -673,10 +906,14 @@ minirag-mcp status --json
 
 # Remove a file from the index (the file itself is untouched on disk)
 minirag-mcp delete ~/docs/old-notes.md
+
+# With a classify.toml: filter by label and date, or preview a file's labels
+minirag-mcp query "budget" --label type=minutes --date-from 2026-08-01
+minirag-mcp classify try ~/docs/notes.md
 ```
 
-The 9 subcommands: `ingest`, `ingest-url`, `sync`, `query`, `read-neighbors`,
-`read`, `list`, `status`, `delete`.
+The 10 subcommands: `ingest`, `ingest-url`, `sync`, `query`, `read-neighbors`,
+`read`, `list`, `status`, `delete`, `classify try`.
 
 Each subcommand's `--json` output carries the same fields as the matching MCP
 tool. Exit status is `0` on success and `1` on failure; `ingest` and `sync`
