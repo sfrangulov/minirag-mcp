@@ -40,7 +40,9 @@ class SyncJob:
             "deleted": 0,
             # Kept in step with the dict `_run_sync_unlocked` builds: a counter that
             # only appears once the job finishes makes every earlier poll report a
-            # different shape.
+            # different shape. For the same reason `relabelled` is here whether or not
+            # the corpus has a classify.toml.
+            "relabelled": 0,
             "unreadable": 0,
             "failed": 0,
         }
@@ -120,6 +122,7 @@ def _run_sync_unlocked(
         "skipped": len(diff.unchanged),
         "moved": 0,
         "deleted": 0,
+        "relabelled": 0,
         "unreadable": len(diff.unreadable),
         "failed": 0,
     }
@@ -157,30 +160,48 @@ def _run_sync_unlocked(
         emit(f"ingested {path}")
         return True
 
-    # A re-path that moved nothing (the origin was deleted meanwhile; delete_file takes
-    # no lock) or raised falls back to reading the file and then dropping the origin,
-    # which ends where the re-path would have. If the read fails too, both stay as they
-    # were and the next sync pairs them again.
-    for move in diff.moved:
-        try:
-            rows = store.move_source(move.source, str(move.path), mtime=move.mtime)
-        except Exception as e:
-            rows = 0
-            emit(f"could not re-path {move.source}, reading {move.path} instead: {e}")
-        if rows:
-            counts["moved"] += 1
-            emit(f"moved {move.source} -> {move.path}")
-        elif ingest(move.path) and store.delete_source(move.source):
+    # One labelling job for the whole run, so the model is loaded at most once and the
+    # re-label pass compares against the taxonomy the run's own ingests were labelled
+    # with.
+    with pipeline.job() as report:
+        # A re-path that moved nothing (the origin was deleted meanwhile; delete_file
+        # takes no lock) or raised falls back to reading the file and then dropping the
+        # origin, which ends where the re-path would have. If the read fails too, both
+        # stay as they were and the next sync pairs them again.
+        for move in diff.moved:
+            try:
+                rows = store.move_source(move.source, str(move.path), mtime=move.mtime)
+            except Exception as e:
+                rows = 0
+                emit(f"could not re-path {move.source}, reading {move.path} instead: {e}")
+            if rows:
+                counts["moved"] += 1
+                emit(f"moved {move.source} -> {move.path}")
+            elif ingest(move.path) and store.delete_source(move.source):
+                counts["deleted"] += 1
+                emit(f"deleted {move.source}")
+
+        for path in diff.to_ingest:
+            ingest(path)
+
+        for source in diff.to_delete:
+            store.delete_source(source)
             counts["deleted"] += 1
-            emit(f"deleted {move.source}")
+            emit(f"deleted {source}")
 
-    for path in diff.to_ingest:
-        ingest(path)
+        # Last, so nothing deleted is labelled and every moved document is: a move leaves
+        # labels stale, since the new folder's path rules may give other values.
+        relabelled, relabel_errors = pipeline.relabel_stale(
+            (str(scope),) if scope else (), on_event=on_event
+        )
+        counts["relabelled"] += relabelled
+        errors.extend(relabel_errors)
 
-    for source in diff.to_delete:
-        store.delete_source(source)
-        counts["deleted"] += 1
-        emit(f"deleted {source}")
+    # Read once the job has ended, since releasing the model can add a problem of its
+    # own. Not failures: the documents are indexed, and only their labels are missing.
+    if report.problems:
+        taxonomy = str(pipeline.labels.path) if pipeline.labels else ""
+        errors.extend({"source": taxonomy, "error": f"labels: {p}"} for p in report.problems)
 
     return counts, errors
 

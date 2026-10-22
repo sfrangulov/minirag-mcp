@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import contextvars
 import hashlib
+import os
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -18,6 +22,9 @@ from minirag_mcp.ingest.parser import (
     parse_html,
     supported_extensions,
 )
+from minirag_mcp.labels import JobReport, Labeler, LabelerSource
+from minirag_mcp.labels.filters import LabelFilterError
+from minirag_mcp.labels.resolve import DocLabels
 from minirag_mcp.security import check_url
 from minirag_mcp.store import ChunkRecord, Store
 
@@ -56,11 +63,82 @@ def parse_url(url: str, *, allow_private: bool = False):
     return _parser.parse_url(url, allow_private=allow_private)
 
 
+def _file_time(info: os.stat_result) -> float:
+    return getattr(info, "st_birthtime", info.st_mtime)
+
+
+def _reason(e: Exception) -> str:
+    return f"{type(e).__name__}: {e}"
+
+
+def _label_columns(doc: DocLabels) -> dict[str, str]:
+    return {
+        "labels_json": doc.labels_json(),
+        "label_keys": doc.label_keys(),
+        "label_hash": doc.taxonomy_hash,
+        "doc_date": doc.date.value,
+        "doc_date_source": doc.date.source,
+    }
+
+
+@dataclass(frozen=True)
+class _Job:
+    pipeline: Pipeline
+    labeler: Labeler | None
+    error: str | None
+    report: JobReport
+
+
+# The job this thread is inside. A job opened inside it on the same pipeline joins it
+# instead of asking the source again, so one sync labels with one taxonomy even when
+# classify.toml is edited underneath it, and its re-label pass compares against the
+# hash its own documents were written with.
+_ACTIVE: contextvars.ContextVar[_Job | None] = contextvars.ContextVar(
+    "minirag_label_job", default=None
+)
+
+
+@contextmanager
+def _activated(job: _Job) -> Iterator[None]:
+    token = _ACTIVE.set(job)
+    try:
+        yield
+    finally:
+        _ACTIVE.reset(token)
+
+
 class Pipeline:
-    def __init__(self, store: Store, embedder, config: Config):
+    def __init__(self, store: Store, embedder, config: Config, labels: LabelerSource | None = None):
         self.store = store
         self.embedder = embedder
         self.config = config
+        self.labels = labels
+
+    @contextmanager
+    def job(self) -> Iterator[JobReport]:
+        """One unit of work for labelling: the model is loaded at most once inside it.
+
+        The report collects labelling problems for the whole job, which another thread's
+        ingest may join; it is the job's, not any one document's.
+        """
+        current = self._active()
+        if current is not None:
+            yield current.report
+            return
+        labeler, error = self.labels.get() if self.labels is not None else (None, None)
+        if labeler is not None:
+            with labeler.job() as report, _activated(_Job(self, labeler, None, report)):
+                yield report
+            return
+        report = JobReport()
+        if error is not None:
+            report.add(f"{self.labels.path} is invalid: {error}")
+        with _activated(_Job(self, None, error, report)):
+            yield report
+
+    def _active(self) -> _Job | None:
+        current = _ACTIVE.get()
+        return current if current is not None and current.pipeline is self else None
 
     @property
     def _count_tokens(self):
@@ -71,19 +149,8 @@ class Pipeline:
         """
         return getattr(self.embedder, "count_tokens", None) or estimate_tokens
 
-    def _chunk_and_store(
-        self,
-        markdown: str,
-        *,
-        source: str,
-        source_type: str,
-        title: str,
-        seed_title: bool,
-        file_hash: str = "",
-        mtime: float = 0.0,
-        ocr_engine: str = "",
-    ) -> IngestResult:
-        """Chunk, embed and store, replacing whatever `source` held before.
+    def _chunk(self, markdown: str, *, source: str, title: str, seed_title: bool):
+        """Cut `markdown` into chunks.
 
         `seed_title` says whether `title` is a real title and may therefore reach the
         chunk text — as chunk 0's opening line, and as part of a transcript window's
@@ -99,8 +166,63 @@ class Pipeline:
         )
         if not chunks:
             raise EmptyDocumentError(f"No text content extracted from {source}")
+        return chunks
+
+    def _label(
+        self,
+        *,
+        source: str,
+        source_type: str,
+        title: str,
+        chunk_texts: Sequence[str],
+        file_time: float | None,
+    ) -> dict[str, str]:
+        """The label columns for a document, empty when labelling is off or failed.
+
+        A labelling failure never fails the ingest: the document is stored unlabelled,
+        its empty hash brings it back to the next re-label pass, and the reason goes to
+        the job's report.
+        """
+        job = self._active()
+        if job is None or job.labeler is None:
+            return {}
+        try:
+            doc = job.labeler.label(
+                source=source,
+                source_type=source_type,
+                title=title,
+                chunk_texts=chunk_texts,
+                file_time=file_time,
+            )
+        except Exception as e:
+            job.report.add(f"{source}: {_reason(e)}")
+            return {}
+        return _label_columns(doc)
+
+    def _chunk_and_store(
+        self,
+        markdown: str,
+        *,
+        source: str,
+        source_type: str,
+        title: str,
+        seed_title: bool,
+        file_hash: str = "",
+        mtime: float = 0.0,
+        ocr_engine: str = "",
+        file_time: float | None = None,
+    ) -> IngestResult:
+        """Chunk, embed, label and store, replacing whatever `source` held before."""
+        chunks = self._chunk(markdown, source=source, title=title, seed_title=seed_title)
         texts = [c.text for c in chunks]
         vectors = self.embedder.embed_documents(texts)
+        labels = self._label(
+            source=source,
+            source_type=source_type,
+            title=title,
+            chunk_texts=texts,
+            file_time=file_time,
+        )
         now = datetime.now(UTC).isoformat()
         records = [
             ChunkRecord(
@@ -119,13 +241,14 @@ class Pipeline:
                 parent_id=f"{source}#p{chunk.parent_index}",
                 ocr_engine=ocr_engine,
                 scheme_version=SCHEME_VERSION,
+                **labels,
             )
             for i, (chunk, vec) in enumerate(zip(chunks, vectors, strict=True))
         ]
         self.store.replace_source(source, records)
         return IngestResult(source=source, chunk_count=len(records), title=title)
 
-    def ingest_file(self, path: Path) -> IngestResult:
+    def _checked_stat(self, path: Path) -> os.stat_result:
         if path.is_dir():
             raise UnsupportedFormatError(
                 f"{path} is a folder; this takes one file. To index a folder, sync it: "
@@ -145,18 +268,24 @@ class Pipeline:
             raise FileTooLargeError(
                 f"{path} is {info.st_size} bytes; MAX_FILE_SIZE is {self.config.max_file_size}"
             )
+        return info
+
+    def ingest_file(self, path: Path) -> IngestResult:
+        info = self._checked_stat(path)
         doc = parse_file(path, self.config)
-        return self._chunk_and_store(
-            doc.markdown,
-            source=str(path),
-            source_type="file",
-            title=doc.title,
-            # a file's title is always a real one: metadata, a heading, or its name
-            seed_title=True,
-            file_hash=file_sha256(path),
-            mtime=info.st_mtime,
-            ocr_engine=doc.ocr_engine,
-        )
+        with self.job():
+            return self._chunk_and_store(
+                doc.markdown,
+                source=str(path),
+                source_type="file",
+                title=doc.title,
+                # a file's title is always a real one: metadata, a heading, or its name
+                seed_title=True,
+                file_hash=file_sha256(path),
+                mtime=info.st_mtime,
+                ocr_engine=doc.ocr_engine,
+                file_time=_file_time(info),
+            )
 
     def ingest_data(
         self, data: str, source: str, fmt: str = "text", title: str | None = None
@@ -169,14 +298,15 @@ class Pipeline:
         else:
             markdown = data
             real_title = find_title(markdown, title)
-        # Without a title of its own the source id stands in, and an id is not a title.
-        return self._chunk_and_store(
-            markdown,
-            source=source,
-            source_type="data",
-            title=real_title or source,
-            seed_title=real_title is not None,
-        )
+        with self.job():
+            # Without a title of its own the source id stands in, and an id is not a title.
+            return self._chunk_and_store(
+                markdown,
+                source=source,
+                source_type="data",
+                title=real_title or source,
+                seed_title=real_title is not None,
+            )
 
     def ingest_url(
         self, url: str, source: str | None = None, title: str | None = None
@@ -189,10 +319,89 @@ class Pipeline:
         explicit = title.strip() if title and title.strip() else None
         # A titleless page is titled after its URL, which is an address, not a title.
         real_title = explicit or (doc.title if doc.has_title else None)
-        return self._chunk_and_store(
-            doc.markdown,
-            source=source or url,
-            source_type="url",
-            title=real_title or doc.title,
-            seed_title=real_title is not None,
-        )
+        with self.job():
+            return self._chunk_and_store(
+                doc.markdown,
+                source=source or url,
+                source_type="url",
+                title=real_title or doc.title,
+                seed_title=real_title is not None,
+            )
+
+    def relabel_stale(
+        self,
+        scopes: tuple[str, ...] = (),
+        on_event: Callable[[str], None] | None = None,
+    ) -> tuple[int, list[dict]]:
+        """Re-label every document in `scopes` whose labels predate the current taxonomy.
+
+        Reads the stored chunk text and writes label columns only: nothing is parsed or
+        embedded again. A document's date does not depend on the taxonomy, so a stored
+        one is kept; only a document never dated (an empty date source) gets one here.
+        """
+        with self.job():
+            job = self._active()
+            if job is None or job.labeler is None:
+                return 0, []
+            labeler = job.labeler
+            target = labeler.taxonomy.hash
+            relabelled = 0
+            errors: list[dict] = []
+            for info in self.store.list_sources(scopes):
+                if info.label_hash == target:
+                    continue
+                try:
+                    file_time = None
+                    if info.source_type == "file":
+                        try:
+                            file_time = _file_time(os.stat(info.source))
+                        except OSError:
+                            pass
+                    doc = labeler.label(
+                        source=info.source,
+                        source_type=info.source_type,
+                        title=info.title,
+                        chunk_texts=[c.text for c in self.store.all_chunks(info.source)],
+                        file_time=file_time,
+                    )
+                    columns = _label_columns(doc)
+                    if info.doc_date_source:
+                        columns["doc_date"] = info.doc_date
+                        columns["doc_date_source"] = info.doc_date_source
+                    self.store.set_document_labels(info.source, **columns)
+                except Exception as e:  # one document never stops the pass
+                    errors.append({"source": info.source, "error": f"labels: {_reason(e)}"})
+                    continue
+                relabelled += 1
+                if on_event:
+                    on_event(f"relabelled {info.source}")
+            return relabelled, errors
+
+    def preview_labels(self, path: Path) -> tuple[DocLabels, dict[str, dict[str, float]]]:
+        """Label one file as an ingest would, with each model answer's full distribution.
+
+        Nothing is embedded or stored.
+        """
+        with self.job():
+            job = self._active()
+            if job is None or job.labeler is None:
+                if self.labels is None:
+                    reason = "this index was opened without a classify.toml"
+                elif job is not None and job.error is not None:
+                    reason = f"{self.labels.path} is invalid: {job.error}"
+                else:
+                    reason = f"there is no {self.labels.path}"
+                raise LabelFilterError(f"document labels are off: {reason}")
+            info = self._checked_stat(path)
+            doc = parse_file(path, self.config)
+            chunks = self._chunk(doc.markdown, source=str(path), title=doc.title, seed_title=True)
+            trace: dict[str, dict[str, float]] = {}
+            labels = job.labeler.label(
+                source=str(path),
+                source_type="file",
+                title=doc.title,
+                chunk_texts=[c.text for c in chunks],
+                file_time=_file_time(info),
+                trace=trace,
+            )
+            return labels, trace
