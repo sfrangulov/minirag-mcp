@@ -5,6 +5,7 @@ from __future__ import annotations
 import json as jsonlib
 import os
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Annotated
 
@@ -16,10 +17,14 @@ from minirag_mcp.config import Config, ConfigError, load_config
 from minirag_mcp.embedder import Embedder, EmbedderUnavailableError, UnknownModelError
 from minirag_mcp.ingest.pipeline import IngestResult, Pipeline
 from minirag_mcp.ingest.scanner import scan_roots
+from minirag_mcp.labels import LabelerSource
+from minirag_mcp.labels.filters import LabelFilterError
+from minirag_mcp.labels.model import default_model_factory
 from minirag_mcp.lock import SyncLockBusy
 from minirag_mcp.results import (
     QueryError,
     join_document,
+    labels_status,
     list_payload,
     ocr_status,
     result_dict,
@@ -54,6 +59,41 @@ def _make_embedder(cfg: Config) -> Embedder:
     return Embedder(cfg.model_name, cfg.cache_dir)  # patched in tests
 
 
+def _make_model_factory() -> Callable | None:
+    return None  # patched in tests; None selects the real llama.cpp factory
+
+
+LabelOpt = Annotated[
+    list[str] | None,
+    Parameter(
+        name="--label",
+        help="facet=value; repeatable. Repeating a facet matches any of its values.",
+    ),
+]
+DateFromOpt = Annotated[
+    str | None, Parameter(name="--date-from", help="Earliest document date, YYYY-MM-DD.")
+]
+DateToOpt = Annotated[
+    str | None, Parameter(name="--date-to", help="Latest document date, YYYY-MM-DD.")
+]
+
+
+def _parse_labels(flags: list[str] | None) -> dict[str, str | list[str]] | None:
+    if not flags:
+        return None
+    out: dict[str, list[str]] = {}
+    for flag in flags:
+        facet, sep, value = flag.partition("=")
+        if not sep or not facet.strip() or not value.strip():
+            _fail(f"--label takes facet=value, got {flag!r}")
+        out.setdefault(facet.strip(), []).append(value.strip())
+    return {k: v[0] if len(v) == 1 else v for k, v in out.items()}
+
+
+def _label_source(cfg: Config) -> LabelerSource:
+    return LabelerSource(cfg.roots, cfg.cache_dir, _make_model_factory() or default_model_factory)
+
+
 def _fail(msg: str) -> None:
     print(f"error: {msg}", file=sys.stderr)
     raise SystemExit(1)
@@ -84,7 +124,7 @@ def _load(
         cfg = _load_cfg(base_dir, db_path, cache_dir, model_name)
         emb = _make_embedder(cfg)
         store = Store(cfg.db_path, dim=emb.dim)
-        return cfg, store, Pipeline(store, emb, cfg)
+        return cfg, store, Pipeline(store, emb, cfg, labels=_label_source(cfg))
     except ConfigError as e:
         _fail(str(e))
         raise AssertionError from e  # unreachable
@@ -230,6 +270,9 @@ def query(
     text: str,
     *,
     scope: list[str] | None = None,
+    label: LabelOpt = None,
+    date_from: DateFromOpt = None,
+    date_to: DateToOpt = None,
     top_k: int = 8,
     base_dir: BaseDirOpt = None,
     db_path: DbPathOpt = None,
@@ -243,10 +286,20 @@ def query(
     """
     if top_k < 1:
         _fail(f"--top-k must be at least 1, got {top_k}")
+    labels = _parse_labels(label)
     cfg, store, pipeline = _load(base_dir, db_path, cache_dir, model_name)
     try:
         payload = run_query(
-            store, pipeline.embedder, cfg, text, top_k=top_k, scopes=tuple(scope or ())
+            store,
+            pipeline.embedder,
+            cfg,
+            text,
+            top_k=top_k,
+            scopes=tuple(scope or ()),
+            labels=labels,
+            date_from=date_from,
+            date_to=date_to,
+            label_source=pipeline.labels,
         )
     except (QueryError, EmbedderUnavailableError) as e:
         _fail(str(e))
@@ -342,6 +395,12 @@ def read(
 def list_cmd(
     *,
     scope: list[str] | None = None,
+    label: LabelOpt = None,
+    date_from: DateFromOpt = None,
+    date_to: DateToOpt = None,
+    sort: Annotated[
+        str | None, Parameter(name="--sort", help="'date' lists newest first, undated last.")
+    ] = None,
     base_dir: BaseDirOpt = None,
     db_path: DbPathOpt = None,
     cache_dir: CacheDirOpt = None,
@@ -358,8 +417,22 @@ def list_cmd(
     unlisted: indexed, under a folder that could not be listed — each such folder is
     named in a warning on stderr and in unlistedFolders with --json.
     """
-    cfg, store, _ = _load(base_dir, db_path, cache_dir, model_name)
-    payload = list_payload(store, cfg.roots, tuple(scope or ()))
+    labels = _parse_labels(label)
+    cfg, store, pipeline = _load(base_dir, db_path, cache_dir, model_name)
+    try:
+        payload = list_payload(
+            store,
+            cfg.roots,
+            tuple(scope or ()),
+            labels=labels,
+            date_from=date_from,
+            date_to=date_to,
+            sort=sort,
+            label_source=pipeline.labels,
+        )
+    except QueryError as e:
+        _fail(str(e))
+        raise AssertionError from e  # unreachable
     human = "\n".join(
         f"[{f['state']}] {f['source']} ({f['chunkCount']} chunks)"
         + (f" [ocr:{f['ocrEngine']}]" if f["ocrEngine"] else "")
@@ -406,6 +479,7 @@ def status(
         payload["chunkCount"] = store.chunk_count()
         payload["sourceCount"] = store.source_count()
         payload.update(scheme_status(store))
+        payload.update(labels_status(_label_source(cfg), store))
     except Exception as e:
         payload["indexError"] = str(e)
     human = "\n".join(f"{k}: {v}" for k, v in payload.items())
@@ -438,3 +512,55 @@ def delete(
     if deleted == 0:
         _fail(f"source not found in index: {key}")
     _emit({"source": key, "deletedChunks": deleted}, json, f"deleted {deleted} chunk(s) of {key}")
+
+
+classify_app = App(name="classify", help="Inspect how documents would be labelled.")
+app.command(classify_app)
+
+
+@classify_app.command(name="try")
+def classify_try(
+    path: str,
+    *,
+    base_dir: BaseDirOpt = None,
+    db_path: DbPathOpt = None,
+    cache_dir: CacheDirOpt = None,
+    model_name: ModelNameOpt = None,
+    json: JsonFlag = False,
+):
+    """Label one file as an ingest would and print every facet's full distribution.
+
+    Nothing is embedded or stored.
+    """
+    cfg, _, pipeline = _load(base_dir, db_path, cache_dir, model_name)
+    try:
+        target = resolve_in_roots(path, cfg.roots, require_absolute=False)
+        doc, trace = pipeline.preview_labels(target)
+    except (SecurityError, LabelFilterError) as e:
+        _fail(str(e))
+        raise AssertionError from e  # unreachable
+    payload = {
+        "source": str(target),
+        "labels": {
+            facet: {
+                "value": lab.value,
+                "confidence": round(lab.confidence, 4),
+                "source": lab.source,
+                "second": lab.second,
+                "uncertain": lab.uncertain,
+            }
+            for facet, lab in doc.labels.items()
+        },
+        "date": {"value": doc.date.value, "source": doc.date.source},
+        "distribution": trace,
+    }
+    lines = [str(target)]
+    for facet, lab in doc.labels.items():
+        flag = " (uncertain)" if lab.uncertain else ""
+        lines.append(f"{facet}: {lab.value} [{lab.source}, {lab.confidence:.2f}]{flag}")
+        for value, p in sorted(trace.get(facet, {}).items(), key=lambda kv: -kv[1]):
+            lines.append(f"    {p:.3f}  {value}")
+    lines.append(
+        f"date: {doc.date.value or 'none'}" + (f" [{doc.date.source}]" if doc.date.value else "")
+    )
+    _emit(payload, json, "\n".join(lines))

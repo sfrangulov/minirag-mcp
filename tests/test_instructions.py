@@ -246,3 +246,8 @@ def test_blank_append_reads_as_unset(raw):
 
 def test_append_is_trimmed_not_reflowed():
     assert build_instructions({APPEND_ENV_VAR: f"  {CORPUS_NOTE}\n"}).endswith(f"\n\n{CORPUS_NOTE}")
+
+
+def test_instructions_mention_labels_within_budget():
+    assert "`labels`" in SERVER_INSTRUCTIONS
+    assert len(SERVER_INSTRUCTIONS) <= MAX_BUILTIN_INSTRUCTIONS_CHARS

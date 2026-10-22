@@ -123,7 +123,7 @@ conversation itself. A search that cannot change the answer costs latency.
 
 <thin_results>
 If the hits are weak, try one or two more queries — different wording, a \
-narrower `scope` — before concluding the corpus is silent, then stop. \
+narrower `scope` or `labels` — before concluding the corpus is silent, then stop. \
 Nothing found may mean nothing indexed: check `status` first.
 </thin_results>
 

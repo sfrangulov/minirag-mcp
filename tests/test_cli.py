@@ -523,3 +523,65 @@ def test_ingest_of_a_folder_with_an_unlistable_subfolder_fails_and_names_it(corp
     assert [f["source"] for f in failed] == [str(hidden)]
     assert "could not list this folder" in failed[0]["error"]
     assert f"warn: {hidden}:" in captured.err
+
+
+CLASSIFY_TAXONOMY = """
+[model]
+path = "/models/fake.gguf"
+temperature = 1.0
+
+[facets.type]
+values.minutes = { description = "Minutes. Decisions." }
+values.report = { description = "Report. Findings." }
+"""
+
+
+def test_classify_try_prints_the_distribution_and_writes_nothing(
+    corpus, capsys, monkeypatch, model_factory, fake_embedder
+):
+    monkeypatch.setattr("minirag_mcp.labels.model.available", lambda: True)
+    monkeypatch.setattr(cli, "_make_model_factory", lambda: model_factory)
+    (corpus / ".minirag").mkdir()
+    (corpus / ".minirag" / "classify.toml").write_text(CLASSIFY_TAXONOMY)
+    (corpus / "m.md").write_text("# Minutes\n\nMinutes of the weekly sync.")
+    model_factory.answers = {"Minutes of": {"minutes": 0.8, "report": 0.2}}
+
+    run(["classify", "try", str(corpus / "m.md"), "--base-dir", str(corpus), "--json"])
+    out = json.loads(capsys.readouterr().out)
+
+    assert out["labels"]["type"]["value"] == "minutes"
+    assert out["distribution"]["type"] == {"minutes": 0.8, "report": 0.2}
+    assert Store(corpus / ".minirag" / "lancedb", dim=fake_embedder.dim).chunk_count() == 0
+    run(["classify", "try", str(corpus / "m.md"), "--base-dir", str(corpus)])
+    human = capsys.readouterr().out
+    assert "type: minutes" in human and "report" in human
+
+
+def test_classify_try_without_classify_toml_fails_loudly(
+    corpus, capsys, monkeypatch, model_factory
+):
+    monkeypatch.setattr(cli, "_make_model_factory", lambda: model_factory)
+    with pytest.raises(SystemExit) as e:
+        run(["classify", "try", str(corpus / "a.md"), "--base-dir", str(corpus)])
+    assert e.value.code == 1
+    assert "document labels are off" in capsys.readouterr().err
+
+
+def test_a_malformed_label_flag_names_the_expected_form(corpus, capsys):
+    with pytest.raises(SystemExit) as e:
+        run(["query", "alpha", "--label", "x", "--base-dir", str(corpus)])
+    assert e.value.code == 1
+    assert "--label takes facet=value, got 'x'" in capsys.readouterr().err
+
+
+def test_list_sorted_by_date_from_the_cli(corpus, capsys):
+    (corpus / "old.md").write_text("# Old\n\nDate: 1 January 2020.")
+    (corpus / "new.md").write_text("# New\n\nDate: 1 January 2026.")
+    run(["ingest", str(corpus), "--base-dir", str(corpus)])
+    capsys.readouterr()
+    run(["list", "--sort", "date", "--base-dir", str(corpus), "--json"])
+    files = json.loads(capsys.readouterr().out)["files"]
+    assert len(files) == 4
+    with pytest.raises(SystemExit):
+        run(["list", "--sort", "size", "--base-dir", str(corpus)])
+    assert "sort must be 'date'" in capsys.readouterr().err
