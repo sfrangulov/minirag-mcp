@@ -3,6 +3,7 @@ import hashlib
 import importlib.util
 import json
 import math
+import os
 import sys
 import types
 import weakref
@@ -109,6 +110,61 @@ def test_a_pinned_download_lands_in_the_cache_dir(tmp_path, monkeypatch):
         {"repo": "o/r", "file": "m.gguf", "revision": "abc123", "cache": tmp_path / "classify"}
     ]
     assert got.read_bytes() == b"weights"
+
+
+def _warm_cache_download(content=b"weights"):
+    """hf_hub_download on a warm cache: the file is written once, then returned untouched."""
+
+    def fake(repo_id, filename, *, revision=None, cache_dir=None, **kw):
+        out = Path(cache_dir) / filename
+        if not out.exists():
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_bytes(content)
+        return str(out)
+
+    return fake
+
+
+class _CountingHashlib:
+    def __init__(self):
+        self.digests = 0
+
+    def sha256(self, *args):
+        self.digests += 1
+        return hashlib.sha256(*args)
+
+
+@pytest.fixture
+def counted_download(monkeypatch):
+    import huggingface_hub
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", _warm_cache_download())
+    counter = _CountingHashlib()
+    monkeypatch.setattr(model, "hashlib", counter)
+    return counter
+
+
+def test_a_verified_download_is_hashed_once_per_process_until_it_changes(
+    tmp_path, counted_download
+):
+    """Every MCP ingest_file is a job of its own, and re-hashing 4.5 GB each time is not."""
+    spec = _spec(hashlib.sha256(b"weights").hexdigest())
+
+    first = resolve_model_file(spec, tmp_path)
+    assert resolve_model_file(spec, tmp_path) == first
+    assert counted_download.digests == 1
+
+    st = first.stat()
+    os.utime(first, ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))
+    assert resolve_model_file(spec, tmp_path) == first
+    assert counted_download.digests == 2
+
+
+def test_a_file_that_failed_verification_fails_it_again(tmp_path, counted_download):
+    spec = _spec("0" * 64)
+    for _ in range(2):
+        with pytest.raises(ModelError, match="0" * 64):
+            resolve_model_file(spec, tmp_path)
 
 
 def test_the_default_factory_without_the_extra_says_what_to_install(tmp_path, monkeypatch):

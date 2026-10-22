@@ -162,8 +162,8 @@ Name rules, in order, over the file name without extension:
     ("19022025 Sales requirements", "2025-02-19"),
     ("27-03-2025 Rates", "2025-03-27"),
     ("25-02-12 Purchasing part 2", "2025-02-12"),
-    ("(1297) D_60 Report of 28.08.25", "2025-08-28"),
-    ("FS D_639 access_26.08_2", None),
+    ("(4821) X_60 Summary of 28.08.25", "2025-08-28"),
+    ("QA X_517 review_26.08_2", None),
     ("31022026 impossible", None),
 ])
 def test_date_from_name(stem, expected): ...
@@ -177,7 +177,7 @@ def test_date_from_name(stem, expected): ...
     ("# Call: demo. Transcript of the call 14.10.2026\n[00:00–02:00] hello", "2026-10-14"),
     ("Исх. № 12/3 от 12.08.2026\nTo the bank", "2026-08-12"),
     # the trap: a cover letter whose only dates belong to the contract it cites
-    ("To the currency control department\nPlease amend contract No 1 dated 23.07.2025, reg. 2/269 of 28/01/2025.", None),
+    ("To the currency control department\nPlease amend contract No 1 dated 23.07.2025, ref. 4/118 of 28/01/2025.", None),
 ])
 def test_date_from_header(text, expected): ...
 

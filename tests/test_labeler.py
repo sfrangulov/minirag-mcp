@@ -247,13 +247,25 @@ def test_labels_that_need_no_model_answer_keep_the_hash_while_the_model_is_out(r
     }
     assert spec.taxonomy_hash == by_path.taxonomy.hash
 
-    # Asked, since the model may override the path value, but resolved by the path.
+
+def test_a_path_label_the_model_could_not_review_carries_no_hash(root, model_factory):
+    """The path value is stored, and the empty hash brings the document back to a re-label
+    pass, where the override the model never got to make can still happen."""
+    model_factory.error = ModelError("needs the extra")
     overridable = make_labeler(root, model_factory, OVERRIDE_ONLY)
     with overridable.job() as report:
         spec = label_file(overridable, root, "specs/s.md")
     assert report.problems == ["needs the extra"]
     assert spec.labels == {"type": Label("spec", 1.0, "path")}
-    assert spec.taxonomy_hash == overridable.taxonomy.hash
+    assert spec.unanswered == {"type"}
+    assert spec.taxonomy_hash == ""
+
+    model_factory.error = None
+    model_factory.default = {"minutes": 0.95, "spec": 0.05}
+    with overridable.job():
+        reviewed = label_file(overridable, root, "specs/s.md")
+    assert reviewed.labels == {"type": Label("minutes", 0.95, "model", second="spec")}
+    assert reviewed.taxonomy_hash == overridable.taxonomy.hash
 
 
 def test_an_unexpected_model_exception_is_reported_not_raised(root, model_factory):
@@ -288,7 +300,8 @@ def test_evidence_is_the_file_name_label_and_6000_collapsed_chars(root, model_fa
         source=str(root / "notes" / "a.pdf"),
         source_type="file",
         title="Ignored title",
-        chunk_texts=["  ".join(words[:700]) + "\n\n", "\t" + "\n \t".join(words[700:])],
+        # Stripped, as the chunker leaves them: only the join can separate w699 from w700.
+        chunk_texts=["  ".join(words[:700]), "\n \t".join(words[700:])],
         file_time=None,
     )
 

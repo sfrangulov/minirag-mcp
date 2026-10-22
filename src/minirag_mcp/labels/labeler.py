@@ -148,14 +148,13 @@ class Labeler:
         date = document_date(
             Path(source).stem if is_file else None, "\n\n".join(chunk_texts), file_time
         )
-        # A facet left without a value by a model problem, not by the document: no hash,
-        # so the next re-label pass tries again. One the path resolved after the model
-        # failed to override it is complete.
-        complete = not (doc.unanswered - labels.keys())
+        # A model problem left a facet unanswered: no hash, so the next re-label pass asks
+        # again. That includes a path value the model could have overridden, which is
+        # stored meanwhile but is not yet the label the taxonomy asks for.
         return DocLabels(
             labels=labels,
             date=date,
-            taxonomy_hash=self._hash if complete else "",
+            taxonomy_hash="" if doc.unanswered else self._hash,
             unanswered=frozenset(doc.unanswered),
         )
 

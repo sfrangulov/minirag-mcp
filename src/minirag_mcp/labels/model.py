@@ -113,6 +113,24 @@ def calibrate(letter_logprobs: Sequence[float], temperature: float) -> list[floa
     return [w / total for w in weights]
 
 
+# sha256 of each downloaded model file this process has read, keyed by what would change
+# if the file did. Every MCP ingest_file is a job of its own, and each job resolves the
+# file again: hashing 4.5 GB every time would cost more than labelling the document.
+_digests: dict[tuple[str, int, int], str] = {}
+
+
+def _sha256(path: Path) -> str:
+    st = path.stat()
+    key = (str(path.resolve()), st.st_size, st.st_mtime_ns)
+    if key not in _digests:
+        digest = hashlib.sha256()
+        with path.open("rb") as fh:
+            for block in iter(lambda: fh.read(1 << 20), b""):
+                digest.update(block)
+        _digests[key] = digest.hexdigest()
+    return _digests[key]
+
+
 def resolve_model_file(spec: ModelSpec, cache_dir: Path) -> Path:
     if spec.path is not None:
         if not spec.path.is_file():
@@ -133,11 +151,7 @@ def resolve_model_file(spec: ModelSpec, cache_dir: Path) -> Path:
     except Exception as e:
         raise ModelError(f"could not download {spec.file} from {spec.repo}: {e}") from e
 
-    digest = hashlib.sha256()
-    with downloaded.open("rb") as fh:
-        for block in iter(lambda: fh.read(1 << 20), b""):
-            digest.update(block)
-    actual = digest.hexdigest()
+    actual = _sha256(downloaded)
     if actual != spec.sha256:
         raise ModelError(
             f"{downloaded} has sha256 {actual}, expected {spec.sha256}; "

@@ -20,9 +20,9 @@ from minirag_mcp.labels.dates import (
         ("19022025 Sales requirements", "2025-02-19"),
         ("27-03-2025 Rates", "2025-03-27"),
         ("25-02-12 Purchasing part 2", "2025-02-12"),
-        ("(1297) D_60 Report of 28.08.25", "2025-08-28"),
+        ("(4821) X_60 Summary of 28.08.25", "2025-08-28"),
         ("api_v1.2.25", None),
-        ("FS D_639 access_26.08_2", None),
+        ("QA X_517 review_26.08_2", None),
         ("31022026 impossible", None),
     ],
 )
@@ -62,7 +62,7 @@ def test_date_from_name(stem, expected):
         # the trap: a cover letter whose only dates belong to the contract it cites
         (
             "To the currency control department\n"
-            "Please amend contract No 1 dated 23.07.2025, reg. 2/269 of 28/01/2025.",
+            "Please amend contract No 1 dated 23.07.2025, ref. 4/118 of 28/01/2025.",
             None,
         ),
     ],

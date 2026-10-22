@@ -203,12 +203,15 @@ def test_text_documents_get_model_labels_but_no_path_or_default_ones(corpus, mod
 
 
 def test_without_classify_toml_nothing_is_labelled_and_no_model_is_made(corpus, model_factory):
-    corpus.pipeline.ingest_file(corpus.doc("alpha/weekly.md", "Minutes of the weekly sync."))
-    corpus.pipeline.ingest_data("Minutes of the board.", source="note-1")
+    with corpus.pipeline.job() as report:
+        corpus.pipeline.ingest_file(corpus.doc("alpha/weekly.md", "Minutes of the weekly sync."))
+        corpus.pipeline.ingest_data("Minutes of the board.", source="note-1")
     corpus.doc("beta/b.md", "Quarterly report.")
 
     counts, errors = corpus.sync()
 
+    # Off means silent: a CLI ingest prints every problem a job reports.
+    assert report.problems == []
     assert errors == []
     assert counts["ingested"] == 1 and counts["relabelled"] == 0
     assert model_factory.calls == []
@@ -220,8 +223,6 @@ def test_without_classify_toml_nothing_is_labelled_and_no_model_is_made(corpus, 
     }
     for row in rows:
         assert all(row[name] == "" for name in FIELDS), row["source"]
-    with corpus.pipeline.job() as report:
-        assert report.problems == []
 
 
 def test_a_labelling_error_leaves_the_document_ingested_and_unlabelled(corpus, monkeypatch):
@@ -459,6 +460,31 @@ def test_documents_a_missing_model_left_unlabelled_are_relabelled_once_it_answer
     for doc in docs:
         assert corpus.store.get_source(str(doc)).label_hash == corpus.hash()
         assert corpus.labels(doc)["type"] == Label("report", 0.9, "model", second="minutes")
+
+
+def test_a_path_label_the_model_could_not_review_is_reviewed_once_it_answers(corpus, model_factory):
+    report = 'values.report = { description = "Report. Findings and figures."'
+    corpus.taxonomy(
+        TAXONOMY.replace("[facets.type]\n", "[facets.type]\noverride_at = 0.9\n").replace(
+            report, report + ', paths = ["reports"]'
+        )
+    )
+    model_factory.error = ModelError("the classify model is not installed")
+    doc = corpus.doc("reports/weekly.md", "Minutes of the weekly sync.")
+
+    counts, errors = corpus.sync()
+
+    assert counts["failed"] == 0 and len(errors) == 1
+    assert corpus.labels(doc)["type"] == Label("report", 1.0, "path")
+    assert corpus.store.get_source(str(doc)).label_hash == ""
+
+    model_factory.error = None
+    model_factory.answers = {"Minutes of": {"minutes": 0.95, "report": 0.05}}
+    counts, errors = corpus.sync()
+
+    assert errors == [] and counts["relabelled"] == 1
+    assert corpus.labels(doc)["type"] == Label("minutes", 0.95, "model", second="report")
+    assert corpus.store.get_source(str(doc)).label_hash == corpus.hash()
 
 
 def test_a_document_labelled_without_the_model_gets_the_hash_while_the_model_is_missing(
