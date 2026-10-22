@@ -50,6 +50,9 @@ class _Document:
     chunk_texts: Sequence[str]
     trace: dict[str, dict[str, float]] | None
     failed: bool = False
+    # Facets the model was asked for and could not answer: it could not be made, or this
+    # document's call failed.
+    unanswered: set[str] = field(default_factory=set)
     _evidence: str | None = field(default=None, init=False, repr=False)
 
     def evidence(self, file_name_label: str) -> str:
@@ -145,11 +148,16 @@ class Labeler:
         date = document_date(
             Path(source).stem if is_file else None, "\n\n".join(chunk_texts), file_time
         )
-        return DocLabels(labels=labels, date=date, taxonomy_hash=self._hash)
+        # A facet left without a value by a model problem, not by the document: no hash,
+        # so the next re-label pass tries again. One the path resolved after the model
+        # failed to override it is complete.
+        complete = not (doc.unanswered - labels.keys())
+        return DocLabels(labels=labels, date=date, taxonomy_hash=self._hash if complete else "")
 
     def _ask(self, report: JobReport, doc: _Document, facet: Facet) -> Mapping[str, float]:
         spec = self.taxonomy.model
         if doc.failed or spec is None:
+            doc.unanswered.add(facet.name)
             return {}
         evidence = doc.evidence(spec.file_name_label)
         options = [(v.id, v.description) for v in facet.values]
@@ -161,11 +169,13 @@ class Labeler:
                     self._model_failed = True
                     report.add(_reason(e))
             if self._model is None:
+                doc.unanswered.add(facet.name)
                 return {}
             try:
                 probs = self._model.probabilities(evidence, facet.question, options)
             except Exception as e:
                 doc.failed = True
+                doc.unanswered.add(facet.name)
                 report.add(f"{doc.source}: {_reason(e)}")
                 return {}
         if doc.trace is not None:

@@ -203,6 +203,59 @@ def test_a_failing_document_keeps_the_path_value_the_model_could_override(root, 
     assert len(model_factory.created[0].calls) == 1
 
 
+def test_a_document_a_model_problem_left_unanswered_carries_no_hash(root, model_factory):
+    """The empty hash is what brings it back to a re-label pass once the model answers."""
+    model_factory.error = ModelError("needs the extra")
+    labeler = make_labeler(root, model_factory)
+    with labeler.job():
+        unloaded = label_file(labeler, root, "notes/a.md")
+    assert unloaded.labels == {"project": Label("core", 1.0, "default")}
+    assert unloaded.taxonomy_hash == ""
+
+    model_factory.error = None
+    model_factory.fail_on = "HUGE"
+    model_factory.default = {"minutes": 1.0}
+    with labeler.job():
+        failed = label_file(labeler, root, "notes/bad.md", text="A HUGE document.")
+        answered = label_file(labeler, root, "notes/good.md")
+    assert failed.labels == {"project": Label("core", 1.0, "default")}
+    assert failed.taxonomy_hash == ""
+    assert answered.labels["type"].value == "minutes"
+    assert answered.taxonomy_hash == labeler.taxonomy.hash
+
+
+OVERRIDE_ONLY = """
+[model]
+path = "/models/fake.gguf"
+temperature = 1.0
+
+[facets.type]
+override_at = 0.9
+values.spec = { description = "Spec.", paths = ["specs"] }
+values.minutes = { description = "Minutes." }
+"""
+
+
+def test_labels_that_need_no_model_answer_keep_the_hash_while_the_model_is_out(root, model_factory):
+    model_factory.error = ModelError("needs the extra")
+    by_path = make_labeler(root, model_factory)
+    with by_path.job():
+        spec = label_file(by_path, root, "specs/s.md")
+    assert spec.labels == {
+        "project": Label("core", 1.0, "default"),
+        "type": Label("spec", 1.0, "path"),
+    }
+    assert spec.taxonomy_hash == by_path.taxonomy.hash
+
+    # Asked, since the model may override the path value, but resolved by the path.
+    overridable = make_labeler(root, model_factory, OVERRIDE_ONLY)
+    with overridable.job() as report:
+        spec = label_file(overridable, root, "specs/s.md")
+    assert report.problems == ["needs the extra"]
+    assert spec.labels == {"type": Label("spec", 1.0, "path")}
+    assert spec.taxonomy_hash == overridable.taxonomy.hash
+
+
 def test_an_unexpected_model_exception_is_reported_not_raised(root, model_factory):
     class Broken(FakeChoiceModel):
         def probabilities(self, evidence, question, options):

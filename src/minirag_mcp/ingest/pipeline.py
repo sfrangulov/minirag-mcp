@@ -26,7 +26,7 @@ from minirag_mcp.labels import JobReport, Labeler, LabelerSource
 from minirag_mcp.labels.filters import LabelFilterError
 from minirag_mcp.labels.resolve import DocLabels
 from minirag_mcp.security import check_url
-from minirag_mcp.store import ChunkRecord, Store
+from minirag_mcp.store import LABEL_COLUMNS, ChunkRecord, SourceInfo, Store
 
 DATA_FORMATS = ("text", "markdown", "html")
 
@@ -79,6 +79,16 @@ def _label_columns(doc: DocLabels) -> dict[str, str]:
         "doc_date": doc.date.value,
         "doc_date_source": doc.date.source,
     }
+
+
+def _already_stored(info: SourceInfo, columns: dict[str, str]) -> bool:
+    """`label_keys` is derived from `labels_json`, so these four decide equality."""
+    return (info.labels_json, info.label_hash, info.doc_date, info.doc_date_source) == (
+        columns["labels_json"],
+        columns["label_hash"],
+        columns["doc_date"],
+        columns["doc_date_source"],
+    )
 
 
 @dataclass(frozen=True)
@@ -343,6 +353,17 @@ class Pipeline:
             job = self._active()
             if job is None or job.labeler is None:
                 return 0, []
+            # Checked once: every document would fail the same way, one error each.
+            missing = [c for c in LABEL_COLUMNS if c in self.store.missing_columns]
+            if missing:
+                return 0, [
+                    {
+                        "source": str(self.store.db_path),
+                        "error": f"labels: this index has no {', '.join(missing)} column(s), "
+                        "so no document was labelled; reopen it with write access and no "
+                        "concurrent writer so they can be added",
+                    }
+                ]
             labeler = job.labeler
             target = labeler.taxonomy.hash
             relabelled = 0
@@ -368,6 +389,11 @@ class Pipeline:
                     if info.doc_date_source:
                         columns["doc_date"] = info.doc_date
                         columns["doc_date_source"] = info.doc_date_source
+                    # A document a model problem keeps unlabelled is back on every sync
+                    # until the model answers; rewriting the same values each time would
+                    # count it as re-labelled and add a table version per document.
+                    if _already_stored(info, columns):
+                        continue
                     self.store.set_document_labels(info.source, **columns)
                 except Exception as e:  # one document never stops the pass
                     errors.append({"source": info.source, "error": f"labels: {_reason(e)}"})
