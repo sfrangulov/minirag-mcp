@@ -28,6 +28,11 @@ GAP_FACTOR = 2.0  # relevance_cutoff boundary must exceed mean gap by this facto
 # unbounded scan. Callers clamp rather than reject: an oversized request is a bad
 # guess at how much context is useful, not an error.
 MAX_TOP_K = 100
+# Label and date columns. Labels are one string rather than a list column: a list<string>
+# cannot be added to an existing table through the SQL-expression migration. `label_keys`
+# is the `|facet=value|` form that `contains()` filters match; `labels_json` is what is
+# shown; an empty `label_hash` marks a document the labeling pass has yet to visit.
+LABEL_COLUMNS = ("labels_json", "label_keys", "label_hash", "doc_date", "doc_date_source")
 
 
 @dataclass(frozen=True)
@@ -50,6 +55,11 @@ class ChunkRecord:
     # and listings unchanged.
     ocr_engine: str = ""
     scheme_version: int = SCHEME_VERSION
+    labels_json: str = ""
+    label_keys: str = ""
+    label_hash: str = ""
+    doc_date: str = ""
+    doc_date_source: str = ""
 
 
 @dataclass(frozen=True)
@@ -65,6 +75,9 @@ class SearchResult:
     # keeps meaning "the chunk that matched", so a client already reading it is
     # unaffected by the change.
     parent_text: str | None = None
+    labels_json: str = ""
+    doc_date: str = ""
+    doc_date_source: str = ""
 
 
 @dataclass(frozen=True)
@@ -83,6 +96,10 @@ class SourceInfo:
     # More rows than distinct chunk indexes: two first ingests of the file raced and
     # both inserted. Its bytes still match, so only this flag gets it re-read.
     duplicated: bool = False
+    labels_json: str = ""
+    label_hash: str = ""
+    doc_date: str = ""
+    doc_date_source: str = ""
 
 
 _META_COLS = [
@@ -94,6 +111,10 @@ _META_COLS = [
     "mtime",
     "scheme_version",
     "ocr_engine",
+    "labels_json",
+    "label_hash",
+    "doc_date",
+    "doc_date_source",
 ]
 
 
@@ -162,6 +183,22 @@ def _is_missing_table(exc: Exception) -> bool:
     return isinstance(exc, FileNotFoundError) or "was not found" in str(exc)
 
 
+def _and_clauses(*clauses: str | None) -> str | None:
+    """AND the non-empty clauses, each parenthesised: the scope clause is an OR chain."""
+    present = [c for c in clauses if c]
+    if not present:
+        return None
+    return " AND ".join(f"({c})" for c in present)
+
+
+def _label_fields(row: dict) -> dict[str, str]:
+    """SourceInfo's label fields; an index whose columns could not be added has none."""
+    return {
+        name: row.get(name) or ""
+        for name in ("labels_json", "label_hash", "doc_date", "doc_date_source")
+    }
+
+
 class DimensionMismatchError(Exception):
     """An existing index was built with a different embedding dimension than requested."""
 
@@ -180,6 +217,7 @@ _SCHEME_COLUMNS = {
 }
 _ADDITIVE_COLUMNS = {
     "ocr_engine": "''",
+    **dict.fromkeys(LABEL_COLUMNS, "''"),
 }
 _ADDED_COLUMNS = {**_SCHEME_COLUMNS, **_ADDITIVE_COLUMNS}
 
@@ -254,6 +292,7 @@ class Store:
                     pa.field("parent_id", pa.string()),
                     pa.field("ocr_engine", pa.string()),
                     pa.field("scheme_version", pa.int32()),
+                    *(pa.field(name, pa.string()) for name in LABEL_COLUMNS),
                 ]
             )
             self._table = self._db.create_table(TABLE, schema=schema)
@@ -408,6 +447,8 @@ class Store:
             if row.get("parent_id"):
                 row["parent_id"] = new + row["parent_id"][cut:]
             row["mtime"] = mtime
+            if "label_hash" in row:
+                row["label_hash"] = ""
             moved.append(row)
         (
             self._table.merge_insert("id")
@@ -462,25 +503,50 @@ class Store:
             for r in rows
         ]
 
+    def set_document_labels(
+        self,
+        source: str,
+        *,
+        labels_json: str,
+        label_keys: str,
+        label_hash: str,
+        doc_date: str,
+        doc_date_source: str,
+    ) -> int:
+        """Write a document's label and date columns on every one of its chunks."""
+        result = self._table.update(
+            where=f"source = '{sql_str(source)}'",
+            values={
+                "labels_json": labels_json,
+                "label_keys": label_keys,
+                "label_hash": label_hash,
+                "doc_date": doc_date,
+                "doc_date_source": doc_date_source,
+            },
+        )
+        return result.rows_updated
+
     def _meta_columns(self) -> list[str]:
         """`_META_COLS`, minus anything an un-migrated older index does not have."""
         present = set(self._table.schema.names)
         return [c for c in _META_COLS if c in present]
 
-    def _iter_meta(self, scopes: tuple[str, ...] = ()) -> list[dict]:
+    def _iter_meta(self, scopes: tuple[str, ...] = (), filter_sql: str | None = None) -> list[dict]:
         q = self._table.search().select(self._meta_columns())
-        clause = sql_clause(scopes)
+        clause = _and_clauses(sql_clause(scopes), filter_sql)
         if clause:
             q = q.where(clause)
         return q.limit(_LIST_LIMIT).to_list()
 
-    def list_sources(self, scopes: tuple[str, ...] = ()) -> list[SourceInfo]:
+    def list_sources(
+        self, scopes: tuple[str, ...] = (), filter_sql: str | None = None
+    ) -> list[SourceInfo]:
         by_source: dict[str, dict] = {}
         counts: dict[str, int] = {}
         indexes: dict[str, set[int]] = {}
         schemes: dict[str, int] = {}
         engines: dict[str, str] = {}
-        for row in self._iter_meta(scopes):
+        for row in self._iter_meta(scopes, filter_sql):
             by_source.setdefault(row["source"], row)
             counts[row["source"]] = counts.get(row["source"], 0) + 1
             indexes.setdefault(row["source"], set()).add(row["chunk_index"])
@@ -498,6 +564,7 @@ class Store:
                 scheme_version=schemes[src],
                 ocr_engine=engines[src] or "",
                 duplicated=counts[src] > len(indexes[src]),
+                **_label_fields(row),
             )
             for src, row in sorted(by_source.items())
         ]
@@ -524,6 +591,7 @@ class Store:
             scheme_version=min(_scheme_of(row) for row in rows),
             ocr_engine=engine,
             duplicated=len(rows) > len({row["chunk_index"] for row in rows}),
+            **_label_fields(r),
         )
 
     def stale_chunk_count(self) -> int:
@@ -588,6 +656,7 @@ class Store:
         grouping: str | None = None,
         max_files: int | None = None,
         include_parents: bool = True,
+        filter_sql: str | None = None,
     ) -> list[SearchResult]:
         """Hybrid search: vector + BM25 fused by weighted RRF, then filtered.
 
@@ -612,7 +681,7 @@ class Store:
         the retrieval unit is what was scored, and the section is only what is read.
         """
         fetch = max(top_k * 4, 50)
-        clause = sql_clause(scopes)
+        clause = _and_clauses(sql_clause(scopes), filter_sql)
 
         vq = self._table.search(query_vector).limit(fetch)
         if clause:
@@ -666,6 +735,9 @@ class Store:
                     score=float(score),
                     distance=distance,
                     parent_id=r.get("parent_id", ""),
+                    labels_json=r.get("labels_json", ""),
+                    doc_date=r.get("doc_date", ""),
+                    doc_date_source=r.get("doc_date_source", ""),
                 )
             )
 
