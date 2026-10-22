@@ -251,6 +251,9 @@ def load_taxonomy(path: Path) -> Taxonomy:
             data = tomllib.load(fh)
     except (OSError, tomllib.TOMLDecodeError) as e:
         raise TaxonomyError(f"{path}: {e}") from e
+    # Not a TOMLDecodeError: tomllib decodes the bytes before it parses them.
+    except UnicodeDecodeError as e:
+        raise TaxonomyError(f"{path}: the file is not UTF-8 ({e}); save it as UTF-8") from e
     try:
         _reject_unknown(data, {"model", "facets"}, "")
         raw_facets = _table(data.get("facets", {}), "facets")

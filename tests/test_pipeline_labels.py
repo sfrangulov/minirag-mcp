@@ -525,6 +525,51 @@ def test_an_invalid_taxonomy_is_one_error_and_not_a_failure(corpus, model_factor
         assert all(row[name] == "" for name in FIELDS)
 
 
+def test_a_taxonomy_that_is_not_utf8_is_one_error_and_not_a_failure(corpus, model_factory):
+    path = corpus.taxonomy_file
+    path.parent.mkdir(parents=True)
+    text = TAXONOMY.replace("Report. Findings and figures.", "Отчёт. Выводы и цифры.")
+    path.write_text(text, encoding="cp1251")
+    corpus.doc("alpha/a.md", "Quarterly report A.")
+    corpus.doc("beta/b.md", "Quarterly report B.")
+
+    counts, errors = corpus.sync()
+
+    assert counts["failed"] == 0 and counts["ingested"] == 2
+    assert len(errors) == 1
+    assert errors[0]["source"] == str(path)
+    assert errors[0]["error"].startswith(f"labels: {path} is invalid: ")
+    assert "UTF-8" in errors[0]["error"]
+    assert model_factory.calls == []
+
+
+def test_a_description_edit_relabels_every_document_even_when_no_label_changes(
+    corpus, model_factory
+):
+    """Labels that come out the same still carry the old hash until they are rewritten,
+    and a document left on an old hash is visited again by every later sync."""
+    corpus.taxonomy()
+    model_factory.default = {"report": 0.75, "minutes": 0.25}
+    sources = [str(corpus.doc(f"alpha/doc{i}.md", f"Quarterly report {i}.")) for i in range(4)]
+    corpus.sync()
+    before = {s: corpus.store.get_source(s).labels_json for s in sources}
+
+    corpus.taxonomy(
+        TAXONOMY.replace("Report. Findings and figures.", "Report. Findings, figures, outlook.")
+    )
+    counts, errors = corpus.sync()
+
+    assert errors == [] and counts["relabelled"] == 4
+    for s in sources:
+        info = corpus.store.get_source(s)
+        assert info.labels_json == before[s]
+        assert info.label_hash == corpus.hash()
+    models = len(model_factory.created)
+    counts, errors = corpus.sync()
+    assert errors == [] and counts["relabelled"] == 0
+    assert len(model_factory.created) == models
+
+
 def test_a_model_that_cannot_be_released_is_reported_by_the_sync(corpus, model_factory):
     """The model is released as the job ends, after the sync's own work is done."""
 

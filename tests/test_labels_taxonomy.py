@@ -38,18 +38,18 @@ values.beta = { description = "Beta project.", paths = ["beta"] }
 """
 
 
-def write(tmp_path: Path, text: str) -> Path:
+def write(tmp_path: Path, text: str, encoding: str = "utf-8") -> Path:
     p = tmp_path / "classify.toml"
-    p.write_text(text, encoding="utf-8")
+    p.write_text(text, encoding=encoding)
     return p
 
 
-def fails(tmp_path: Path, text: str, pattern: str) -> None:
+def fails(tmp_path: Path, text: str, pattern: str, encoding: str = "utf-8") -> None:
     """Assert load_taxonomy rejects `text` with a message that starts with `pattern`.
 
     The message is matched with the file path stripped: tmp_path embeds the test name.
     """
-    path = write(tmp_path, text)
+    path = write(tmp_path, text, encoding)
     with pytest.raises(TaxonomyError) as exc:
         load_taxonomy(path)
     message = str(exc.value)
@@ -241,6 +241,12 @@ def test_within_is_validated_and_normalised(tmp_path):
 
 def test_invalid_toml_is_a_taxonomy_error(tmp_path):
     fails(tmp_path, "[model\n", r"(Invalid|Unclosed|Expected)")
+
+
+def test_a_file_that_is_not_utf8_is_a_taxonomy_error(tmp_path):
+    """An editor on a Russian-locale Windows machine saves cp1251 by default."""
+    text = MINIMAL.replace("Minutes. Date, participants, decisions.", "Протокол совещания.")
+    fails(tmp_path, text, r"the file is not UTF-8", encoding="cp1251")
 
 
 def test_hash_ignores_formatting_but_not_content(tmp_path):
