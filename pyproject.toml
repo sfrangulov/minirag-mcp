@@ -4,7 +4,8 @@ version = "0.7.0"
 description = "Local-first RAG MCP server: hybrid search over your documents, fully local"
 readme = "README.md"
 requires-python = ">=3.11"
-license = "MIT"
+license = "MIT AND Apache-2.0"
+license-files = ["LICENSE", "LICENSES/*"]
 dependencies = [
     "fastmcp>=3.4",
     "lancedb>=0.36",
@@ -23,6 +24,10 @@ dependencies = [
     # runs at startup on every install, extra or not. The bound matches the floor
     # markitdown[pdf] already imposes, so declaring it can never move the resolution.
     "pdfminer.six>=20251230",
+    # markitdown already pulls this in, but we import it directly: a .vtt that is not
+    # UTF-8 is decoded by its detection. markitdown declares it with no floor; 3.0 is
+    # the floor of the converter ingest/vtt.py is adapted from.
+    "charset-normalizer>=3.0",
 ]
 
 [project.scripts]

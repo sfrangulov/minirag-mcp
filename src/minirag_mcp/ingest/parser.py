@@ -1,4 +1,5 @@
-"""markitdown wrapper: files, HTML strings, URLs -> Markdown + title."""
+"""markitdown wrapper: files, HTML strings, URLs -> Markdown + title. A .vtt file goes
+to `vtt` instead."""
 
 from __future__ import annotations
 
@@ -16,6 +17,7 @@ from requests.adapters import HTTPAdapter
 
 from minirag_mcp import ocr
 from minirag_mcp.config import Config
+from minirag_mcp.ingest import vtt
 from minirag_mcp.security import SecurityError, check_url
 
 logger = logging.getLogger(__name__)
@@ -34,6 +36,7 @@ SUPPORTED_EXTENSIONS = frozenset(
         ".csv",
         ".epub",
         ".ipynb",
+        ".vtt",
     }
 )
 
@@ -400,7 +403,21 @@ def _converted_markdown(result) -> str:
     return strip_data_uri_images(result.markdown or "")
 
 
+def _parse_vtt(path: Path) -> ParsedDoc:
+    """Not through markitdown, which has no WebVTT converter and would hand a .vtt to
+    its plain-text one: the raw cue ids, timings and tags indexed as a clean success.
+    Registering ours there would not help — a converter that raises is skipped for the
+    next one that accepts the file, which is that same plain-text converter."""
+    try:
+        markdown = vtt.to_markdown(path.read_bytes())
+    except (OSError, vtt.VttError) as e:
+        raise ParserError(f"Failed to convert {path}: {e}") from e
+    return ParsedDoc(markdown=markdown, title=_file_title(markdown, None, path.stem))
+
+
 def parse_file(path: Path, config: Config | None = None) -> ParsedDoc:
+    if path.suffix.lower() == ".vtt":
+        return _parse_vtt(path)
     if path.suffix.lower() in IMAGE_EXTENSIONS:
         if not ocr.available():
             raise ParserError(f"{path} is an image, which needs OCR; {ocr.INSTALL_HINT}")
