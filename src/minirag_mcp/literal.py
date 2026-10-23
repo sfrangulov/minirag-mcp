@@ -35,11 +35,16 @@ _IGNORABLE = "\u00ad\u200b\u200c\u200d\u2060\ufeff"
 # Characters the slow path drops: the ignorables, a markdown escape's backslash, and
 # the combining dot "İ" leaves behind when lowered.
 _DROPPED = re.compile(f"[{_IGNORABLE}]|\\\\(?=[_*])|i\u0307")
-_SAME = str.maketrans({"ё": "е", "ς": "σ"})
+
 _QUOTES = {'"': '"', "'": "'", "«": "»", "“": "”"}
 # A letter or digit. Unlike `\w`, not an underscore: document codes separate words with it.
 _ALNUM = r"[^\W_]"
 MAX_FORM_CHARS = 60
+
+
+def _same(s: str) -> str:
+    # Not str.translate: with a mapping table it is about 300 times slower on Cyrillic.
+    return s.replace("ё", "е").replace("ς", "σ")
 
 
 def _fold_map(s: str) -> tuple[str, list[int] | None]:
@@ -51,7 +56,7 @@ def _fold_map(s: str) -> tuple[str, list[int] | None]:
     nfc = unicodedata.normalize("NFC", s)
     low = nfc.lower()
     if len(low) == len(nfc) and not _DROPPED.search(nfc):
-        return low.translate(_SAME), None
+        return _same(low), None
     out: list[str] = []
     where: list[int] = []
     for k, c in enumerate(nfc):
@@ -62,7 +67,7 @@ def _fold_map(s: str) -> tuple[str, list[int] | None]:
                 continue
             out.append(ch)
             where.append(k)
-    return "".join(out).translate(_SAME), where
+    return _same("".join(out)), where
 
 
 def fold(s: str) -> str:
