@@ -40,10 +40,11 @@ _BLANK_LINES = re.compile(r"\n{2,}")
 # Characters markitdown adds to a page's text: the pipes and dashes of a Markdown table.
 _TABLE_MARKUP = frozenset("|-")
 # How far past the end of the chunk before it a chunk's own text may start, in
-# non-whitespace characters, on top of four times its own length and the length of any
-# chunks in between that could not be placed. What legitimately lies between two
-# consecutive chunks is what neither of them holds as its own: headings carried in a
-# breadcrumb, a table's header row.
+# non-whitespace characters, on top of four times its own length, the length of any
+# chunks in between that could not be placed, and how far apart the copies of an
+# ambiguous chunk before it lay. What legitimately lies between two consecutive chunks
+# is what neither of them holds as its own: headings carried in a breadcrumb, a table's
+# header row.
 _WINDOW = 4096
 
 
@@ -214,12 +215,15 @@ class _Flat:
             self.keys.append(consumed)
             self.numbers.append(page)
 
-    def find(self, own: str, lo: int, hi: int) -> int:
-        """The first place in [lo, hi) where `own` starts and ends on a word boundary."""
+    def find(self, own: str, lo: int, hi: int) -> list[int]:
+        """Every place in [lo, hi) where `own` starts and ends on a word boundary."""
+        out: list[int] = []
         at = self.text.find(own, lo, hi)
-        while at >= 0 and not (self.edges[at] and self.edges[at + len(own)]):
+        while at >= 0:
+            if self.edges[at] and self.edges[at + len(own)]:
+                out.append(at)
             at = self.text.find(own, at + 1, hi)
-        return at
+        return out
 
     def label(self, lo: int, hi: int) -> str:
         first = bisect_right(self.keys, lo) - 1
@@ -239,9 +243,12 @@ def chunk_pages(markdown: str, starts: PageStarts, chunks: Sequence[Chunk]) -> l
 
     A chunk's own text is the document's text but for whitespace, so it is looked for
     exactly, as whole words. Chunks normally follow the document, so each is looked for
-    from where the one before it ended, and no further than a chunk can have drifted. A
-    transcript whose clock goes back is cut out of order; there a chunk is placed only
-    where its text occurs once in the whole document.
+    from the earliest place the one before it can have ended, and no further than a
+    chunk can have drifted. A transcript whose clock goes back is cut out of order, so
+    there the whole document is searched and no chunk's place bears on another's.
+
+    Ambiguity means no page: a chunk is given one only when every place its text is
+    found gives the same pages.
     """
     if not starts:
         return [""] * len(chunks)
@@ -249,25 +256,23 @@ def chunk_pages(markdown: str, starts: PageStarts, chunks: Sequence[Chunk]) -> l
     ordered = in_document_order(markdown)
     out: list[str] = []
     cursor = 0
-    unplaced = 0
+    slack = 0
     for chunk in chunks:
         own = "".join(chunk.text[chunk.own_start :].split())
         if not own:
             out.append("")
             continue
         if ordered:
-            end = min(len(flat.text), cursor + _WINDOW + 4 * len(own) + unplaced)
-            at = flat.find(own, cursor, end)
+            found = flat.find(own, cursor, cursor + _WINDOW + 4 * len(own) + slack)
         else:
-            at = flat.find(own, 0, len(flat.text))
-            if at >= 0 and flat.find(own, at + 1, len(flat.text)) >= 0:
-                at = -1
-        if at < 0:
+            found = flat.find(own, 0, len(flat.text))
+        if not found:
             out.append("")
-            unplaced += len(own)
+            slack += len(own)
             continue
-        out.append(flat.label(at, at + len(own)))
+        labels = {flat.label(at, at + len(own)) for at in found}
+        out.append(labels.pop() if len(labels) == 1 else "")
         if ordered:
-            cursor = at + len(own)
-            unplaced = 0
+            cursor = found[0] + len(own)
+            slack = found[-1] - found[0]
     return out

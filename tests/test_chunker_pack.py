@@ -348,6 +348,26 @@ def test_every_chunk_s_own_text_is_the_document_s_text_but_for_whitespace(name, 
         assert text in flat, repr(c.text[:200])
 
 
+def test_a_table_header_the_section_cut_repeats_is_never_own_text():
+    """A table longer than a section is cut with its header repeated in every piece; a
+    piece left with that copy and a footer line holds nothing of its own in the copy."""
+    header = "| Code | Batch | Location |\n| --- | --- | --- |"
+    rows = "\n".join(f"| IC-{i:04d} | B{i:05d} | Warehouse {i % 7} |" for i in range(150))
+    footer = "Page 1 of 3 - inventory report, " + "confidential " * 280
+    markdown = f"{header}\n{rows}\n{footer.strip()}"
+    chunks = chunk_markdown(markdown, count_tokens=count)
+    assert any(c.text.startswith(header) and footer[:30] in c.text for c in chunks) or any(
+        c.text.startswith(header) and "IC-" not in c.text for c in chunks
+    ), "the cut has to leave the footer in a piece of its own to prove anything"
+    assert not any("| Code | Batch | Location |" in own(c) for c in chunks)
+
+
+def test_a_heading_cleaned_to_stand_as_text_has_no_own_text():
+    chunks = chunk_markdown("# A\n\nText.\n\n## `config`\n\n## B\n\nMore.", count_tokens=count)
+    [heading] = [c for c in chunks if "config" in c.text]
+    assert own(heading) == ""
+
+
 def test_a_transcript_whose_clock_goes_back_is_not_in_document_order():
     from minirag_mcp.chunker import in_document_order
 

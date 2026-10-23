@@ -937,7 +937,9 @@ results, `read_chunk_neighbors` chunks and a `find_mentions` `firstMatch`, and
 the CLI prints it as `p. 12`. Other formats, and a PDF fetched by `ingest_url`,
 carry no `pages` at all. A page that cannot be told for certain is left out
 rather than guessed: a chunk gets one only where its own text is found, word for
-word, where the document says it should be.
+word, where the document says it should be, and only when every copy of that text
+there is on the same page — a table of identical rows, or a phrase repeated on
+every page, gets none.
 
 Upgrading costs one pass over your PDFs. The first sync after it reads again
 every PDF indexed before page numbers existed — with OCR again for a scanned

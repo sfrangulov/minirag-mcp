@@ -167,9 +167,9 @@ def _rows(top, cells):
     return out
 
 
-def test_identical_rows_on_both_sides_of_a_page_break_keep_their_own_pages(tmp_path):
-    """Every row is the same text, so only order can tell them apart: a chunk of
-    page-2 rows must not be placed among the page-3 copies."""
+def test_identical_rows_on_both_sides_of_a_page_break_never_get_the_other_page(tmp_path):
+    """Every row is the same text: a chunk of page-2 rows must not be placed among the
+    page-3 copies. Where its rows cannot be told from those, it gets no page."""
     same = ("Bolt M8", "10", "1.20")
     page2 = _rows(740, [("Item", "Qty", "Price"), ("Nut M6", "4", "0.30")] + [same] * 6)
     page3 = _rows(740, [same] * 6 + [("Washer", "2", "0.05")])
@@ -190,12 +190,82 @@ def test_identical_rows_on_both_sides_of_a_page_break_keep_their_own_pages(tmp_p
             continue
         span = sorted(set(row_pages[seen : seen + len(rows)]))
         seen += len(rows)
-        assert label == "-".join(str(p) for p in dict.fromkeys([span[0], span[-1]])), (
-            label,
-            chunk.text,
-        )
+        expected = "-".join(str(p) for p in dict.fromkeys([span[0], span[-1]]))
+        assert label in ("", expected), (label, chunk.text)
         checked += 1
     assert seen == len(row_pages) and checked >= 4
+
+
+CONTINUED = ["Description", "Unit", "Qty", "Price"]
+SUPPLY = ["Supply of goods", "pcs", "0.00", "0.00"]
+
+
+@pytest.mark.parametrize(("page_count", "per_page"), [(3, 2), (6, 5), (12, 20)])
+def test_a_table_of_identical_rows_continued_over_pages_gets_no_wrong_page(
+    tmp_path, page_count, per_page
+):
+    """markitdown makes the first row of every continuation page that page's table
+    header. The line is in the document but in no chunk's own text, so a row equal to it
+    would be found there, one row early, and the lag grows with every page."""
+
+    def page(first):
+        lines, y = [], 740
+        for row in ([CONTINUED] if first else []) + [SUPPLY] * per_page:
+            lines += [(x, y, cell) for x, cell in zip((40, 200, 300, 400), row, strict=True)]
+            y -= 20
+        return lines
+
+    path = _pdf(tmp_path, [page(i == 0) for i in range(page_count)])
+    chunks, labels = _chunks(path)
+    rows_on = [per_page] + [per_page - 1] * (page_count - 1)
+    page_index = used = 0
+    for chunk, label in zip(chunks, labels, strict=True):
+        own = chunk.text[chunk.own_start :].strip()
+        if not own.startswith("|"):
+            continue
+        while page_index < len(rows_on) - 1 and used >= rows_on[page_index]:
+            page_index, used = page_index + 1, 0
+        assert label in ("", str(page_index + 1)), (label, page_index + 1, own)
+        used += own.count("\n") + 1
+
+
+def test_a_long_table_page_cut_before_its_footer_gets_no_wrong_page(tmp_path):
+    """A table page over the section cap is cut with its header repeated in every piece.
+    A piece holding nothing but that copy and the page's footer must not take the next
+    page's identical header for its own text."""
+    head = ["Item code", "Batch", "Location", "Received", "Inspected", "Owner"]
+    columns = (30, 120, 210, 300, 390, 480)
+
+    def page(number):
+        lines, y = [], 775
+        rows = [head] + [
+            [
+                f"IC-{number}{i:03d}",
+                f"B{number}{i:04d}",
+                "WH" + "x" * 11,
+                "2024-01-15",
+                "2024-01-16",
+                "Team-A",
+            ]
+            for i in range(52)
+        ]
+        for row in rows:
+            lines += [(x, y, cell) for x, cell in zip(columns, row, strict=True)]
+            y -= 12
+        lines.append((150, 20, f"Page {number} of 3 - inventory report, confidential"))
+        return lines
+
+    chunks, labels = _chunks(_pdf(tmp_path, [page(n) for n in (1, 2, 3)]))
+    for chunk, label in zip(chunks, labels, strict=True):
+        own = chunk.text[chunk.own_start :]
+        found = sorted(
+            {int(code[3]) for code in re.findall(r"IC-\d{4}", own)}
+            | {int(n) for n in re.findall(r"Page (\d) of", own)}
+        )
+        if label:
+            assert found, ("a page for a chunk with nothing of its own", label, chunk.text)
+            expected = str(found[0]) if found[0] == found[-1] else f"{found[0]}-{found[-1]}"
+            assert label == expected, (label, chunk.text[:200])
 
 
 def test_a_page_of_bare_spaces_does_not_shift_the_pages_after_it(tmp_path):
@@ -361,7 +431,7 @@ def test_context_a_chunk_repeats_does_not_widen_its_pages():
     assert pages.chunk_pages(markdown, _starts(markdown), chunks) == ["1", "2"]
 
 
-def test_a_row_is_not_placed_at_a_later_copy_reached_through_the_header():
+def test_a_row_that_cannot_be_told_from_copies_on_another_page_gets_no_page():
     header = "| A | B |\n| --- | --- |\n"
     markdown = f"{header}| x | 1 |\n| x | 1 |\n\n\f| x | 1 |\n| --- | --- |\n| x | 1 |"
     chunks = [
@@ -369,7 +439,26 @@ def test_a_row_is_not_placed_at_a_later_copy_reached_through_the_header():
         _chunk("| x | 1 |", header),
         _chunk("| x | 1 |", "| x | 1 |\n| --- | --- |\n"),
     ]
-    assert pages.chunk_pages(markdown, _starts(markdown), chunks) == ["1", "1", "2"]
+    assert pages.chunk_pages(markdown, _starts(markdown), chunks) == ["", "", "2"]
+
+
+def test_text_found_twice_on_one_page_still_gets_that_page():
+    markdown = "Same line.\n\nSame line.\n\nOther.\n\n\fPage two."
+    chunks = [_chunk(t) for t in ("Same line.", "Same line.", "Other.", "Page two.")]
+    assert pages.chunk_pages(markdown, _starts(markdown), chunks) == ["1", "1", "1", "2"]
+
+
+def test_after_an_ambiguous_chunk_the_next_is_looked_for_from_its_first_copy():
+    markdown = "Same line.\n\nB unique.\n\n\fFiller on page two.\n\n\fSame line."
+    chunks = [_chunk(t) for t in ("Same line.", "B unique.", "Filler on page two.", "Same line.")]
+    assert pages.chunk_pages(markdown, _starts(markdown), chunks) == ["", "1", "2", "3"]
+
+
+def test_after_an_ambiguous_chunk_the_next_may_be_as_far_as_its_last_copy():
+    filler = " ".join(f"word{i}" for i in range(500))
+    markdown = f"Dup.\n\n{filler}\n\n\fDup.\n\n{filler.upper()}\n\nNext unique."
+    chunks = [_chunk("Dup."), _chunk("Next unique.")]
+    assert pages.chunk_pages(markdown, _starts(markdown), chunks) == ["", "2"]
 
 
 def test_a_breadcrumb_from_an_earlier_page_does_not_widen_a_chunk():
@@ -415,13 +504,41 @@ def test_a_chunk_not_found_ahead_is_not_placed_at_a_copy_behind():
     assert pages.chunk_pages(markdown, _starts(markdown), chunks) == ["1", "1", ""]
 
 
-def test_a_chunk_is_found_after_the_one_before_it_not_at_an_earlier_copy():
+def test_a_chunk_that_could_not_be_placed_still_counts_toward_how_far_the_next_may_be():
+    """The middle chunk joins two paragraphs the document keeps apart, so it is found
+    nowhere; the text it holds still lies between its neighbours."""
+    first = " ".join(f"alpha{i}" for i in range(400))
+    second = " ".join(f"beta{i}" for i in range(400))
+    markdown = f"Opening.\n\n{first}\n\nAside.\n\n{second}\n\n\fClosing words."
+    chunks = [_chunk("Opening."), _chunk(f"{first}\n\n{second}"), _chunk("Closing words.")]
+    assert pages.chunk_pages(markdown, _starts(markdown), chunks) == ["1", "", "2"]
+
+
+def test_a_chunk_whose_text_lies_only_behind_the_one_before_it_gets_no_page():
+    """In a document cut in order a chunk follows the one before it. One whose text is
+    found only earlier is not where the order says, so where it is cannot be told."""
+    markdown = "Opening lines.\n\nAlpha.\n\nBeta.\n\n\fGamma."
+    chunks = [_chunk(t) for t in ("Alpha.", "Beta.", "Opening lines.", "Gamma.")]
+    assert pages.chunk_pages(markdown, _starts(markdown), chunks) == ["1", "1", "", "2"]
+
+
+def test_a_repeated_text_is_placed_once_the_chunks_before_it_rule_out_the_other_copy():
     markdown = "Confidential notice.\n\nBody one.\n\n\fConfidential notice.\n\nBody two."
     chunks = [
         _chunk(text)
         for text in ("Confidential notice.", "Body one.", "Confidential notice.", "Body two.")
     ]
-    assert pages.chunk_pages(markdown, _starts(markdown), chunks) == ["1", "1", "2", "2"]
+    assert pages.chunk_pages(markdown, _starts(markdown), chunks) == ["", "1", "2", "2"]
+
+
+def test_a_heading_cleaned_of_its_markup_is_not_looked_for():
+    """`config` is not in the document as written: the heading reads `` `config` ``. The
+    same word in page 2's prose must not be taken for it."""
+    page1 = "# Settings\n\nIntro text about the tool.\n\n## `config`\n\n## Usage\n\nRun it daily."
+    markdown = page1 + "\fEdit the config file before the first run. More text here."
+    chunks = chunk_markdown(markdown, count_tokens=COUNT)
+    labels = pages.chunk_pages(markdown, _starts(markdown), chunks)
+    assert [label for c, label in zip(chunks, labels, strict=True) if "config" in c.text][0] == ""
 
 
 def test_out_of_order_chunks_are_placed_only_where_their_text_is_unique():

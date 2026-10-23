@@ -16,7 +16,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from typing import Protocol
 
-from minirag_mcp.chunker.pack import join_parent, pack_section, shared_lines
+from minirag_mcp.chunker.pack import join_parent, pack_section, shared_lines, without_leading
 from minirag_mcp.chunker.sections import detect_category, in_document_order, split_sections
 from minirag_mcp.chunker.tokens import CountTokens, estimate_tokens
 
@@ -52,9 +52,9 @@ class Chunk:
     text: str
     parent_index: int
     # Where the unit's own text begins: before it is context repeated in the unit — the
-    # seeded title, a breadcrumb, a time-window label, a table's header row. The own text
-    # is the document's own, but for whitespace, unless it is a heading that had no text
-    # of its own and was cleaned of its markup to stand in for it.
+    # seeded title, a breadcrumb, a time-window label, a table's header row, even when the
+    # unit holds it as content. The own text is the document's own, but for whitespace;
+    # a heading cleaned of its markup to stand as text has none.
     own_start: int = 0
 
 
@@ -69,21 +69,6 @@ def _seed_title(body: str, title: str) -> str:
     left alone, which is also what keeps re-ingest idempotent.
     """
     return body if not title.strip() or title in body else f"# {title}\n\n{body}"
-
-
-def _past(text: str, start: int, seed: str) -> int:
-    """The offset after `seed` at `start` of `text`, ignoring whitespace; `start` when
-    the text does not begin with it."""
-    at = start
-    for ch in "".join(seed.split()):
-        while at < len(text) and text[at].isspace():
-            at += 1
-        if at >= len(text) or text[at] != ch:
-            return start
-        at += 1
-    while at < len(text) and text[at].isspace():
-        at += 1
-    return at
 
 
 def chunk_markdown(
@@ -109,17 +94,16 @@ def chunk_markdown(
         sections[0] = replace(sections[0], body=seeded)
     chunks: list[Chunk] = []
     parent = 0
-    for section in sections:
+    for index, section in enumerate(sections):
         units = pack_section(section, count_tokens, budget)
+        if index == 0 and seed:
+            units = without_leading(units, seed)
         if not units:
             continue
         chunks += [
             Chunk(text=unit.text, parent_index=parent, own_start=unit.own_start) for unit in units
         ]
         parent += 1
-    if seed and chunks:
-        first = chunks[0]
-        chunks[0] = replace(first, own_start=_past(first.text, first.own_start, seed))
     return chunks
 
 

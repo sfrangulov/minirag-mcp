@@ -182,6 +182,39 @@ def _owning(text: str, own: str) -> Packed:
     return Packed(text, len(text) - len(own))
 
 
+def _skip(text: str, start: int, count: int) -> int:
+    """The offset in `text` past `count` non-whitespace characters from `start`, and any
+    whitespace that follows them."""
+    at = start
+    while at < len(text) and (count or text[at].isspace()):
+        if not text[at].isspace():
+            count -= 1
+        at += 1
+    return at
+
+
+def without_leading(units: Sequence[Packed], context: str) -> list[Packed]:
+    """`units` with `context` taken out of their own text, where their own text, read in
+    order and without whitespace, begins with it.
+
+    Text a unit carries as content can still be a copy: the title seeded into a
+    document's first section, the header a cut table repeats. Whitespace is ignored
+    because packing rejoins atoms with separators of its own.
+    """
+    wanted = "".join(context.split())
+    owned = "".join("".join(u.text[u.own_start :].split()) for u in units)
+    if not wanted or not owned.startswith(wanted):
+        return list(units)
+    out: list[Packed] = []
+    left = len(wanted)
+    for unit in units:
+        mine = len("".join(unit.text[unit.own_start :].split()))
+        take = min(left, mine)
+        out.append(Packed(unit.text, _skip(unit.text, unit.own_start, take)) if take else unit)
+        left -= take
+    return out
+
+
 def _render(prefix: str, header: str, body: str) -> str:
     parts = []
     if prefix:
@@ -349,7 +382,9 @@ def pack_section(section: Section, count_tokens: CountTokens, budget: int) -> li
                 flush()
         run.append(atom)
     flush()
-    return units
+    if not section.verbatim:
+        return [Packed(unit.text, len(unit.text)) for unit in units]
+    return without_leading(units, section.repeated)
 
 
 def shared_lines(previous: Sequence[str], lines: Sequence[str]) -> int:
