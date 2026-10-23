@@ -29,6 +29,10 @@ dependencies = [
     # the floor of the converter ingest/vtt.py is adapted from.
     "charset-normalizer>=3.0",
     "pathspec>=0.12",
+    # lancedb already pulls this in, but we import it directly: look-alike signatures are
+    # computed and compared as arrays. The bound is lancedb's own floor, so declaring it
+    # can never move the resolution.
+    "numpy>=1.24",
 ]
 
 [project.scripts]

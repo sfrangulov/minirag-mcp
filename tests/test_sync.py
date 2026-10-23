@@ -995,3 +995,75 @@ def test_a_scoped_sync_reached_through_an_inner_root_is_not_failed_by_its_parent
         os.chmod(docs / "a", 0o755)
 
     assert counts["ingested"] == 1 and counts["failed"] == 0
+
+
+def _before_signatures(env):
+    """An index synced by a version that predates look-alike signatures."""
+    from lookalike_texts import MINUTES, REGULATION_V1, REGULATION_V2
+
+    cfg, store, pipeline, root = env
+    (root / "v1.md").write_text(REGULATION_V1)
+    (root / "v2.md").write_text(REGULATION_V2)
+    (root / "minutes.md").write_text(MINUTES)
+    counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    assert counts["ingested"] >= 3 and errors == []
+    store._db.drop_table("signatures")
+    return Store(store.db_path, dim=store.dim)
+
+
+class _NoEmbedder:
+    dim = 8
+
+    def embed_documents(self, texts):
+        raise AssertionError("a backfill must not embed")
+
+
+def test_sync_signs_an_index_from_before_signatures_from_its_stored_text(env, monkeypatch):
+    cfg, _, _, root = env
+    store = _before_signatures(env)
+    monkeypatch.setattr(
+        "minirag_mcp.ingest.pipeline.parse_file",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("a backfill must not parse")),
+    )
+    pipeline = Pipeline(store, _NoEmbedder(), cfg)
+    assert len(store.unsigned_sources()) == 3
+
+    events = []
+    counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size, on_event=events.append)
+
+    assert errors == []
+    assert counts["signed"] == 3 and counts["ingested"] == 0 and counts["skipped"] == 3
+    assert f"signed {root / 'v1.md'}" in events
+    assert store.unsigned_sources() == []
+    assert [n.source for n in store.look_alikes([str(root / "v1.md")])[str(root / "v1.md")]] == [
+        str(root / "v2.md")
+    ]
+    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    assert counts["signed"] == 0
+
+
+def test_a_scoped_sync_signs_only_inside_its_scope(env):
+    cfg, _, _, root = env
+    (root / "sub").mkdir()
+    (root / "sub" / "c.md").write_text("# C\n\nCharlie body text for the corpus.")
+    store = _before_signatures(env)
+    pipeline = Pipeline(store, _NoEmbedder(), cfg)
+    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size, scope=root / "sub")
+    assert counts["signed"] == 1
+    assert len(store.unsigned_sources()) == 3
+
+
+def test_a_sync_that_ingests_signs_at_ingest_and_counts_no_backfill(env):
+    cfg, store, pipeline, root = env
+    seed(root)
+    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    assert counts["ingested"] == 2 and counts["signed"] == 0
+    assert store.unsigned_sources() == []
+
+
+def test_a_job_reports_the_same_count_keys_before_and_after_it_runs(env):
+    """A counter that only appears once the job finishes changes every earlier poll's shape."""
+    cfg, store, pipeline, root = env
+    seed(root)
+    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    assert set(sync_mod.SyncJob(job_id="x").counts) == set(counts)

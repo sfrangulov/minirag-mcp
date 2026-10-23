@@ -12,7 +12,7 @@ from typing import Annotated
 from cyclopts import App, Parameter
 
 from minirag_mcp import __version__
-from minirag_mcp.chunker import SCHEME_VERSION
+from minirag_mcp.chunker import SCHEME_VERSION, join_document
 from minirag_mcp.config import Config, ConfigError, load_config
 from minirag_mcp.embedder import Embedder, EmbedderUnavailableError, UnknownModelError
 from minirag_mcp.ingest.ignore import IGNORE_FILE, IgnoredFileError, excluded_by
@@ -26,7 +26,6 @@ from minirag_mcp.results import (
     QueryError,
     ignore_status,
     ingest_reply,
-    join_document,
     labels_status,
     list_payload,
     ocr_status,
@@ -34,6 +33,7 @@ from minirag_mcp.results import (
     run_find,
     run_query,
     scheme_status,
+    signature_status,
 )
 from minirag_mcp.security import SecurityError, resolve_in_roots
 from minirag_mcp.store import DimensionMismatchError, IndexOpenError, Store
@@ -158,6 +158,14 @@ def _document_suffix(row: dict) -> str:
     for facet, lab in row.get("labels", {}).items():
         parts.append(f"{facet}={lab['value']}" + (" (uncertain)" if lab["uncertain"] else ""))
     return "".join(f" {p}" for p in parts)
+
+
+def _look_alike_lines(row: dict, indent: str) -> list[str]:
+    return [
+        f"{indent}looks like {a['displayPath']} ({a['overlap']:.0%} shared text)"
+        + _document_suffix(a)
+        for a in row.get("lookAlikes", ())
+    ]
 
 
 def _documents(n: int) -> str:
@@ -352,11 +360,14 @@ def query(
         raise AssertionError from e  # unreachable
     if payload["results"]:
         human = "\n".join(_result_line(r) for r in payload["results"])
-        human += "\n\nSources:\n" + "\n".join(
-            f"  {s['source']} ({s['hits']} hit{'s' if s['hits'] != 1 else ''})"
-            + _document_suffix(s)
-            for s in payload["sources"]
-        )
+        lines = []
+        for s in payload["sources"]:
+            lines.append(
+                f"  {s['source']} ({s['hits']} hit{'s' if s['hits'] != 1 else ''})"
+                + _document_suffix(s)
+            )
+            lines += _look_alike_lines(s, "      ")
+        human += "\n\nSources:\n" + "\n".join(lines)
     else:
         human = "no results" + (f" — {payload['notice']}" if "notice" in payload else "")
     _emit(payload, json, human)
@@ -379,6 +390,7 @@ def _find_human(payload: dict) -> str:
         lines.append(f"{row['displayPath']} ({', '.join(what)}){terms}" + _document_suffix(row))
         if row["firstMatch"]:
             lines.append(f"    {row['firstMatch']['snippet']}")
+        lines += _look_alike_lines(row, "    ")
     if "nextOffset" in payload:
         lines.append(f"more: rerun with --offset {payload['nextOffset']}")
     if "notice" in payload:
@@ -606,6 +618,7 @@ def status(
         payload["chunkCount"] = store.chunk_count()
         payload["sourceCount"] = store.source_count()
         payload.update(scheme_status(store))
+        payload.update(signature_status(store))
         payload.update(labels_status(_label_source(cfg), store))
     except Exception as e:
         payload["indexError"] = str(e)

@@ -45,6 +45,7 @@ class SyncJob:
             # different shape. For the same reason `relabelled` is here whether or not
             # the corpus has a classify.toml.
             "relabelled": 0,
+            "signed": 0,
             "ignored": 0,
             "unreadable": 0,
             "failed": 0,
@@ -131,6 +132,7 @@ def _run_sync_unlocked(
         "moved": 0,
         "deleted": 0,
         "relabelled": 0,
+        "signed": 0,
         "ignored": sum(1 for p in ignored if scope is None or is_under(str(p), str(scope))),
         "unreadable": len(diff.unreadable),
         "failed": 0,
@@ -205,6 +207,15 @@ def _run_sync_unlocked(
         )
         counts["relabelled"] += relabelled
         errors.extend(relabel_errors)
+
+    # After every other write of the run, which signs what it ingests and moves. What is
+    # left unsigned predates signatures or lost a write. Not failures: those documents
+    # are indexed and searchable; only their look-alikes go unnamed.
+    signed, sign_errors = store.backfill_signatures(
+        (str(scope),) if scope else (), on_event=on_event
+    )
+    counts["signed"] += signed
+    errors.extend(sign_errors)
 
     # Read once the job has ended, since releasing the model can add a problem of its
     # own. Not failures: the documents are indexed, and only their labels are missing.

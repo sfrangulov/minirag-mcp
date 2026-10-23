@@ -12,7 +12,9 @@ Two units, deliberately separated (the small-to-big / parent-document pattern):
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
+from typing import Protocol
 
 from minirag_mcp.chunker.pack import join_parent, pack_section, shared_lines
 from minirag_mcp.chunker.sections import detect_category, split_sections
@@ -36,6 +38,7 @@ __all__ = [
     "chunk_markdown",
     "detect_category",
     "estimate_tokens",
+    "join_document",
     "join_parent",
     "shared_lines",
 ]
@@ -88,3 +91,35 @@ def chunk_markdown(
         chunks += [Chunk(text=unit, parent_index=parent) for unit in units]
         parent += 1
     return chunks
+
+
+class Unit(Protocol):
+    """A stored retrieval unit, as far as rebuilding its document needs one."""
+
+    text: str
+    parent_id: str
+
+
+def join_document(chunks: Sequence[Unit]) -> str:
+    """A source's indexed text, rebuilt for reading rather than concatenated.
+
+    Every retrieval unit repeats whatever context its own vector needed — a heading
+    breadcrumb, a time-window label, a table's header row — so joining the units
+    verbatim prints that context once per unit. Measured on the real corpus, that
+    inflated the document by 22% at the median and 2.64x at the tail, and for a table it
+    plants a header row in the middle of the rows. `join_parent` already knows how to
+    drop the leading lines a unit shares with the one before it, so this applies it per
+    section and joins the sections.
+
+    A chunk with no `parent_id` — an index predating parent sections — is its own group,
+    so nothing is ever deduplicated across two chunks that were never one section.
+    """
+    groups: list[list[str]] = []
+    current: str | None = None
+    for chunk in chunks:
+        parent = chunk.parent_id or None
+        if parent is None or parent != current:
+            groups.append([])
+            current = parent
+        groups[-1].append(chunk.text)
+    return "\n\n".join(text for text in (join_parent(g) for g in groups) if text)

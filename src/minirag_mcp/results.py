@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from minirag_mcp import literal, ocr
-from minirag_mcp.chunker import join_parent, shared_lines
+from minirag_mcp.chunker import shared_lines
 from minirag_mcp.config import Config
 from minirag_mcp.ingest import ignore
 from minirag_mcp.ingest.pipeline import IngestResult
@@ -113,31 +113,6 @@ def parent_map(results: Iterable[SearchResult]) -> dict[str, str]:
     return out
 
 
-def join_document(chunks: Sequence[SearchResult]) -> str:
-    """A source's indexed text, rebuilt for reading rather than concatenated.
-
-    Every retrieval unit repeats whatever context its own vector needed — a heading
-    breadcrumb, a time-window label, a table's header row — so joining the units
-    verbatim prints that context once per unit. Measured on the real corpus, that
-    inflated the document by 22% at the median and 2.64x at the tail, and for a table it
-    plants a header row in the middle of the rows. `join_parent` already knows how to
-    drop the leading lines a unit shares with the one before it, so this applies it per
-    section and joins the sections.
-
-    A chunk with no `parent_id` — an index predating parent sections — is its own group,
-    so nothing is ever deduplicated across two chunks that were never one section.
-    """
-    groups: list[list[str]] = []
-    current: str | None = None
-    for chunk in chunks:
-        parent = chunk.parent_id or None
-        if parent is None or parent != current:
-            groups.append([])
-            current = parent
-        groups[-1].append(chunk.text)
-    return "\n\n".join(text for text in (join_parent(g) for g in groups) if text)
-
-
 def scheme_status(store: Store) -> dict:
     """The chunking-scheme half of `status`, identical for the server and the CLI.
 
@@ -152,6 +127,44 @@ def scheme_status(store: Store) -> dict:
             f"{stale} chunk(s) predate the current chunking scheme. {RESYNC_HINT}"
         )
     return out
+
+
+def signature_status(store: Store) -> dict:
+    """The look-alike half of `status`, identical for the server and the CLI.
+
+    Absent when every indexed document is signed, so an index that is up to date sees
+    the status it always had.
+    """
+    unsigned = len(store.unsigned_sources())
+    if not unsigned:
+        return {}
+    return {
+        "unsignedSourceCount": unsigned,
+        "lookAlikesWarning": f"{unsigned} indexed document(s) have no look-alike signature, "
+        "so search results do not name their look-alikes. A sync (sync_start, or "
+        "`minirag-mcp sync`) computes them from the stored text, reading and embedding "
+        "nothing again.",
+    }
+
+
+def add_look_alikes(rows: Sequence[dict], store: Store, roots: Sequence[Path]) -> None:
+    """Give each document row with look-alikes a `lookAlikes` list; leave the rest as is.
+
+    Taken from the whole index, whatever scope or filter produced the rows: a sibling
+    outside them is the one the caller cannot otherwise find out about.
+    """
+    found = store.look_alikes(row["source"] for row in rows)
+    for row in rows:
+        if near := found.get(row["source"]):
+            row["lookAlikes"] = [
+                {
+                    "source": n.source,
+                    "displayPath": display_path(n.source, roots),
+                    "overlap": round(n.overlap, 2),
+                    **document_fields("", n.doc_date, n.doc_date_source),
+                }
+                for n in near
+            ]
 
 
 def ignore_status(roots: Sequence[Path]) -> dict:
@@ -316,6 +329,7 @@ def run_query(
         "sources": aggregate_sources(results, config.roots),
         "parents": parent_map(results),
     }
+    add_look_alikes(payload["sources"], store, config.roots)
     if label_filter is not None and labeler is not None:
         payload["filterCounts"] = filter_counts(
             label_filter, store.list_sources(scopes=scopes), labeler.taxonomy, config.roots
@@ -487,6 +501,7 @@ def run_find(
         "forms": forms,
         "documents": rows[offset : offset + limit],
     }
+    add_look_alikes(payload["documents"], store, roots)
     if offset + limit < len(rows):
         payload["nextOffset"] = offset + limit
     if label_filter is not None and labeler is not None:
