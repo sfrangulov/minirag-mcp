@@ -723,3 +723,50 @@ def test_a_pipeline_without_a_label_source_labels_nothing(tmp_path, fake_embedde
     assert errors == [] and counts["ingested"] == 1 and counts["relabelled"] == 0
     assert store.get_source(str(root / "a.md")).label_hash == ""
     assert pipeline.relabel_stale() == (0, [])
+
+
+# --- what an ingest says about its own labels -------------------------------------------
+
+
+def test_an_ingest_whose_model_failed_says_which_labels_are_missing_and_why(corpus, model_factory):
+    corpus.taxonomy()
+    model_factory.error = ModelError("could not download fake.gguf: offline")
+    result = corpus.pipeline.ingest_file(corpus.doc("alpha/a.md", "Notes."))
+    assert result.label_problem == (
+        "stored without a type label: could not download fake.gguf: offline. "
+        "The next sync asks again."
+    )
+
+
+def test_every_document_of_a_job_the_model_failed_in_carries_the_problem(corpus, model_factory):
+    """The job's report names a failure once; the second document must not look clean."""
+    corpus.taxonomy()
+    model_factory.error = ModelError("no model here")
+    with corpus.pipeline.job():
+        first = corpus.pipeline.ingest_file(corpus.doc("a.md", "One."))
+        second = corpus.pipeline.ingest_file(corpus.doc("b.md", "Two."))
+    assert first.label_problem and "no model here" in first.label_problem
+    assert second.label_problem == first.label_problem
+
+
+def test_a_document_the_model_choked_on_says_so_and_the_next_one_is_clean(corpus, model_factory):
+    corpus.taxonomy()
+    model_factory.fail_on = "Poison"
+    with corpus.pipeline.job():
+        bad = corpus.pipeline.ingest_file(corpus.doc("a.md", "Poison pill."))
+        good = corpus.pipeline.ingest_file(corpus.doc("b.md", "Plain notes."))
+    assert bad.label_problem and "cannot read a document containing Poison" in bad.label_problem
+    assert good.label_problem is None
+
+
+def test_an_invalid_taxonomy_is_named_on_the_ingest(corpus):
+    path = corpus.taxonomy("[facets.type\n")
+    result = corpus.pipeline.ingest_file(corpus.doc("a.md", "Notes."))
+    assert result.label_problem.startswith(f"stored without labels: {path} is invalid: ")
+
+
+def test_a_labelled_or_unlabelled_corpus_reports_no_problem(tmp_path, fake_embedder, model_factory):
+    corpus = make_corpus(tmp_path, fake_embedder, model_factory)
+    assert corpus.pipeline.ingest_file(corpus.doc("a.md", "Notes.")).label_problem is None
+    corpus.taxonomy()
+    assert corpus.pipeline.ingest_file(corpus.doc("b.md", "Notes.")).label_problem is None

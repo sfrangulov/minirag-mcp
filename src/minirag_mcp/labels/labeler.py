@@ -12,6 +12,7 @@ from pathlib import Path
 from minirag_mcp.labels import model as _model
 from minirag_mcp.labels.dates import document_date
 from minirag_mcp.labels.model import (
+    INSTALL_HINT,
     MAX_EVIDENCE_CHARS,
     ChoiceModel,
     ModelError,
@@ -53,6 +54,7 @@ class _Document:
     # Facets the model was asked for and could not answer: it could not be made, or this
     # document's call failed.
     unanswered: set[str] = field(default_factory=set)
+    reason: str = ""
     _evidence: str | None = field(default=None, init=False, repr=False)
 
     def evidence(self, file_name_label: str) -> str:
@@ -88,6 +90,9 @@ class Labeler:
         self._lock = threading.RLock()
         self._model: ChoiceModel | None = None
         self._model_failed = False
+        # Why the last attempt to make the model failed. Kept past the job, which retries
+        # afresh, so `status` can say what went wrong instead of "on demand".
+        self._last_failure: str | None = None
 
     @property
     def roots(self) -> tuple[Path, ...]:
@@ -156,12 +161,14 @@ class Labeler:
             date=date,
             taxonomy_hash="" if doc.unanswered else self._hash,
             unanswered=frozenset(doc.unanswered),
+            reason=doc.reason if doc.unanswered else "",
         )
 
     def _ask(self, report: JobReport, doc: _Document, facet: Facet) -> Mapping[str, float]:
         spec = self.taxonomy.model
         if doc.failed or spec is None:
             doc.unanswered.add(facet.name)
+            doc.reason = doc.reason or "classify.toml has no [model]"
             return {}
         evidence = doc.evidence(spec.file_name_label)
         options = [(v.id, v.description) for v in facet.values]
@@ -169,18 +176,22 @@ class Labeler:
             if self._model is None and not self._model_failed:
                 try:
                     self._model = self._model_factory(spec, self._cache_dir)
+                    self._last_failure = None
                 except Exception as e:
                     self._model_failed = True
-                    report.add(_reason(e))
+                    self._last_failure = _reason(e)
+                    report.add(self._last_failure)
             if self._model is None:
                 doc.unanswered.add(facet.name)
+                doc.reason = doc.reason or self._last_failure or ""
                 return {}
             try:
                 probs = self._model.probabilities(evidence, facet.question, options)
             except Exception as e:
                 doc.failed = True
                 doc.unanswered.add(facet.name)
-                report.add(f"{doc.source}: {_reason(e)}")
+                doc.reason = _reason(e)
+                report.add(f"{doc.source}: {doc.reason}")
                 return {}
         if doc.trace is not None:
             doc.trace[facet.name] = dict(probs)
@@ -189,9 +200,22 @@ class Labeler:
     def model_state(self) -> str:
         if self._model is not None:
             return "loaded"
-        if any(f.needs_model for f in self.taxonomy.facets) and not _model.available():
-            return "unavailable"
-        return "on demand"
+        return "unavailable" if self.model_problem() else "on demand"
+
+    def model_problem(self) -> str | None:
+        """Why the model cannot answer here, or None when it can or is not needed.
+
+        Checked without loading it: the extra, then a local model file, then the last
+        load this process tried. A download not yet made is not a problem until it fails.
+        """
+        if self._model is not None or not any(f.needs_model for f in self.taxonomy.facets):
+            return None
+        if not _model.available():
+            return INSTALL_HINT
+        spec = self.taxonomy.model
+        if spec is not None and spec.path is not None and not spec.path.is_file():
+            return f"the classify model file {spec.path} does not exist"
+        return self._last_failure
 
 
 class LabelerSource:

@@ -366,14 +366,21 @@ source distribution, so you need a C/C++ toolchain (on macOS, the Xcode
 command-line tools: `xcode-select --install`). It took about 40 seconds on an
 Apple M-series laptop. The base install gains no dependency and no compile step.
 
-If the file is present and the extra is missing, model-answered facets stay unset,
-and that is reported rather than skipped silently: `status` reports
-`labels.model: "unavailable"` with the install command in `labels.modelHint` and
-counts the documents under `unlabelled`; `sync` lists the reason in its errors;
-`minirag-mcp ingest` and `ingest-url` print it as a `warn:` line; `classify try`
-exits 1; and a filter on such a facet carries a `filterNotice`. The MCP ingest
-tools (`ingest_file`, `ingest_data`, `ingest_url`) store the document and do not
-repeat the reason in their reply: `status` is where it shows.
+If the file is present and the model cannot run (the extra is missing, the model
+file is not there, or loading it failed), model-answered facets stay unset, and
+that is reported rather than skipped silently:
+
+- `status` reports `labels.model: "unavailable"` with the reason in
+  `labels.modelHint`, and counts the documents under `unlabelled`.
+- An ingest stores the document and names what it was stored without, and why, in
+  `labelProblem`. That covers the MCP tools `ingest_file`, `ingest_data` and
+  `ingest_url`, and `minirag-mcp ingest` and `ingest-url`, which also print a
+  `warn:` line.
+- `sync` lists the reason in its errors and asks the model again for every
+  document left without a label.
+- `classify try` exits 1, and a filter on such a facet carries a `filterNotice`.
+
+A model downloaded on first use counts as available until a download fails.
 
 The file is re-read when it changes, so a long-running server picks up an edit
 without a restart. A file that cannot be parsed is reported by `status` under

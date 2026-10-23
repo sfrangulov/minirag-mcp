@@ -197,9 +197,15 @@ def root(tmp_path) -> Path:
 
 
 @pytest.fixture
-def with_file(root):
+def with_file(root, tmp_path):
+    # A real file: a missing one makes the model "unavailable", whatever the fake does.
+    model_file = tmp_path / "models" / "fake.gguf"
+    model_file.parent.mkdir()
+    model_file.write_bytes(b"gguf")
     (root / ".minirag").mkdir()
-    (root / ".minirag" / "classify.toml").write_text(LABEL_TOML)
+    (root / ".minirag" / "classify.toml").write_text(
+        LABEL_TOML.replace("/models/fake.gguf", str(model_file))
+    )
 
 
 @pytest.fixture
@@ -448,3 +454,28 @@ def test_a_filter_on_a_model_facet_without_the_extra_says_what_to_install(
     assert "type" in payload["filterNotice"]
     assert labels_status(label_source, store)["labels"]["model"] == "unavailable"
     assert "modelHint" in labels_status(label_source, store)["labels"]
+
+
+def test_status_and_a_filter_name_a_model_file_that_is_not_there(
+    root, tmp_path, monkeypatch, fake_embedder
+):
+    monkeypatch.setattr("minirag_mcp.labels.model.available", lambda: True)
+    missing = tmp_path / "models" / "absent.gguf"
+    (root / ".minirag").mkdir()
+    (root / ".minirag" / "classify.toml").write_text(
+        LABEL_TOML.replace("/models/fake.gguf", str(missing))
+    )
+    source = LabelerSource((root,), tmp_path / "cache", FakeModelFactory())
+    store = Store(tmp_path / "db", dim=fake_embedder.dim)
+    reason = f"the classify model file {missing} does not exist"
+    labels = labels_status(source, store)["labels"]
+    assert labels["model"] == "unavailable" and labels["modelHint"] == reason
+    got = run_query(
+        store,
+        fake_embedder,
+        make_config(root, tmp_path),
+        "x",
+        labels={"type": "spec"},
+        label_source=source,
+    )
+    assert got["filterNotice"].endswith(f"which cannot run here: {reason}")

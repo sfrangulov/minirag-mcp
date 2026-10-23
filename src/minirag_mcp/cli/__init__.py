@@ -23,6 +23,7 @@ from minirag_mcp.lock import SyncLockBusy
 from minirag_mcp.results import (
     DEFAULT_FIND_LIMIT,
     QueryError,
+    ingest_reply,
     join_document,
     labels_status,
     list_payload,
@@ -225,10 +226,13 @@ def ingest(
                 done.append(pipeline.ingest_file(f))
             except Exception as e:  # per-file failures never abort the batch
                 failures.append({"source": str(f), "error": str(e)})
-    payload = {
-        "ingested": [{"source": r.source, "chunkCount": r.chunk_count} for r in done],
-        "failed": failures,
-    }
+    ingested = []
+    for r in done:
+        row = {"source": r.source, "chunkCount": r.chunk_count}
+        if r.label_problem:
+            row["labelProblem"] = r.label_problem
+        ingested.append(row)
+    payload = {"ingested": ingested, "failed": failures}
     human = "\n".join([f"ingested {len(done)} file(s):"] + [f"  {r.source}" for r in done])
     _emit(payload, json, human)
     for fail in failures:
@@ -257,11 +261,7 @@ def ingest_url(
             r = pipeline.ingest_url(url, source=source, title=title)
     except Exception as e:
         _fail(str(e))
-    _emit(
-        {"source": r.source, "chunkCount": r.chunk_count, "title": r.title},
-        json,
-        f"ingested {r.source} ({r.chunk_count} chunks)",
-    )
+    _emit(ingest_reply(r), json, f"ingested {r.source} ({r.chunk_count} chunks)")
     _warn_labelling(pipeline, report.problems)
 
 

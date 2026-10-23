@@ -625,8 +625,7 @@ def test_a_filter_that_leaves_documents_out_says_so_in_human_output(
     expected = [
         "warn: 3 documents in scope were left out for having no label for a filtered facet",
         "warn: 1 document in scope was left out for having no date",
-        "warn: labels for type come from the model, which this installation cannot run; "
-        + INSTALL_HINT,
+        "warn: labels for type come from the model, which cannot run here: " + INSTALL_HINT,
     ]
 
     run(["list", *flags])

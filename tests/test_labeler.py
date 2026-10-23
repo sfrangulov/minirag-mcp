@@ -474,7 +474,10 @@ def test_a_document_without_model_facets_does_not_wait_for_another_threads_call(
 
 
 def test_model_state_is_loaded_unavailable_or_on_demand(root, model_factory, monkeypatch):
-    labeler = make_labeler(root, model_factory)
+    present = root.parent / "models" / "fake.gguf"
+    present.parent.mkdir()
+    present.write_bytes(b"gguf")
+    labeler = make_labeler(root, model_factory, TAXONOMY.replace("/models/fake.gguf", str(present)))
 
     monkeypatch.setattr(model, "available", lambda: True)
     assert labeler.model_state() == "on demand"
@@ -571,3 +574,31 @@ def test_source_reports_a_file_that_fails_validation_as_an_error(root, model_fac
     assert labeler is None
     assert error is not None and error.startswith(f"{path}: ")
     assert key in error
+
+
+def test_a_model_file_that_is_not_there_makes_the_model_unavailable(
+    root, model_factory, monkeypatch
+):
+    monkeypatch.setattr(model, "available", lambda: True)
+    missing = root.parent / "models" / "absent.gguf"
+    labeler = make_labeler(root, model_factory, TAXONOMY.replace("/models/fake.gguf", str(missing)))
+    assert labeler.model_state() == "unavailable"
+    assert labeler.model_problem() == f"the classify model file {missing} does not exist"
+
+
+def test_a_failed_load_stays_reported_until_a_load_succeeds(root, model_factory, monkeypatch):
+    monkeypatch.setattr(model, "available", lambda: True)
+    present = root.parent / "models" / "fake.gguf"
+    present.parent.mkdir()
+    present.write_bytes(b"gguf")
+    labeler = make_labeler(root, model_factory, TAXONOMY.replace("/models/fake.gguf", str(present)))
+    assert labeler.model_state() == "on demand" and labeler.model_problem() is None
+    model_factory.error = ModelError("sha256 mismatch")
+    with labeler.job():
+        label_file(labeler, root, "notes/a.md")
+    assert labeler.model_state() == "unavailable"
+    assert labeler.model_problem() == "sha256 mismatch"
+    model_factory.error = None
+    with labeler.job():
+        label_file(labeler, root, "notes/b.md")
+    assert labeler.model_state() == "on demand" and labeler.model_problem() is None
