@@ -13,7 +13,9 @@ import importlib.util
 import json
 import math
 import sys
-from collections.abc import Sequence
+import threading
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Protocol
 
@@ -66,8 +68,9 @@ def _route_llama_logs(llama_cpp) -> None:
             if level != _LOG_CONT:
                 last[0] = level
             if last[0] == _LOG_ERROR and text:
-                sys.stderr.write(text.decode("utf-8", "replace"))
-                sys.stderr.flush()
+                out = _stderr()
+                out.write(text.decode("utf-8", "replace"))
+                out.flush()
 
         _log_callback = (llama_cpp, forward)
     llama_cpp.llama_log_set(_log_callback[1], ctypes.c_void_p(0))
@@ -160,6 +163,49 @@ def resolve_model_file(spec: ModelSpec, cache_dir: Path) -> Path:
     return downloaded
 
 
+class _MutedFor:
+    """sys.stderr with one thread's writes dropped and every other thread's passed on."""
+
+    def __init__(self, target, thread: int):
+        self.target = target
+        self._thread = thread
+
+    def write(self, s: str) -> int:
+        if threading.get_ident() == self._thread:
+            return len(s)
+        return self.target.write(s)
+
+    def __getattr__(self, name: str):
+        return getattr(self.target, name)
+
+
+def _stderr():
+    """sys.stderr, past a load's muting: llama.cpp's errors must still reach it."""
+    out = sys.stderr
+    return out.target if isinstance(out, _MutedFor) else out
+
+
+# A swap restored out of order would leave a muted stream installed, so loads take turns.
+_QUIET = threading.Lock()
+
+
+@contextmanager
+def _quiet_load() -> Iterator[None]:
+    """Drop what llama-cpp-python prints to sys.stderr while this thread loads a model.
+
+    With verbose=True that is about 17 KB a load, the chat template twice, and every
+    MCP ingest_file is a job of its own. Python-level only: no file descriptor is
+    touched, since fd 1 is the MCP channel, and the server's other threads keep writing.
+    """
+    with _QUIET:
+        target = sys.stderr
+        sys.stderr = _MutedFor(target, threading.get_ident())
+        try:
+            yield
+        finally:
+            sys.stderr = target
+
+
 class LlamaChoiceModel:
     def __init__(self, path: Path, temperature: float):
         try:
@@ -175,13 +221,14 @@ class LlamaChoiceModel:
         _route_llama_logs(llama_cpp)
         self._temperature = temperature
         try:
-            self._llm = Llama(
-                model_path=str(path),
-                n_ctx=N_CTX,
-                n_gpu_layers=-1,
-                n_batch=2048,
-                verbose=True,
-            )
+            with _quiet_load():
+                self._llm = Llama(
+                    model_path=str(path),
+                    n_ctx=N_CTX,
+                    n_gpu_layers=-1,
+                    n_batch=2048,
+                    verbose=True,
+                )
         except Exception as e:
             raise ModelError(f"could not load the classify model {path}: {e}") from e
 

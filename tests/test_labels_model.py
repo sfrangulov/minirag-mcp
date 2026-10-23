@@ -5,6 +5,7 @@ import json
 import math
 import os
 import sys
+import threading
 import types
 import weakref
 from pathlib import Path
@@ -192,7 +193,11 @@ def fake_llama_cpp(monkeypatch):
     mod.made = []
     mod.callbacks = []
 
+    mod.on_load = None
+
     def make(**kwargs):
+        if mod.on_load is not None:
+            mod.on_load()
         llm = _FakeLlama(**kwargs)
         mod.made.append(llm)
         return llm
@@ -251,3 +256,44 @@ def test_the_log_callback_stays_referenced_while_the_library_can_call_it(fake_ll
     fake_llama_cpp.callbacks.clear()
     gc.collect()
     assert ref() is not None
+
+
+def test_what_the_library_prints_while_loading_is_dropped_but_errors_still_show(
+    fake_llama_cpp, tmp_path, capfd
+):
+    """llama-cpp-python prints about 17 KB per load with verbose=True, and every MCP
+    ingest_file is its own job, so that repeated on every call."""
+
+    def load():
+        print("Model metadata: {'general.name': 'x'}", file=sys.stderr)
+        print("Using gguf chat template: {% for m in messages %}", file=sys.stderr)
+        fake_llama_cpp.callbacks[-1](3, b"error loading tensor\n", None)
+
+    fake_llama_cpp.on_load = load
+    model.LlamaChoiceModel(tmp_path / "m.gguf", 2.07)
+    assert capfd.readouterr().err == "error loading tensor\n"
+
+
+def test_another_thread_writing_to_stderr_during_a_load_is_not_lost(
+    fake_llama_cpp, tmp_path, capsys
+):
+    def load():
+        other = threading.Thread(target=lambda: print("server log line", file=sys.stderr))
+        other.start()
+        other.join()
+
+    fake_llama_cpp.on_load = load
+    model.LlamaChoiceModel(tmp_path / "m.gguf", 2.07)
+    assert "server log line" in capsys.readouterr().err
+
+
+def test_stderr_is_restored_when_a_load_fails(fake_llama_cpp, tmp_path):
+    before = sys.stderr
+
+    def load():
+        raise ValueError("bad magic")
+
+    fake_llama_cpp.on_load = load
+    with pytest.raises(ModelError, match="bad magic"):
+        model.LlamaChoiceModel(tmp_path / "m.gguf", 2.07)
+    assert sys.stderr is before
