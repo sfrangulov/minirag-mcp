@@ -177,6 +177,15 @@ def scan_roots(
             seen_ignored.add(p)
             ignored.append(p)
 
+    def held(folder: Path) -> bool:
+        """A nested root whose rule file cannot be read: reported, never walked."""
+        root = ignorer.root_of(folder)
+        if root is None or root not in broken:
+            return False
+        if blind is not None:
+            blind.append((folder, broken[root]))
+        return True
+
     def excluded(p: Path, is_dir: bool) -> bool:
         if ignorer.matches(p, is_dir) is None:
             return False
@@ -185,7 +194,10 @@ def scan_roots(
 
     for root in roots:
         top = Path(root)
-        reason = next((m for r, m in broken.items() if r == top or r in top.parents), None)
+        reason = next(
+            (broken[r] for f in (top, *top.parents) if (r := ignorer.root_of(f)) in broken),
+            None,
+        )
         if reason is not None:
             if blind is not None:
                 blind.append((top, reason))
@@ -201,6 +213,7 @@ def scan_roots(
                 for d in dirnames
                 if not d.startswith(".")
                 and d not in SKIP_DIRS
+                and not held(Path(dirpath) / d)
                 and not excluded(Path(dirpath) / d, True)
             )
             for name in sorted(filenames):
@@ -220,9 +233,14 @@ def scan_roots(
                     continue
                 if not _contained(resolved, real_roots):
                     continue  # symlink escaping every root: not part of the corpus
-                if p.is_symlink() and ignorer.excluded_by(resolved) is not None:
-                    drop(p)  # its text is the excluded file's
-                    continue
+                if p.is_symlink():
+                    try:
+                        target_excluded = ignorer.excluded_by(resolved) is not None
+                    except ignore.IgnoreFileError:
+                        continue  # its target's root is held: so is the link
+                    if target_excluded:
+                        drop(p)  # its text is the excluded file's
+                        continue
                 seen.add(resolved)
                 st = p.stat()
                 entries.append(ScanEntry(path=p, size=st.st_size, mtime=st.st_mtime))

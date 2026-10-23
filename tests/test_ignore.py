@@ -292,3 +292,81 @@ async def test_status_reports_a_rule_file_it_cannot_read(root, env, fake_embedde
         (root / IGNORE_FILE).chmod(0o600)
     (entry,) = st["ignoreFiles"]
     assert entry["file"] == str(root / IGNORE_FILE) and "cannot read" in entry["error"]
+
+
+def test_a_nested_root_with_a_broken_rule_file_is_held_and_the_rest_goes_on(tmp_path):
+    outer = tmp_path / "A"
+    inner = outer / "B"
+    inner.mkdir(parents=True)
+    (outer / "o.md").write_text("# o\n\nOuter.")
+    (inner / "i.md").write_text("# i\n\nInner.")
+    (inner / IGNORE_FILE).symlink_to(inner / "nowhere")
+    blind: list = []
+    got = {e.path for e in scan_roots([outer, inner], blind=blind)}
+    assert got == {outer / "o.md"}
+    assert {b[0] for b in blind} == {inner}
+
+
+def test_a_link_into_a_held_root_is_left_out_without_stopping_the_scan(tmp_path):
+    a, b = tmp_path / "A", tmp_path / "B"
+    a.mkdir()
+    b.mkdir()
+    (b / "t.md").write_text("# t\n\nTarget.")
+    (b / IGNORE_FILE).write_text("x/\n")
+    (a / "link.md").symlink_to(b / "t.md")
+    (a / "own.md").write_text("# own\n\nOwn.")
+    (b / IGNORE_FILE).chmod(0)
+    try:
+        got = {e.path for e in scan_roots([a, b], blind=[])}
+    finally:
+        (b / IGNORE_FILE).chmod(0o600)
+    assert got == {a / "own.md"}
+
+
+def test_a_scoped_sync_of_a_root_that_cannot_be_listed_is_not_blamed_on_rules(root, env, capsys):
+    root.chmod(0)
+    try:
+        code, out, err = run_cli(["sync", str(root), *flags(env), "--json"], capsys)
+    finally:
+        root.chmod(0o700)
+    assert IGNORE_FILE not in err
+    assert code == 1 and json.loads(out)["counts"]["failed"] == 1
+
+
+def test_nested_roots_typed_in_different_case_still_share_rules(tmp_path):
+    outer = tmp_path / "docs"
+    inner = outer / "Inner"
+    inner.mkdir(parents=True)
+    if not (tmp_path / "DOCS").exists():
+        pytest.skip("case-sensitive filesystem: the two spellings are two folders")
+    (inner / "secret.md").write_text("# s\n\nSecret.")
+    (inner / IGNORE_FILE).write_text("secret.md\n")
+    got = scan_roots([outer, tmp_path / "Docs" / "Inner"])
+    assert not any(e.path.name == "secret.md" for e in got)
+
+
+def test_where_case_matters_to_a_negation_the_file_stays_out(root):
+    (root / "readme.md").write_text("# r\n\nText.")
+    rules(root, "*.md\n!README.md\n")
+    assert "readme.md" not in rel_paths(scan_roots([root]), root)
+
+
+async def test_status_of_a_root_that_cannot_be_listed_names_no_rule_file(root, env, fake_embedder):
+    root.chmod(0)
+    try:
+        async with Client(create_app(load_config(env), embedder=fake_embedder)) as c:
+            st = (await c.call_tool("status", {})).data
+    finally:
+        root.chmod(0o700)
+    assert "ignoreFiles" not in st
+
+
+def test_ingesting_a_folder_reads_the_rules_once(root, env, capsys, monkeypatch):
+    import minirag_mcp.ingest.ignore as ig
+
+    rules(root, "drafts/\n")
+    calls = []
+    real = ig.load
+    monkeypatch.setattr(ig, "load", lambda r, **kw: calls.append(r) or real(r, **kw))
+    code, _, _ = run_cli(["ingest", str(root), *flags(env)], capsys)
+    assert code == 0 and len(calls) <= 2

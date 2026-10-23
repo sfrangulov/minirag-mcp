@@ -198,6 +198,8 @@ def ingest(
     """Ingest files or directories (recursive)."""
     cfg, store, pipeline = _load(base_dir, db_path, cache_dir, model_name)
     files: list[Path] = []
+    # Already held to the rules by their scan; only files named directly are checked again.
+    scanned: set[Path] = set()
     seen: set[Path] = set()
     failures: list[dict] = []
     try:
@@ -207,11 +209,11 @@ def ingest(
             if p.is_dir() and (by := excluded_by(p, cfg.roots)) is not None:
                 failures.append({"source": str(p), "error": f"{p} is excluded by {by}"})
                 continue
-            candidates = (
-                [e.path for e in scan_roots([p], blind=blind, rule_roots=cfg.roots)]
-                if p.is_dir()
-                else [p]
-            )
+            if p.is_dir():
+                candidates = [e.path for e in scan_roots([p], blind=blind, rule_roots=cfg.roots)]
+                scanned.update(candidates)
+            else:
+                candidates = [p]
             failures += [
                 {
                     "source": str(folder),
@@ -232,7 +234,7 @@ def ingest(
     with pipeline.job() as report:
         for f in files:
             try:
-                done.append(pipeline.ingest_file(f))
+                done.append(pipeline.ingest_file(f, rules_checked=f in scanned))
             except Exception as e:  # per-file failures never abort the batch
                 failures.append({"source": str(f), "error": str(e)})
     payload = {"ingested": [ingest_reply(r) for r in done], "failed": failures}

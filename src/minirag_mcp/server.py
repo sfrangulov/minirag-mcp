@@ -16,7 +16,7 @@ from minirag_mcp import __version__
 from minirag_mcp.chunker import SCHEME_VERSION
 from minirag_mcp.config import Config, ConfigError, load_config
 from minirag_mcp.embedder import Embedder
-from minirag_mcp.ingest.ignore import excluded_by
+from minirag_mcp.ingest.ignore import scope_excluded_by
 from minirag_mcp.ingest.pipeline import Pipeline
 from minirag_mcp.instructions import build_instructions
 from minirag_mcp.labels import LabelerSource
@@ -125,7 +125,7 @@ def create_app(
         scope = None
         if path is not None:
             scope = resolve_in_roots(path, c.config.roots)
-            if (by := excluded_by(scope, c.config.roots)) is not None:
+            if (by := scope_excluded_by(scope, c.config.roots)) is not None:
                 raise ToolError(f"{scope} is excluded by {by}; nothing under it can be synced")
         return {"jobId": c.sync.start(scope)}
 
