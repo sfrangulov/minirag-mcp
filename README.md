@@ -44,6 +44,11 @@ built on [fastmcp](https://github.com/jlowin/fastmcp),
   See [Titles and filenames](#titles-and-filenames).
 - **Multilingual by default** — the default embedding model covers 50+
   languages, so English and Russian corpora both work out of the box.
+- **Converted once, not re-read every chat** — a PDF handed to an assistant is read
+  again, page by page, in every new conversation, and scanned pages cost the most.
+  Here each document is converted (and OCRed) once at ingest, and a question
+  brings back only the sections that answer it, so it costs those sections rather
+  than the whole file.
 - **Chunks sized in tokens, passages returned whole** — what gets ranked is a
   small unit that fits the embedding model's 128-token ceiling; what comes back
   is the section around it — a transcript time window, a heading section, a
