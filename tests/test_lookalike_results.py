@@ -73,7 +73,7 @@ def expected_overlap(store, a, b):
 
 def test_a_query_names_the_other_version_of_a_document_it_returns(corpus):
     root, config, store, embedder = corpus
-    v1 = src(root, "regs/v1.md")
+    v1, v2 = src(root, "regs/v1.md"), src(root, "archive/v2.md")
     store.set_document_labels(
         v2,
         labels_json="",
