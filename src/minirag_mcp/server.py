@@ -16,12 +16,14 @@ from minirag_mcp import __version__
 from minirag_mcp.chunker import SCHEME_VERSION
 from minirag_mcp.config import Config, ConfigError, load_config
 from minirag_mcp.embedder import Embedder
+from minirag_mcp.ingest.ignore import scope_excluded_by
 from minirag_mcp.ingest.pipeline import Pipeline
 from minirag_mcp.instructions import build_instructions
 from minirag_mcp.labels import LabelerSource
 from minirag_mcp.labels.model import default_model_factory
 from minirag_mcp.results import (
     DEFAULT_FIND_LIMIT,
+    ignore_status,
     ingest_reply,
     join_document,
     labels_status,
@@ -123,6 +125,8 @@ def create_app(
         scope = None
         if path is not None:
             scope = resolve_in_roots(path, c.config.roots)
+            if (by := scope_excluded_by(scope, c.config.roots)) is not None:
+                raise ToolError(f"{scope} is excluded by {by}; nothing under it can be synced")
         return {"jobId": c.sync.start(scope)}
 
     @mcp.tool
@@ -131,8 +135,8 @@ def create_app(
         """Poll a sync job started by sync_start.
 
         Returns state ('pending' | 'running' | 'succeeded' | 'failed'),
-        counts (scanned/ingested/skipped/moved/deleted/relabelled/unreadable/
-        failed), and any per-file errors. Only the latest job is retained — an
+        counts (scanned/ingested/skipped/moved/deleted/relabelled/ignored/
+        unreadable/failed), and any per-file errors. Only the latest job is retained — an
         old jobId, or any jobId from before a server restart, raises an error.
 
         relabelled counts documents whose labels were rewritten from their
@@ -141,6 +145,10 @@ def create_app(
         problem had left a facet unanswered. It stays 0 without a classify.toml.
         A labelling problem appears in errors with its message prefixed
         "labels:"; it is not a failure.
+
+        ignored counts the files and folders a .miniragignore rule excluded
+        from the scan, a folder once; a file indexed before its rule was
+        added is deleted from the index and counted under deleted.
 
         unreadable counts indexed sources this installation cannot read
         because an optional extra is absent (images need [ocr]); each one
@@ -423,6 +431,9 @@ def create_app(
         Indexed files under one are listed as "unlisted": still indexed and
         searchable, not checked against the disk.
 
+        `ignored`, present when a .miniragignore rule excluded anything,
+        counts the files and folders it left out, a folder once.
+
         `labels`, `dateFrom` and `dateTo` filter as in query_documents;
         sort="date" lists newest first, documents without a date last. Rows
         carry `labels` and `date` when present.
@@ -478,6 +489,9 @@ def create_app(
         when it is above zero, schemeWarning explains that those chunks need
         a re-sync to be rebuilt.
 
+        ignoreFiles, present when a root has a .miniragignore: each file with
+        its number of rules, or the error that stops scanning under its root.
+
         ocr names the OCR engine this install can use, or is "unavailable"
         when the optional extra is missing — scanned PDFs and images cannot
         be indexed then, and ocrHint says what to install.
@@ -497,6 +511,7 @@ def create_app(
             "hybridWeight": config.hybrid_weight,
             "chunkScheme": SCHEME_VERSION,
             **ocr_status(),
+            **ignore_status(config.roots),
         }
         try:
             c = ctx()

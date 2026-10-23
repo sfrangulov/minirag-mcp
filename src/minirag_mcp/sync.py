@@ -11,9 +11,11 @@ from pathlib import Path
 
 from minirag_mcp import ocr
 from minirag_mcp.config import Config
+from minirag_mcp.ingest.ignore import IgnoredFileError, scope_excluded_by
 from minirag_mcp.ingest.pipeline import Pipeline
 from minirag_mcp.ingest.scanner import compute_diff, scan_roots
 from minirag_mcp.lock import SyncLock, sync_lock
+from minirag_mcp.scope import is_under
 from minirag_mcp.store import Store
 
 
@@ -43,6 +45,7 @@ class SyncJob:
             # different shape. For the same reason `relabelled` is here whether or not
             # the corpus has a classify.toml.
             "relabelled": 0,
+            "ignored": 0,
             "unreadable": 0,
             "failed": 0,
         }
@@ -98,13 +101,17 @@ def _run_sync_unlocked(
 ) -> tuple[dict[str, int], list[dict]]:
     """The body of `run_sync`. The caller must already hold the sync lock."""
     scope = scope.resolve() if scope is not None else None
+    if scope is not None and (by := scope_excluded_by(scope, roots)) is not None:
+        # A silent no-op otherwise: every count zero, exit 0, nothing synced.
+        raise IgnoredFileError(f"{scope} is excluded by {by}; nothing under it can be synced")
 
     def emit(msg: str) -> None:
         if on_event:
             on_event(msg)
 
     blind: list[tuple[Path, str | None]] = []
-    entries = scan_roots(list(roots), blind=blind)
+    ignored: list[Path] = []
+    entries = scan_roots(list(roots), blind=blind, ignored=ignored)
     diff = compute_diff(
         entries,
         store.list_sources(),
@@ -112,6 +119,7 @@ def _run_sync_unlocked(
         scope=scope,
         roots=roots,
         blind=blind,
+        ignored=ignored,
     )
     counts = {
         "scanned": len(diff.to_ingest)
@@ -123,6 +131,7 @@ def _run_sync_unlocked(
         "moved": 0,
         "deleted": 0,
         "relabelled": 0,
+        "ignored": sum(1 for p in ignored if scope is None or is_under(str(p), str(scope))),
         "unreadable": len(diff.unreadable),
         "failed": 0,
     }
@@ -150,7 +159,7 @@ def _run_sync_unlocked(
 
     def ingest(path: Path) -> bool:
         try:
-            pipeline.ingest_file(path)
+            pipeline.ingest_file(path, rules_checked=True)
         except Exception as e:  # per-file failures never abort the job
             counts["failed"] += 1
             errors.append({"source": str(path), "error": str(e)})

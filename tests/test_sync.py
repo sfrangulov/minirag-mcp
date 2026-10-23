@@ -47,10 +47,10 @@ def test_run_sync_collects_per_file_errors(env, monkeypatch):
 
     real = pipeline.ingest_file
 
-    def flaky(path):
+    def flaky(path, **kw):
         if path.name == "b.md":
             raise RuntimeError("boom")
-        return real(path)
+        return real(path, **kw)
 
     monkeypatch.setattr(pipeline, "ingest_file", flaky)
     counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
@@ -77,9 +77,9 @@ def test_manager_rejects_concurrent_and_forgets_old(env):
     gate = threading.Event()
     real = pipeline.ingest_file
 
-    def slow(path):
+    def slow(path, **kw):
         gate.wait(5)
-        return real(path)
+        return real(path, **kw)
 
     pipeline.ingest_file = slow
     mgr = SyncManager(pipeline, store, cfg)
@@ -413,9 +413,9 @@ def test_manager_holds_the_lock_for_the_job_and_releases_it_after(env):
     gate = threading.Event()
     real = pipeline.ingest_file
 
-    def slow(path):
+    def slow(path, **kw):
         gate.wait(5)
-        return real(path)
+        return real(path, **kw)
 
     pipeline.ingest_file = slow
     mgr = SyncManager(pipeline, store, cfg)
@@ -459,9 +459,9 @@ def test_in_process_guard_fires_before_the_cross_process_lock(env):
     gate = threading.Event()
     real = pipeline.ingest_file
 
-    def slow(path):
+    def slow(path, **kw):
         gate.wait(5)
-        return real(path)
+        return real(path, **kw)
 
     pipeline.ingest_file = slow
     mgr = SyncManager(pipeline, store, cfg)
@@ -625,9 +625,9 @@ def moving(tmp_path, fake_embedder):
     parsed: list[str] = []
     real = pipeline.ingest_file
 
-    def spy(path):
+    def spy(path, **kw):
         parsed.append(str(path))
-        return real(path)
+        return real(path, **kw)
 
     pipeline.ingest_file = spy
     return cfg, store, pipeline, cfg.roots[0], parsed
