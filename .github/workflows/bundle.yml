@@ -12,6 +12,9 @@ on:
       - ".github/workflows/bundle.yml"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   bundle:
     runs-on: ${{ matrix.os }}
