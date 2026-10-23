@@ -29,6 +29,10 @@ built on [fastmcp](https://github.com/jlowin/fastmcp),
   ranking (LanceDB BM25 full-text search) by weighted Reciprocal Rank Fusion,
   so exact identifiers and error codes surface alongside semantically similar
   passages.
+- **Every mention, counted** — `find_mentions` lists every document that
+  contains a word or phrase, not the top few, and says how many documents it
+  searched, so "list all", "how many" and "it is not there" get a complete
+  answer. See [Finding every mention](#finding-every-mention).
 - **Filenames are searchable** — keyword search covers document titles as well
   as body text, and an informative filename becomes the document's title when
   the document's own heading is boilerplate. In many real document sets the
@@ -682,7 +686,7 @@ ever mention that its vectors describe truncated text.
 
 ## MCP Tools
 
-11 tools, all backed by the same index:
+12 tools, all backed by the same index:
 
 | Tool | Purpose |
 |---|---|
@@ -692,6 +696,7 @@ ever mention that its vectors describe truncated text.
 | `ingest_data` | Ingest text/markdown/html content the client holds, under a source id you choose. |
 | `ingest_url` | Fetch an http(s) URL, convert it to Markdown, and index it. |
 | `query_documents` | Hybrid search: semantic similarity plus a keyword boost for exact terms. Each hit carries `text` (the passage that matched) and `parentId`; the enclosing sections come back once each in the response's `parents` map — see [Chunking](#chunking). |
+| `find_mentions` | Every indexed document that mentions a word or phrase, with the number searched and matched, the word forms matched, and a snippet per document. Paged, never capped. See [Finding every mention](#finding-every-mention). |
 | `read_chunk_neighbors` | Read the chunks immediately before and after a search result, for context. |
 | `read_file` | Read a source's entire indexed content as Markdown, reconstructed from its chunks rather than concatenated from them. |
 | `list_files` | List files found on disk under the document roots, plus indexed data/url sources. |
@@ -700,6 +705,61 @@ ever mention that its vectors describe truncated text.
 
 MCP tool file paths (`filePath`) must be absolute and inside a configured
 document root.
+
+### Finding every mention
+
+`query_documents` ranks passages and returns the best few. That answers "what do
+my documents say about X", and cannot answer "which documents mention X": it
+stops at `topK` without saying what it left out, and a query for a term that
+occurs nowhere still returns the nearest passages. `find_mentions` scans the
+whole index instead and counts.
+
+On a real 746-document corpus, a term occurring in 218 documents showed up in 24
+of the top 100 ranked hits; a term occurring in none got 21 documents back from
+ranked search, and `0 of 746` from `find_mentions`.
+
+The matching rule:
+
+- **From the start of a word, open at the end.** `акт` finds `акта` and
+  `актов`, never `контакт`, so a stem catches inflected forms. An underscore,
+  a hyphen or punctuation starts a new word; a letter or digit does not.
+- **The open end overcounts, visibly.** `акт` also finds `актуально`. Every
+  response carries `forms`: each word form a term matched, with how many
+  documents have it. On the corpus above, `акт` matched 406 documents, and
+  `forms` showed the word itself in 122 of them, next to `активы` (107),
+  `активов` (99) and `актуально` (84).
+- **Quotes close the end.** `"акт"` matches that word only. To count one word
+  in all its forms, pass the forms, each quoted, with `match="any"`: that gave
+  166 documents for `акт` on the same corpus.
+- **Case, ё/е and Unicode composition are ignored**, so `отчет` finds `ОТЧЁТ`,
+  and a filename macOS stored decomposed still matches.
+- **Whitespace inside a phrase** matches any run of whitespace, line breaks
+  included.
+- **What conversion left in the text is ignored.** markitdown escapes `_` and `*`
+  in DOCX, HTML and XLSX (`ТЗ\_2024\_015`), and Word keeps optional hyphens and
+  zero-width marks inside words; `ТЗ_2024_015` and `договор` still match.
+- **Literal, not semantic.** A synonym or another spelling is another term.
+
+Several terms combine per document: `match="all"` (the default) keeps documents
+that contain every term somewhere, `match="any"` those with at least one. Titles
+are searched as well as text.
+
+The response gives `searchedDocuments` (indexed documents in scope that pass
+the filters), `matchedDocuments`, `matchedChunks`, and the `documents`, title
+matches first, then by the number of chunks that mention a term. A heading that
+every chunk of a section repeats counts once. A page holds
+at most 200 documents; `nextOffset` is present while more remain, and the counts
+always cover every match. With no match, `notice` says so and states what was
+searched.
+
+"None" covers only what is indexed: files not yet synced (`list_files` shows
+them) and scans without OCR have no text to search. Two narrower gaps: a phrase
+that a chunk boundary splits is not found, and neither is text stored in a
+Unicode form that is neither composed nor decomposed (CJK compatibility
+ideographs, for one).
+
+From a terminal, a term that starts with a dash goes after `--`, with every
+option before it: `minirag-mcp find --base-dir ~/docs -- -15%`.
 
 ## Search by Default
 
@@ -909,6 +969,10 @@ minirag-mcp ingest-url https://example.com/release-notes --source release-notes
 # Hybrid search
 minirag-mcp query "connection timeout error" --top-k 5
 
+# Every document that mentions a term; quote it for that exact word only
+minirag-mcp find "акт сверки"
+minirag-mcp find '"акт"' '"акта"' '"актов"' --any
+
 # Search only under one subtree
 minirag-mcp query "changelog" --scope ~/docs/releases
 
@@ -933,8 +997,8 @@ minirag-mcp query "budget" --label type=minutes --date-from 2026-08-01
 minirag-mcp classify try ~/docs/notes.md
 ```
 
-The 10 subcommands: `ingest`, `ingest-url`, `sync`, `query`, `read-neighbors`,
-`read`, `list`, `status`, `delete`, `classify try`.
+The 11 subcommands: `ingest`, `ingest-url`, `sync`, `query`, `find`,
+`read-neighbors`, `read`, `list`, `status`, `delete`, `classify try`.
 
 Each subcommand's `--json` output carries the same fields as the matching MCP
 tool. Exit status is `0` on success and `1` on failure; `ingest` and `sync`

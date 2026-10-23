@@ -21,12 +21,14 @@ from minirag_mcp.labels import LabelerSource
 from minirag_mcp.labels.model import default_model_factory
 from minirag_mcp.lock import SyncLockBusy
 from minirag_mcp.results import (
+    DEFAULT_FIND_LIMIT,
     QueryError,
     join_document,
     labels_status,
     list_payload,
     ocr_status,
     result_dict,
+    run_find,
     run_query,
     scheme_status,
 )
@@ -353,6 +355,80 @@ def query(
     else:
         human = "no results" + (f" — {payload['notice']}" if "notice" in payload else "")
     _emit(payload, json, human)
+    _warn_filter(payload)
+
+
+def _find_human(payload: dict) -> str:
+    searched = payload["searchedDocuments"]
+    lines = [
+        f"{payload['matchedDocuments']} of {searched} document{'' if searched == 1 else 's'} "
+        "searched match."
+    ]
+    for term, forms in payload["forms"].items():
+        lines.append(f"{term}: " + ", ".join(f"{form} {n}" for form, n in forms.items()))
+    for row in payload["documents"]:
+        what = [f"{row['hits']} hit{'' if row['hits'] == 1 else 's'}"]
+        if row["inTitle"]:
+            what.append("in title")
+        terms = f" — {', '.join(row['terms'])}" if "terms" in row else ""
+        lines.append(f"{row['displayPath']} ({', '.join(what)}){terms}" + _document_suffix(row))
+        if row["firstMatch"]:
+            lines.append(f"    {row['firstMatch']['snippet']}")
+    if "nextOffset" in payload:
+        lines.append(f"more: rerun with --offset {payload['nextOffset']}")
+    if "notice" in payload:
+        lines.append(payload["notice"])
+    return "\n".join(lines)
+
+
+@app.command
+def find(
+    terms: list[str],
+    *,
+    any_: Annotated[
+        bool, Parameter(name="--any", help="Match documents containing any term, not all.")
+    ] = False,
+    scope: list[str] | None = None,
+    label: LabelOpt = None,
+    date_from: DateFromOpt = None,
+    date_to: DateToOpt = None,
+    limit: int = DEFAULT_FIND_LIMIT,
+    offset: int = 0,
+    base_dir: BaseDirOpt = None,
+    db_path: DbPathOpt = None,
+    cache_dir: CacheDirOpt = None,
+    model_name: ModelNameOpt = None,
+    json: JsonFlag = False,
+):
+    """List every indexed document that mentions a word or phrase.
+
+    A term matches where a word begins and its end is open ("акт" finds "акта", not
+    "контакт", but also "актуально"); a quoted term ('"акт"') matches that exact word
+    only. Case, ё/е and Unicode composition are ignored. A document must contain every
+    term, or any of them with --any. The word forms each term matched are listed first.
+    --limit (capped at 200) pages the listing; the counts cover every match. A term that
+    starts with a dash goes after `--`, and every option before it.
+    """
+    labels = _parse_labels(label)
+    cfg, store, pipeline = _load(base_dir, db_path, cache_dir, model_name)
+    try:
+        payload = run_find(
+            store,
+            cfg.roots,
+            terms,
+            match="any" if any_ else "all",
+            scopes=tuple(scope or ()),
+            labels=labels,
+            date_from=date_from,
+            date_to=date_to,
+            limit=limit,
+            offset=offset,
+            label_source=pipeline.labels,
+        )
+    except QueryError as e:
+        _fail(str(e))
+        raise AssertionError from e  # unreachable
+    _emit(payload, json, _find_human(payload))
     _warn_filter(payload)
 
 

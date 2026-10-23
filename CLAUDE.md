@@ -87,7 +87,7 @@ anything user-visible must appear identically through both.
 
 ```
 src/minirag_mcp/
-  server.py      FastMCP app, 11 tools          cli/          10 subcommands
+  server.py      FastMCP app, 12 tools          cli/          11 subcommands
                           \                    /
                            pipeline / store / embedder        <- the core
   ingest/parser.py    markitdown: file, HTML, URL -> Markdown + title
@@ -98,6 +98,7 @@ src/minirag_mcp/
   embedder.py         fastembed, lazy model load, unit-normalized vectors
   store.py            LanceDB: vectors + BM25 FTS over text and title, hybrid search
   scope.py            the single definition of "is this path inside that prefix"
+  literal.py          the single definition of "does this text mention that term"
   security.py         document-root containment, URL host rules
   sync.py             one background job, per-file failures never abort it
   labels/             taxonomy, dates, facet resolution, in-process choice model, filters

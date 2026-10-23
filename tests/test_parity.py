@@ -422,3 +422,28 @@ async def test_a_labels_failure_in_status_is_a_labels_error_not_an_index_error(
             "file": str(labelled_root / ".minirag" / "classify.toml"),
             "error": "RuntimeError: cannot tell the model state",
         }
+
+
+async def test_find_returns_the_same_payload_through_both(
+    root, tmp_path, capsys, monkeypatch, fake_embedder
+):
+    monkeypatch.setattr(cli, "_make_embedder", lambda cfg: fake_embedder)
+    (root / "sub" / "b.md").write_text("# Beta\n\nТокены и авторизация, Alpha.")
+    env = {"BASE_DIR": str(root), "DB_PATH": str(tmp_path / "db")}
+    code, _, _ = run_cli(["sync", *_flags(env)], capsys)
+    assert code == 0
+    args = {"terms": ["alpha", "auth"], "match": "any"}
+    is_error, mcp_payload = await call_mcp(env, "find_mentions", args, fake_embedder)
+    code, out, _ = run_cli(["find", "alpha", "auth", "--any", *_flags(env), "--json"], capsys)
+    assert not is_error and code == 0
+    assert json.loads(out) == mcp_payload
+    assert mcp_payload["matchedDocuments"] == 2
+
+
+async def test_an_empty_term_is_refused_by_both(root, tmp_path, capsys, monkeypatch, fake_embedder):
+    monkeypatch.setattr(cli, "_make_embedder", lambda cfg: fake_embedder)
+    env = {"BASE_DIR": str(root), "DB_PATH": str(tmp_path / "db")}
+    is_error, text = await call_mcp(env, "find_mentions", {"terms": " "}, fake_embedder)
+    code, _, err = run_cli(["find", " ", *_flags(env)], capsys)
+    assert is_error and "a term must not be empty" in text
+    assert code == 1 and "a term must not be empty" in err

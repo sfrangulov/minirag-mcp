@@ -7,11 +7,14 @@ shapes a SearchResult for output belongs in this module, imported by both sides.
 
 from __future__ import annotations
 
+import re
+import unicodedata
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 
-from minirag_mcp import ocr
-from minirag_mcp.chunker import join_parent
+from minirag_mcp import literal, ocr
+from minirag_mcp.chunker import join_parent, shared_lines
 from minirag_mcp.config import Config
 from minirag_mcp.ingest.scanner import FileState, compute_states, scan_roots
 from minirag_mcp.labels.filters import (
@@ -41,6 +44,19 @@ EMPTY_INDEX_NOTICE = (
     "Nothing is indexed yet, so no query can match. Index the document roots first: "
     "sync_start, or `minirag-mcp sync`."
 )
+FILTERED_OUT_NOTICE = (
+    "No indexed document in scope passes the label and date filters, so nothing was "
+    "searched; filterCounts says how many were left out and why."
+)
+MAX_TERMS = 10
+# Documents per find_mentions page. Every match is still counted; the rest is paged.
+DEFAULT_FIND_LIMIT = 50
+MAX_FIND_LIMIT = 200
+SNIPPET_CHARS = 200
+# Word forms reported per term: enough to show what a stem caught besides the word meant.
+MAX_FORMS = 20
+_SNIPPET_BEFORE = 60
+_SPACE = re.compile(r"\s")
 
 
 class QueryError(ValueError):
@@ -277,6 +293,182 @@ def run_query(
             payload["filterNotice"] = notice
     if not results and (notice := empty_result_notice(store, scopes)):
         payload["notice"] = notice
+    return payload
+
+
+@dataclass
+class _Mentions:
+    """What one document's matching chunks add up to."""
+
+    first: SearchResult
+    in_title: bool
+    terms: set[int] = field(default_factory=set)
+    forms: dict[int, set[str]] = field(default_factory=dict)
+    hits: int = 0
+    first_match: dict | None = None
+
+    def add(self, found: Sequence[literal.Match | None]) -> list[literal.Match]:
+        for i, m in enumerate(found):
+            if m is not None:
+                self.terms.add(i)
+                self.forms.setdefault(i, set()).update(m.forms)
+        return [m for m in found if m is not None]
+
+
+def _snippet(text: str, span: tuple[int, int]) -> str:
+    """A window of `text` around `span`, cut at whitespace, whitespace collapsed."""
+    start, end = span
+    lo = max(0, start - _SNIPPET_BEFORE)
+    hi = min(len(text), lo + SNIPPET_CHARS)
+    if lo > 0 and (m := _SPACE.search(text, lo, start)):
+        lo = m.end()
+    if hi < len(text) and (tail := list(_SPACE.finditer(text, min(end, hi), hi))):
+        hi = tail[-1].start()
+    body = " ".join(text[lo:hi].split())
+    return ("…" if lo > 0 else "") + body + ("…" if hi < len(text) else "")
+
+
+def _parse_terms(terms: str | Sequence[str]) -> list[literal.Term]:
+    raw = [terms] if isinstance(terms, str) else list(terms)
+    if not raw:
+        raise QueryError("terms must not be empty")
+    if len(raw) > MAX_TERMS:
+        raise QueryError(f"at most {MAX_TERMS} terms, got {len(raw)}")
+    try:
+        return [literal.term(t) for t in raw]
+    except ValueError as e:
+        raise QueryError(str(e)) from e
+
+
+def _absence_notice(searched: int, terms: Sequence[literal.Term], match: str) -> str:
+    shown = ", ".join(t.text if t.exact else f'"{t.text}"' for t in terms)
+    what = shown if len(terms) == 1 else f"{match} of {shown}"
+    head = (
+        f"None of the {searched} documents searched contains {what}"
+        if searched != 1
+        else f"The one document searched does not contain {what}"
+    )
+    if all(t.exact for t in terms):
+        how = "as a whole word" if len(terms) == 1 else "as whole words"
+    elif any(t.exact for t in terms):
+        how = "(quoted terms as whole words, the others from the start of a word)"
+    else:
+        how = "from the start of a word"
+    return (
+        f"{head} {how}, ignoring case, ё/е and Unicode composition. "
+        "The match is literal: another word or spelling for the same thing is not found, "
+        "so try a shorter stem or a synonym, or query_documents to search by meaning."
+    )
+
+
+def run_find(
+    store: Store,
+    roots: Sequence[Path],
+    terms: str | Sequence[str],
+    *,
+    match: str = "all",
+    scopes: Sequence[str] = (),
+    labels: Mapping[str, str | Sequence[str]] | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    limit: int = DEFAULT_FIND_LIMIT,
+    offset: int = 0,
+    label_source: LabelerSource | None = None,
+) -> dict:
+    """`find_mentions` and `minirag-mcp find`, as one implementation.
+
+    Every document is counted, however many match; only the listing is paged. The
+    counts are the point: "how many", "all of them" and "none" are the questions ranked
+    search cannot answer, because it stops at top-k without saying so.
+    """
+    parsed = _parse_terms(terms)
+    if match not in ("all", "any"):
+        raise QueryError(f"match must be 'all' or 'any', got {match!r}")
+    if limit < 1:
+        raise QueryError(f"limit must be at least 1, got {limit}")
+    if offset < 0:
+        raise QueryError(f"offset must not be negative, got {offset}")
+    limit = min(limit, MAX_FIND_LIMIT)
+    scopes = tuple(scopes)
+    label_filter, labeler = _parse_filter(store, labels, date_from, date_to, label_source)
+    filter_sql = to_sql(label_filter) if label_filter else None
+
+    # Read before the scan, so a sync landing in between cannot make matched exceed it.
+    searched = len(store.list_sources(scopes=scopes, filter_sql=filter_sql))
+    docs: dict[str, _Mentions] = {}
+    previous: tuple[str, int, list[str]] | None = None
+    for chunk in store.literal_candidates(parsed, scopes=scopes, filter_sql=filter_sql):
+        doc = docs.get(chunk.source)
+        if doc is None:
+            doc = docs[chunk.source] = _Mentions(chunk, in_title=False)
+            doc.in_title = bool(doc.add(literal.matches(parsed, chunk.title)))
+        # A header repeated from the chunk before is that chunk's mention, not a new
+        # one. When that chunk is not a candidate, its header holds no term anyway.
+        lines = chunk.text.split("\n")
+        own = lines
+        if previous is not None and previous[:2] == (chunk.source, chunk.chunk_index - 1):
+            own = lines[shared_lines(previous[2], lines) :]
+        previous = (chunk.source, chunk.chunk_index, lines)
+        text = "\n".join(own)
+        found = doc.add(literal.matches(parsed, text))
+        if not found:
+            continue
+        doc.hits += 1
+        if doc.first_match is None:
+            span = min(m.span for m in found)
+            doc.first_match = {
+                "chunkIndex": chunk.chunk_index,
+                "parentId": chunk.parent_id or None,
+                "snippet": _snippet(unicodedata.normalize("NFC", text), span),
+            }
+
+    needed = len(parsed) if match == "all" else 1
+    matched = [d for d in docs.values() if len(d.terms) >= needed]
+    rows = []
+    for d in matched:
+        row = {
+            "source": d.first.source,
+            "displayPath": display_path(d.first.source, roots),
+            "title": d.first.title,
+            "hits": d.hits,
+            "inTitle": d.in_title,
+        }
+        if len(parsed) > 1:
+            row["terms"] = [parsed[i].text for i in sorted(d.terms)]
+        row["firstMatch"] = d.first_match
+        row.update(document_fields(d.first.labels_json, d.first.doc_date, d.first.doc_date_source))
+        rows.append(row)
+    rows.sort(key=lambda r: (not r["inTitle"], -r["hits"], r["displayPath"]))
+    forms: dict[str, dict[str, int]] = {}
+    for i, t in enumerate(parsed):
+        counts: dict[str, int] = {}
+        for d in matched:
+            for form in d.forms.get(i, ()):
+                counts[form] = counts.get(form, 0) + 1
+        if counts:
+            ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+            forms[t.text] = dict(ranked[:MAX_FORMS])
+
+    payload: dict = {
+        "searchedDocuments": searched,
+        "matchedDocuments": len(rows),
+        "matchedChunks": sum(d.hits for d in matched),
+        "forms": forms,
+        "documents": rows[offset : offset + limit],
+    }
+    if offset + limit < len(rows):
+        payload["nextOffset"] = offset + limit
+    if label_filter is not None and labeler is not None:
+        payload["filterCounts"] = filter_counts(
+            label_filter, store.list_sources(scopes=scopes), labeler.taxonomy, roots
+        )
+        if notice := filter_notice(label_filter, labeler):
+            payload["filterNotice"] = notice
+    if not rows:
+        if searched:
+            payload["notice"] = _absence_notice(searched, parsed, match)
+        else:
+            payload["notice"] = empty_result_notice(store, scopes) or FILTERED_OUT_NOTICE
     return payload
 
 

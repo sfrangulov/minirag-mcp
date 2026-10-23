@@ -1,4 +1,4 @@
-"""FastMCP server: 11 tools over the shared core."""
+"""FastMCP server: 12 tools over the shared core."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
+from typing import Literal
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
@@ -20,11 +21,13 @@ from minirag_mcp.instructions import build_instructions
 from minirag_mcp.labels import LabelerSource
 from minirag_mcp.labels.model import default_model_factory
 from minirag_mcp.results import (
+    DEFAULT_FIND_LIMIT,
     join_document,
     labels_status,
     list_payload,
     ocr_status,
     result_dict,
+    run_find,
     run_query,
     scheme_status,
 )
@@ -213,6 +216,10 @@ def create_app(
         to section text. Use `sources` to answer "which documents
         cover this topic" without inspecting individual chunks.
 
+        Results are ranked and stop at topK without saying what they
+        left out. For every document that mentions a term, how many do,
+        or whether something is mentioned at all, use find_mentions.
+
         `text` is the passage that matched and that `score` describes.
         `parentId` names the section it sits in — a transcript time
         window, a heading section, a slide, a table. Look it up in
@@ -251,6 +258,67 @@ def create_app(
             labels=labels,
             date_from=dateFrom,
             date_to=dateTo,
+            label_source=c.labels,
+        )
+
+    @mcp.tool
+    @guard
+    def find_mentions(
+        terms: str | list[str],
+        match: Literal["all", "any"] = "all",
+        scope: str | list[str] | None = None,
+        labels: dict[str, str | list[str]] | None = None,
+        dateFrom: str | None = None,
+        dateTo: str | None = None,
+        limit: int = DEFAULT_FIND_LIMIT,
+        offset: int = 0,
+    ) -> dict:
+        """List every indexed document that mentions a word or phrase, with counts.
+
+        For "which documents mention X", "list all", "how many", and "is X
+        mentioned anywhere": this scans the whole index, where
+        query_documents ranks a few passages and stops.
+
+        A term matches where a word begins and its end is open: акт finds
+        акта and актов, not контакт — but also актуально. `forms` lists the
+        word forms each term matched, with how many documents have each;
+        check it before trusting a count. A term wrapped in double quotes
+        matches that exact word only, so to narrow, pass the forms you
+        want, each quoted, with match="any". Case, ё/е and Unicode
+        composition are ignored. The match is literal, so a synonym or
+        another spelling is another term. `terms` is one string or a list
+        of up to 10; match="all" keeps documents containing every term
+        somewhere, match="any" those with at least one, and each row then
+        lists its `terms`. Titles are searched too.
+
+        Returns searchedDocuments (indexed documents in scope that pass the
+        filters), matchedDocuments, matchedChunks, `forms`, and `documents`:
+        title matches (`inTitle`) first, then by `hits`, the chunks that
+        mention a term. Each row has `displayPath` and `firstMatch`
+        {chunkIndex, parentId, snippet}, or null when only the title
+        matched. `limit` (default 50, capped at 200) pages the list and
+        `nextOffset` is present while more remain; the counts always cover
+        every match. With no match, `notice` states the absence and what it
+        covered.
+
+        Only indexed text is searched: files not yet synced (list_files
+        shows them) and images without OCR are not, and a phrase that a
+        chunk boundary splits is not found. scope, labels, dateFrom
+        and dateTo filter as in query_documents, and citations follow its
+        rule: each document's `displayPath`, verbatim.
+        """
+        c = ctx()
+        return run_find(
+            c.store,
+            c.config.roots,
+            terms,
+            match=match,
+            scopes=_scopes(scope),
+            labels=labels,
+            date_from=dateFrom,
+            date_to=dateTo,
+            limit=limit,
+            offset=offset,
             label_source=c.labels,
         )
 

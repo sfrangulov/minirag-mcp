@@ -776,3 +776,32 @@ def test_classify_try_on_a_file_it_cannot_read_is_an_error_not_a_traceback(
     assert e.value.code == 1
     err = capsys.readouterr().err
     assert err.startswith("error: ") and message in err
+
+
+def test_find_human_output_lists_documents_with_their_counts(corpus, capsys):
+    run(["ingest", str(corpus), "--base-dir", str(corpus)])
+    capsys.readouterr()
+    run(["find", "alpha", "--base-dir", str(corpus)])
+    out = capsys.readouterr().out
+    lines = out.splitlines()
+    assert lines[0] == "1 of 2 documents searched match."
+    assert lines[1] == "alpha: alpha 1"
+    assert lines[2].startswith("a.md (1 hit, in title)")
+    assert "Alpha body about tokens" in lines[3]
+
+
+def test_find_human_output_states_an_absence(corpus, capsys):
+    run(["ingest", str(corpus), "--base-dir", str(corpus)])
+    capsys.readouterr()
+    run(["find", "kubernetes", "--base-dir", str(corpus)])
+    out = capsys.readouterr().out
+    assert out.startswith("0 of 2 documents searched match.")
+    assert "None of the 2 documents searched contains" in out
+
+
+def test_find_says_when_more_pages_remain(corpus, capsys):
+    run(["ingest", str(corpus), "--base-dir", str(corpus)])
+    capsys.readouterr()
+    run(["find", "alpha", "err", "--any", "--limit", "1", "--base-dir", str(corpus)])
+    out = capsys.readouterr().out
+    assert "--offset 1" in out
