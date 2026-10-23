@@ -121,12 +121,14 @@ def _run_sync_unlocked(
         roots=roots,
         blind=blind,
         ignored=ignored,
+        record_pages="pages" not in store.missing_columns,
     )
     counts = {
         "scanned": len(diff.to_ingest)
         + len(diff.moved)
         + len(diff.unchanged)
-        + len(diff.oversized),
+        + len(diff.oversized)
+        + len(diff.kept_scans),
         "ingested": 0,
         "skipped": len(diff.unchanged),
         "moved": 0,
@@ -134,7 +136,7 @@ def _run_sync_unlocked(
         "relabelled": 0,
         "signed": 0,
         "ignored": sum(1 for p in ignored if scope is None or is_under(str(p), str(scope))),
-        "unreadable": len(diff.unreadable),
+        "unreadable": len(diff.unreadable) + len(diff.kept_scans),
         "failed": 0,
     }
     errors: list[dict] = []
@@ -156,6 +158,14 @@ def _run_sync_unlocked(
                 "source": source,
                 "error": "kept in the index: this installation cannot read this file type, "
                 f"so it was neither re-ingested nor deleted; {ocr.INSTALL_HINT}",
+            }
+        )
+    for path in diff.kept_scans:
+        errors.append(
+            {
+                "source": str(path),
+                "error": "kept as indexed, without page numbers: it was read with OCR, which "
+                f"this installation lacks, and reading it again needs it; {ocr.INSTALL_HINT}",
             }
         )
 

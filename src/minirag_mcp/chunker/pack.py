@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import NamedTuple
 
 from minirag_mcp.chunker.sections import (
     SENTENCE_END,
@@ -168,6 +169,57 @@ def section_atoms(body: str) -> list[Atom]:
     return atoms
 
 
+class Packed(NamedTuple):
+    """A retrieval unit, and where in it the unit's own text begins: everything before
+    `own_start` is context repeated from elsewhere (a breadcrumb, a table's header row,
+    the note on a split fence). `verbatim` is False when the own text is not the
+    document's as it stands: a heading cleaned of its markup, or a piece of a word cut
+    to fit the budget."""
+
+    text: str
+    own_start: int
+    verbatim: bool = True
+
+
+def _owning(text: str, own: str, verbatim: bool = True) -> Packed:
+    return Packed(text, len(text) - len(own), verbatim)
+
+
+def _skip(text: str, start: int, count: int) -> int:
+    """The offset in `text` past `count` non-whitespace characters from `start`, and any
+    whitespace that follows them."""
+    at = start
+    while at < len(text) and (count or text[at].isspace()):
+        if not text[at].isspace():
+            count -= 1
+        at += 1
+    return at
+
+
+def without_leading(units: Sequence[Packed], context: str) -> list[Packed]:
+    """`units` with `context` taken out of their own text, where their own text, read in
+    order and without whitespace, begins with it.
+
+    Text a unit carries as content can still be a copy: the title seeded into a
+    document's first section, the header a cut table repeats. Whitespace is ignored
+    because packing rejoins atoms with separators of its own.
+    """
+    wanted = "".join(context.split())
+    owned = "".join("".join(u.text[u.own_start :].split()) for u in units)
+    if not wanted or not owned.startswith(wanted):
+        return list(units)
+    out: list[Packed] = []
+    left = len(wanted)
+    for unit in units:
+        mine = len("".join(unit.text[unit.own_start :].split()))
+        take = min(left, mine)
+        out.append(
+            unit._replace(own_start=_skip(unit.text, unit.own_start, take)) if take else unit
+        )
+        left -= take
+    return out
+
+
 def _render(prefix: str, header: str, body: str) -> str:
     parts = []
     if prefix:
@@ -216,24 +268,26 @@ def _greedy(pieces: Sequence[str], glue: str, wrap, count_tokens: CountTokens, b
     return out
 
 
-def _force_split(text: str, wrap, count_tokens: CountTokens, budget: int) -> list[str]:
+def _force_split(text: str, wrap, count_tokens: CountTokens, budget: int) -> list[tuple[str, bool]]:
     """Last resort for one piece that does not fit: split at whitespace, then anywhere.
 
     This is what a single table row longer than the whole budget goes through. The row
     is never cut for the *reader* — the parent section still holds it intact — but its
     retrieval units have to fit the encoder, and a truncated vector would drop the tail
     entirely rather than merely index it separately.
+
+    Each piece comes with whether it is whole words: one cut out of a word is not.
     """
-    out: list[str] = []
+    out: list[tuple[str, bool]] = []
     for piece in _greedy(text.split(" "), " ", wrap, count_tokens, budget):
         if count_tokens(wrap(piece)) <= budget and piece:
-            out.append(piece)
+            out.append((piece, True))
         else:
-            out += _greedy(list(piece), "", wrap, count_tokens, budget)
-    return [p for p in out if p.strip()]
+            out += [(cut, False) for cut in _greedy(list(piece), "", wrap, count_tokens, budget)]
+    return [(p, whole) for p, whole in out if p.strip()]
 
 
-def _split_fence(prefix: str, code: str, count_tokens: CountTokens, budget: int) -> list[str]:
+def _split_fence(prefix: str, code: str, count_tokens: CountTokens, budget: int) -> list[Packed]:
     """Cut a fence that ran past the ceiling, at line boundaries, marking every piece.
 
     Line boundaries rather than `_force_split`'s whitespace, because code read a line
@@ -246,13 +300,13 @@ def _split_fence(prefix: str, code: str, count_tokens: CountTokens, budget: int)
     def wrap(text: str) -> str:
         return _render(prefix, "", f"{FENCE_SPLIT_NOTE}\n{text}")
 
-    pieces: list[str] = []
+    pieces: list[tuple[str, bool]] = []
     for rough in _greedy(code.split("\n"), "\n", wrap, count_tokens, budget):
         if rough.strip() and count_tokens(wrap(rough)) <= budget:
-            pieces.append(rough)
+            pieces.append((rough, True))
         else:
             pieces += _force_split(rough, wrap, count_tokens, budget)
-    return [wrap(piece) for piece in pieces]
+    return [_owning(wrap(piece), piece, whole) for piece, whole in pieces]
 
 
 def _resolve_headers(
@@ -286,7 +340,7 @@ def _resolve_headers(
     return out
 
 
-def pack_section(section: Section, count_tokens: CountTokens, budget: int) -> list[str]:
+def pack_section(section: Section, count_tokens: CountTokens, budget: int) -> list[Packed]:
     """Retrieval units for one section, every one within `budget` tokens.
 
     The only unit that may exceed it is a closed fenced code block, which is atomic —
@@ -297,7 +351,7 @@ def pack_section(section: Section, count_tokens: CountTokens, budget: int) -> li
         return []
     prefix = _choose_prefix(section.prefixes, count_tokens, budget)
     atoms = _resolve_headers(atoms, prefix, count_tokens, budget)
-    units: list[str] = []
+    units: list[Packed] = []
     run: list[Atom] = []
 
     def flush() -> None:
@@ -308,15 +362,15 @@ def pack_section(section: Section, count_tokens: CountTokens, budget: int) -> li
         rendered = _render(prefix, header, body)
         if run[0].kind == CODE:
             if count_tokens(rendered) <= budget * FENCE_BUDGET_MULTIPLE:
-                units.append(rendered)
+                units.append(_owning(rendered, body))
             else:
                 units.extend(_split_fence(prefix, body, count_tokens, budget))
         elif count_tokens(rendered) <= budget:
-            units.append(rendered)
+            units.append(_owning(rendered, body))
         else:
             units.extend(
-                _render(prefix, header, piece)
-                for piece in _force_split(
+                _owning(_render(prefix, header, piece), piece, whole)
+                for piece, whole in _force_split(
                     body, lambda t: _render(prefix, header, t), count_tokens, budget
                 )
             )
@@ -335,7 +389,9 @@ def pack_section(section: Section, count_tokens: CountTokens, budget: int) -> li
                 flush()
         run.append(atom)
     flush()
-    return units
+    if not section.verbatim:
+        return [unit._replace(verbatim=False) for unit in units]
+    return without_leading(units, section.repeated)
 
 
 def shared_lines(previous: Sequence[str], lines: Sequence[str]) -> int:

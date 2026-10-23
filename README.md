@@ -935,6 +935,25 @@ measured to *degrade* attribution quality by 16–276% against the best
 granularity ([arXiv 2604.01432][granularity]). `sources` is that document list
 already, which is why `displayPath` lives there.
 
+Pages, for a PDF. A document is what an answer cites, but a page is how a person
+finds the passage in it, so a hit from a PDF carries `pages` — `"12"`, or
+`"12-13"` for a chunk that runs across a page break — in `query_documents`
+results, `read_chunk_neighbors` chunks and a `find_mentions` `firstMatch`, and
+the CLI prints it as `p. 12`. Other formats, and a PDF fetched by `ingest_url`,
+carry no `pages` at all. A page that cannot be told for certain is left out
+rather than guessed: a chunk gets one only where its own text is found, word for
+word, where the document says it should be, and only when every copy of that text
+there is on the same page — a table of identical rows, or a phrase repeated on
+every page, gets none.
+
+Upgrading costs one pass over your PDFs. The first sync after it reads again
+every PDF indexed before page numbers existed — with OCR again for a scanned
+one, and with the choice model labelling it again when the corpus has a
+`classify.toml`. Until then `status` counts them as `unpagedSourceCount` and
+`list_files` shows them as `stale_pages`. On an install without the `[ocr]`
+extra, a PDF that was read with OCR is kept as it is, listed as `unreadable`,
+rather than read again without its scanned pages.
+
 Plain text, not a link — the one thing a model can still get wrong about a
 string it is copying is to wrap it. A `file://` URL is refused or mishandled by
 every client checked: Claude Desktop denylists the scheme outright, Claude Code

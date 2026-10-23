@@ -85,8 +85,10 @@ def result_dict(r: SearchResult) -> dict:
     the response's `parents` map, not once per hit: a good chunking scheme puts several
     hits of one query in the same section, and attaching the section to every hit made
     about a third of a response the same words resent.
+
+    `pages` appears only on a chunk of a PDF whose pages are known.
     """
-    return {
+    out = {
         "text": r.text,
         "source": r.source,
         "title": r.title,
@@ -95,6 +97,9 @@ def result_dict(r: SearchResult) -> dict:
         "distance": r.distance,
         "parentId": r.parent_id or None,
     }
+    if r.pages:
+        out["pages"] = r.pages
+    return out
 
 
 def parent_map(results: Iterable[SearchResult]) -> dict[str, str]:
@@ -127,6 +132,37 @@ def scheme_status(store: Store) -> dict:
             f"{stale} chunk(s) predate the current chunking scheme. {RESYNC_HINT}"
         )
     return out
+
+
+def pages_status(store: Store) -> dict:
+    """The page-number half of `status`, identical for the server and the CLI.
+
+    Absent when no PDF predates page numbers, so an index that is up to date sees the
+    status it always had.
+    """
+    unpaged = store.unpaged_pdfs()
+    if not unpaged:
+        return {}
+    head = (
+        f"{len(unpaged)} PDF document(s) were indexed before page numbers were stored, so "
+        "their results carry no `pages`."
+    )
+    if "pages" in store.missing_columns:
+        warning = (
+            f"{head} This index has no column for them and could not gain one when it was "
+            "opened, without write access or while another process was writing it. Open it "
+            "with write access and no other writer — `minirag-mcp sync` does — and that "
+            "sync reads them again."
+        )
+    else:
+        warning = f"{head} The next sync (sync_start, or `minirag-mcp sync`) reads them again."
+        scanned = 0 if ocr.available() else sum(1 for engine in unpaged.values() if engine)
+        if scanned:
+            warning += (
+                f" {scanned} of them were read with OCR, which this install lacks, so a sync "
+                f"keeps them as they are; {ocr.INSTALL_HINT}."
+            )
+    return {"unpagedSourceCount": len(unpaged), "pagesWarning": warning}
 
 
 def signature_status(store: Store) -> dict:
@@ -466,6 +502,8 @@ def run_find(
                 "parentId": chunk.parent_id or None,
                 "snippet": _snippet(unicodedata.normalize("NFC", text), span),
             }
+            if chunk.pages:
+                doc.first_match["pages"] = chunk.pages
 
     needed = len(parsed) if match == "all" else 1
     matched = [d for d in docs.values() if len(d.terms) >= needed]

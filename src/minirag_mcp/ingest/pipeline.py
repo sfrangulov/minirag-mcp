@@ -14,7 +14,7 @@ from pathlib import Path
 from minirag_mcp import ocr
 from minirag_mcp.chunker import SCHEME_VERSION, chunk_markdown, estimate_tokens
 from minirag_mcp.config import Config
-from minirag_mcp.ingest import ignore
+from minirag_mcp.ingest import ignore, pages
 from minirag_mcp.ingest import parser as _parser
 from minirag_mcp.ingest.ignore import IgnoredFileError
 from minirag_mcp.ingest.parser import (
@@ -271,10 +271,12 @@ class Pipeline:
         mtime: float = 0.0,
         ocr_engine: str = "",
         file_time: float | None = None,
+        page_starts: pages.PageStarts = (),
     ) -> IngestResult:
         """Chunk, embed, label and store, replacing whatever `source` held before."""
         chunks = self._chunk(markdown, source=source, title=title, seed_title=seed_title)
         texts = [c.text for c in chunks]
+        chunk_pages = pages.chunk_pages(markdown, page_starts, chunks)
         vectors = self.embedder.embed_documents(texts)
         labels, label_problem = self._label(
             source=source,
@@ -301,6 +303,7 @@ class Pipeline:
                 parent_id=f"{source}#p{chunk.parent_index}",
                 ocr_engine=ocr_engine,
                 scheme_version=SCHEME_VERSION,
+                pages=chunk_pages[i],
                 **labels,
             )
             for i, (chunk, vec) in enumerate(zip(chunks, vectors, strict=True))
@@ -352,6 +355,7 @@ class Pipeline:
                 mtime=info.st_mtime,
                 ocr_engine=doc.ocr_engine,
                 file_time=_file_time(info),
+                page_starts=doc.page_starts,
             )
 
     def ingest_data(

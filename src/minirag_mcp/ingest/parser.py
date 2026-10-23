@@ -17,7 +17,7 @@ from requests.adapters import HTTPAdapter
 
 from minirag_mcp import ocr
 from minirag_mcp.config import Config
-from minirag_mcp.ingest import vtt
+from minirag_mcp.ingest import pages, vtt
 from minirag_mcp.security import SecurityError, check_url
 
 logger = logging.getLogger(__name__)
@@ -181,6 +181,9 @@ class ParsedDoc:
     has_title: bool = True
     # Non-empty when OCR produced some or all of `markdown` (engine name).
     ocr_engine: str = ""
+    # Where each page of a PDF starts in `markdown`; () for other formats, and for a
+    # PDF whose pages could not be told apart.
+    page_starts: pages.PageStarts = ()
 
 
 class _GuardedHTTPAdapter(HTTPAdapter):
@@ -437,40 +440,47 @@ def parse_file(path: Path, config: Config | None = None) -> ParsedDoc:
         raise ParserError(f"Failed to convert {path}: {e}") from e
     markdown = _converted_markdown(result)
     ocr_engine = ""
-    if config is not None and path.suffix.lower() == ".pdf":
-        markdown, ocr_engine = _pdf_with_ocr_fallback(path, markdown, config)
+    starts: pages.PageStarts = ()
+    if path.suffix.lower() == ".pdf":
+        starts = pages.pdf_page_starts(path, markdown)
+        if config is not None:
+            markdown, ocr_engine, starts = _pdf_with_ocr_fallback(path, markdown, config, starts)
     return ParsedDoc(
         markdown=markdown,
         title=_file_title(markdown, result.title, path.stem),
         ocr_engine=ocr_engine,
+        page_starts=starts,
     )
 
 
-def _pdf_with_ocr_fallback(path: Path, markdown: str, config: Config) -> tuple[str, str]:
+def _pdf_with_ocr_fallback(
+    path: Path, markdown: str, config: Config, starts: pages.PageStarts
+) -> tuple[str, str, pages.PageStarts]:
     """Route near-empty PDF pages through OCR; keep text-layer pages as they are.
 
     Per-page, not whole-document: a text cover page over scanned pages must
-    not mask them. Threshold 0 disables the check entirely.
+    not mask them. Threshold 0 disables the check entirely. `starts` are the page
+    starts of `markdown`, returned for whatever text comes back.
     """
     threshold = config.ocr_min_chars_per_page
     if threshold <= 0:
-        return markdown, ""
+        return markdown, "", starts
     if not ocr.available() and markdown.strip():
         # The per-page pass is a second full pdfminer parse of a file markitdown has
         # already parsed. With no OCR to route pages to, its only remaining use is
         # telling a file with no text at all from one with some, and a converter result
         # that carries text has answered that.
-        return markdown, ""
+        return markdown, "", starts
     try:
         page_texts = ocr.pdf_page_texts(path)
     except Exception as e:
         # pdfminer failing on an exotic PDF must not break the markitdown result that
         # already succeeded, but a silently disabled OCR path must still be visible.
         logger.warning("pdf_page_texts failed for %s, OCR routing skipped: %s", path, e)
-        return markdown, ""
+        return markdown, "", starts
     needs = [i for i, text in enumerate(page_texts) if len(text.strip()) < threshold]
     if not needs:
-        return markdown, ""
+        return markdown, "", starts
     if not ocr.available():
         # Reached only with an empty conversion: the short-circuit above has already
         # returned every PDF markitdown got text out of, and that is what keeps a
@@ -481,18 +491,19 @@ def _pdf_with_ocr_fallback(path: Path, markdown: str, config: Config) -> tuple[s
             raise ParserError(
                 f"{path} looks like a scanned PDF (no text layer); {ocr.INSTALL_HINT}"
             )
-        return markdown, ""  # partial text beats refusal
+        return markdown, "", starts  # partial text beats refusal
     try:
         recognized = ocr.ocr_pdf(path, config, needs)
     except ocr.OcrError as e:
         raise ParserError(str(e)) from e
-    # markitdown's markdown has no page boundaries to splice into: a scanned page's
-    # recognized text is appended after the converted document rather than woven
-    # back into page order, trading position for keeping the good pages' own
+    # markitdown's markdown does not reliably mark page boundaries to splice into: a
+    # scanned page's recognized text is appended after the converted document rather
+    # than woven back into page order, trading position for keeping the good pages' own
     # structure (tables, headings) intact instead of flattening the whole document
-    # to raw per-page text the moment any single page needs OCR.
-    ocr_text = "\n\n".join(text for i in needs if (text := recognized.get(i, "").strip()))
-    if not ocr_text:
+    # to raw per-page text the moment any single page needs OCR. Its page number
+    # travels with it in the page starts.
+    scanned = [(i, text) for i in needs if (text := recognized.get(i, "").strip())]
+    if not scanned:
         # OCR finding nothing is only fatal when the converter found nothing either:
         # markitdown (pdfplumber) and pdfminer's per-page pass are separate
         # extractors and can disagree on an odd encoding or a degenerate text box,
@@ -500,9 +511,12 @@ def _pdf_with_ocr_fallback(path: Path, markdown: str, config: Config) -> tuple[s
         # every page fell below the per-page threshold and OCR added nothing.
         if len(needs) == len(page_texts) and not markdown.strip():
             raise ParserError(f"{path}: OCR produced no text (page may be blank or unreadable)")
-        return markdown, ""  # OCR added nothing; the converter already carried content
-    merged = "\n\n".join(part for part in (markdown.strip(), ocr_text) if part)
-    return merged, ocr.ENGINE_RAPIDOCR
+        return markdown, "", starts  # OCR added nothing; the converter already carried content
+    parts = [(text, ((0, i + 1),)) for i, text in scanned]
+    if converted := markdown.strip():
+        parts.insert(0, (converted, pages.stripped(markdown, starts)))
+    merged, merged_starts = pages.joined(parts)
+    return merged, ocr.ENGINE_RAPIDOCR, merged_starts
 
 
 def parse_html(html: str, title: str | None = None) -> ParsedDoc:

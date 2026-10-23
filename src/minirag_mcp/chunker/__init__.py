@@ -16,8 +16,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from typing import Protocol
 
-from minirag_mcp.chunker.pack import join_parent, pack_section, shared_lines
-from minirag_mcp.chunker.sections import detect_category, split_sections
+from minirag_mcp.chunker.pack import join_parent, pack_section, shared_lines, without_leading
+from minirag_mcp.chunker.sections import detect_category, in_document_order, split_sections
 from minirag_mcp.chunker.tokens import CountTokens, estimate_tokens
 
 # Bumped whenever chunk boundaries or chunk text change meaning. Stored on every row so
@@ -38,6 +38,7 @@ __all__ = [
     "chunk_markdown",
     "detect_category",
     "estimate_tokens",
+    "in_document_order",
     "join_document",
     "join_parent",
     "shared_lines",
@@ -50,6 +51,12 @@ class Chunk:
 
     text: str
     parent_index: int
+    # Where the unit's own text begins: before it is context repeated in the unit — the
+    # seeded title, a breadcrumb, a time-window label, a table's header row, even when the
+    # unit holds it as content. The own text is the document's own, but for whitespace,
+    # unless `verbatim` is False: a heading cleaned of its markup, a piece of a word.
+    own_start: int = 0
+    verbatim: bool = True
 
 
 def _seed_title(body: str, title: str) -> str:
@@ -80,15 +87,24 @@ def chunk_markdown(
     the caller has no real title, only a source id or a URL.
     """
     sections = split_sections(markdown, title=title)
+    seed = ""
     if sections:
-        sections[0] = replace(sections[0], body=_seed_title(sections[0].body, title))
+        seeded = _seed_title(sections[0].body, title)
+        if seeded != sections[0].body:
+            seed = f"# {title}"
+        sections[0] = replace(sections[0], body=seeded)
     chunks: list[Chunk] = []
     parent = 0
-    for section in sections:
+    for index, section in enumerate(sections):
         units = pack_section(section, count_tokens, budget)
+        if index == 0 and seed:
+            units = without_leading(units, seed)
         if not units:
             continue
-        chunks += [Chunk(text=unit, parent_index=parent) for unit in units]
+        chunks += [
+            Chunk(unit.text, parent, own_start=unit.own_start, verbatim=unit.verbatim)
+            for unit in units
+        ]
         parent += 1
     return chunks
 

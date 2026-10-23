@@ -67,6 +67,9 @@ class ChunkRecord:
     label_hash: str = ""
     doc_date: str = ""
     doc_date_source: str = ""
+    # The PDF pages the chunk came from, "12" or "12-13"; "" for other formats and where
+    # the page is not known. A row written before the column existed reads as None.
+    pages: str = ""
 
 
 @dataclass(frozen=True)
@@ -85,6 +88,7 @@ class SearchResult:
     labels_json: str = ""
     doc_date: str = ""
     doc_date_source: str = ""
+    pages: str = ""
 
 
 @dataclass(frozen=True)
@@ -107,6 +111,8 @@ class SourceInfo:
     label_hash: str = ""
     doc_date: str = ""
     doc_date_source: str = ""
+    # False when a chunk of this source was stored before page numbers were.
+    pages_recorded: bool = True
 
 
 _META_COLS = [
@@ -122,6 +128,7 @@ _META_COLS = [
     "label_hash",
     "doc_date",
     "doc_date_source",
+    "pages",
 ]
 
 
@@ -259,8 +266,15 @@ _SCHEME_COLUMNS = {
 _ADDITIVE_COLUMNS = {
     "ocr_engine": "''",
     **dict.fromkeys(LABEL_COLUMNS, "''"),
+    # NULL, not '': a row that predates page numbers is told apart from one whose page
+    # is not known.
+    "pages": "CAST(NULL AS STRING)",
 }
 _ADDED_COLUMNS = {**_SCHEME_COLUMNS, **_ADDITIVE_COLUMNS}
+
+
+def _pages_recorded(rows: Iterable[dict]) -> bool:
+    return all(row.get("pages") is not None for row in rows)
 
 
 def _scheme_of(row: dict) -> int:
@@ -334,6 +348,7 @@ class Store:
                     pa.field("ocr_engine", pa.string()),
                     pa.field("scheme_version", pa.int32()),
                     *(pa.field(name, pa.string()) for name in LABEL_COLUMNS),
+                    pa.field("pages", pa.string()),
                 ]
             )
             self._table = self._db.create_table(TABLE, schema=schema)
@@ -488,12 +503,19 @@ class Store:
             self._table.delete(clause)
             self._delete_signature(source)
             return
+        # An additive column this index could not gain reads as empty, and is written as
+        # nothing: the write must not fail on a column the table does not have.
+        absent = [c for c in self.missing_columns if c in _ADDITIVE_COLUMNS]
+        rows = [asdict(r) for r in records]
+        for row in rows:
+            for column in absent:
+                del row[column]
         (
             self._table.merge_insert(["id", "ingested_at"])
             .when_matched_update_all()
             .when_not_matched_insert_all()
             .when_not_matched_by_source_delete(clause)
-            .execute([asdict(r) for r in records])
+            .execute(rows)
         )
         self._sign(source, records)
 
@@ -838,6 +860,7 @@ class Store:
                 score=0.0,
                 distance=None,
                 parent_id=r.get("parent_id", ""),
+                pages=r.get("pages") or "",
             )
             for r in rows
         ]
@@ -855,6 +878,7 @@ class Store:
                 score=0.0,
                 distance=None,
                 parent_id=r.get("parent_id", ""),
+                pages=r.get("pages") or "",
             )
             for r in rows
         ]
@@ -902,6 +926,7 @@ class Store:
         indexes: dict[str, set[int]] = {}
         schemes: dict[str, int] = {}
         engines: dict[str, str] = {}
+        unpaged: set[str] = set()
         for row in self._iter_meta(scopes, filter_sql):
             by_source.setdefault(row["source"], row)
             counts[row["source"]] = counts.get(row["source"], 0) + 1
@@ -909,6 +934,8 @@ class Store:
             scheme = _scheme_of(row)
             schemes[row["source"]] = min(schemes.get(row["source"], scheme), scheme)
             engines[row["source"]] = engines.get(row["source"]) or row.get("ocr_engine", "")
+            if not _pages_recorded([row]):
+                unpaged.add(row["source"])
         return [
             SourceInfo(
                 source=src,
@@ -921,6 +948,7 @@ class Store:
                 ocr_engine=engines[src] or "",
                 duplicated=counts[src] > len(indexes[src]),
                 **_label_fields(row),
+                pages_recorded=src not in unpaged,
             )
             for src, row in sorted(by_source.items())
         ]
@@ -948,7 +976,34 @@ class Store:
             ocr_engine=engine,
             duplicated=len(rows) > len({row["chunk_index"] for row in rows}),
             **_label_fields(r),
+            pages_recorded=_pages_recorded(rows),
         )
+
+    def unpaged_pdfs(self) -> dict[str, str]:
+        """PDF files with a chunk stored before page numbers were, each with its OCR
+        engine ("" when OCR read none of it). Asked of the index rather than listed from
+        every document, so `status` stays quick on a large one."""
+        present = set(self._table.schema.names)
+        clauses = ["source_type = 'file'", "lower(source) LIKE '%.pdf'"]
+        if "pages" in present:
+            clauses.append("pages IS NULL")
+        columns = ["source", *(["ocr_engine"] if "ocr_engine" in present else [])]
+        rows = (
+            self._table.search()
+            .where(" AND ".join(clauses))
+            .select(columns)
+            .limit(_LIST_LIMIT)
+            .to_arrow()
+        )
+        engines = (
+            rows.column("ocr_engine").to_pylist()
+            if "ocr_engine" in columns
+            else [""] * rows.num_rows
+        )
+        out: dict[str, str] = {}
+        for source, engine in zip(rows.column("source").to_pylist(), engines, strict=True):
+            out[source] = out.get(source) or engine or ""
+        return out
 
     def stale_chunk_count(self) -> int:
         """Chunks written by an older chunking scheme. Detected, never assumed.
@@ -1013,7 +1068,7 @@ class Store:
             sql_clause(scopes), filter_sql, literal.sql_clause(terms, FTS_COLUMNS)
         )
         present = set(self._table.schema.names)
-        wanted = ["source", "title", "chunk_index", "text", "parent_id", *LABEL_COLUMNS]
+        wanted = ["source", "title", "chunk_index", "text", "parent_id", "pages", *LABEL_COLUMNS]
         table = (
             self._table.search()
             .where(clause)
@@ -1035,6 +1090,7 @@ class Store:
                     labels_json=r.get("labels_json") or "",
                     doc_date=r.get("doc_date") or "",
                     doc_date_source=r.get("doc_date_source") or "",
+                    pages=r.get("pages") or "",
                 )
 
     def chunk_count(self) -> int:
@@ -1137,6 +1193,7 @@ class Store:
                     labels_json=r.get("labels_json", ""),
                     doc_date=r.get("doc_date", ""),
                     doc_date_source=r.get("doc_date_source", ""),
+                    pages=r.get("pages") or "",
                 )
             )
 
