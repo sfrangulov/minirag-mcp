@@ -237,9 +237,11 @@ def create_app(
         cover this topic" without inspecting individual chunks.
 
         A `sources` row carries `lookAlikes` when other indexed documents
-        share at least half its text: up to 3, most first, each with
-        `source`, `displayPath`, `overlap` (0..1, the estimated share of
-        five-word runs the two have in common) and `date` when known. They
+        overlap it by 0.5 or more: up to 3, most first, each with `source`,
+        `displayPath`, `overlap` (0..1, the estimated Jaccard similarity of
+        the two texts' five-word runs: runs in common over runs in either,
+        so a short text wholly inside a much longer one scores low) and
+        `date` when known. They
         come from the whole index, outside scope and filters too. Overlap is
         measured text, not a verdict on which one is current: an older
         version or a sibling filled in from one template can hold other

@@ -662,8 +662,12 @@ class Store:
 
     def _signature_state(self) -> _Signatures:
         """`_read_signature_index`, kept until either table gains a version."""
-        table = self._signature_table(create=False)
-        key = (self._table.version, None if table is None else table.version)
+        try:
+            table = self._signature_table(create=False)
+            version = None if table is None else table.version
+        except Exception:
+            version = None  # _read_signature_index warns
+        key = (self._table.version, version)
         cached = self._signature_cache
         if cached is not None and cached[0] == key:
             return cached[1]
@@ -697,25 +701,37 @@ class Store:
         picked: list[int] = []
         signed: set[str] = set()
         values = np.zeros((0, NUM_PERM), dtype=np.uint32)
-        table = self._signature_table(create=False)
-        if table is not None:
-            sigs = table.search().select(_signature_schema().names).limit(_LIST_LIMIT).to_arrow()
-            flat = sigs.column("signature").combine_chunks().flatten()
-            values = flat.to_numpy(zero_copy_only=False).astype(np.uint32).reshape(-1, NUM_PERM)
-            for i, (source, stamp, shingles) in enumerate(
-                zip(
-                    sigs.column("source").to_pylist(),
-                    sigs.column("ingested_at").to_pylist(),
-                    sigs.column("shingles").to_pylist(),
-                    strict=True,
+        rows: list[tuple[str, str, int]] = []
+        # A signatures table that cannot be read leaves every document unsigned, never
+        # takes search, status or sync down with it.
+        try:
+            table = self._signature_table(create=False)
+            if table is not None:
+                sigs = (
+                    table.search().select(_signature_schema().names).limit(_LIST_LIMIT).to_arrow()
                 )
-            ):
-                if source in signed or stamp_of.get(source) is None or stamp_of[source] != stamp:
-                    continue
-                signed.add(source)
-                if shingles > 0:
-                    sources.append(source)
-                    picked.append(i)
+                flat = sigs.column("signature").combine_chunks().flatten()
+                values = flat.to_numpy(zero_copy_only=False).astype(np.uint32).reshape(-1, NUM_PERM)
+                rows = list(
+                    zip(
+                        sigs.column("source").to_pylist(),
+                        sigs.column("ingested_at").to_pylist(),
+                        sigs.column("shingles").to_pylist(),
+                        strict=True,
+                    )
+                )
+                if len(rows) != len(values):
+                    raise ValueError(f"{len(values)} signatures for {len(rows)} rows")
+        except Exception as e:
+            self._warn_signature("read the look-alike signatures", e)
+            rows, values = [], np.zeros((0, NUM_PERM), dtype=np.uint32)
+        for i, (source, stamp, shingles) in enumerate(rows):
+            if source in signed or stamp_of.get(source) is None or stamp_of[source] != stamp:
+                continue
+            signed.add(source)
+            if shingles > 0:
+                sources.append(source)
+                picked.append(i)
         return _Signatures(
             index=SignatureIndex(sources, values[picked]),
             dates=dates,

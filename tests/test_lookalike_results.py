@@ -152,3 +152,54 @@ def test_status_counts_documents_without_a_signature_only_when_there_are_any(cor
     assert all(
         "lookAlikes" not in r for r in run_query(store, embedder, config, "заявки")["sources"]
     )
+
+
+def test_a_signatures_table_that_cannot_be_read_leaves_search_and_sync_working(corpus):
+    import lancedb
+    import pyarrow as pa
+
+    from minirag_mcp.sync import run_sync
+
+    root, config, store, embedder = corpus
+    db = lancedb.connect(str(config.db_path))
+    db.drop_table(SIGNATURE_TABLE)
+    db.create_table(
+        SIGNATURE_TABLE,
+        schema=pa.schema(
+            [
+                pa.field("source", pa.string()),
+                pa.field("ingested_at", pa.string()),
+                pa.field("shingles", pa.int32()),
+                pa.field("signature", pa.list_(pa.uint32(), 64)),
+            ]
+        ),
+    ).add([{"source": "x", "ingested_at": "t", "shingles": 1, "signature": [0] * 64}])
+    store = Store(config.db_path, dim=embedder.dim)
+    with pytest.warns(RuntimeWarning, match="look-alike signatures"):
+        got = run_query(store, embedder, config, "regulation")
+    assert got["results"] and all("lookAlikes" not in s for s in got["sources"])
+    assert signature_status(store)["unsignedSourceCount"] == len(FILES)
+    pipeline = Pipeline(store, embedder, config)
+    counts, errors = run_sync(pipeline, store, config.roots, config.max_file_size)
+    assert counts["failed"] == 0
+    assert any(e["error"].startswith("lookAlikes:") for e in errors)
+
+
+def test_a_document_whose_chunks_carry_two_stamps_is_unsigned_not_compared(corpus):
+    """Two racing first ingests can store a document twice; its signature then
+    describes only one copy, so it is not used until a sync re-reads the document."""
+    root, config, store, embedder = corpus
+    v1, v2 = src(root, "regs/v1.md"), src(root, "archive/v2.md")
+    before = run_query(store, embedder, config, "regulation")
+    assert any(la["source"] == v1 for s in before["sources"] for la in s.get("lookAlikes", []))
+    rows = store._table.search().where(f"source = '{v1}'").limit(1000).to_list()
+    columns = store._table.schema.names
+    store._table.add(
+        [
+            {**{c: r[c] for c in columns}, "id": r["id"] + "-dup", "ingested_at": "9999"}
+            for r in rows
+        ]
+    )
+    after = run_query(store, embedder, config, "regulation")
+    assert not any(la["source"] == v1 for s in after["sources"] for la in s.get("lookAlikes", []))
+    assert v1 in store.unsigned_sources()

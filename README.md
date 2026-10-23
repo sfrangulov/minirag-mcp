@@ -819,13 +819,15 @@ option before it: `minirag-mcp find --base-dir ~/docs -- -15%`.
 
 ### Look-alike documents
 
-A `query_documents` source or a `find_mentions` document that shares at least
-half its text with other indexed documents carries `lookAlikes`: up to three of
+A `query_documents` source or a `find_mentions` document that overlaps other
+indexed documents by 0.5 or more carries `lookAlikes`: up to three of
 them, most first, each with `source`, `displayPath`, `overlap` and the document
 `date` when one is known, as in `{"source": "/docs/archive/regulation_v2.md",
 "displayPath": "archive/regulation_v2.md", "overlap": 0.71}`. `overlap` is the
-estimated share of five-word runs the two texts have in common, from a MinHash
-signature each document gets at ingest; they come from the whole index,
+estimated Jaccard similarity of the two texts' five-word runs (runs in common over
+runs in either), from a MinHash signature each document gets at ingest. A short
+text wholly contained in a version three times its length scores about 0.33 and
+is not flagged. Look-alikes come from the whole index,
 whatever the scope or filters, and a row with none has no `lookAlikes` key. It
 is a measurement, not a verdict on which document is current: an older version
 and a sibling filled in from the same template look alike and may hold other
