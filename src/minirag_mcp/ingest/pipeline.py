@@ -48,6 +48,9 @@ class IngestResult:
     source: str
     chunk_count: int
     title: str
+    # Why the document was stored without some or all of its labels; None when nothing
+    # is missing or the corpus has no classify.toml.
+    label_problem: str | None = None
 
 
 def file_sha256(path: Path) -> str:
@@ -131,6 +134,30 @@ def _activated(job: _Job) -> Iterator[None]:
         _ACTIVE.reset(token)
 
 
+def _named(facets: Sequence[str]) -> str:
+    return f"{facets[0]} label" if len(facets) == 1 else f"{', '.join(facets)} labels"
+
+
+def _label_problem(doc: DocLabels) -> str | None:
+    """What a model problem left out of a document's labels, in words.
+
+    A facet with a path rule the model may override keeps its path value meanwhile:
+    that label is there, only unconfirmed, and saying it is missing would be wrong.
+    """
+    if not doc.unanswered:
+        return None
+    missing = sorted(f for f in doc.unanswered if f not in doc.labels)
+    unconfirmed = sorted(f for f in doc.unanswered if f in doc.labels)
+    parts = []
+    if missing:
+        parts.append(
+            f"without a {_named(missing)}" if len(missing) == 1 else f"without {_named(missing)}"
+        )
+    if unconfirmed:
+        parts.append(f"with its {_named(unconfirmed)} from the path, unconfirmed by the model")
+    return f"stored {' and '.join(parts)}: {doc.reason}. A full sync asks again."
+
+
 class Pipeline:
     def __init__(self, store: Store, embedder, config: Config, labels: LabelerSource | None = None):
         self.store = store
@@ -200,16 +227,23 @@ class Pipeline:
         title: str,
         chunk_texts: Sequence[str],
         file_time: float | None,
-    ) -> dict[str, str]:
-        """The label columns for a document, empty when labelling is off or failed.
+    ) -> tuple[dict[str, str], str | None]:
+        """The label columns for a document, and why any of them are missing.
 
         A labelling failure never fails the ingest: the document is stored unlabelled,
         its empty hash brings it back to the next re-label pass, and the reason goes to
-        the job's report.
+        the job's report. The report names a failure once per job, so the document's
+        own outcome is returned too: a second document of a job whose model could not
+        be made would otherwise look labelled.
         """
         job = self._active()
-        if job is None or job.labeler is None:
-            return {}
+        if job is None:
+            return {}, None
+        if job.labeler is None:
+            problem = None
+            if job.error is not None:
+                problem = f"stored without labels: {self.labels.path} is invalid: {job.error}"
+            return {}, problem
         try:
             doc = job.labeler.label(
                 source=source,
@@ -220,8 +254,8 @@ class Pipeline:
             )
         except Exception as e:
             job.report.add(f"{source}: {_reason(e)}")
-            return {}
-        return _label_columns(doc)
+            return {}, f"stored without labels: {_reason(e)}"
+        return _label_columns(doc), _label_problem(doc)
 
     def _chunk_and_store(
         self,
@@ -240,7 +274,7 @@ class Pipeline:
         chunks = self._chunk(markdown, source=source, title=title, seed_title=seed_title)
         texts = [c.text for c in chunks]
         vectors = self.embedder.embed_documents(texts)
-        labels = self._label(
+        labels, label_problem = self._label(
             source=source,
             source_type=source_type,
             title=title,
@@ -270,7 +304,9 @@ class Pipeline:
             for i, (chunk, vec) in enumerate(zip(chunks, vectors, strict=True))
         ]
         self.store.replace_source(source, records)
-        return IngestResult(source=source, chunk_count=len(records), title=title)
+        return IngestResult(
+            source=source, chunk_count=len(records), title=title, label_problem=label_problem
+        )
 
     def _checked_stat(self, path: Path) -> os.stat_result:
         if path.is_dir():

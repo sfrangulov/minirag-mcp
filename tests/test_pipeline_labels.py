@@ -240,6 +240,7 @@ def test_a_labelling_error_leaves_the_document_ingested_and_unlabelled(corpus, m
     for row in corpus.rows(str(doc)):
         assert all(row[name] == "" for name in FIELDS)
     assert report.problems == [f"{doc}: RuntimeError: cannot label this"]
+    assert result.label_problem == "stored without labels: RuntimeError: cannot label this"
 
 
 def test_documents_ingested_inside_one_job_share_one_model_and_one_taxonomy(corpus, model_factory):
@@ -723,3 +724,72 @@ def test_a_pipeline_without_a_label_source_labels_nothing(tmp_path, fake_embedde
     assert errors == [] and counts["ingested"] == 1 and counts["relabelled"] == 0
     assert store.get_source(str(root / "a.md")).label_hash == ""
     assert pipeline.relabel_stale() == (0, [])
+
+
+# --- what an ingest says about its own labels -------------------------------------------
+
+
+def test_an_ingest_whose_model_failed_says_which_labels_are_missing_and_why(corpus, model_factory):
+    corpus.taxonomy()
+    model_factory.error = ModelError("could not download fake.gguf: offline")
+    result = corpus.pipeline.ingest_file(corpus.doc("alpha/a.md", "Notes."))
+    assert result.label_problem == (
+        "stored without a type label: could not download fake.gguf: offline. "
+        "A full sync asks again."
+    )
+
+
+def test_two_missing_labels_are_named_together(corpus, model_factory):
+    corpus.taxonomy(TAXONOMY + '[facets.topic]\nvalues.a = { description = "A." }\n')
+    model_factory.error = ModelError("no model here")
+    result = corpus.pipeline.ingest_file(corpus.doc("a.md", "Notes."))
+    assert result.label_problem.startswith("stored without topic, type labels: no model here.")
+
+
+def test_a_path_label_the_model_could_not_confirm_is_named_as_such(corpus, model_factory):
+    report = 'values.report = { description = "Report. Findings and figures."'
+    corpus.taxonomy(
+        TAXONOMY.replace("[facets.type]\n", "[facets.type]\noverride_at = 0.9\n").replace(
+            report, report + ', paths = ["reports"]'
+        )
+    )
+    model_factory.error = ModelError("no model here")
+    result = corpus.pipeline.ingest_file(corpus.doc("reports/weekly.md", "Minutes."))
+    assert result.label_problem == (
+        "stored with its type label from the path, unconfirmed by the model: no model here. "
+        "A full sync asks again."
+    )
+
+
+def test_every_document_of_a_job_the_model_failed_in_carries_the_problem(corpus, model_factory):
+    """The job's report names a failure once; the second document must not look clean."""
+    corpus.taxonomy()
+    model_factory.error = ModelError("no model here")
+    with corpus.pipeline.job():
+        first = corpus.pipeline.ingest_file(corpus.doc("a.md", "One."))
+        second = corpus.pipeline.ingest_file(corpus.doc("b.md", "Two."))
+    assert first.label_problem and "no model here" in first.label_problem
+    assert second.label_problem == first.label_problem
+
+
+def test_a_document_the_model_choked_on_says_so_and_the_next_one_is_clean(corpus, model_factory):
+    corpus.taxonomy()
+    model_factory.fail_on = "Poison"
+    with corpus.pipeline.job():
+        bad = corpus.pipeline.ingest_file(corpus.doc("a.md", "Poison pill."))
+        good = corpus.pipeline.ingest_file(corpus.doc("b.md", "Plain notes."))
+    assert bad.label_problem and "cannot read a document containing Poison" in bad.label_problem
+    assert good.label_problem is None
+
+
+def test_an_invalid_taxonomy_is_named_on_the_ingest(corpus):
+    path = corpus.taxonomy("[facets.type\n")
+    result = corpus.pipeline.ingest_file(corpus.doc("a.md", "Notes."))
+    assert result.label_problem.startswith(f"stored without labels: {path} is invalid: ")
+
+
+def test_a_labelled_or_unlabelled_corpus_reports_no_problem(tmp_path, fake_embedder, model_factory):
+    corpus = make_corpus(tmp_path, fake_embedder, model_factory)
+    assert corpus.pipeline.ingest_file(corpus.doc("a.md", "Notes.")).label_problem is None
+    corpus.taxonomy()
+    assert corpus.pipeline.ingest_file(corpus.doc("b.md", "Notes.")).label_problem is None

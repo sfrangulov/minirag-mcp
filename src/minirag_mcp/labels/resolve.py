@@ -29,6 +29,8 @@ class DocLabels:
     taxonomy_hash: str
     # Facets the model was asked for and did not answer because of a model problem.
     unanswered: frozenset[str] = frozenset()
+    # The model problem that left them unanswered.
+    reason: str = ""
 
     def labels_json(self) -> str:
         if not self.labels:

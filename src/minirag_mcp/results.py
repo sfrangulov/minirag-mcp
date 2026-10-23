@@ -16,6 +16,7 @@ from pathlib import Path
 from minirag_mcp import literal, ocr
 from minirag_mcp.chunker import join_parent, shared_lines
 from minirag_mcp.config import Config
+from minirag_mcp.ingest.pipeline import IngestResult
 from minirag_mcp.ingest.scanner import FileState, compute_states, scan_roots
 from minirag_mcp.labels.filters import (
     LabelFilter,
@@ -61,6 +62,18 @@ _SPACE = re.compile(r"\s")
 
 class QueryError(ValueError):
     """A query that cannot run as given."""
+
+
+def ingest_reply(r: IngestResult) -> dict:
+    """One ingested document as the ingest tools and commands report it.
+
+    `labelProblem` appears only when labels are missing, so a corpus without a
+    classify.toml sees the reply it always had.
+    """
+    out = {"source": r.source, "chunkCount": r.chunk_count, "title": r.title}
+    if r.label_problem:
+        out["labelProblem"] = r.label_problem
+    return out
 
 
 def result_dict(r: SearchResult) -> dict:
@@ -529,10 +542,10 @@ def _labels_status(source: LabelerSource, store: Store | None) -> dict:
         return {}
     taxonomy = labeler.taxonomy
     infos = store.list_sources() if store is not None else []
-    state = labeler.model_state()
+    state, problem = labeler.model_status()
     out: dict = {"file": str(source.path), "model": state}
     if state == "unavailable":
-        out["modelHint"] = INSTALL_HINT
+        out["modelHint"] = problem or INSTALL_HINT
     facets: dict = {}
     for facet in taxonomy.facets:
         counts = dict.fromkeys(facet.value_ids, 0)

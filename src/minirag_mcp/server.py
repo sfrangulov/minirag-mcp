@@ -22,6 +22,7 @@ from minirag_mcp.labels import LabelerSource
 from minirag_mcp.labels.model import default_model_factory
 from minirag_mcp.results import (
     DEFAULT_FIND_LIMIT,
+    ingest_reply,
     join_document,
     labels_status,
     list_payload,
@@ -161,12 +162,13 @@ def create_app(
 
         filePath must be an absolute path inside a configured document root.
         Re-ingesting an already-indexed file discards its old chunks and
-        replaces them with freshly parsed ones.
+        replaces them with freshly parsed ones. With a classify.toml,
+        `labelProblem` says which labels the document was stored without,
+        and why; a full sync asks again.
         """
         c = ctx()
         path = resolve_in_roots(filePath, c.config.roots)
-        r = c.pipeline.ingest_file(path)
-        return {"source": r.source, "chunkCount": r.chunk_count, "title": r.title}
+        return ingest_reply(c.pipeline.ingest_file(path))
 
     @mcp.tool
     @guard
@@ -176,10 +178,12 @@ def create_app(
         format is one of "text", "markdown", or "html" (default "text").
         source is a stable identifier you pick, not a filesystem path —
         re-using it replaces the previously ingested content for that id,
-        so reuse the same source to update an item.
+        so reuse the same source to update an item. `labelProblem` is as
+        in ingest_file.
         """
-        r = ctx().pipeline.ingest_data(data, source=source, fmt=format, title=title)
-        return {"source": r.source, "chunkCount": r.chunk_count, "title": r.title}
+        return ingest_reply(
+            ctx().pipeline.ingest_data(data, source=source, fmt=format, title=title)
+        )
 
     @mcp.tool
     @guard
@@ -192,9 +196,9 @@ def create_app(
         reaches the network — every other tool works purely against local
         files and the local index. source defaults to the URL itself; pass
         one to control the index key or to update a previously ingested URL.
+        `labelProblem` is as in ingest_file.
         """
-        r = ctx().pipeline.ingest_url(url, source=source, title=title)
-        return {"source": r.source, "chunkCount": r.chunk_count, "title": r.title}
+        return ingest_reply(ctx().pipeline.ingest_url(url, source=source, title=title))
 
     @mcp.tool
     @guard
@@ -480,7 +484,8 @@ def create_app(
 
         labels, present only when the corpus has a classify.toml: its facets,
         value descriptions and document counts, unlabelled and uncertain
-        counts, and the model state — or the file's error.
+        counts, and the model state, with modelHint saying why when it is
+        "unavailable" — or the file's error.
         """
         if config is None or config_error is not None:
             return {"version": __version__, "configError": config_error or "no configuration"}

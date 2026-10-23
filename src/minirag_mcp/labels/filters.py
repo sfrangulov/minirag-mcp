@@ -14,7 +14,6 @@ from datetime import date
 from pathlib import Path
 
 from minirag_mcp.labels.labeler import Labeler
-from minirag_mcp.labels.model import INSTALL_HINT
 from minirag_mcp.labels.resolve import decode_labels, root_relative
 from minirag_mcp.labels.taxonomy import Facet, Taxonomy
 from minirag_mcp.scope import is_under
@@ -164,12 +163,10 @@ def filter_counts(
 
 
 def filter_notice(f: LabelFilter, labeler: Labeler) -> str | None:
-    if labeler.model_state() != "unavailable":
-        return None
     names = [name for name, _ in f.labels if labeler.taxonomy.facet(name).needs_model]
     if not names:
         return None
-    return (
-        f"labels for {', '.join(names)} come from the model, which this installation "
-        f"cannot run; {INSTALL_HINT}"
-    )
+    problem = labeler.model_problem()
+    if problem is None:
+        return None
+    return f"labels for {', '.join(names)} come from the model, which cannot run here: {problem}"

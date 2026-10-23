@@ -10,6 +10,7 @@ from minirag_mcp.labels.filters import (
     LabelFilter,
     LabelFilterError,
     filter_counts,
+    filter_notice,
     parse_filter,
     source_matches,
     to_sql,
@@ -211,3 +212,11 @@ def test_to_sql_has_the_documented_shape():
         "(contains(label_keys, '|type=minutes|') OR contains(label_keys, '|type~minutes|')) "
         "AND doc_date != '' AND doc_date >= '2026-10-12' AND doc_date <= '2026-10-18'"
     )
+
+
+def test_a_filter_on_path_facets_never_asks_about_the_model(labeler, monkeypatch):
+    def unreachable(self):
+        raise AssertionError("model_problem() called for a filter that needs no model")
+
+    monkeypatch.setattr(type(labeler), "model_problem", unreachable)
+    assert filter_notice(parse(labeler, {"project": "core"}), labeler) is None

@@ -19,6 +19,7 @@ import minirag_mcp.embedder as embedder_mod
 from minirag_mcp.config import load_config
 from minirag_mcp.embedder import Embedder
 from minirag_mcp.labels import Labeler
+from minirag_mcp.labels.model import ModelError
 from minirag_mcp.server import create_app
 
 
@@ -408,7 +409,7 @@ async def test_a_labels_failure_in_status_is_a_labels_error_not_an_index_error(
     def broken(self):
         raise RuntimeError("cannot tell the model state")
 
-    monkeypatch.setattr(Labeler, "model_state", broken)
+    monkeypatch.setattr(Labeler, "model_status", broken)
     env = {"BASE_DIR": str(labelled_root), "DB_PATH": str(tmp_path / "db")}
     _, st = await call_mcp(env, "status", {}, fake_embedder)
     code, out, _ = run_cli(["status", *_flags(env), "--json"], capsys)
@@ -447,3 +448,56 @@ async def test_an_empty_term_is_refused_by_both(root, tmp_path, capsys, monkeypa
     code, _, err = run_cli(["find", " ", *_flags(env)], capsys)
     assert is_error and "a term must not be empty" in text
     assert code == 1 and "a term must not be empty" in err
+
+
+async def test_an_ingest_says_why_its_labels_are_missing_in_both_shells(
+    labelled_root, tmp_path, capsys, monkeypatch, fake_embedder, model_factory
+):
+    monkeypatch.setattr(cli, "_make_embedder", lambda cfg: fake_embedder)
+    monkeypatch.setattr(cli, "_make_model_factory", lambda: model_factory)
+    model_factory.error = ModelError("could not download fake.gguf: offline")
+    env = {"BASE_DIR": str(labelled_root), "DB_PATH": str(tmp_path / "db")}
+    async with Client(
+        create_app(load_config(env), embedder=fake_embedder, model_factory=model_factory)
+    ) as c:
+        by_file = (
+            await c.call_tool("ingest_file", {"filePath": str(labelled_root / "aaa-notes.md")})
+        ).data
+        by_data = (await c.call_tool("ingest_data", {"data": "Notes.", "source": "n-1"})).data
+    code, out, _ = run_cli(
+        ["ingest", str(labelled_root / "alpha" / "plan.md"), *_flags(env), "--json"], capsys
+    )
+    expected = (
+        "stored without a type label: could not download fake.gguf: offline. "
+        "A full sync asks again."
+    )
+    assert by_file["labelProblem"] == by_data["labelProblem"] == expected
+    assert code == 0 and json.loads(out)["ingested"][0]["labelProblem"] == expected
+
+
+async def test_an_ingest_without_labels_keeps_its_reply_shape(root, tmp_path, fake_embedder):
+    env = {"BASE_DIR": str(root), "DB_PATH": str(tmp_path / "db")}
+    is_error, reply = await call_mcp(
+        env, "ingest_file", {"filePath": str(root / "sub" / "a.md")}, fake_embedder
+    )
+    assert not is_error and set(reply) == {"source", "chunkCount", "title"}
+
+
+async def test_ingest_url_says_why_its_labels_are_missing_in_both_shells(
+    labelled_root, tmp_path, capsys, monkeypatch, fake_embedder, model_factory, public_dns
+):
+    import minirag_mcp.ingest.pipeline as pmod
+    from minirag_mcp.ingest.parser import ParsedDoc
+
+    monkeypatch.setattr(pmod, "parse_url", lambda url, **kw: ParsedDoc("# R\n\nNotes.", "R"))
+    monkeypatch.setattr(cli, "_make_embedder", lambda cfg: fake_embedder)
+    monkeypatch.setattr(cli, "_make_model_factory", lambda: model_factory)
+    model_factory.error = ModelError("no model here")
+    env = {"BASE_DIR": str(labelled_root), "DB_PATH": str(tmp_path / "db")}
+    async with Client(
+        create_app(load_config(env), embedder=fake_embedder, model_factory=model_factory)
+    ) as c:
+        reply = (await c.call_tool("ingest_url", {"url": "https://example.com/p"})).data
+    code, out, _ = run_cli(["ingest-url", "https://example.com/q", *_flags(env), "--json"], capsys)
+    assert "no model here" in reply["labelProblem"]
+    assert code == 0 and json.loads(out)["labelProblem"] == reply["labelProblem"]
