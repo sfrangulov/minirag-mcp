@@ -112,8 +112,15 @@ class Run:
 
 def test_items_file_loads_and_covers_every_group():
     items = load_items()
-    assert {i.group for i in items} == {"search", "no_search", "thin", "reading", "injection"}
-    assert 12 <= len(items) <= 16
+    assert {i.group for i in items} == {
+        "search",
+        "no_search",
+        "thin",
+        "reading",
+        "injection",
+        "every",
+    }
+    assert 15 <= len(items) <= 20
 
 
 def test_counts_query_calls_and_flags_unexpected_search():
@@ -367,3 +374,48 @@ def test_extra_citations_accept_any_served_document_but_still_need_an_expected_o
     optional = _item(allowed=(), extra_citations_ok=True, cite_optional=True)
     assert score(optional, none)["sources_ok"] is True
     assert score(optional, both)["sources_ok"] is True
+
+
+def _found(paths) -> str:
+    return json.dumps(
+        {
+            "searchedDocuments": 9,
+            "matchedDocuments": len(paths),
+            "forms": {},
+            "documents": [{"source": "/abs/" + p, "displayPath": p, "hits": 1} for p in paths],
+        },
+        ensure_ascii=False,
+    )
+
+
+def test_find_mentions_is_a_search_and_its_documents_count_as_served():
+    t = (
+        Run()
+        .call("find_mentions", _found((TRIP, NEWS)), terms="командиров")
+        .answer(f"В двух документах.\n\nSources:\n{TRIP}\n{NEWS}")
+    )
+    row = score(
+        _item(group="every", tool="find_mentions", answer=("двух",), allowed=(TRIP, NEWS)), t
+    )
+    assert row["searched"] and row["search_ok"]
+    assert row["n_query"] == 0
+    assert row["tool_ok"] is True
+    assert row["sources_ok"] is True
+
+
+def test_an_expected_tool_that_was_not_called_fails():
+    t = Run().call("query_documents", _payload(), query="командировки").answer("3 рабочих")
+    row = score(_item(group="every", tool="find_mentions"), t)
+    assert row["search_ok"] is True
+    assert row["tool_ok"] is False
+
+
+def test_an_item_without_an_expected_tool_does_not_judge_one():
+    t = Run().call("query_documents", _payload(), query="a").answer("3 рабочих")
+    assert score(_item(), t)["tool_ok"] is None
+
+
+def test_find_mentions_on_a_no_search_item_is_an_unexpected_search():
+    t = Run().call("find_mentions", _found(()), terms="x").answer("391")
+    row = score(_item(group="no_search", search=False, answer=("391",), allowed=()), t)
+    assert row["searched"] is True and row["search_ok"] is False

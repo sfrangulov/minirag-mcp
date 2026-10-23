@@ -46,6 +46,7 @@ from score import score_dir
 REPO = HERE.parent.parent
 READ_TOOLS = (
     "query_documents",
+    "find_mentions",
     "status",
     "read_file",
     "read_chunk_neighbors",

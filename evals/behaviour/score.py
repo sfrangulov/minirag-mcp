@@ -151,10 +151,15 @@ def _nfc(s: str) -> str:
     return unicodedata.normalize("NFC", s)
 
 
+# Every tool that searches the documents; the per-query metrics are query_documents' own.
+SEARCH_TOOLS = ("query_documents", "find_mentions")
+
+
 def score(item: Item, t: Transcript) -> dict:
     queries = [c for c in t.calls if c.name == "query_documents"]
     payloads = [_json(c.result) for c in queries]
     names = [c.name for c in t.calls]
+    searched = any(n in SEARCH_TOOLS for n in names)
 
     # An empty result whose notice names a scope that matches nothing is already
     # explained; `status` could add nothing to it.
@@ -183,6 +188,9 @@ def score(item: Item, t: Transcript) -> dict:
         offered += [s.get("displayPath", "") for s in p.get("sources", [])]
         snippets += [r.get("text", "") for r in p.get("results", [])]
         parents += list((p.get("parents") or {}).values())
+    for c in t.calls:
+        if c.name == "find_mentions" and (p := _json(c.result)) is not None:
+            offered += [d.get("displayPath", "") for d in p.get("documents", [])]
     reads = [
         c.result or ""
         for c in t.calls
@@ -251,8 +259,9 @@ def score(item: Item, t: Transcript) -> dict:
     return {
         "item": item.id,
         "group": item.group,
-        "searched": bool(queries),
-        "search_ok": bool(queries) == item.search,
+        "searched": searched,
+        "search_ok": searched == item.search,
+        "tool_ok": None if item.tool is None else item.tool in names,
         "n_query": len(queries),
         "query_budget_ok": None if item.max_queries is None else len(queries) <= item.max_queries,
         "status_after_empty": status_after_empty,
@@ -292,6 +301,7 @@ _READING = {
 }
 COLUMNS = (
     ("search_ok", "searched as expected"),
+    ("tool_ok", "tool as expected"),
     ("n_query", "query calls"),
     ("query_budget_ok", "≤ max queries"),
     ("status_after_empty", "status after empty"),

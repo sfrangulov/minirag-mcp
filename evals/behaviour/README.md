@@ -15,7 +15,7 @@ characters. A defect in one replicate of three is noise.
 | File | What it is |
 |---|---|
 | `corpus/` | Nine short documents of a fictional company, in Russian. Synthetic on purpose: the reading and injection items need passages placed exactly, and no client document may enter this repository. |
-| `items.toml` | The questions: five groups, one per instruction block, each with what a correct run looks like. |
+| `items.toml` | The questions: one group per instruction block, plus `every` for questions only `find_mentions` can answer, each with what a correct run looks like. |
 | `check_items.py` | Confirms against the real retriever, with no model involved, that each item is built the way it claims (for example, that the passage a reading item depends on reaches the model only through `parents`). Run it after editing the corpus. |
 | `run.py` | Runs every item `--reps` times through `claude -p` with only this server attached, then scores. `--dry-run` prints the run count and launches nothing. |
 | `score.py` | Reads the stream-json transcripts and computes the metrics; `summary.md` marks where replicates diverge. |
@@ -44,7 +44,8 @@ build that worktree's environment and pass `--server-bin <worktree>/.venv/bin/mi
 
 | Column | Meaning |
 |---|---|
-| searched as expected | `query_documents` was called iff the item expects a search |
+| searched as expected | a search tool (`query_documents` or `find_mentions`) was called iff the item expects a search |
+| tool as expected | the tool the item names was called; "list all", "how many" and "is it mentioned" need `find_mentions`, a question about meaning `query_documents` |
 | query calls | number of `query_documents` calls per replicate |
 | ≤ max queries | thin-result items: stopped within the bound |
 | status after empty | a `status` call followed the first empty result |
