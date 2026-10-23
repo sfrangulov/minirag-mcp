@@ -602,3 +602,42 @@ def test_a_failed_load_stays_reported_until_a_load_succeeds(root, model_factory,
     with labeler.job():
         label_file(labeler, root, "notes/b.md")
     assert labeler.model_state() == "on demand" and labeler.model_problem() is None
+
+
+def test_a_model_path_that_cannot_be_checked_is_reported_not_raised(
+    root, model_factory, monkeypatch
+):
+    monkeypatch.setattr(model, "available", lambda: True)
+    locked = root.parent / "locked"
+    locked.mkdir()
+    labeler = make_labeler(
+        root, model_factory, TAXONOMY.replace("/models/fake.gguf", str(locked / "m.gguf"))
+    )
+    locked.chmod(0)
+    try:
+        problem = labeler.model_problem()
+    finally:
+        locked.chmod(0o700)
+    assert problem.startswith(f"the classify model file {locked / 'm.gguf'} cannot be checked")
+
+
+def test_a_folder_at_the_model_path_is_not_a_file(root, model_factory, monkeypatch):
+    monkeypatch.setattr(model, "available", lambda: True)
+    folder = root.parent / "m.gguf"
+    folder.mkdir()
+    labeler = make_labeler(root, model_factory, TAXONOMY.replace("/models/fake.gguf", str(folder)))
+    assert labeler.model_problem() == f"the classify model file {folder} is not a file"
+
+
+def test_a_failed_load_is_forgotten_once_the_model_file_appears(root, model_factory, monkeypatch):
+    monkeypatch.setattr(model, "available", lambda: True)
+    path = root.parent / "models" / "fake.gguf"
+    path.parent.mkdir()
+    path.write_bytes(b"truncated")
+    labeler = make_labeler(root, model_factory, TAXONOMY.replace("/models/fake.gguf", str(path)))
+    model_factory.error = ModelError("bad magic")
+    with labeler.job():
+        label_file(labeler, root, "notes/a.md")
+    assert labeler.model_problem() == "bad magic"
+    path.write_bytes(b"a whole model")
+    assert labeler.model_problem() is None

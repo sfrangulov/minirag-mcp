@@ -542,10 +542,10 @@ def _labels_status(source: LabelerSource, store: Store | None) -> dict:
         return {}
     taxonomy = labeler.taxonomy
     infos = store.list_sources() if store is not None else []
-    state = labeler.model_state()
+    state, problem = labeler.model_status()
     out: dict = {"file": str(source.path), "model": state}
     if state == "unavailable":
-        out["modelHint"] = labeler.model_problem() or INSTALL_HINT
+        out["modelHint"] = problem or INSTALL_HINT
     facets: dict = {}
     for facet in taxonomy.facets:
         counts = dict.fromkeys(facet.value_ids, 0)

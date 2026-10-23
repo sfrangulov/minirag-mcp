@@ -134,6 +134,30 @@ def _activated(job: _Job) -> Iterator[None]:
         _ACTIVE.reset(token)
 
 
+def _named(facets: Sequence[str]) -> str:
+    return f"{facets[0]} label" if len(facets) == 1 else f"{', '.join(facets)} labels"
+
+
+def _label_problem(doc: DocLabels) -> str | None:
+    """What a model problem left out of a document's labels, in words.
+
+    A facet with a path rule the model may override keeps its path value meanwhile:
+    that label is there, only unconfirmed, and saying it is missing would be wrong.
+    """
+    if not doc.unanswered:
+        return None
+    missing = sorted(f for f in doc.unanswered if f not in doc.labels)
+    unconfirmed = sorted(f for f in doc.unanswered if f in doc.labels)
+    parts = []
+    if missing:
+        parts.append(
+            f"without a {_named(missing)}" if len(missing) == 1 else f"without {_named(missing)}"
+        )
+    if unconfirmed:
+        parts.append(f"with its {_named(unconfirmed)} from the path, unconfirmed by the model")
+    return f"stored {' and '.join(parts)}: {doc.reason}. A full sync asks again."
+
+
 class Pipeline:
     def __init__(self, store: Store, embedder, config: Config, labels: LabelerSource | None = None):
         self.store = store
@@ -231,12 +255,7 @@ class Pipeline:
         except Exception as e:
             job.report.add(f"{source}: {_reason(e)}")
             return {}, f"stored without labels: {_reason(e)}"
-        problem = None
-        if doc.unanswered:
-            facets = ", ".join(sorted(doc.unanswered))
-            missing = f"a {facets} label" if len(doc.unanswered) == 1 else f"{facets} labels"
-            problem = f"stored without {missing}: {doc.reason}. The next sync asks again."
-        return _label_columns(doc), problem
+        return _label_columns(doc), _label_problem(doc)
 
     def _chunk_and_store(
         self,

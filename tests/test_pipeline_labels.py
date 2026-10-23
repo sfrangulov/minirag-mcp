@@ -240,6 +240,7 @@ def test_a_labelling_error_leaves_the_document_ingested_and_unlabelled(corpus, m
     for row in corpus.rows(str(doc)):
         assert all(row[name] == "" for name in FIELDS)
     assert report.problems == [f"{doc}: RuntimeError: cannot label this"]
+    assert result.label_problem == "stored without labels: RuntimeError: cannot label this"
 
 
 def test_documents_ingested_inside_one_job_share_one_model_and_one_taxonomy(corpus, model_factory):
@@ -734,7 +735,29 @@ def test_an_ingest_whose_model_failed_says_which_labels_are_missing_and_why(corp
     result = corpus.pipeline.ingest_file(corpus.doc("alpha/a.md", "Notes."))
     assert result.label_problem == (
         "stored without a type label: could not download fake.gguf: offline. "
-        "The next sync asks again."
+        "A full sync asks again."
+    )
+
+
+def test_two_missing_labels_are_named_together(corpus, model_factory):
+    corpus.taxonomy(TAXONOMY + '[facets.topic]\nvalues.a = { description = "A." }\n')
+    model_factory.error = ModelError("no model here")
+    result = corpus.pipeline.ingest_file(corpus.doc("a.md", "Notes."))
+    assert result.label_problem.startswith("stored without topic, type labels: no model here.")
+
+
+def test_a_path_label_the_model_could_not_confirm_is_named_as_such(corpus, model_factory):
+    report = 'values.report = { description = "Report. Findings and figures."'
+    corpus.taxonomy(
+        TAXONOMY.replace("[facets.type]\n", "[facets.type]\noverride_at = 0.9\n").replace(
+            report, report + ', paths = ["reports"]'
+        )
+    )
+    model_factory.error = ModelError("no model here")
+    result = corpus.pipeline.ingest_file(corpus.doc("reports/weekly.md", "Minutes."))
+    assert result.label_problem == (
+        "stored with its type label from the path, unconfirmed by the model: no model here. "
+        "A full sync asks again."
     )
 
 

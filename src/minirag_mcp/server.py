@@ -164,7 +164,7 @@ def create_app(
         Re-ingesting an already-indexed file discards its old chunks and
         replaces them with freshly parsed ones. With a classify.toml,
         `labelProblem` says which labels the document was stored without,
-        and why; the next sync asks again.
+        and why; a full sync asks again.
         """
         c = ctx()
         path = resolve_in_roots(filePath, c.config.roots)

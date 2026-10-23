@@ -6,6 +6,7 @@ import math
 import os
 import sys
 import threading
+import time
 import types
 import weakref
 from pathlib import Path
@@ -261,8 +262,6 @@ def test_the_log_callback_stays_referenced_while_the_library_can_call_it(fake_ll
 def test_what_the_library_prints_while_loading_is_dropped_but_errors_still_show(
     fake_llama_cpp, tmp_path, capfd
 ):
-    """llama-cpp-python prints about 17 KB per load with verbose=True, and every MCP
-    ingest_file is its own job, so that repeated on every call."""
 
     def load():
         print("Model metadata: {'general.name': 'x'}", file=sys.stderr)
@@ -296,4 +295,31 @@ def test_stderr_is_restored_when_a_load_fails(fake_llama_cpp, tmp_path):
     fake_llama_cpp.on_load = load
     with pytest.raises(ModelError, match="bad magic"):
         model.LlamaChoiceModel(tmp_path / "m.gguf", 2.07)
+    assert sys.stderr is before
+
+
+def test_overlapping_loads_in_two_threads_leave_stderr_as_it_was(fake_llama_cpp, tmp_path):
+    """A swap restored out of order would leave a muted stream installed for good."""
+    before = sys.stderr
+    first_in, second_in = threading.Event(), threading.Event()
+
+    def load():
+        if threading.current_thread().name == "first":
+            first_in.set()
+            second_in.wait(timeout=1)
+        else:
+            second_in.set()
+            time.sleep(0.3)
+
+    fake_llama_cpp.on_load = load
+
+    def build():
+        model.LlamaChoiceModel(tmp_path / "m.gguf", 2.07)
+
+    first = threading.Thread(target=build, name="first")
+    second = threading.Thread(target=lambda: (first_in.wait(), build()), name="second")
+    first.start()
+    second.start()
+    first.join()
+    second.join()
     assert sys.stderr is before

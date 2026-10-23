@@ -186,7 +186,7 @@ def _stderr():
 
 
 # A swap restored out of order would leave a muted stream installed, so loads take turns.
-_QUIET = threading.Lock()
+_QUIET = threading.RLock()
 
 
 @contextmanager

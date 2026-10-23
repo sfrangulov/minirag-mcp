@@ -376,8 +376,8 @@ that is reported rather than skipped silently:
   `labelProblem`. That covers the MCP tools `ingest_file`, `ingest_data` and
   `ingest_url`, and `minirag-mcp ingest` and `ingest-url`, which also print a
   `warn:` line.
-- `sync` lists the reason in its errors and asks the model again for every
-  document left without a label.
+- `sync` lists the reason in its errors, and a full sync asks the model again for
+  every document left without a label.
 - `classify try` exits 1, and a filter on such a facet carries a `filterNotice`.
 
 A model downloaded on first use counts as available until a download fails.

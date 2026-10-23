@@ -226,13 +226,7 @@ def ingest(
                 done.append(pipeline.ingest_file(f))
             except Exception as e:  # per-file failures never abort the batch
                 failures.append({"source": str(f), "error": str(e)})
-    ingested = []
-    for r in done:
-        row = {"source": r.source, "chunkCount": r.chunk_count}
-        if r.label_problem:
-            row["labelProblem"] = r.label_problem
-        ingested.append(row)
-    payload = {"ingested": ingested, "failed": failures}
+    payload = {"ingested": [ingest_reply(r) for r in done], "failed": failures}
     human = "\n".join([f"ingested {len(done)} file(s):"] + [f"  {r.source}" for r in done])
     _emit(payload, json, human)
     for fail in failures:

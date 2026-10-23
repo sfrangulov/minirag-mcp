@@ -163,10 +163,10 @@ def filter_counts(
 
 
 def filter_notice(f: LabelFilter, labeler: Labeler) -> str | None:
-    problem = labeler.model_problem()
-    if problem is None:
-        return None
     names = [name for name, _ in f.labels if labeler.taxonomy.facet(name).needs_model]
     if not names:
+        return None
+    problem = labeler.model_problem()
+    if problem is None:
         return None
     return f"labels for {', '.join(names)} come from the model, which cannot run here: {problem}"
