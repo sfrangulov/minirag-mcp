@@ -16,11 +16,13 @@ from fastmcp import Client
 
 import minirag_mcp.cli as cli
 import minirag_mcp.embedder as embedder_mod
+from lookalike_texts import MINUTES, REGULATION_V1, REGULATION_V2
 from minirag_mcp.config import load_config
 from minirag_mcp.embedder import Embedder
 from minirag_mcp.labels import Labeler
 from minirag_mcp.labels.model import ModelError
 from minirag_mcp.server import create_app
+from minirag_mcp.store import SIGNATURE_TABLE, Store
 
 
 @pytest.fixture
@@ -501,3 +503,65 @@ async def test_ingest_url_says_why_its_labels_are_missing_in_both_shells(
     code, out, _ = run_cli(["ingest-url", "https://example.com/q", *_flags(env), "--json"], capsys)
     assert "no model here" in reply["labelProblem"]
     assert code == 0 and json.loads(out)["labelProblem"] == reply["labelProblem"]
+
+
+@pytest.fixture
+def lookalike_root(tmp_path):
+    root = tmp_path / "docs"
+    (root / "regs").mkdir(parents=True)
+    (root / "archive").mkdir()
+    (root / "regs" / "v1.md").write_text(REGULATION_V1)
+    (root / "archive" / "v2.md").write_text(REGULATION_V2)
+    (root / "minutes.md").write_text(MINUTES)
+    return root
+
+
+async def test_query_and_find_name_the_same_look_alikes_through_both(
+    lookalike_root, tmp_path, capsys, monkeypatch, fake_embedder
+):
+    monkeypatch.setattr(cli, "_make_embedder", lambda cfg: fake_embedder)
+    env = {"BASE_DIR": str(lookalike_root), "DB_PATH": str(tmp_path / "db")}
+    code, _, _ = run_cli(["sync", *_flags(env)], capsys)
+    assert code == 0
+    scope = str(lookalike_root / "regs")
+    _, res = await call_mcp(
+        env, "query_documents", {"query": "заявки на закупку", "scope": scope}, fake_embedder
+    )
+    _, found = await call_mcp(env, "find_mentions", {"terms": "закупочной"}, fake_embedder)
+    code_q, out_q, _ = run_cli(
+        ["query", "заявки на закупку", "--scope", scope, *_flags(env), "--json"], capsys
+    )
+    code_f, out_f, _ = run_cli(["find", "закупочной", *_flags(env), "--json"], capsys)
+
+    assert code_q == code_f == 0
+    assert json.loads(out_q) == res and json.loads(out_f) == found
+    [row] = res["sources"]
+    [alike] = row["lookAlikes"]
+    assert alike["displayPath"] == "archive/v2.md" and 0.5 <= alike["overlap"] <= 1
+    assert {r["displayPath"]: len(r["lookAlikes"]) for r in found["documents"]} == {
+        "regs/v1.md": 1,
+        "archive/v2.md": 1,
+    }
+
+
+async def test_status_reports_unsigned_documents_the_same_way_in_both(
+    lookalike_root, tmp_path, capsys, monkeypatch, fake_embedder
+):
+    monkeypatch.setattr(cli, "_make_embedder", lambda cfg: fake_embedder)
+    env = {"BASE_DIR": str(lookalike_root), "DB_PATH": str(tmp_path / "db")}
+    run_cli(["sync", *_flags(env)], capsys)
+    _, st = await call_mcp(env, "status", {}, fake_embedder)
+    assert "unsignedSourceCount" not in st and "lookAlikesWarning" not in st
+
+    Store(tmp_path / "db", dim=fake_embedder.dim)._db.drop_table(SIGNATURE_TABLE)
+    _, st = await call_mcp(env, "status", {}, fake_embedder)
+    code, out, _ = run_cli(["status", *_flags(env), "--json"], capsys)
+    cli_st = json.loads(out)
+    assert code == 0
+    assert st["unsignedSourceCount"] == cli_st["unsignedSourceCount"] == 3
+    assert st["lookAlikesWarning"] == cli_st["lookAlikesWarning"]
+
+    code, out, _ = run_cli(["sync", *_flags(env), "--json"], capsys)
+    assert code == 0 and json.loads(out)["counts"]["signed"] == 3
+    _, st = await call_mcp(env, "status", {}, fake_embedder)
+    assert "unsignedSourceCount" not in st

@@ -1,23 +1,29 @@
-"""LanceDB persistence: one `chunks` table + BM25 FTS index."""
+"""LanceDB persistence: a `chunks` table with BM25 FTS indexes, and look-alike signatures."""
 
 from __future__ import annotations
 
 import statistics
 import warnings
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import asdict, dataclass, replace
 from datetime import timedelta
 from pathlib import Path
+from typing import NamedTuple
 
 import lancedb
+import numpy as np
 import pyarrow as pa
 from lancedb.index import FTS
 
 from minirag_mcp import literal
-from minirag_mcp.chunker import SCHEME_VERSION, join_parent
-from minirag_mcp.scope import sql_clause, sql_str
+from minirag_mcp.chunker import SCHEME_VERSION, join_document, join_parent
+from minirag_mcp.lookalike import NUM_PERM, LookAlike, Signature, SignatureIndex, signature
+from minirag_mcp.scope import is_under, sql_clause, sql_str
 
 TABLE = "chunks"
+SIGNATURE_TABLE = "signatures"
+# Sources a backfill signs per commit.
+_SIGN_BATCH = 64
 # Columns carrying BM25 indexes. `title` is indexed because for many document sets the
 # filename is where the document code and subject live, and nowhere else.
 FTS_COLUMNS = ("text", "title")
@@ -200,6 +206,40 @@ def _label_fields(row: dict) -> dict[str, str]:
     }
 
 
+def _signature_schema() -> pa.Schema:
+    return pa.schema(
+        [
+            pa.field("source", pa.string()),
+            # The `ingested_at` of the chunks the signature was computed from. Every ingest
+            # stamps its chunks afresh, so a signature is current exactly when it matches.
+            pa.field("ingested_at", pa.string()),
+            pa.field("signature", pa.list_(pa.uint32(), NUM_PERM)),
+            pa.field("shingles", pa.int64()),
+        ]
+    )
+
+
+def _in_clause(sources: Iterable[str]) -> str:
+    values = ", ".join(f"'{sql_str(s)}'" for s in sources)
+    return f"source IN ({values})"
+
+
+class _Unit(NamedTuple):
+    text: str
+    parent_id: str
+
+
+@dataclass(frozen=True)
+class _Signatures:
+    """What the signature table says about the chunks table, at one pair of versions."""
+
+    index: SignatureIndex
+    dates: dict[str, tuple[str, str]]
+    # Indexed sources without a current signature, each with the stamp its chunks carry,
+    # or None when they carry more than one: two first ingests raced and both inserted.
+    unsigned: dict[str, str | None]
+
+
 class DimensionMismatchError(Exception):
     """An existing index was built with a different embedding dimension than requested."""
 
@@ -302,6 +342,36 @@ class Store:
             self._check_dim(db_path, dim)
             self._ensure_scheme_columns(db_path)
             self._ensure_fts_indices(db_path)
+        self._signatures = self._open_signatures(db_path)
+        self._signature_cache: tuple[tuple, _Signatures] | None = None
+
+    def _open_signatures(self, db_path: Path):
+        """The look-alike signature table, created when missing — best effort, never fatal.
+
+        Creating it is a write, and opening an index must not require write access, for
+        the reasons `_ensure_fts_indices` gives. Without it no result names a look-alike
+        and `status` counts every document as unsigned, so the gap is reported.
+        """
+        try:
+            return self._db.open_table(SIGNATURE_TABLE)
+        except Exception as e:
+            problem: Exception = e
+            if _is_missing_table(e):
+                try:
+                    return self._db.create_table(
+                        SIGNATURE_TABLE, schema=_signature_schema(), exist_ok=True
+                    )
+                except Exception as created:
+                    problem = created
+        warnings.warn(
+            f"Could not open or create the look-alike signature table of the index at "
+            f"{db_path}: {problem}. Search still works, but no result names its "
+            f"look-alikes until the table exists — reopen the index with write access "
+            f"and sync to build it.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+        return None
 
     def _ensure_scheme_columns(self, db_path: Path) -> None:
         """Add the columns this version writes, if an older index lacks them.
@@ -416,6 +486,7 @@ class Store:
         clause = f"source = '{sql_str(source)}'"
         if not records:
             self._table.delete(clause)
+            self._delete_signature(source)
             return
         (
             self._table.merge_insert(["id", "ingested_at"])
@@ -424,6 +495,7 @@ class Store:
             .when_not_matched_by_source_delete(clause)
             .execute([asdict(r) for r in records])
         )
+        self._sign(source, records)
 
     def move_source(self, old: str, new: str, *, mtime: float) -> int:
         """Re-path a source's chunks in one commit, keeping their text and vectors.
@@ -458,6 +530,7 @@ class Store:
             .when_not_matched_by_source_delete(clause)
             .execute(moved)
         )
+        self._move_signature(old, new)
         return len(moved)
 
     def delete_source(self, source: str) -> int:
@@ -465,7 +538,273 @@ class Store:
         before = self._table.count_rows(filter=clause)
         if before:
             self._table.delete(clause)
+        self._delete_signature(source)
         return before
+
+    # Look-alike signatures live in a table of their own, so no write spans both tables
+    # in one commit. What keeps the two consistent is the chunk stamp a signature
+    # carries: it is written only while the source's chunks still carry that stamp, and
+    # used only where they still do. Whatever a crash or a race leaves behind reads as
+    # unsigned, which `status` counts and the next sync signs. A failed signature write
+    # never fails the chunk write it follows.
+
+    def _signature_table(self, *, create: bool):
+        if self._signatures is None:
+            try:
+                self._signatures = self._db.open_table(SIGNATURE_TABLE)
+            except Exception as e:
+                if not create:
+                    return None
+                if not _is_missing_table(e):
+                    raise
+                self._signatures = self._db.create_table(
+                    SIGNATURE_TABLE, schema=_signature_schema(), exist_ok=True
+                )
+        return self._signatures
+
+    def _warn_signature(self, what: str, e: Exception) -> None:
+        warnings.warn(
+            f"Could not {what} in the index at {self.db_path}: {e}. Until a sync signs it, "
+            "results do not name its look-alikes.",
+            RuntimeWarning,
+            stacklevel=4,
+        )
+
+    def _sign(self, source: str, records: Sequence[ChunkRecord]) -> None:
+        ordered = sorted(records, key=lambda r: r.chunk_index)
+        try:
+            self._put_signatures(
+                [(source, ordered[0].ingested_at, signature(join_document(ordered)))]
+            )
+        except Exception as e:
+            self._warn_signature(f"write the look-alike signature of {source}", e)
+
+    def _put_signatures(self, entries: Sequence[tuple[str, str, Signature]]) -> list[str]:
+        """Write each signature whose source's chunks all still carry its stamp."""
+        if not entries:
+            return []
+        rows = (
+            self._table.search()
+            .where(_in_clause(source for source, _, _ in entries))
+            .select(["source", "ingested_at"])
+            .limit(_LIST_LIMIT)
+            .to_arrow()
+        )
+        stamps: dict[str, set[str]] = {}
+        for source, stamp in zip(
+            rows.column("source").to_pylist(), rows.column("ingested_at").to_pylist(), strict=True
+        ):
+            stamps.setdefault(source, set()).add(stamp)
+        current = [e for e in entries if stamps.get(e[0]) == {e[1]}]
+        if current:
+            self._write_signatures(current)
+        return [source for source, _, _ in current]
+
+    def _write_signatures(self, entries: Sequence[tuple[str, str, Signature]]) -> None:
+        values = np.concatenate([sig.values for _, _, sig in entries]).astype(np.uint32)
+        data = pa.table(
+            {
+                "source": pa.array([source for source, _, _ in entries], pa.string()),
+                "ingested_at": pa.array([stamp for _, stamp, _ in entries], pa.string()),
+                "signature": pa.FixedSizeListArray.from_arrays(pa.array(values), NUM_PERM),
+                "shingles": pa.array([sig.shingles for _, _, sig in entries], pa.int64()),
+            },
+            schema=_signature_schema(),
+        )
+        # Keyed like `replace_source`, so a row of the same source under another stamp,
+        # one a racing insert left behind included, is deleted in the same commit.
+        (
+            self._signature_table(create=True)
+            .merge_insert(["source", "ingested_at"])
+            .when_matched_update_all()
+            .when_not_matched_insert_all()
+            .when_not_matched_by_source_delete(_in_clause(source for source, _, _ in entries))
+            .execute(data)
+        )
+
+    def _move_signature(self, old: str, new: str) -> None:
+        try:
+            table = self._signature_table(create=False)
+            if table is None:
+                return
+            rows = (
+                table.search()
+                .where(f"source = '{sql_str(old)}'")
+                .select(_signature_schema().names)
+                .limit(_LIST_LIMIT)
+                .to_arrow()
+            )
+            if not rows.num_rows:
+                return
+            rows = rows.set_column(
+                rows.schema.get_field_index("source"),
+                "source",
+                pa.array([new] * rows.num_rows, pa.string()),
+            )
+            (
+                table.merge_insert(["source", "ingested_at"])
+                .when_matched_update_all()
+                .when_not_matched_insert_all()
+                .when_not_matched_by_source_delete(_in_clause((old, new)))
+                .execute(rows)
+            )
+        except Exception as e:
+            self._warn_signature(f"move the look-alike signature of {old} to {new}", e)
+
+    def _delete_signature(self, source: str) -> None:
+        clause = f"source = '{sql_str(source)}'"
+        try:
+            table = self._signature_table(create=False)
+            if table is not None and table.count_rows(filter=clause):
+                table.delete(clause)
+        except Exception as e:
+            self._warn_signature(f"delete the look-alike signature of {source}", e)
+
+    def _signature_state(self) -> _Signatures:
+        """`_read_signature_index`, kept until either table gains a version."""
+        table = self._signature_table(create=False)
+        key = (self._table.version, None if table is None else table.version)
+        cached = self._signature_cache
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        state = self._read_signature_index()
+        self._signature_cache = (key, state)
+        return state
+
+    def _read_signature_index(self) -> _Signatures:
+        present = set(self._table.schema.names)
+        dated = [c for c in ("doc_date", "doc_date_source") if c in present]
+        meta = (
+            self._table.search()
+            .select(["source", "ingested_at", *dated])
+            .limit(_LIST_LIMIT)
+            .to_arrow()
+            .group_by("source")
+            .aggregate(
+                [("ingested_at", "min"), ("ingested_at", "max")] + [(c, "max") for c in dated]
+            )
+        )
+        stamp_of: dict[str, str | None] = {}
+        dates: dict[str, tuple[str, str]] = {}
+        for row in meta.to_pylist():
+            low, high = row["ingested_at_min"], row["ingested_at_max"]
+            stamp_of[row["source"]] = low if low == high else None
+            dates[row["source"]] = (
+                row.get("doc_date_max") or "",
+                row.get("doc_date_source_max") or "",
+            )
+        sources: list[str] = []
+        picked: list[int] = []
+        signed: set[str] = set()
+        values = np.zeros((0, NUM_PERM), dtype=np.uint32)
+        table = self._signature_table(create=False)
+        if table is not None:
+            sigs = table.search().select(_signature_schema().names).limit(_LIST_LIMIT).to_arrow()
+            flat = sigs.column("signature").combine_chunks().flatten()
+            values = flat.to_numpy(zero_copy_only=False).astype(np.uint32).reshape(-1, NUM_PERM)
+            for i, (source, stamp, shingles) in enumerate(
+                zip(
+                    sigs.column("source").to_pylist(),
+                    sigs.column("ingested_at").to_pylist(),
+                    sigs.column("shingles").to_pylist(),
+                    strict=True,
+                )
+            ):
+                if source in signed or stamp_of.get(source) is None or stamp_of[source] != stamp:
+                    continue
+                signed.add(source)
+                if shingles > 0:
+                    sources.append(source)
+                    picked.append(i)
+        return _Signatures(
+            index=SignatureIndex(sources, values[picked]),
+            dates=dates,
+            unsigned={s: stamp for s, stamp in stamp_of.items() if s not in signed},
+        )
+
+    def look_alikes(self, sources: Iterable[str]) -> dict[str, list[LookAlike]]:
+        """The look-alikes of each of `sources` that has any, from the whole index."""
+        wanted = list(dict.fromkeys(sources))
+        if not wanted:
+            return {}
+        state = self._signature_state()
+        out: dict[str, list[LookAlike]] = {}
+        for source in wanted:
+            if near := state.index.near(source):
+                out[source] = [
+                    replace(
+                        n,
+                        doc_date=state.dates[n.source][0],
+                        doc_date_source=state.dates[n.source][1],
+                    )
+                    for n in near
+                ]
+        return out
+
+    def unsigned_sources(self, scopes: tuple[str, ...] = ()) -> list[str]:
+        """Indexed sources in `scopes` without a current look-alike signature."""
+        return sorted(
+            s
+            for s in self._signature_state().unsigned
+            if not scopes or any(is_under(s, p) for p in scopes)
+        )
+
+    def backfill_signatures(
+        self,
+        scopes: tuple[str, ...] = (),
+        on_event: Callable[[str], None] | None = None,
+    ) -> tuple[int, list[dict]]:
+        """Sign every source in `scopes` that has no current signature.
+
+        From the stored chunk text, rebuilt as `read_file` rebuilds it: nothing is parsed
+        or embedded again. A source whose chunks carry two stamps is left alone; the
+        sync's diff re-reads such a source, and that ingest signs it.
+        """
+        todo = sorted(
+            s
+            for s, stamp in self._signature_state().unsigned.items()
+            if stamp is not None and (not scopes or any(is_under(s, p) for p in scopes))
+        )
+        signed = 0
+        for start in range(0, len(todo), _SIGN_BATCH):
+            try:
+                written = self._put_signatures(
+                    self._stored_signatures(todo[start : start + _SIGN_BATCH])
+                )
+            except Exception as e:  # every later batch would fail the same way
+                return signed, [
+                    {
+                        "source": str(self.db_path),
+                        "error": f"lookAlikes: {type(e).__name__}: {e}; "
+                        f"{len(todo) - signed} document(s) left without a look-alike "
+                        "signature, which the next sync retries",
+                    }
+                ]
+            signed += len(written)
+            if on_event:
+                for source in written:
+                    on_event(f"signed {source}")
+        return signed, []
+
+    def _stored_signatures(self, sources: Sequence[str]) -> list[tuple[str, str, Signature]]:
+        present = set(self._table.schema.names)
+        wanted = ["source", "chunk_index", "text", "parent_id", "ingested_at"]
+        rows = (
+            self._table.search()
+            .where(_in_clause(sources))
+            .select([c for c in wanted if c in present])
+            .limit(_LIST_LIMIT)
+            .to_list()
+        )
+        grouped: dict[str, list[dict]] = {}
+        for row in rows:
+            grouped.setdefault(row["source"], []).append(row)
+        out = []
+        for source, group in grouped.items():
+            group.sort(key=lambda r: r["chunk_index"])
+            units = [_Unit(r["text"], r.get("parent_id") or "") for r in group]
+            out.append((source, group[0]["ingested_at"], signature(join_document(units))))
+        return out
 
     def neighbors(
         self, source: str, chunk_index: int, before: int = 1, after: int = 1

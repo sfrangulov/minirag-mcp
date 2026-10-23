@@ -804,3 +804,33 @@ def test_find_says_when_more_pages_remain(corpus, capsys):
     run(["find", "alpha", "err", "--any", "--limit", "1", "--base-dir", str(corpus)])
     out = capsys.readouterr().out
     assert "--offset 1" in out
+
+
+@pytest.fixture
+def versions(tmp_path):
+    from lookalike_texts import MINUTES, REGULATION_V1, REGULATION_V2
+
+    (tmp_path / "archive").mkdir()
+    (tmp_path / "v1.md").write_text(REGULATION_V1)
+    (tmp_path / "archive" / "v2.md").write_text(REGULATION_V2)
+    (tmp_path / "minutes.md").write_text(MINUTES)
+    run(["sync", "--base-dir", str(tmp_path)])
+    return tmp_path
+
+
+def test_query_human_output_names_a_sources_look_alikes(versions, capsys):
+    capsys.readouterr()
+    run(["query", "заявки на закупку", "--base-dir", str(versions), "--top-k", "20"])
+    out = capsys.readouterr().out.split("Sources:\n")[1].splitlines()
+    v1 = out.index(next(line for line in out if line.startswith(f"  {versions / 'v1.md'} (")))
+    assert out[v1 + 1].startswith("      looks like archive/v2.md (")
+    assert "% shared text" in out[v1 + 1]
+    assert not any("looks like" in line and "minutes.md" in line for line in out)
+
+
+def test_find_human_output_names_a_documents_look_alikes(versions, capsys):
+    capsys.readouterr()
+    run(["find", "закупочной", "--base-dir", str(versions)])
+    out = capsys.readouterr().out
+    assert "    looks like archive/v2.md (" in out
+    assert "    looks like v1.md (" in out

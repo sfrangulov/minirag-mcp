@@ -13,7 +13,7 @@ from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 
 from minirag_mcp import __version__
-from minirag_mcp.chunker import SCHEME_VERSION
+from minirag_mcp.chunker import SCHEME_VERSION, join_document
 from minirag_mcp.config import Config, ConfigError, load_config
 from minirag_mcp.embedder import Embedder
 from minirag_mcp.ingest.ignore import scope_excluded_by
@@ -25,7 +25,6 @@ from minirag_mcp.results import (
     DEFAULT_FIND_LIMIT,
     ignore_status,
     ingest_reply,
-    join_document,
     labels_status,
     list_payload,
     ocr_status,
@@ -33,6 +32,7 @@ from minirag_mcp.results import (
     run_find,
     run_query,
     scheme_status,
+    signature_status,
 )
 from minirag_mcp.security import resolve_in_roots
 from minirag_mcp.store import Store
@@ -135,9 +135,10 @@ def create_app(
         """Poll a sync job started by sync_start.
 
         Returns state ('pending' | 'running' | 'succeeded' | 'failed'),
-        counts (scanned/ingested/skipped/moved/deleted/relabelled/ignored/
-        unreadable/failed), and any per-file errors. Only the latest job is retained — an
-        old jobId, or any jobId from before a server restart, raises an error.
+        counts (scanned/ingested/skipped/moved/deleted/relabelled/signed/
+        ignored/unreadable/failed), and any per-file errors. Only the latest job is
+        retained — an old jobId, or any jobId from before a server restart, raises an
+        error.
 
         relabelled counts documents whose labels were rewritten from their
         stored text, with nothing re-embedded: classify.toml changed, a move
@@ -145,6 +146,13 @@ def create_app(
         problem had left a facet unanswered. It stays 0 without a classify.toml.
         A labelling problem appears in errors with its message prefixed
         "labels:"; it is not a failure.
+
+        signed counts documents given the signature that finds their
+        look-alikes, computed from their stored text with nothing read or
+        embedded again: documents indexed before signatures existed, or whose
+        signature could not be written when they were ingested. An ingest signs
+        its own documents, so it is usually 0. A problem appears in errors
+        prefixed "lookAlikes:"; it is not a failure.
 
         ignored counts the files and folders a .miniragignore rule excluded
         from the scan, a folder once; a file indexed before its rule was
@@ -227,6 +235,15 @@ def create_app(
         what the other tools take), and `parents`, a map from parentId
         to section text. Use `sources` to answer "which documents
         cover this topic" without inspecting individual chunks.
+
+        A `sources` row carries `lookAlikes` when other indexed documents
+        share at least half its text: up to 3, most first, each with
+        `source`, `displayPath`, `overlap` (0..1, the estimated share of
+        five-word runs the two have in common) and `date` when known. They
+        come from the whole index, outside scope and filters too. Overlap is
+        measured text, not a verdict on which one is current: an older
+        version or a sibling filled in from one template can hold other
+        figures, so check both before quoting one.
 
         Results are ranked and stop at topK without saying what they
         left out. For every document that mentions a term, how many do,
@@ -311,7 +328,8 @@ def create_app(
         matched. `limit` (default 50, capped at 200) pages the list and
         `nextOffset` is present while more remain; the counts always cover
         every match. With no match, `notice` states the absence and what it
-        covered.
+        covered. A row carries `lookAlikes` as in query_documents, from the
+        whole index: check them before quoting a figure.
 
         Only indexed text is searched: files not yet synced (list_files
         shows them) and images without OCR are not, and a phrase that a
@@ -489,6 +507,10 @@ def create_app(
         when it is above zero, schemeWarning explains that those chunks need
         a re-sync to be rebuilt.
 
+        unsignedSourceCount, present when above zero, counts indexed documents
+        without the signature that finds their look-alikes, so no result names
+        theirs; lookAlikesWarning says a sync computes them.
+
         ignoreFiles, present when a root has a .miniragignore: each file with
         its number of rules, or the error that stops scanning under its root.
 
@@ -518,6 +540,7 @@ def create_app(
             out["chunkCount"] = c.store.chunk_count()
             out["sourceCount"] = c.store.source_count()
             out.update(scheme_status(c.store))
+            out.update(signature_status(c.store))
             out.update(labels_status(c.labels, c.store))
         except Exception as e:
             out["indexError"] = str(e)

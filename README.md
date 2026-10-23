@@ -33,6 +33,10 @@ built on [fastmcp](https://github.com/jlowin/fastmcp),
   contains a word or phrase, not the top few, and says how many documents it
   searched, so "list all", "how many" and "it is not there" get a complete
   answer. See [Finding every mention](#finding-every-mention).
+- **Look-alike documents named** — a result whose document shares most of its
+  text with other indexed documents, such as another version of it or a sibling
+  from the same template, names them and how much text they share. See
+  [Look-alike documents](#look-alike-documents).
 - **Filenames are searchable** — keyword search covers document titles as well
   as body text, and an informative filename becomes the document's title when
   the document's own heading is boilerplate. In many real document sets the
@@ -743,17 +747,17 @@ ever mention that its vectors describe truncated text.
 | Tool | Purpose |
 |---|---|
 | `sync_start` | Reconcile the index with the document roots (or one path inside them). Returns a `jobId`; the work runs in a background thread. |
-| `sync_status` | Poll a sync job started by `sync_start`: its state, per-file errors and `counts` (`scanned`, `ingested`, `skipped`, `moved`, `deleted`, `relabelled`, `unreadable`, `failed`). `relabelled` counts documents whose [labels](#document-labels-optional) were rewritten from their stored text; it stays 0 without a `classify.toml`. |
+| `sync_status` | Poll a sync job started by `sync_start`: its state, per-file errors and `counts` (`scanned`, `ingested`, `skipped`, `moved`, `deleted`, `relabelled`, `signed`, `ignored`, `unreadable`, `failed`). `relabelled` counts documents whose [labels](#document-labels-optional) were rewritten from their stored text; it stays 0 without a `classify.toml`. `signed` counts documents given a [look-alike](#look-alike-documents) signature from their stored text, such as every document of an index built before signatures existed. |
 | `ingest_file` | Ingest or re-ingest one file, replacing any content already indexed for it. |
 | `ingest_data` | Ingest text/markdown/html content the client holds, under a source id you choose. |
 | `ingest_url` | Fetch an http(s) URL, convert it to Markdown, and index it. |
-| `query_documents` | Hybrid search: semantic similarity plus a keyword boost for exact terms. Each hit carries `text` (the passage that matched) and `parentId`; the enclosing sections come back once each in the response's `parents` map — see [Chunking](#chunking). |
-| `find_mentions` | Every indexed document that mentions a word or phrase, with the number searched and matched, the word forms matched, and a snippet per document. Paged, never capped. See [Finding every mention](#finding-every-mention). |
+| `query_documents` | Hybrid search: semantic similarity plus a keyword boost for exact terms. Each hit carries `text` (the passage that matched) and `parentId`; the enclosing sections come back once each in the response's `parents` map — see [Chunking](#chunking). A source with [look-alikes](#look-alike-documents) names them in `lookAlikes`. |
+| `find_mentions` | Every indexed document that mentions a word or phrase, with the number searched and matched, the word forms matched, a snippet and any `lookAlikes` per document. Paged, never capped. See [Finding every mention](#finding-every-mention). |
 | `read_chunk_neighbors` | Read the chunks immediately before and after a search result, for context. |
 | `read_file` | Read a source's entire indexed content as Markdown, reconstructed from its chunks rather than concatenated from them. |
 | `list_files` | List files found on disk under the document roots, plus indexed data/url sources. |
 | `delete_file` | Delete an indexed file, data item, or url item from the index. |
-| `status` | Report configuration and index status, including whether the index predates the current chunking scheme. Works even when configuration is invalid. |
+| `status` | Report configuration and index status, including whether the index predates the current chunking scheme and how many documents still lack a look-alike signature (`unsignedSourceCount`, present only when above zero). Works even when configuration is invalid. |
 
 MCP tool file paths (`filePath`) must be absolute and inside a configured
 document root.
@@ -812,6 +816,23 @@ ideographs, for one).
 
 From a terminal, a term that starts with a dash goes after `--`, with every
 option before it: `minirag-mcp find --base-dir ~/docs -- -15%`.
+
+### Look-alike documents
+
+A `query_documents` source or a `find_mentions` document that shares at least
+half its text with other indexed documents carries `lookAlikes`: up to three of
+them, most first, each with `source`, `displayPath`, `overlap` and the document
+`date` when one is known, as in `{"source": "/docs/archive/regulation_v2.md",
+"displayPath": "archive/regulation_v2.md", "overlap": 0.71}`. `overlap` is the
+estimated share of five-word runs the two texts have in common, from a MinHash
+signature each document gets at ingest; they come from the whole index,
+whatever the scope or filters, and a row with none has no `lookAlikes` key. It
+is a measurement, not a verdict on which document is current: an older version
+and a sibling filled in from the same template look alike and may hold other
+figures, so check both before quoting a number. On a real 746-document corpus,
+206 documents have look-alikes. An index built before signatures existed gets
+them on its next sync, from its stored text, with nothing read or embedded
+again (3.3 s for that corpus).
 
 ## Search by Default
 
