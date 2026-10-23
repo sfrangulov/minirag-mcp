@@ -498,3 +498,10 @@ async def test_query_documents_points_to_find_mentions_for_every_match(app):
     async with Client(mcp) as c:
         tools = {t.name: t for t in await c.list_tools()}
     assert "find_mentions" in tools["query_documents"].description
+
+
+async def test_find_mentions_offers_match_as_an_enum(app):
+    mcp, _ = app
+    async with Client(mcp) as c:
+        tools = {t.name: t for t in await c.list_tools()}
+    assert set(tools["find_mentions"].inputSchema["properties"]["match"]["enum"]) == {"all", "any"}

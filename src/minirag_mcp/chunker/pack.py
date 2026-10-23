@@ -338,6 +338,20 @@ def pack_section(section: Section, count_tokens: CountTokens, budget: int) -> li
     return units
 
 
+def shared_lines(previous: Sequence[str], lines: Sequence[str]) -> int:
+    """How many leading `lines` repeat the start of the unit before them.
+
+    That is the header a unit carries for its own vector — a heading breadcrumb, a time
+    window label, a table's header row — and not text of its own. At least one line is
+    always left as the unit's own.
+    """
+    limit = min(len(previous), len(lines) - 1, MAX_SHARED_LINES)
+    shared = 0
+    while shared < limit and previous[shared] == lines[shared]:
+        shared += 1
+    return shared
+
+
 def join_parent(texts: Sequence[str]) -> str:
     """Rebuild a section from the retrieval units stored for it, in order.
 
@@ -355,11 +369,7 @@ def join_parent(texts: Sequence[str]) -> str:
     previous = kept[0].split("\n")
     for text in kept[1:]:
         lines = text.split("\n")
-        limit = min(len(previous), len(lines) - 1, MAX_SHARED_LINES)
-        shared = 0
-        while shared < limit and previous[shared] == lines[shared]:
-            shared += 1
-        body = lines[shared:]
+        body = lines[shared_lines(previous, lines) :]
         while body and not body[0].strip():
             body.pop(0)
         previous = lines

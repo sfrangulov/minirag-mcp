@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from minirag_mcp import literal, ocr
-from minirag_mcp.chunker import join_parent
+from minirag_mcp.chunker import join_parent, shared_lines
 from minirag_mcp.config import Config
 from minirag_mcp.ingest.scanner import FileState, compute_states, scan_roots
 from minirag_mcp.labels.filters import (
@@ -319,10 +319,10 @@ def _snippet(text: str, span: tuple[int, int]) -> str:
     """A window of `text` around `span`, cut at whitespace, whitespace collapsed."""
     start, end = span
     lo = max(0, start - _SNIPPET_BEFORE)
-    hi = min(len(text), max(end, lo + SNIPPET_CHARS))
+    hi = min(len(text), lo + SNIPPET_CHARS)
     if lo > 0 and (m := _SPACE.search(text, lo, start)):
         lo = m.end()
-    if hi < len(text) and (tail := list(_SPACE.finditer(text, end, hi))):
+    if hi < len(text) and (tail := list(_SPACE.finditer(text, min(end, hi), hi))):
         hi = tail[-1].start()
     body = " ".join(text[lo:hi].split())
     return ("…" if lo > 0 else "") + body + ("…" if hi < len(text) else "")
@@ -393,13 +393,24 @@ def run_find(
     label_filter, labeler = _parse_filter(store, labels, date_from, date_to, label_source)
     filter_sql = to_sql(label_filter) if label_filter else None
 
+    # Read before the scan, so a sync landing in between cannot make matched exceed it.
+    searched = len(store.list_sources(scopes=scopes, filter_sql=filter_sql))
     docs: dict[str, _Mentions] = {}
+    previous: tuple[str, int, list[str]] | None = None
     for chunk in store.literal_candidates(parsed, scopes=scopes, filter_sql=filter_sql):
         doc = docs.get(chunk.source)
         if doc is None:
             doc = docs[chunk.source] = _Mentions(chunk, in_title=False)
             doc.in_title = bool(doc.add(literal.matches(parsed, chunk.title)))
-        found = doc.add(literal.matches(parsed, chunk.text))
+        # A header repeated from the chunk before is that chunk's mention, not a new
+        # one. When that chunk is not a candidate, its header holds no term anyway.
+        lines = chunk.text.split("\n")
+        own = lines
+        if previous is not None and previous[:2] == (chunk.source, chunk.chunk_index - 1):
+            own = lines[shared_lines(previous[2], lines) :]
+        previous = (chunk.source, chunk.chunk_index, lines)
+        text = "\n".join(own)
+        found = doc.add(literal.matches(parsed, text))
         if not found:
             continue
         doc.hits += 1
@@ -408,7 +419,7 @@ def run_find(
             doc.first_match = {
                 "chunkIndex": chunk.chunk_index,
                 "parentId": chunk.parent_id or None,
-                "snippet": _snippet(unicodedata.normalize("NFC", chunk.text), span),
+                "snippet": _snippet(unicodedata.normalize("NFC", text), span),
             }
 
     needed = len(parsed) if match == "all" else 1
@@ -438,7 +449,6 @@ def run_find(
             ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
             forms[t.text] = dict(ranked[:MAX_FORMS])
 
-    searched = len(store.list_sources(scopes=scopes, filter_sql=filter_sql))
     payload: dict = {
         "searchedDocuments": searched,
         "matchedDocuments": len(rows),

@@ -2,7 +2,7 @@ import unicodedata
 
 import pytest
 
-from minirag_mcp.literal import fold, matches, term
+from minirag_mcp.literal import MAX_FORM_CHARS, fold, matches, term
 
 
 def nfd(s: str) -> str:
@@ -10,10 +10,10 @@ def nfd(s: str) -> str:
 
 
 def found(raw: str, text: str) -> str | None:
-    span = term(raw).search(text)
-    if span is None:
+    (m,) = matches([term(raw)], text)
+    if m is None:
         return None
-    return unicodedata.normalize("NFC", text)[span[0] : span[1]]
+    return unicodedata.normalize("NFC", text)[m.span[0] : m.span[1]]
 
 
 def test_fold_ignores_case_yo_and_composition():
@@ -45,7 +45,7 @@ def test_the_matched_span_is_the_whole_word_as_written_in_the_text():
     assert found("договор", "Подписан Договора №5") == "Договора"
 
 
-@pytest.mark.parametrize("raw", ['"акт"', "«акт»", "“акт”"])
+@pytest.mark.parametrize("raw", ['"акт"', "«акт»", "“акт”", "'акт'"])
 def test_a_quoted_term_matches_only_that_exact_word(raw):
     assert found(raw, "Акт сверки") == "Акт"
     assert found(raw, "два акта") is None
@@ -92,3 +92,31 @@ def test_regex_metacharacters_in_a_term_are_literal():
 
 def test_an_nfd_text_matches_an_nfc_term():
     assert found("показателей", nfd("Свод показателей")) is not None
+
+
+def test_markdown_escapes_in_converted_documents_are_transparent():
+    # markitdown writes DOCX, HTML and XLSX text through markdownify, which escapes these.
+    assert found("ТЗ_2024_015", r"см. ТЗ\_2024\_015") == r"ТЗ\_2024\_015"
+    assert found("5*3", r"итого 5\*3") == r"5\*3"
+    (m,) = matches([term("тз_2024")], r"ТЗ\_2024\_015")
+    assert m.forms == frozenset({"тз_2024"})
+
+
+@pytest.mark.parametrize("mark", ["\u00ad", "\u200b", "\u200c", "\u200d", "\u2060", "\ufeff"])
+def test_invisible_characters_inside_a_word_are_transparent(mark):
+    assert found("договор", f"Наш дого{mark}вор") == f"дого{mark}вор"
+
+
+def test_greek_final_sigma_matches_either_way():
+    assert found("οδος", "ΟΔΟΣ") == "ΟΔΟΣ"
+    assert found("ΟΔΟΣ", "οδος") == "οδος"
+
+
+def test_dotted_capital_i_matches_a_plain_i():
+    assert found("istanbul", "İstanbul") == "İstanbul"
+
+
+def test_a_runaway_word_form_is_cut():
+    (m,) = matches([term("x")], "x" + "y" * 5000)
+    (form,) = m.forms
+    assert len(form) == MAX_FORM_CHARS + 1 and form.endswith("…")

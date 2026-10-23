@@ -5,10 +5,13 @@ import pytest
 
 from conftest import FakeModelFactory
 from label_helpers import L, record
+from minirag_mcp.config import load_config
+from minirag_mcp.ingest.pipeline import Pipeline
 from minirag_mcp.labels import LabelerSource
-from minirag_mcp.literal import term
+from minirag_mcp.literal import matches, sql_pattern, sql_subject, term
 from minirag_mcp.results import (
     EMPTY_INDEX_NOTICE,
+    FILTERED_OUT_NOTICE,
     MAX_FIND_LIMIT,
     MAX_TERMS,
     SNIPPET_CHARS,
@@ -265,3 +268,117 @@ def test_an_absent_quoted_term_is_named_once_quoted(store):
     notice = find(store, '"акт"')["notice"]
     assert 'contain "акт" as a whole word' in notice
     assert '""' not in notice
+
+
+# --- the SQL prefilter never drops what Python accepts ---------------------------------
+
+
+def _sweep_words():
+    """Every BMP character the fold could get wrong, in a word and at a word's end.
+
+    Left out: characters with no case, no decomposition and no special handling, such
+    as CJK ideographs, which both sides pass through unchanged. Checking those too
+    triples the run time and has nothing to find.
+    """
+    for cp in range(0x20, 0x10000):
+        c = chr(cp)
+        category = unicodedata.category(c)
+        if category in ("Cs", "Co", "Cn", "Cc"):
+            continue
+        if not (
+            cp < 0x80
+            or category in ("Lu", "Ll", "Lt", "Mn", "Mc", "Me", "Cf")
+            or c.lower() != c
+            or c.upper() != c
+            or unicodedata.normalize("NFD", c) != c
+            or unicodedata.normalize("NFC", c) != c
+        ):
+            continue
+        yield "a" + c + "b"
+        yield "AB" + c
+
+
+def test_the_sql_prefilter_keeps_every_row_the_rule_accepts(tmp_path):
+    """A row the SQL drops is never shown to the Python rule, so the tool would answer
+    "none" for a document that has the term. Checked by DataFusion's own `lower` and Rust
+    regex, which are what the store runs, not by a Python stand-in for them."""
+    rows = []
+    for w in _sweep_words():
+        if unicodedata.normalize("NFC", w) != w and unicodedata.normalize("NFD", w) != w:
+            continue  # stored in neither form: the documented limit
+        try:
+            t = term(w)
+        except ValueError:
+            continue
+        if matches([t], w)[0] is not None:
+            rows.append({"text": w, "pat": sql_pattern([t])})
+    import lancedb
+
+    table = lancedb.connect(tmp_path).create_table("t", rows)
+    missed = table.search().where(f"NOT regexp_like({sql_subject('text')}, pat)").limit(len(rows))
+    assert [r["text"] for r in missed.to_list()] == []
+    assert len(rows) > 25_000
+
+
+# --- what real ingestion stores ----------------------------------------------------------
+
+
+def _pipeline(tmp_path, fake_embedder):
+    root = tmp_path / "docs"
+    root.mkdir()
+    cfg = load_config({"BASE_DIR": str(root), "DB_PATH": str(tmp_path / "db")})
+    store = Store(cfg.db_path, dim=fake_embedder.dim)
+    return root, store, Pipeline(store, fake_embedder, cfg)
+
+
+def test_a_code_in_converted_html_is_found(tmp_path, fake_embedder):
+    root, store, pipeline = _pipeline(tmp_path, fake_embedder)
+    pipeline.ingest_data("<p>Согласно ТЗ_2024_015 итого 5*3.</p>", source="memo", fmt="html")
+    for raw in ("ТЗ_2024_015", "5*3"):
+        got = run_find(store, (root,), raw)
+        assert [d["source"] for d in got["documents"]] == ["memo"], raw
+
+
+def test_a_heading_repeated_on_every_chunk_counts_once(tmp_path, fake_embedder):
+    root, store, pipeline = _pipeline(tmp_path, fake_embedder)
+    body = " ".join(f"Слово номер {i} в длинном абзаце про поставки." for i in range(60))
+    doc = root / "doc.md"
+    doc.write_text(f"# Регламент\n\n## Акт сверки\n\n{body}\n\n{body}\n\n## Склад\n\n{body}\n")
+    pipeline.ingest_file(doc)
+    assert len(store.all_chunks(str(doc))) > 6
+    (row,) = run_find(store, (root,), "сверки")["documents"]
+    assert row["hits"] == 1
+    assert run_find(store, (root,), "поставки")["documents"][0]["hits"] == len(
+        store.all_chunks(str(doc))
+    )
+
+
+def test_paging_ends_exactly_at_a_multiple_of_the_limit(store):
+    docs(store, {f"{i}.md": "акт" for i in range(6)})
+    assert find(store, "акт", limit=3)["nextOffset"] == 3
+    assert "nextOffset" not in find(store, "акт", limit=3, offset=3)
+
+
+def test_a_filter_that_excludes_everything_says_so(tmp_path):
+    root = tmp_path / "docs"
+    (root / ".minirag").mkdir(parents=True)
+    (root / ".minirag" / "classify.toml").write_text(TAXONOMY)
+    store = Store(tmp_path / "db", dim=8)
+    src = str(root / "m.md")
+    store.replace_source(src, [record(src, {"type": L("minutes")}, text="акт")])
+    source = LabelerSource((root,), tmp_path / "cache", FakeModelFactory())
+    got = run_find(store, (root,), "акт", labels={"type": "spec"}, label_source=source)
+    assert got["notice"] == FILTERED_OUT_NOTICE
+
+
+def test_a_snippet_from_decomposed_text_is_composed(store):
+    text = unicodedata.normalize("NFD", "Годовой отчёт за квартал")
+    docs(store, {"a.md": text})
+    snippet = find(store, "отчет")["documents"][0]["firstMatch"]["snippet"]
+    assert snippet == unicodedata.normalize("NFC", text)
+
+
+def test_a_snippet_stays_bounded_around_a_huge_token(store):
+    docs(store, {"a.md": "начало акт" + "я" * 5000 + " конец"})
+    snippet = find(store, "акт")["documents"][0]["firstMatch"]["snippet"]
+    assert len(snippet) <= SNIPPET_CHARS + 2

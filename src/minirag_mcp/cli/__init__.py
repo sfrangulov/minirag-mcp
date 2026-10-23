@@ -406,7 +406,8 @@ def find(
     "контакт", but also "актуально"); a quoted term ('"акт"') matches that exact word
     only. Case, ё/е and Unicode composition are ignored. A document must contain every
     term, or any of them with --any. The word forms each term matched are listed first.
-    --limit (capped at 200) pages the listing; the counts cover every match.
+    --limit (capped at 200) pages the listing; the counts cover every match. A term that
+    starts with a dash goes after `--`, and every option before it.
     """
     labels = _parse_labels(label)
     cfg, store, pipeline = _load(base_dir, db_path, cache_dir, model_name)

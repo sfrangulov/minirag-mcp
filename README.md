@@ -725,8 +725,9 @@ The matching rule:
   a hyphen or punctuation starts a new word; a letter or digit does not.
 - **The open end overcounts, visibly.** `акт` also finds `актуально`. Every
   response carries `forms`: each word form a term matched, with how many
-  documents have it. On the corpus above, `акт` matched 406 documents, of
-  which `актив…` and `актуал…` were most.
+  documents have it. On the corpus above, `акт` matched 406 documents, and
+  `forms` showed the word itself in 122 of them, next to `активы` (107),
+  `активов` (99) and `актуально` (84).
 - **Quotes close the end.** `"акт"` matches that word only. To count one word
   in all its forms, pass the forms, each quoted, with `match="any"`: that gave
   166 documents for `акт` on the same corpus.
@@ -734,6 +735,9 @@ The matching rule:
   and a filename macOS stored decomposed still matches.
 - **Whitespace inside a phrase** matches any run of whitespace, line breaks
   included.
+- **What conversion left in the text is ignored.** markitdown escapes `_` and `*`
+  in DOCX, HTML and XLSX (`ТЗ\_2024\_015`), and Word keeps optional hyphens and
+  zero-width marks inside words; `ТЗ_2024_015` and `договор` still match.
 - **Literal, not semantic.** A synonym or another spelling is another term.
 
 Several terms combine per document: `match="all"` (the default) keeps documents
@@ -742,13 +746,20 @@ are searched as well as text.
 
 The response gives `searchedDocuments` (indexed documents in scope that pass
 the filters), `matchedDocuments`, `matchedChunks`, and the `documents`, title
-matches first, then by the number of chunks that mention a term. A page holds
+matches first, then by the number of chunks that mention a term. A heading that
+every chunk of a section repeats counts once. A page holds
 at most 200 documents; `nextOffset` is present while more remain, and the counts
 always cover every match. With no match, `notice` says so and states what was
 searched.
 
 "None" covers only what is indexed: files not yet synced (`list_files` shows
-them) and scans without OCR have no text to search.
+them) and scans without OCR have no text to search. Two narrower gaps: a phrase
+that a chunk boundary splits is not found, and neither is text stored in a
+Unicode form that is neither composed nor decomposed (CJK compatibility
+ideographs, for one).
+
+From a terminal, a term that starts with a dash goes after `--`, with every
+option before it: `minirag-mcp find --base-dir ~/docs -- -15%`.
 
 ## Search by Default
 

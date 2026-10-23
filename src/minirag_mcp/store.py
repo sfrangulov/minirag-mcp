@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import statistics
 import warnings
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import asdict, dataclass, replace
 from datetime import timedelta
 from pathlib import Path
@@ -645,41 +645,42 @@ class Store:
         *,
         scopes: tuple[str, ...] = (),
         filter_sql: str | None = None,
-    ) -> list[SearchResult]:
+    ) -> Iterator[SearchResult]:
         """Every chunk whose text or title may contain one of `terms`, in document order.
 
         A superset of the matches: the SQL clause cannot see where a word starts, so the
-        caller keeps what `Term.search` accepts. Never capped, because a report that a
-        term is absent is only as good as the scan behind it.
+        caller keeps what `literal.matches` accepts. Never capped, because a report that
+        a term is absent is only as good as the scan behind it. Rows are handed out a
+        batch at a time: a broad stem can select most of the index, and its text sits
+        far more compactly in Arrow than as Python strings.
         """
         clause = _and_clauses(
             sql_clause(scopes), filter_sql, literal.sql_clause(terms, FTS_COLUMNS)
         )
         present = set(self._table.schema.names)
         wanted = ["source", "title", "chunk_index", "text", "parent_id", *LABEL_COLUMNS]
-        rows = (
+        table = (
             self._table.search()
             .where(clause)
             .select([c for c in wanted if c in present])
             .limit(_LIST_LIMIT)
-            .to_list()
+            .to_arrow()
+            .sort_by([("source", "ascending"), ("chunk_index", "ascending")])
         )
-        rows.sort(key=lambda r: (r["source"], r["chunk_index"]))
-        return [
-            SearchResult(
-                text=r["text"],
-                source=r["source"],
-                title=r["title"],
-                chunk_index=r["chunk_index"],
-                score=0.0,
-                distance=None,
-                parent_id=r.get("parent_id") or "",
-                labels_json=r.get("labels_json") or "",
-                doc_date=r.get("doc_date") or "",
-                doc_date_source=r.get("doc_date_source") or "",
-            )
-            for r in rows
-        ]
+        for batch in table.to_batches(max_chunksize=1024):
+            for r in batch.to_pylist():
+                yield SearchResult(
+                    text=r["text"],
+                    source=r["source"],
+                    title=r["title"],
+                    chunk_index=r["chunk_index"],
+                    score=0.0,
+                    distance=None,
+                    parent_id=r.get("parent_id") or "",
+                    labels_json=r.get("labels_json") or "",
+                    doc_date=r.get("doc_date") or "",
+                    doc_date_source=r.get("doc_date_source") or "",
+                )
 
     def chunk_count(self) -> int:
         return self._table.count_rows()

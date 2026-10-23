@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
-from minirag_mcp.chunker.pack import join_parent, pack_section
+from minirag_mcp.chunker.pack import join_parent, pack_section, shared_lines
 from minirag_mcp.chunker.sections import detect_category, split_sections
 from minirag_mcp.chunker.tokens import CountTokens, estimate_tokens
 
@@ -37,6 +37,7 @@ __all__ = [
     "detect_category",
     "estimate_tokens",
     "join_parent",
+    "shared_lines",
 ]
 
 

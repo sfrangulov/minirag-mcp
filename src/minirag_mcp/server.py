@@ -7,6 +7,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
+from typing import Literal
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
@@ -264,7 +265,7 @@ def create_app(
     @guard
     def find_mentions(
         terms: str | list[str],
-        match: str = "all",
+        match: Literal["all", "any"] = "all",
         scope: str | list[str] | None = None,
         labels: dict[str, str | list[str]] | None = None,
         dateFrom: str | None = None,
@@ -301,7 +302,8 @@ def create_app(
         covered.
 
         Only indexed text is searched: files not yet synced (list_files
-        shows them) and images without OCR are not. scope, labels, dateFrom
+        shows them) and images without OCR are not, and a phrase that a
+        chunk boundary splits is not found. scope, labels, dateFrom
         and dateTo filter as in query_documents, and citations follow its
         rule: each document's `displayPath`, verbatim.
         """
