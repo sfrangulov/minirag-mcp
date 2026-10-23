@@ -2,13 +2,36 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
+# A line of a page: text set below the line before it, or (x, y, text) placed exactly,
+# which is how a table's cells are laid out.
+Line = str | tuple[float, float, str]
+
+_LEADING = 14
+
 
 def _escape(text: str) -> str:
     return text.replace("\\", r"\\").replace("(", r"\(").replace(")", r"\)")
 
 
-def build_pdf(pages: list[str]) -> bytes:
-    """A valid single-font PDF. Each entry is the page's text; "" means no text.
+def _content(page: str | Sequence[Line]) -> bytes:
+    if isinstance(page, str):
+        return f"BT /F1 12 Tf 72 720 Td ({_escape(page)}) Tj ET".encode()
+    ops = [f"BT /F1 12 Tf {_LEADING} TL 72 720 Td"]
+    for line in page:
+        if isinstance(line, tuple):
+            x, y, text = line
+            ops.append(f"1 0 0 1 {x} {y} Tm ({_escape(text)}) Tj")
+        else:
+            ops.append(f"({_escape(line)}) Tj T*")
+    ops.append("ET")
+    return " ".join(ops).encode()
+
+
+def build_pdf(pages: Sequence[str | Sequence[Line]]) -> bytes:
+    """A valid single-font PDF. Each entry is one page: its text as a single line, or a
+    list of lines; "" or [] is a page with no text.
 
     Cyrillic cannot be encoded in the standard-font byte strings this builder
     writes, so tests use ASCII markers; the OCR routing logic under test only
@@ -25,7 +48,7 @@ def build_pdf(pages: list[str]) -> bytes:
     kids_placeholder = add(b"")  # pages node, patched below
     for text in pages:
         if text:
-            stream = f"BT /F1 12 Tf 72 720 Td ({_escape(text)}) Tj ET".encode()
+            stream = _content(text)
             content = add(b"<< /Length %d >>\nstream\n%s\nendstream" % (len(stream), stream))
             body = (
                 b"<< /Type /Page /Parent %d 0 R /MediaBox [0 0 612 792] "

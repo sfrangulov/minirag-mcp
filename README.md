@@ -930,6 +930,16 @@ measured to *degrade* attribution quality by 16–276% against the best
 granularity ([arXiv 2604.01432][granularity]). `sources` is that document list
 already, which is why `displayPath` lives there.
 
+Pages, for a PDF. A document is what an answer cites, but a page is how a person
+finds the passage in it, so a hit from a PDF carries `pages` — `"12"`, or
+`"12-13"` for a chunk that runs across a page break — in `query_documents`
+results, `read_chunk_neighbors` chunks and a `find_mentions` `firstMatch`, and
+the CLI prints it as `p. 12`. Other formats, and a PDF fetched by `ingest_url`,
+carry no `pages` at all. A page that cannot be told for certain is left out
+rather than guessed. A PDF indexed before page numbers existed is counted by
+`status` as `unpagedSourceCount`, listed as `stale_pages`, and read again by the
+next sync — which for a scanned PDF means OCR again.
+
 Plain text, not a link — the one thing a model can still get wrong about a
 string it is copying is to wrap it. A `file://` URL is refused or mishandled by
 every client checked: Claude Desktop denylists the scheme outright, Claude Code

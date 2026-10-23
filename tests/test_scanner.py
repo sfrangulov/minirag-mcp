@@ -323,3 +323,40 @@ def test_scan_roots_sees_images_only_with_ocr(tmp_path, monkeypatch):
     monkeypatch.setattr(ocr, "available", lambda: True)
     names = {e.path.name for e in scan_roots([tmp_path])}
     assert names == {"doc.md", "scan.png"}
+
+
+def test_a_pdf_indexed_before_page_numbers_is_read_again_and_listed_as_such(tmp_path):
+    """Its bytes have not changed, so without this a sync would skip it forever and its
+    results would never carry a page."""
+    from dataclasses import replace
+
+    pdf = tmp_path / "a.pdf"
+    pdf.write_bytes(b"%PDF-fake")
+    md = tmp_path / "b.md"
+    md.write_text("unchanged")
+    entries = scan_roots([tmp_path])
+    indexed = [
+        replace(
+            info(str(p), file_hash=file_sha256(p), mtime=p.stat().st_mtime), pages_recorded=False
+        )
+        for p in (pdf, md)
+    ]
+    states = {s.source: s.state for s in compute_states(entries, indexed)}
+    assert states == {str(pdf): "stale_pages", str(md): "ingested"}
+    assert compute_diff(entries, indexed, max_file_size=10**9).to_ingest == [pdf]
+
+
+def test_a_moved_pdf_from_before_page_numbers_is_read_again_rather_than_moved(tmp_path):
+    from dataclasses import replace
+
+    (tmp_path / "new").mkdir()
+    pdf = tmp_path / "new" / "a.pdf"
+    pdf.write_bytes(b"%PDF-fake")
+    paged = info(str(tmp_path / "a.pdf"), file_hash=file_sha256(pdf))
+    entries = scan_roots([tmp_path])
+    assert len(compute_diff(entries, [paged], max_file_size=10**9, roots=[tmp_path]).moved) == 1
+
+    old = replace(paged, pages_recorded=False)
+    diff = compute_diff(entries, [old], max_file_size=10**9, roots=[tmp_path])
+    assert diff.moved == []
+    assert diff.to_ingest == [pdf] and diff.to_delete == [old.source]

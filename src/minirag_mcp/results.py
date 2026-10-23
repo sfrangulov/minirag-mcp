@@ -17,6 +17,7 @@ from minirag_mcp import literal, ocr
 from minirag_mcp.chunker import shared_lines
 from minirag_mcp.config import Config
 from minirag_mcp.ingest import ignore
+from minirag_mcp.ingest.pages import predates_pages
 from minirag_mcp.ingest.pipeline import IngestResult
 from minirag_mcp.ingest.scanner import FileState, compute_states, scan_roots
 from minirag_mcp.labels.filters import (
@@ -85,8 +86,10 @@ def result_dict(r: SearchResult) -> dict:
     the response's `parents` map, not once per hit: a good chunking scheme puts several
     hits of one query in the same section, and attaching the section to every hit made
     about a third of a response the same words resent.
+
+    `pages` appears only on a chunk of a PDF whose pages are known.
     """
-    return {
+    out = {
         "text": r.text,
         "source": r.source,
         "title": r.title,
@@ -95,6 +98,9 @@ def result_dict(r: SearchResult) -> dict:
         "distance": r.distance,
         "parentId": r.parent_id or None,
     }
+    if r.pages:
+        out["pages"] = r.pages
+    return out
 
 
 def parent_map(results: Iterable[SearchResult]) -> dict[str, str]:
@@ -127,6 +133,23 @@ def scheme_status(store: Store) -> dict:
             f"{stale} chunk(s) predate the current chunking scheme. {RESYNC_HINT}"
         )
     return out
+
+
+def pages_status(store: Store) -> dict:
+    """The page-number half of `status`, identical for the server and the CLI.
+
+    Absent when no PDF predates page numbers, so an index that is up to date sees the
+    status it always had.
+    """
+    unpaged = sum(1 for info in store.list_sources() if predates_pages(info))
+    if not unpaged:
+        return {}
+    return {
+        "unpagedSourceCount": unpaged,
+        "pagesWarning": f"{unpaged} PDF document(s) were indexed before page numbers were "
+        "stored, so their results carry no `pages`. The next sync (sync_start, or "
+        "`minirag-mcp sync`) reads them again to add them.",
+    }
 
 
 def signature_status(store: Store) -> dict:
@@ -466,6 +489,8 @@ def run_find(
                 "parentId": chunk.parent_id or None,
                 "snippet": _snippet(unicodedata.normalize("NFC", text), span),
             }
+            if chunk.pages:
+                doc.first_match["pages"] = chunk.pages
 
     needed = len(parsed) if match == "all" else 1
     matched = [d for d in docs.values() if len(d.terms) >= needed]

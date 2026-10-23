@@ -36,6 +36,7 @@ def _row(source, i, text, parent_id=""):
         "label_hash": "",
         "doc_date": "",
         "doc_date_source": "",
+        "pages": "",
     }
 
 

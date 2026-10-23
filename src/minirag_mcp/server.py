@@ -28,6 +28,7 @@ from minirag_mcp.results import (
     labels_status,
     list_payload,
     ocr_status,
+    pages_status,
     result_dict,
     run_find,
     run_query,
@@ -258,6 +259,12 @@ def create_app(
         small to act on. A chunk indexed before parent sections existed
         has parentId null and no entry; re-sync to fill it in.
 
+        A hit from a PDF file also carries `pages`, the page or pages its
+        text came from ("12" or "12-13"), which is how a person finds the
+        passage in the original; other sources have none. Name
+        the page in your answer when the user will want to check a
+        passage. The Sources list below stays one bare path per document.
+
         topK must be at least 1 and is capped at 100; a larger value is
         silently clamped to the cap rather than rejected.
 
@@ -326,8 +333,9 @@ def create_app(
         filters), matchedDocuments, matchedChunks, `forms`, and `documents`:
         title matches (`inTitle`) first, then by `hits`, the chunks that
         mention a term. Each row has `displayPath` and `firstMatch`
-        {chunkIndex, parentId, snippet}, or null when only the title
-        matched. `limit` (default 50, capped at 200) pages the list and
+        {chunkIndex, parentId, snippet, and `pages` in a PDF as in
+        query_documents}, or null when only the title matched. `limit`
+        (default 50, capped at 200) pages the list and
         `nextOffset` is present while more remain; the counts always cover
         every match. With no match, `notice` states the absence and what it
         covered. A row carries `lookAlikes` as in query_documents, from the
@@ -368,7 +376,8 @@ def create_app(
         Provide exactly one of filePath (absolute path inside a document
         root) or source (the id of a data/url item). before/after control
         how many chunks to include on each side of chunkIndex (both
-        default to 1).
+        default to 1). A chunk of a PDF carries `pages` as in
+        query_documents.
         """
         c = ctx()
         if filePath is not None:
@@ -437,9 +446,11 @@ def create_app(
         disk), "stale" (changed on disk since it was indexed),
         "stale_scheme" (unchanged on disk, but indexed under an older
         chunking scheme, so its vectors are not comparable with current
-        ones), "not_ingested" (never indexed), or "unreadable" (indexed and
-        still on disk, but of a type this installation cannot read because
-        an optional extra is absent — images need [ocr]). Everything but
+        ones), "stale_pages" (an unchanged PDF indexed before page numbers
+        were stored, so its results carry none), "not_ingested" (never
+        indexed), or "unreadable" (indexed and still on disk, but of a type
+        this installation cannot read because an optional extra is absent —
+        images need [ocr]). Everything but
         "ingested" and "unreadable" needs a sync_start; an "unreadable"
         source is kept as indexed and no sync can refresh it here.
         "stale_scheme" is the per-source view of what status reports as
@@ -513,6 +524,10 @@ def create_app(
         without the signature that finds their look-alikes, so no result names
         theirs; lookAlikesWarning says a sync computes them.
 
+        unpagedSourceCount, present when above zero, counts PDFs indexed
+        before page numbers were stored, whose results carry no `pages`;
+        pagesWarning says the next sync reads them again.
+
         ignoreFiles, present when a root has a .miniragignore: each file with
         its number of rules, or the error that stops scanning under its root.
 
@@ -543,6 +558,7 @@ def create_app(
             out["sourceCount"] = c.store.source_count()
             out.update(scheme_status(c.store))
             out.update(signature_status(c.store))
+            out.update(pages_status(c.store))
             out.update(labels_status(c.labels, c.store))
         except Exception as e:
             out["indexError"] = str(e)

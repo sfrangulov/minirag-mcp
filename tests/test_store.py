@@ -418,3 +418,50 @@ def test_replacing_a_source_clears_chunks_a_racing_first_ingest_stored_twice(sto
     )
 
     assert sorted(c.text for c in store.all_chunks("/a.md")) == ["new 0", "new 1"]
+
+
+# --- page numbers ------------------------------------------------------------------
+
+
+def test_an_index_from_before_page_numbers_gains_the_column_and_tells_its_rows_apart(tmp_path):
+    db_path = tmp_path / "db"
+    _older_table(db_path, {"pages"}, [_row("/a.pdf", 0, "x"), _row("/b.md", 0, "y")])
+
+    store = Store(db_path, dim=8)
+
+    assert "pages" in store._table.schema.names and store.missing_columns == ()
+    assert [(s.source, s.pages_recorded) for s in store.list_sources()] == [
+        ("/a.pdf", False),
+        ("/b.md", False),
+    ]
+    assert not store.get_source("/a.pdf").pages_recorded
+    store.replace_source("/a.pdf", [replace(rec("/a.pdf", 0, "x"), pages="1")])
+    store.replace_source("/b.md", [rec("/b.md", 0, "y")])
+    assert [s.pages_recorded for s in store.list_sources()] == [True, True]
+
+
+def test_pages_reach_every_read_path(store):
+    from minirag_mcp.literal import term
+
+    store.replace_source(
+        "/a.pdf",
+        [replace(rec("/a.pdf", i, f"clause {i}"), pages=p) for i, p in enumerate(["1", "1-2", ""])],
+    )
+    assert [r.pages for r in store.all_chunks("/a.pdf")] == ["1", "1-2", ""]
+    assert [r.pages for r in store.neighbors("/a.pdf", 1)] == ["1", "1-2", ""]
+    hits = store.search("clause", [0.1] * 8, top_k=3)
+    assert sorted(r.pages for r in hits) == ["", "1", "1-2"]
+    assert sorted(r.pages for r in store.literal_candidates([term("clause")])) == ["", "1", "1-2"]
+
+
+def test_an_index_that_cannot_gain_the_page_column_still_searches(tmp_path, monkeypatch):
+    db_path = tmp_path / "db"
+    table = _older_table(db_path, {"pages"}, [_row("/a.pdf", 0, "clause text")])
+    monkeypatch.setattr(type(table), "add_columns", _raise_commit_conflict)
+
+    with pytest.warns(RuntimeWarning, match="pages"):
+        store = Store(db_path, dim=8)
+
+    assert store.schema_migrated and store.missing_columns == ("pages",)
+    assert not store.get_source("/a.pdf").pages_recorded
+    assert [r.pages for r in store.search("clause", [0.1] * 8, top_k=1)] == [""]

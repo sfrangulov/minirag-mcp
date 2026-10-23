@@ -29,6 +29,7 @@ from minirag_mcp.results import (
     labels_status,
     list_payload,
     ocr_status,
+    pages_status,
     result_dict,
     run_find,
     run_query,
@@ -144,10 +145,16 @@ def _emit(payload: dict, as_json: bool, human: str) -> None:
     print(jsonlib.dumps(payload, ensure_ascii=False, indent=2) if as_json else human)
 
 
+def _on_pages(pages: str) -> str:
+    """`p. 12` or `pp. 12-13` for a PDF chunk's pages, after a space; "" without them."""
+    if not pages:
+        return ""
+    return f" {'pp' if '-' in pages else 'p'}. {pages}"
+
+
 def _result_line(r: dict) -> str:
-    return (
-        f"[{r['score']:.3f}] {r['source']}#{r['chunkIndex']} — {r['title']}\n    {r['text'][:160]}"
-    )
+    where = f"{r['source']}#{r['chunkIndex']}{_on_pages(r.get('pages', ''))}"
+    return f"[{r['score']:.3f}] {where} — {r['title']}\n    {r['text'][:160]}"
 
 
 def _document_suffix(row: dict) -> str:
@@ -388,8 +395,9 @@ def _find_human(payload: dict) -> str:
             what.append("in title")
         terms = f" — {', '.join(row['terms'])}" if "terms" in row else ""
         lines.append(f"{row['displayPath']} ({', '.join(what)}){terms}" + _document_suffix(row))
-        if row["firstMatch"]:
-            lines.append(f"    {row['firstMatch']['snippet']}")
+        if first := row["firstMatch"]:
+            on = _on_pages(first.get("pages", ""))
+            lines.append(f"   {on}: {first['snippet']}" if on else f"    {first['snippet']}")
         lines += _look_alike_lines(row, "    ")
     if "nextOffset" in payload:
         lines.append(f"more: rerun with --offset {payload['nextOffset']}")
@@ -477,7 +485,10 @@ def read_neighbors(
     chunks = store.neighbors(key, chunk_index, before=before, after=after)
     payload = {"chunks": [result_dict(r) for r in chunks]}
     human = (
-        "\n\n".join(f"[{r.chunk_index}] {r.source} — {r.title}\n{r.text}" for r in chunks)
+        "\n\n".join(
+            f"[{r.chunk_index}] {r.source}{_on_pages(r.pages)} — {r.title}\n{r.text}"
+            for r in chunks
+        )
         or "no chunks"
     )
     _emit(payload, json, human)
@@ -544,7 +555,8 @@ def list_cmd(
     """List files on disk with ingestion state, plus indexed data/url sources.
 
     States: ingested, stale (changed on disk), stale_scheme (unchanged on disk but
-    indexed under an older chunking scheme), not_ingested, unreadable (indexed and
+    indexed under an older chunking scheme), stale_pages (an unchanged PDF indexed
+    before page numbers were stored), not_ingested, unreadable (indexed and
     still on disk, but of a type this install cannot read because an optional extra
     is absent — images need [ocr]). Everything but ingested and unreadable needs a
     sync; an unreadable source is kept as indexed and no sync can refresh it here.
@@ -619,6 +631,7 @@ def status(
         payload["sourceCount"] = store.source_count()
         payload.update(scheme_status(store))
         payload.update(signature_status(store))
+        payload.update(pages_status(store))
         payload.update(labels_status(_label_source(cfg), store))
     except Exception as e:
         payload["indexError"] = str(e)

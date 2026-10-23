@@ -9,6 +9,7 @@ from pathlib import Path
 
 from minirag_mcp.chunker import SCHEME_VERSION
 from minirag_mcp.ingest import ignore
+from minirag_mcp.ingest.pages import predates_pages
 from minirag_mcp.ingest.parser import IMAGE_EXTENSIONS, SUPPORTED_EXTENSIONS, supported_extensions
 from minirag_mcp.ingest.pipeline import file_sha256
 from minirag_mcp.scope import is_under
@@ -291,7 +292,8 @@ def compute_diff(
 
     A source whose chunks predate the current chunking scheme is re-ingested whatever
     its bytes say. Its file has not changed; what it was cut into has. Without this,
-    `status` would tell the user to re-sync and the re-sync would skip every file.
+    `status` would tell the user to re-sync and the re-sync would skip every file. A
+    PDF indexed before page numbers were stored is re-ingested for the same reason.
 
     Deletion is proposed only for a source this installation could have scanned, or one
     whose file is gone. An extension in `KNOWN_EXTENSIONS` but not in the current
@@ -340,7 +342,12 @@ def compute_diff(
             oversized.append(e.path)
             continue
         prior = indexed_files.get(str(e.path))
-        if prior is None or prior.scheme_version < SCHEME_VERSION or prior.duplicated:
+        if (
+            prior is None
+            or prior.scheme_version < SCHEME_VERSION
+            or prior.duplicated
+            or predates_pages(prior)
+        ):
             to_ingest.append(e.path)
         elif prior.mtime == e.mtime or prior.file_hash == file_sha256(e.path):
             unchanged.append(e.path)
@@ -439,14 +446,19 @@ def _pair_moves(
 
     The name has to match because a title can come from it: a renamed file may need a
     different title, and only a re-ingest computes one. A source cut by an older
-    chunking scheme is not paired, since it needs re-cutting anyway. Pairing is one to
-    one, in path order, so two identical copies of one vanished file move it to the
-    first and ingest the second.
+    chunking scheme, or a PDF stored without page numbers, is not paired, since it needs
+    reading again anyway. Pairing is one to one, in path order, so two identical copies
+    of one vanished file move it to the first and ingest the second.
     """
     gone: dict[tuple[str, str], list[str]] = {}
     for source in to_delete:
         prior = indexed[source]
-        if prior.file_hash and prior.scheme_version >= SCHEME_VERSION and not prior.duplicated:
+        if (
+            prior.file_hash
+            and prior.scheme_version >= SCHEME_VERSION
+            and not prior.duplicated
+            and not predates_pages(prior)
+        ):
             gone.setdefault((Path(source).name, prior.file_hash), []).append(source)
     if not gone:
         return []
@@ -471,21 +483,25 @@ class FileState:
     source: str
     source_type: str
     title: str
-    # "ingested" | "not_ingested" | "stale" | "stale_scheme" | "unreadable" | "unlisted"
+    # "ingested" | "not_ingested" | "stale" | "stale_scheme" | "stale_pages" | "unreadable"
+    # | "unlisted"
     state: str
     chunk_count: int
     ocr_engine: str = ""
 
 
 def _indexed_state(prior: SourceInfo) -> str:
-    """Whether an indexed source is current, or was cut by an older chunking scheme.
+    """Whether an indexed source is current, or needs reading again though unchanged: cut
+    by an older chunking scheme, or a PDF stored before page numbers were.
 
     A scheme-stale source needs the same action as a changed one — re-ingest — and
     `compute_diff` already re-ingests it. Reporting it as plain "ingested" is what made
     the listing contradict `status`, which says the index is stale and to re-sync; an
     agent choosing what to work on from the listing would have seen nothing to do.
     """
-    return "stale_scheme" if prior.scheme_version < SCHEME_VERSION else "ingested"
+    if prior.scheme_version < SCHEME_VERSION:
+        return "stale_scheme"
+    return "stale_pages" if predates_pages(prior) else "ingested"
 
 
 def compute_states(
@@ -502,6 +518,8 @@ def compute_states(
     - "stale_scheme": unchanged on disk, but indexed under an older chunking scheme —
       its vectors were computed over differently cut text and are not comparable with
       new ones, so it needs re-ingesting all the same.
+    - "stale_pages": an unchanged PDF indexed before page numbers were stored; a sync
+      reads it again to add them.
     - "not_ingested": file not in index.
     - "unreadable": indexed, still on disk, but of a type this installation cannot read
       because an optional extra is absent (images need [ocr]). The scan never looked for
