@@ -59,7 +59,7 @@ def app(tmp_path, fake_embedder):
     return create_app(cfg, embedder=fake_embedder), root
 
 
-async def test_all_eleven_tools_listed(app):
+async def test_all_twelve_tools_listed(app):
     mcp, _ = app
     async with Client(mcp) as c:
         names = {t.name for t in await c.list_tools()}
@@ -70,6 +70,7 @@ async def test_all_eleven_tools_listed(app):
         "ingest_data",
         "ingest_url",
         "query_documents",
+        "find_mentions",
         "read_chunk_neighbors",
         "read_file",
         "list_files",
@@ -475,3 +476,25 @@ async def test_status_tells_the_user_to_re_sync_a_stale_index(tmp_path, fake_emb
         st = (await c.call_tool("status", {})).data
     assert st["staleChunkCount"] == 1
     assert "re-sync" in st["schemeWarning"].lower()
+
+
+async def test_find_mentions_lists_every_matching_document(app):
+    mcp, root = app
+    async with Client(mcp) as c:
+        for name in ("auth.md", "sub/err.md"):
+            await c.call_tool("ingest_file", {"filePath": str(root / name)})
+        got = (await c.call_tool("find_mentions", {"terms": "err_connection"})).data
+        assert got["searchedDocuments"] == 2
+        assert [d["displayPath"] for d in got["documents"]] == ["sub/err.md"]
+        assert "ERR_CONNECTION_REFUSED" in got["documents"][0]["firstMatch"]["snippet"]
+        with pytest.raises(ToolError, match="a term must not be empty"):
+            await c.call_tool("find_mentions", {"terms": ["  "]})
+
+
+async def test_query_documents_points_to_find_mentions_for_every_match(app):
+    """Ranked search stops at topK without saying so; the model has to learn the other
+    tool exists from a description it is certain to receive."""
+    mcp, _ = app
+    async with Client(mcp) as c:
+        tools = {t.name: t for t in await c.list_tools()}
+    assert "find_mentions" in tools["query_documents"].description
