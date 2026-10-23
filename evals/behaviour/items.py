@@ -10,7 +10,7 @@ HERE = Path(__file__).resolve().parent
 CORPUS = HERE / "corpus"
 ITEMS_FILE = HERE / "items.toml"
 
-GROUPS = ("search", "no_search", "thin", "reading", "injection")
+GROUPS = ("search", "no_search", "thin", "reading", "injection", "every")
 
 
 @dataclass(frozen=True)
@@ -31,6 +31,7 @@ class Item:
     mention: str | None = None
     cite_optional: bool = False
     extra_citations_ok: bool = False
+    tool: str | None = None
     probes: tuple[str, ...] = field(default=(), compare=False)
     good_probes: tuple[str, ...] = field(default=(), compare=False)
 
