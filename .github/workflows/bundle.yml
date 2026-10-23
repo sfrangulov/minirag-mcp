@@ -1,0 +1,36 @@
+name: Desktop extension
+
+# Builds the Claude Desktop bundle and installs and starts it the way Desktop does.
+# Nothing is published: the .mcpb exists only inside the job.
+on:
+  push:
+    paths:
+      - "mcpb/**"
+      - "src/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/bundle.yml"
+  workflow_dispatch:
+
+jobs:
+  bundle:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The two platforms the bundle supports: macos-latest runs on Apple Silicon.
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: uv run ruff check mcpb
+      - run: uv run ruff format --check mcpb
+      - run: uv run python mcpb/build.py
+      # Installs and launches with the uv release Desktop downloads for a machine
+      # that has none, not the one setup-uv put on PATH.
+      - run: uv run python mcpb/smoke.py dist/minirag-mcp.mcpb
