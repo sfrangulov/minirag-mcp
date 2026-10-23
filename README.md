@@ -117,18 +117,20 @@ uv run python mcpb/smoke.py dist/minirag-mcp.mcpb   # install and start it as De
   that requires signed extensions refuses it.
 
 **Verified:** the official `mcpb` CLI validates and packs it, and `mcpb/smoke.py`
-passes on an Apple Silicon Mac. That script repeats outside the app what Claude
-Desktop 3.6556 does with such a file — unpack it into a folder whose path has a
-space, run `uv sync --quiet` there, start the server with the manifest's arguments,
-the picked folder and only the environment variables Desktop passes on — and checks
-`initialize`, the tool list and `status`; `--search` also indexes and finds a
-document. It ran with uv 0.9.7, which Desktop downloads when a machine has no uv.
-**Not verified:** installing through the Desktop app itself, on macOS or Windows —
-the folder picker, the install dialog, the extension appearing under Connectors —
-and anything on Windows beyond package availability. The first start after
-installing took about 50 seconds on the test Mac (later ones, about 2); whether
-Desktop waits that long is untested. If the extension shows as failed right after
-installing, turn it off and on in **Settings > Extensions**.
+passes on an Apple Silicon Mac and, in CI (`.github/workflows/bundle.yml`), on
+GitHub's macOS (Apple Silicon) and Windows x64 runners. That script repeats outside
+the app what Claude Desktop 3.6556 does with such a file — unpack it into a folder
+whose path has a space, run `uv sync --quiet` there, start the server with the
+manifest's arguments, the picked folder and only the environment variables Desktop
+passes on — and checks `initialize`, the tool list and `status`; `--search` also
+indexes and finds a document (run on the Mac only). It uses uv 0.9.7, which Desktop
+downloads when a machine has no uv. **Not verified:** installing through the
+Desktop app itself, on macOS or Windows — the install dialog, the folder picker,
+the extension appearing under Connectors. The first start after installing took
+4–9 seconds on the CI runners but about 50 on the development Mac, loading native
+libraries for the first time (later starts: about 2); whether Desktop waits that
+long is untested. If the extension shows as failed right after installing, turn it
+off and on in **Settings > Extensions**.
 
 ### Claude Desktop
 
