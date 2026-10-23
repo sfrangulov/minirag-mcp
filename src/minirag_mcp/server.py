@@ -16,6 +16,7 @@ from minirag_mcp import __version__
 from minirag_mcp.chunker import SCHEME_VERSION
 from minirag_mcp.config import Config, ConfigError, load_config
 from minirag_mcp.embedder import Embedder
+from minirag_mcp.ingest.ignore import excluded_by
 from minirag_mcp.ingest.pipeline import Pipeline
 from minirag_mcp.instructions import build_instructions
 from minirag_mcp.labels import LabelerSource
@@ -124,6 +125,8 @@ def create_app(
         scope = None
         if path is not None:
             scope = resolve_in_roots(path, c.config.roots)
+            if (by := excluded_by(scope, c.config.roots)) is not None:
+                raise ToolError(f"{scope} is excluded by {by}; nothing under it can be synced")
         return {"jobId": c.sync.start(scope)}
 
     @mcp.tool
@@ -132,8 +135,8 @@ def create_app(
         """Poll a sync job started by sync_start.
 
         Returns state ('pending' | 'running' | 'succeeded' | 'failed'),
-        counts (scanned/ingested/skipped/moved/deleted/relabelled/unreadable/
-        failed), and any per-file errors. Only the latest job is retained — an
+        counts (scanned/ingested/skipped/moved/deleted/relabelled/ignored/
+        unreadable/failed), and any per-file errors. Only the latest job is retained — an
         old jobId, or any jobId from before a server restart, raises an error.
 
         relabelled counts documents whose labels were rewritten from their

@@ -285,8 +285,20 @@ What a rule excluded is counted, never dropped silently:
   excluded. A folder counts once.
 - `status` lists each `.miniragignore` with its number of rules, as `ignoreFiles`.
 
-An ignore file that exists but cannot be read stops the scan of its root with an
-error. Scanning past it would index exactly what it was written to keep out.
+Matching ignores case and Unicode composition, as git does on macOS: `private/`
+also keeps out `Private/`, and a folder name macOS stored decomposed matches the
+same rule typed composed. When roots nest, a path is held to the rules of every
+root above it. A symlink whose target a rule excludes is left out as well. Only
+the file at the top of a root is read; one in a subfolder has no effect.
+
+An ignore file that exists but cannot be read (or is a broken link) stops the
+scan of its root, because scanning past it would index exactly what it was written
+to keep out. That root is reported the way a folder that cannot be listed is: in
+`sync` errors and as failed, under `unlistedFolders` in `list_files`, and in
+`status`. Nothing indexed under it is deleted, and the other roots sync as usual.
+A `sync` or `list_files` scope inside an excluded folder is refused rather than
+answered with zeros.
+
 Hidden files and folders, Office lock files (`~$…`), `node_modules`,
 `__pycache__` and virtualenvs are skipped with or without one.
 

@@ -149,11 +149,13 @@ def scan_roots(
     caller comparing the result with the index must not read the absence of files under
     them as deletion.
 
-    Each walk honours the `.miniragignore` of the configured root it lies under:
+    Every path is held to the `.miniragignore` of each configured root above it:
     `rule_roots`, which default to `roots` and differ only when a folder inside a root
-    is scanned on its own. A folder a rule excludes is not walked at all. When `ignored`
-    is given, it collects every excluded file and folder, a folder once; an unreadable
-    ignore file raises `IgnoreFileError`.
+    is scanned on its own. A folder a rule excludes is not walked, and a symlink whose
+    target a rule excludes is left out too. When `ignored` is given, it collects every
+    excluded file and folder, a folder once. A root under an ignore file that cannot be
+    read is not walked and goes into `blind` with the reason, like a folder that cannot
+    be listed: nothing under it is deleted, and the other roots are scanned as usual.
 
     Returns entries sorted by path.
     """
@@ -166,16 +168,31 @@ def scan_roots(
         if blind is not None:
             blind.append((Path(error.filename), error.strerror or str(error)))
 
-    def excluded(rules: ignore.Rules | None, base: Path, p: Path, is_dir: bool) -> bool:
-        if rules is None or not rules.excludes(p.relative_to(base).as_posix(), is_dir):
-            return False
-        if ignored is not None:
+    ignorer = ignore.Ignorer(rule_roots or roots)
+    broken = ignorer.broken()
+    seen_ignored: set[Path] = set()
+
+    def drop(p: Path) -> None:
+        if ignored is not None and p not in seen_ignored:
+            seen_ignored.add(p)
             ignored.append(p)
+
+    def excluded(p: Path, is_dir: bool) -> bool:
+        if ignorer.matches(p, is_dir) is None:
+            return False
+        drop(p)
         return True
 
     for root in roots:
-        base = ignore.owner(Path(root), rule_roots or roots) or Path(root)
-        rules = ignore.load(base)
+        top = Path(root)
+        reason = next((m for r, m in broken.items() if r == top or r in top.parents), None)
+        if reason is not None:
+            if blind is not None:
+                blind.append((top, reason))
+            continue
+        if ignorer.excluded_by(top) is not None:
+            drop(top)  # an inner root an outer root's rule takes out whole
+            continue
         for dirpath, dirnames, filenames in os.walk(root, onerror=note):
             if blind is not None and dirpath == os.fspath(root) and not dirnames and not filenames:
                 blind.append((Path(root), None))
@@ -184,15 +201,18 @@ def scan_roots(
                 for d in dirnames
                 if not d.startswith(".")
                 and d not in SKIP_DIRS
-                and not excluded(rules, base, Path(dirpath) / d, True)
+                and not excluded(Path(dirpath) / d, True)
             )
             for name in sorted(filenames):
                 if name.startswith(".") or name.startswith(OFFICE_LOCK_PREFIX):
                     continue
                 p = Path(dirpath) / name
-                if p.suffix.lower() not in exts:
+                suffix = p.suffix.lower()
+                # Checked before the extensions this install reads, so a file indexed
+                # earlier by an install with an extra is still known to be excluded.
+                if suffix not in KNOWN_EXTENSIONS or excluded(p, False):
                     continue
-                if excluded(rules, base, p, False):
+                if suffix not in exts:
                     continue
                 # Dedupe by resolved path to handle overlapping roots
                 resolved = p.resolve()
@@ -200,6 +220,9 @@ def scan_roots(
                     continue
                 if not _contained(resolved, real_roots):
                     continue  # symlink escaping every root: not part of the corpus
+                if p.is_symlink() and ignorer.excluded_by(resolved) is not None:
+                    drop(p)  # its text is the excluded file's
+                    continue
                 seen.add(resolved)
                 st = p.stat()
                 entries.append(ScanEntry(path=p, size=st.st_size, mtime=st.st_mtime))
@@ -239,6 +262,7 @@ def compute_diff(
     scope: Path | None = None,
     roots: Sequence[Path] = (),
     blind: Sequence[tuple[Path, str | None]] = (),
+    ignored: Sequence[Path] = (),
 ) -> SyncDiff:
     """Compute sync diff: files to ingest, delete, and unchanged status.
 
@@ -320,6 +344,8 @@ def compute_diff(
         hidden_by = next((path for path, _ in blind if is_under(src, str(path))), None)
         if hidden_by is not None:
             hidden[src] = hidden_by
+        elif any(is_under(src, str(p)) for p in ignored):
+            to_delete.append(src)  # even one this install cannot read: a rule took it out
         elif _kept_unreadable(src, needs_extra):
             unreadable.append(src)
         else:

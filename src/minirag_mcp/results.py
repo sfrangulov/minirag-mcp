@@ -162,7 +162,7 @@ def ignore_status(roots: Sequence[Path]) -> dict:
     files = []
     for root in roots:
         try:
-            rules = ignore.load(root)
+            rules = ignore.load(root, strict=True)
         except ignore.IgnoreFileError as e:
             files.append({"file": str(Path(root) / ignore.IGNORE_FILE), "error": str(e)})
             continue
@@ -631,6 +631,9 @@ def list_payload(
     if sort not in (None, "date"):
         raise QueryError(f"sort must be 'date', got {sort!r}")
     label_filter, labeler = _parse_filter(store, labels, date_from, date_to, label_source)
+    for scope in scopes:
+        if (by := ignore.excluded_by(Path(scope), roots)) is not None:
+            raise QueryError(f"{scope} is excluded by {by}; nothing under it is listed")
     blind: list[tuple[Path, str | None]] = []
     ignored: list[Path] = []
     entries = scan_roots(roots, blind=blind, ignored=ignored)

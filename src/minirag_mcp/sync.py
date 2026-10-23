@@ -11,6 +11,7 @@ from pathlib import Path
 
 from minirag_mcp import ocr
 from minirag_mcp.config import Config
+from minirag_mcp.ingest.ignore import IgnoredFileError, excluded_by
 from minirag_mcp.ingest.pipeline import Pipeline
 from minirag_mcp.ingest.scanner import compute_diff, scan_roots
 from minirag_mcp.lock import SyncLock, sync_lock
@@ -100,6 +101,9 @@ def _run_sync_unlocked(
 ) -> tuple[dict[str, int], list[dict]]:
     """The body of `run_sync`. The caller must already hold the sync lock."""
     scope = scope.resolve() if scope is not None else None
+    if scope is not None and (by := excluded_by(scope, roots)) is not None:
+        # A silent no-op otherwise: every count zero, exit 0, nothing synced.
+        raise IgnoredFileError(f"{scope} is excluded by {by}; nothing under it can be synced")
 
     def emit(msg: str) -> None:
         if on_event:
@@ -115,6 +119,7 @@ def _run_sync_unlocked(
         scope=scope,
         roots=roots,
         blind=blind,
+        ignored=ignored,
     )
     counts = {
         "scanned": len(diff.to_ingest)
@@ -154,7 +159,7 @@ def _run_sync_unlocked(
 
     def ingest(path: Path) -> bool:
         try:
-            pipeline.ingest_file(path)
+            pipeline.ingest_file(path, rules_checked=True)
         except Exception as e:  # per-file failures never abort the job
             counts["failed"] += 1
             errors.append({"source": str(path), "error": str(e)})

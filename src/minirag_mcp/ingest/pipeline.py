@@ -332,9 +332,11 @@ class Pipeline:
             )
         return info
 
-    def ingest_file(self, path: Path) -> IngestResult:
+    def ingest_file(self, path: Path, *, rules_checked: bool = False) -> IngestResult:
+        """`rules_checked` is a sync's: its scan already held the file to the rules, and
+        a rule file edited mid-sync must not turn files it scanned into failures."""
         # Refused rather than indexed: the next sync would take it out again, silently.
-        if (by := ignore.excluded_by(path, self.config.roots)) is not None:
+        if not rules_checked and (by := ignore.excluded_by(path, self.config.roots)) is not None:
             raise IgnoredFileError(f"{path} is excluded by {by}; remove its rule to index it")
         info = self._checked_stat(path)
         doc = parse_file(path, self.config)

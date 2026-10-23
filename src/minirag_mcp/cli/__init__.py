@@ -15,7 +15,7 @@ from minirag_mcp import __version__
 from minirag_mcp.chunker import SCHEME_VERSION
 from minirag_mcp.config import Config, ConfigError, load_config
 from minirag_mcp.embedder import Embedder, EmbedderUnavailableError, UnknownModelError
-from minirag_mcp.ingest.ignore import IGNORE_FILE, excluded_by
+from minirag_mcp.ingest.ignore import IGNORE_FILE, IgnoredFileError, excluded_by
 from minirag_mcp.ingest.pipeline import IngestResult, Pipeline
 from minirag_mcp.ingest.scanner import scan_roots
 from minirag_mcp.labels import LabelerSource
@@ -298,7 +298,7 @@ def sync(
             scope=scope,
             on_event=lambda m: print(m, file=sys.stderr),
         )
-    except SyncLockBusy as e:
+    except (SyncLockBusy, IgnoredFileError) as e:
         _fail(str(e))
         raise AssertionError from e  # unreachable
     human = ", ".join(f"{k}: {v}" for k, v in counts.items())
