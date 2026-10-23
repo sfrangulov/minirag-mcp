@@ -1,11 +1,18 @@
 """PDF page numbers: where each page starts in a PDF's converted text, and which pages
-each chunk cut from that text came from."""
+each chunk cut from that text came from.
+
+A wrong page is worse than none: a reader sent to page 12 for a passage on page 40
+stops trusting every page after it. Wherever the evidence is short of certain, the
+answer is "no page".
+"""
 
 from __future__ import annotations
 
 import logging
 import re
+import unicodedata
 from bisect import bisect_right
+from collections import Counter
 from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -14,6 +21,8 @@ from pdfminer.converter import PDFPageAggregator
 from pdfminer.layout import LTChar, LTContainer, LTItem
 from pdfminer.pdfinterp import PDFPageInterpreter, PDFResourceManager
 from pdfminer.pdfpage import PDFPage
+
+from minirag_mcp.chunker import Chunk, in_document_order
 
 if TYPE_CHECKING:
     from minirag_mcp.store import SourceInfo
@@ -28,13 +37,14 @@ UNKNOWN = 0
 
 _FEEDS = re.compile(r"\f+")
 _BLANK_LINES = re.compile(r"\n{2,}")
-# How far past the end of the previous chunk a chunk is looked for before the whole
-# text is searched, in non-whitespace characters, on top of four times its own length.
-# What lies between two consecutive chunks is what neither of them carries: headings
-# that went into a breadcrumb, a section that had nothing but a heading.
+# Characters markitdown adds to a page's text: the pipes and dashes of a Markdown table.
+_TABLE_MARKUP = frozenset("|-")
+# How far past the end of the chunk before it a chunk's own text may start, in
+# non-whitespace characters, on top of four times its own length and the length of any
+# chunks in between that could not be placed. What legitimately lies between two
+# consecutive chunks is what neither of them holds as its own: headings carried in a
+# breadcrumb, a table's header row.
 _WINDOW = 4096
-# The shortest tail of a chunk that is taken as found. Shorter runs turn up by chance.
-_MIN_RUN = 8
 
 
 def predates_pages(info: SourceInfo) -> bool:
@@ -52,29 +62,43 @@ def page_count(path: Path) -> int:
         return sum(1 for _ in PDFPage.get_pages(fh))
 
 
-def _has_text(item: LTItem) -> bool:
+def _chars(item: LTItem):
     if isinstance(item, LTChar):
-        return bool(item.get_text().strip())
-    if isinstance(item, LTContainer):
-        return any(_has_text(child) for child in item)
-    return False
+        yield item.get_text()
+    elif isinstance(item, LTContainer):
+        for child in item:
+            yield from _chars(child)
 
 
-def text_pages(path: Path) -> list[int]:
-    """The zero-based pages that carry a character other than whitespace.
+def _print(texts) -> Counter[str]:
+    """What a page's text is made of, whatever order it was read in.
 
-    Characters only, without pdfminer's layout analysis: whether a page has text does
-    not depend on how its lines are grouped, and the grouping is the expensive part.
+    Decomposed rather than composed, so a combining mark counts the same whichever
+    character an extractor's reading order put in front of it; compatibility
+    decomposition, so a ligature pdfplumber expands counts the same as the glyph.
+    """
+    return Counter(
+        ch
+        for text in texts
+        for ch in unicodedata.normalize("NFKD", text)
+        if not ch.isspace() and ch not in _TABLE_MARKUP
+    )
+
+
+def page_prints(path: Path) -> list[Counter[str]]:
+    """Every page's characters, as `_print` counts them; empty for a page with no text.
+
+    Characters only, without pdfminer's layout analysis: what a page holds does not
+    depend on how its lines are grouped, and the grouping is the expensive part.
     """
     rsrc = PDFResourceManager()
     device = PDFPageAggregator(rsrc, laparams=None)
     interpreter = PDFPageInterpreter(rsrc, device)
-    out: list[int] = []
+    out: list[Counter[str]] = []
     with path.open("rb") as fh:
-        for index, page in enumerate(PDFPage.get_pages(fh)):
+        for page in PDFPage.get_pages(fh):
             interpreter.process_page(page)
-            if _has_text(device.get_result()):
-                out.append(index)
+            out.append(_print(_chars(device.get_result())))
     return out
 
 
@@ -95,12 +119,15 @@ def _pdf_page_starts(path: Path, markdown: str) -> PageStarts:
     """markitdown converts a PDF one of two ways. Prose goes through pdfminer, which
     ends every page with a form feed. A document with a table on any page goes through
     pdfplumber a page at a time, and the pages, which hold no blank line of their own,
-    are joined by one. Neither route leaves anything for a page with no text, and
-    markitdown's trailing-whitespace cleanup deletes a form feed whose line has nothing
-    else on it, which is what a page holding only spaces leaves behind.
+    are joined by one. Neither route leaves anything for a page with no text. And the
+    route's own clean-up moves text across those boundaries: trailing whitespace is
+    stripped from every line, which deletes a form feed whose line holds only spaces and
+    turns a table row of no-break spaces into a blank line, and a lone `.1` at the foot
+    of a page is joined to the first line of the next.
 
-    So the separators are trusted outright only when every page boundary survived,
-    and otherwise matched one to one against the pages that carry text.
+    So the separators are trusted outright only when every page boundary survived, and
+    otherwise each block between them must hold exactly the characters of the page it
+    is matched to.
     """
     if not markdown.strip():
         return ()
@@ -110,27 +137,36 @@ def _pdf_page_starts(path: Path, markdown: str) -> PageStarts:
     feeds = [m.end() for m in re.finditer("\f", markdown)]
     if len(feeds) == count - 1:
         return ((0, 1), *((at, page) for page, at in enumerate(feeds, start=2)))
-    with_text = text_pages(path)
+    prints = page_prints(path)
+    with_text = [index for index, chars in enumerate(prints) if chars]
     # One page of text has no boundary to find, and through pdfminer it can hold any
     # number of blank lines.
     separator = _FEEDS if feeds or len(with_text) == 1 else _BLANK_LINES
-    segments: list[int] = []
+    blocks: list[tuple[int, int]] = []
     at = 0
     for m in separator.finditer(markdown):
         if markdown[at : m.start()].strip():
-            segments.append(at)
+            blocks.append((at, m.start()))
         at = m.end()
     if markdown[at:].strip():
-        segments.append(at)
-    if len(segments) != len(with_text):
+        blocks.append((at, len(markdown)))
+    if len(blocks) != len(with_text):
         logger.warning(
             "no page numbers for %s: %d text block(s) for %d page(s) with text",
             path,
-            len(segments),
+            len(blocks),
             len(with_text),
         )
         return ()
-    return tuple((at, index + 1) for at, index in zip(segments, with_text, strict=True))
+    for (start, end), index in zip(blocks, with_text, strict=True):
+        if _print([markdown[start:end]]) != prints[index]:
+            logger.warning(
+                "no page numbers for %s: the text matched to page %d is not that page's",
+                path,
+                index + 1,
+            )
+            return ()
+    return tuple((start, index + 1) for (start, _), index in zip(blocks, with_text, strict=True))
 
 
 def stripped(text: str, starts: PageStarts) -> PageStarts:
@@ -156,83 +192,82 @@ def joined(parts: Sequence[tuple[str, PageStarts]], sep: str = "\n\n") -> tuple[
     return sep.join(text for text, _ in parts), tuple(out)
 
 
-def _label(first: int, last: int) -> str:
-    return str(first) if first == last else f"{first}-{last}"
+class _Flat:
+    """`markdown` without its whitespace, with where its words begin and end, and which
+    page each character is on."""
 
+    def __init__(self, markdown: str, starts: PageStarts) -> None:
+        words = markdown.split()
+        self.text = "".join(words)
+        self.edges = bytearray(len(self.text) + 1)
+        self.edges[0] = 1
+        at = 0
+        for word in words:
+            at += len(word)
+            self.edges[at] = 1
+        self.keys: list[int] = []
+        self.numbers: list[int] = []
+        previous = consumed = 0
+        for offset, page in sorted(starts, key=lambda s: s[0]):
+            consumed += len("".join(markdown[previous:offset].split()))
+            previous = offset
+            self.keys.append(consumed)
+            self.numbers.append(page)
 
-def chunk_pages(markdown: str, starts: PageStarts, texts: Sequence[str]) -> list[str]:
-    """The pages each of `texts`, chunks cut in order from `markdown`, came from: "12",
-    "12-13", or "" where that is not known.
+    def find(self, own: str, lo: int, hi: int) -> int:
+        """The first place in [lo, hi) where `own` starts and ends on a word boundary."""
+        at = self.text.find(own, lo, hi)
+        while at >= 0 and not (self.edges[at] and self.edges[at + len(own)]):
+            at = self.text.find(own, at + 1, hi)
+        return at
 
-    The chunker changes nothing in a chunk's own text but whitespace, and puts any
-    context it repeats — the document title, a heading breadcrumb, a table's header
-    row — in front of it. So with whitespace removed, the end of every chunk is a run
-    of the document's own characters, and it is looked for from where the chunk before
-    it ended. A chunk whose own text is too short to find that way lies between its
-    neighbours, and gets the pages of what lies between them.
-    """
-    if not starts:
-        return [""] * len(texts)
-    flat = "".join(markdown.split())
-    keys: list[int] = []
-    numbers: list[int] = []
-    previous = consumed = 0
-    for offset, page in sorted(starts, key=lambda s: s[0]):
-        consumed += len("".join(markdown[previous:offset].split()))
-        previous = offset
-        keys.append(consumed)
-        numbers.append(page)
-
-    def label(lo: int, hi: int) -> str:
-        if lo >= hi:
-            return ""
-        first = bisect_right(keys, lo) - 1
-        last = bisect_right(keys, hi - 1) - 1
+    def label(self, lo: int, hi: int) -> str:
+        first = bisect_right(self.keys, lo) - 1
+        last = bisect_right(self.keys, hi - 1) - 1
         if first < 0:
             return ""
-        touched = numbers[first : last + 1]
+        touched = self.numbers[first : last + 1]
         if UNKNOWN in touched:
             return ""
-        return _label(min(touched), max(touched))
+        low, high = min(touched), max(touched)
+        return str(low) if low == high else f"{low}-{high}"
 
-    spans: list[tuple[int, int] | None] = []
-    before: list[int] = []
-    cursor = 0
-    for text in texts:
-        before.append(cursor)
-        span = _locate("".join(text.split()), flat, cursor)
-        spans.append(span)
-        if span is not None:
-            cursor = max(cursor, span[1])
+
+def chunk_pages(markdown: str, starts: PageStarts, chunks: Sequence[Chunk]) -> list[str]:
+    """The pages each of `chunks`, cut from `markdown`, came from: "12", "12-13", or ""
+    where that is not certain.
+
+    A chunk's own text is the document's text but for whitespace, so it is looked for
+    exactly, as whole words. Chunks normally follow the document, so each is looked for
+    from where the one before it ended, and no further than a chunk can have drifted. A
+    transcript whose clock goes back is cut out of order; there a chunk is placed only
+    where its text occurs once in the whole document.
+    """
+    if not starts:
+        return [""] * len(chunks)
+    flat = _Flat(markdown, starts)
+    ordered = in_document_order(markdown)
     out: list[str] = []
-    for i, span in enumerate(spans):
-        if span is None:
-            after = next((s[0] for s in spans[i + 1 :] if s is not None), len(flat))
-            span = (before[i], after)
-        out.append(label(*span))
-    return out
-
-
-def _locate(own: str, flat: str, cursor: int) -> tuple[int, int] | None:
-    """Where in `flat` the longest tail of `own` is, looked for from `cursor` on."""
-    if not own:
-        return None
-    end = min(len(flat), cursor + _WINDOW + 4 * len(own))
-    at = flat.find(own, cursor, end)
-    if at >= 0:
-        return at, at + len(own)
-    best = None
-    lo, hi = _MIN_RUN, len(own) - 1
-    while lo <= hi:
-        size = (lo + hi) // 2
-        at = flat.find(own[-size:], cursor, end)
-        if at >= 0:
-            best, lo = (at, at + size), size + 1
+    cursor = 0
+    unplaced = 0
+    for chunk in chunks:
+        own = "".join(chunk.text[chunk.own_start :].split())
+        if not own:
+            out.append("")
+            continue
+        if ordered:
+            end = min(len(flat.text), cursor + _WINDOW + 4 * len(own) + unplaced)
+            at = flat.find(own, cursor, end)
         else:
-            hi = size - 1
-    if best is not None:
-        return best
-    at = flat.find(own, cursor)
-    if at < 0:
-        at = flat.find(own)
-    return (at, at + len(own)) if at >= 0 else None
+            at = flat.find(own, 0, len(flat.text))
+            if at >= 0 and flat.find(own, at + 1, len(flat.text)) >= 0:
+                at = -1
+        if at < 0:
+            out.append("")
+            unplaced += len(own)
+            continue
+        out.append(flat.label(at, at + len(own)))
+        if ordered:
+            cursor = at + len(own)
+            unplaced = 0
+    return out

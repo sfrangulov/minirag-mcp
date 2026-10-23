@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import NamedTuple
 
 from minirag_mcp.chunker.sections import (
     SENTENCE_END,
@@ -168,6 +169,19 @@ def section_atoms(body: str) -> list[Atom]:
     return atoms
 
 
+class Packed(NamedTuple):
+    """A retrieval unit, and where in it the unit's own text begins: everything before
+    `own_start` is context repeated from elsewhere (a breadcrumb, a table's header row,
+    the note on a split fence)."""
+
+    text: str
+    own_start: int
+
+
+def _owning(text: str, own: str) -> Packed:
+    return Packed(text, len(text) - len(own))
+
+
 def _render(prefix: str, header: str, body: str) -> str:
     parts = []
     if prefix:
@@ -233,7 +247,7 @@ def _force_split(text: str, wrap, count_tokens: CountTokens, budget: int) -> lis
     return [p for p in out if p.strip()]
 
 
-def _split_fence(prefix: str, code: str, count_tokens: CountTokens, budget: int) -> list[str]:
+def _split_fence(prefix: str, code: str, count_tokens: CountTokens, budget: int) -> list[Packed]:
     """Cut a fence that ran past the ceiling, at line boundaries, marking every piece.
 
     Line boundaries rather than `_force_split`'s whitespace, because code read a line
@@ -252,7 +266,7 @@ def _split_fence(prefix: str, code: str, count_tokens: CountTokens, budget: int)
             pieces.append(rough)
         else:
             pieces += _force_split(rough, wrap, count_tokens, budget)
-    return [wrap(piece) for piece in pieces]
+    return [_owning(wrap(piece), piece) for piece in pieces]
 
 
 def _resolve_headers(
@@ -286,7 +300,7 @@ def _resolve_headers(
     return out
 
 
-def pack_section(section: Section, count_tokens: CountTokens, budget: int) -> list[str]:
+def pack_section(section: Section, count_tokens: CountTokens, budget: int) -> list[Packed]:
     """Retrieval units for one section, every one within `budget` tokens.
 
     The only unit that may exceed it is a closed fenced code block, which is atomic —
@@ -297,7 +311,7 @@ def pack_section(section: Section, count_tokens: CountTokens, budget: int) -> li
         return []
     prefix = _choose_prefix(section.prefixes, count_tokens, budget)
     atoms = _resolve_headers(atoms, prefix, count_tokens, budget)
-    units: list[str] = []
+    units: list[Packed] = []
     run: list[Atom] = []
 
     def flush() -> None:
@@ -308,14 +322,14 @@ def pack_section(section: Section, count_tokens: CountTokens, budget: int) -> li
         rendered = _render(prefix, header, body)
         if run[0].kind == CODE:
             if count_tokens(rendered) <= budget * FENCE_BUDGET_MULTIPLE:
-                units.append(rendered)
+                units.append(_owning(rendered, body))
             else:
                 units.extend(_split_fence(prefix, body, count_tokens, budget))
         elif count_tokens(rendered) <= budget:
-            units.append(rendered)
+            units.append(_owning(rendered, body))
         else:
             units.extend(
-                _render(prefix, header, piece)
+                _owning(_render(prefix, header, piece), piece)
                 for piece in _force_split(
                     body, lambda t: _render(prefix, header, t), count_tokens, budget
                 )

@@ -293,3 +293,65 @@ def test_a_childless_bodiless_heading_reaches_a_chunk():
 def test_a_document_that_already_carries_its_title_is_not_seeded():
     chunks = chunk_markdown("# MD Title\n\nBody here.", count_tokens=count, title="MD Title")
     assert chunks[0].text == "# MD Title\n\nBody here."
+
+
+# --- each chunk's own text: what follows the context it repeats ---------------------
+
+
+def own(chunk) -> str:
+    return chunk.text[chunk.own_start :]
+
+
+def squeeze(text: str) -> str:
+    return "".join(text.split())
+
+
+def test_a_table_chunk_s_own_text_starts_after_the_header_it_repeats():
+    chunks = chunk_markdown(SPREADSHEET, count_tokens=count, budget=60)
+    later = [c for c in chunks if "| 2.0 |" in c.text]
+    assert later and all(c.own_start > 0 for c in later)
+    for c in later:
+        assert "Unnamed" not in own(c) and own(c).startswith("|")
+
+
+def test_a_heading_chunk_s_own_text_starts_after_its_breadcrumb():
+    markdown = "# Part\n\n## Scope\n\n" + "Clause text of the scope. " * 30
+    chunks = chunk_markdown(markdown, count_tokens=count)
+    assert len(chunks) > 1
+    for c in chunks:
+        assert c.text.startswith("Part > Scope\n\n")
+        assert own(c).startswith("Clause")
+
+
+def test_the_seeded_title_is_not_the_first_chunk_s_own_text():
+    chunks = chunk_markdown("Body of the document.", count_tokens=count, title="Some Title")
+    assert chunks[0].text.startswith("# Some Title")
+    assert own(chunks[0]) == "Body of the document."
+
+
+def test_a_split_fence_s_note_is_not_its_own_text():
+    code = "```python\n" + "\n".join(f"line_{i} = {i}" for i in range(400)) + "\n```"
+    chunks = chunk_markdown(code, count_tokens=count)
+    pieces = [c for c in chunks if FENCE_SPLIT_NOTE in c.text]
+    assert len(pieces) > 1
+    assert not any(FENCE_SPLIT_NOTE in own(c) for c in pieces)
+
+
+@pytest.mark.parametrize("name", CORPUS)
+@pytest.mark.parametrize("budget", [40, DEFAULT_TOKEN_BUDGET])
+def test_every_chunk_s_own_text_is_the_document_s_text_but_for_whitespace(name, budget):
+    """Page numbers are found by locating each chunk's own text in the document."""
+    markdown, title = CORPUS[name]
+    flat = squeeze(markdown)
+    for c in chunk_markdown(markdown, count_tokens=count, title=title, budget=budget):
+        text = squeeze(own(c))
+        assert text in flat, repr(c.text[:200])
+
+
+def test_a_transcript_whose_clock_goes_back_is_not_in_document_order():
+    from minirag_mcp.chunker import in_document_order
+
+    turns = "\n".join(f"{m}:00\nTurn {m}." for m in range(0, 8))
+    assert in_document_order(turns)
+    assert not in_document_order(turns + "\n" + turns)
+    assert in_document_order("# A\n\nText.\n\n# B\n\nMore.")

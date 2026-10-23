@@ -160,9 +160,10 @@ def create_app(
         added is deleted from the index and counted under deleted.
 
         unreadable counts indexed sources this installation cannot read
-        because an optional extra is absent (images need [ocr]); each one
-        appears in errors saying it was kept rather than deleted, but it is
-        not a failure and does not make the job fail.
+        because an optional extra is absent (images need [ocr], and so does
+        reading again a PDF that was read with OCR before page numbers were
+        stored); each one appears in errors saying it was kept as it is, but
+        it is not a failure and does not make the job fail.
 
         A folder the scan could not see into (a missing root, one without read
         permission, an empty folder where a root was mounted) also appears in
@@ -259,11 +260,9 @@ def create_app(
         small to act on. A chunk indexed before parent sections existed
         has parentId null and no entry; re-sync to fill it in.
 
-        A hit from a PDF file also carries `pages`, the page or pages its
-        text came from ("12" or "12-13"), which is how a person finds the
-        passage in the original; other sources have none. Name
-        the page in your answer when the user will want to check a
-        passage. The Sources list below stays one bare path per document.
+        A hit from a PDF file also carries `pages`, the page or pages of
+        the file its text came from ("12" or "12-13"); a hit from any other
+        source, or whose page is not certain, has none.
 
         topK must be at least 1 and is capped at 100; a larger value is
         silently clamped to the cap rather than rejected.

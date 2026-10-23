@@ -17,7 +17,6 @@ from minirag_mcp import literal, ocr
 from minirag_mcp.chunker import shared_lines
 from minirag_mcp.config import Config
 from minirag_mcp.ingest import ignore
-from minirag_mcp.ingest.pages import predates_pages
 from minirag_mcp.ingest.pipeline import IngestResult
 from minirag_mcp.ingest.scanner import FileState, compute_states, scan_roots
 from minirag_mcp.labels.filters import (
@@ -141,15 +140,29 @@ def pages_status(store: Store) -> dict:
     Absent when no PDF predates page numbers, so an index that is up to date sees the
     status it always had.
     """
-    unpaged = sum(1 for info in store.list_sources() if predates_pages(info))
+    unpaged = store.unpaged_pdfs()
     if not unpaged:
         return {}
-    return {
-        "unpagedSourceCount": unpaged,
-        "pagesWarning": f"{unpaged} PDF document(s) were indexed before page numbers were "
-        "stored, so their results carry no `pages`. The next sync (sync_start, or "
-        "`minirag-mcp sync`) reads them again to add them.",
-    }
+    head = (
+        f"{len(unpaged)} PDF document(s) were indexed before page numbers were stored, so "
+        "their results carry no `pages`."
+    )
+    if "pages" in store.missing_columns:
+        warning = (
+            f"{head} This index has no column for them and could not gain one when it was "
+            "opened, without write access or while another process was writing it. Open it "
+            "with write access and no other writer — `minirag-mcp sync` does — and that "
+            "sync reads them again."
+        )
+    else:
+        warning = f"{head} The next sync (sync_start, or `minirag-mcp sync`) reads them again."
+        scanned = 0 if ocr.available() else sum(1 for engine in unpaged.values() if engine)
+        if scanned:
+            warning += (
+                f" {scanned} of them were read with OCR, which this install lacks, so a sync "
+                f"keeps them as they are; {ocr.INSTALL_HINT}."
+            )
+    return {"unpagedSourceCount": len(unpaged), "pagesWarning": warning}
 
 
 def signature_status(store: Store) -> dict:

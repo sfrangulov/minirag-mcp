@@ -465,3 +465,28 @@ def test_an_index_that_cannot_gain_the_page_column_still_searches(tmp_path, monk
     assert store.schema_migrated and store.missing_columns == ("pages",)
     assert not store.get_source("/a.pdf").pages_recorded
     assert [r.pages for r in store.search("clause", [0.1] * 8, top_k=1)] == [""]
+    assert store.unpaged_pdfs() == {"/a.pdf": ""}
+
+    store.replace_source("/b.md", [replace(rec("/b.md", 0, "written anyway"), pages="")])
+    assert [c.text for c in store.all_chunks("/b.md")] == ["written anyway"]
+
+
+def test_the_pdfs_without_pages_are_found_by_query_with_their_ocr_engine(tmp_path):
+    db_path = tmp_path / "db"
+    rows = [
+        _row("/a.pdf", 0, "x"),
+        _row("/B.PDF", 0, "y") | {"ocr_engine": "rapidocr"},
+        _row("/c.md", 0, "z"),
+        _row("/d.pdf", 0, "w") | {"source_type": "data"},
+    ]
+    _older_table(db_path, {"pages"}, rows)
+    store = Store(db_path, dim=8)
+    assert store.unpaged_pdfs() == {"/a.pdf": "", "/B.PDF": "rapidocr"}
+    store.replace_source("/a.pdf", [replace(rec("/a.pdf", 0, "x"), pages="1")])
+    assert store.unpaged_pdfs() == {"/B.PDF": "rapidocr"}
+
+
+def test_a_moved_source_keeps_its_pages(store):
+    store.replace_source("/a.pdf", [replace(rec("/a.pdf", 0, "x"), pages="3-4")])
+    store.move_source("/a.pdf", "/sub/a.pdf", mtime=2.0)
+    assert [c.pages for c in store.all_chunks("/sub/a.pdf")] == ["3-4"]

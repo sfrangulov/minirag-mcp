@@ -7,6 +7,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from minirag_mcp import ocr
 from minirag_mcp.chunker import SCHEME_VERSION
 from minirag_mcp.ingest import ignore
 from minirag_mcp.ingest.pages import predates_pages
@@ -52,6 +53,10 @@ class SyncDiff:
     # Indexed sources whose file reappeared elsewhere with the same name and bytes.
     # Neither side is in `to_delete` or `to_ingest`: the record is re-pathed instead.
     moved: list[Move] = field(default_factory=list)
+    # Unchanged PDFs that predate page numbers and were read with OCR, which this
+    # install lacks: read again they would lose their scanned pages and pass for
+    # current, so they are kept as they are.
+    kept_scans: list[Path] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -273,6 +278,14 @@ def _in_scope(path_str: str, scope: Path | None) -> bool:
     return is_under(str(Path(path_str)), str(scope))
 
 
+def _needs_ocr_for_pages(prior: SourceInfo) -> bool:
+    return predates_pages(prior) and bool(prior.ocr_engine) and not ocr.available()
+
+
+def _reread_for_pages(prior: SourceInfo, record_pages: bool) -> bool:
+    return record_pages and predates_pages(prior) and not _needs_ocr_for_pages(prior)
+
+
 def compute_diff(
     entries: list[ScanEntry],
     indexed: list[SourceInfo],
@@ -282,6 +295,7 @@ def compute_diff(
     roots: Sequence[Path] = (),
     blind: Sequence[tuple[Path, str | None]] = (),
     ignored: Sequence[Path] = (),
+    record_pages: bool = True,
 ) -> SyncDiff:
     """Compute sync diff: files to ingest, delete, and unchanged status.
 
@@ -293,7 +307,9 @@ def compute_diff(
     A source whose chunks predate the current chunking scheme is re-ingested whatever
     its bytes say. Its file has not changed; what it was cut into has. Without this,
     `status` would tell the user to re-sync and the re-sync would skip every file. A
-    PDF indexed before page numbers were stored is re-ingested for the same reason.
+    PDF indexed before page numbers were stored is re-ingested for the same reason,
+    unless the index has no column to record them in (`record_pages`), or the PDF was
+    read with OCR and this install has none: it is then in `kept_scans`.
 
     Deletion is proposed only for a source this installation could have scanned, or one
     whose file is gone. An extension in `KNOWN_EXTENSIONS` but not in the current
@@ -332,6 +348,7 @@ def compute_diff(
     to_ingest: list[Path] = []
     unchanged: list[Path] = []
     oversized: list[Path] = []
+    kept_scans: list[Path] = []
     seen: set[str] = set()
 
     for e in entries:
@@ -342,15 +359,15 @@ def compute_diff(
             oversized.append(e.path)
             continue
         prior = indexed_files.get(str(e.path))
-        if (
-            prior is None
-            or prior.scheme_version < SCHEME_VERSION
-            or prior.duplicated
-            or predates_pages(prior)
-        ):
+        if prior is None or prior.scheme_version < SCHEME_VERSION or prior.duplicated:
             to_ingest.append(e.path)
         elif prior.mtime == e.mtime or prior.file_hash == file_sha256(e.path):
-            unchanged.append(e.path)
+            if _reread_for_pages(prior, record_pages):
+                to_ingest.append(e.path)
+            elif record_pages and _needs_ocr_for_pages(prior):
+                kept_scans.append(e.path)
+            else:
+                unchanged.append(e.path)
         else:
             to_ingest.append(e.path)
 
@@ -381,7 +398,7 @@ def compute_diff(
     # behind cannot give. Behind a folder that cannot be listed the original may still
     # be there, so a copy elsewhere proves nothing.
     emptied = sorted(s for s, folder in hidden.items() if reason[folder] is None)
-    moved = _pair_moves(to_delete + emptied, to_ingest, indexed_files, entries)
+    moved = _pair_moves(to_delete + emptied, to_ingest, indexed_files, entries, record_pages)
     paired_sources = {m.source for m in moved}
     paired_paths = {m.path for m in moved}
     to_delete = [s for s in to_delete if s not in paired_sources]
@@ -416,6 +433,7 @@ def compute_diff(
         unreadable=sorted(unreadable),
         held=held,
         moved=moved,
+        kept_scans=kept_scans,
     )
 
 
@@ -441,14 +459,16 @@ def _pair_moves(
     to_ingest: list[Path],
     indexed: dict[str, SourceInfo],
     entries: list[ScanEntry],
+    record_pages: bool = True,
 ) -> list[Move]:
     """Pair each vanished source with a new path holding the same bytes under the same name.
 
     The name has to match because a title can come from it: a renamed file may need a
     different title, and only a re-ingest computes one. A source cut by an older
-    chunking scheme, or a PDF stored without page numbers, is not paired, since it needs
-    reading again anyway. Pairing is one to one, in path order, so two identical copies
-    of one vanished file move it to the first and ingest the second.
+    chunking scheme, or a PDF stored without page numbers that a sync would read again,
+    is not paired, since it needs reading again anyway. Pairing is one to one, in path
+    order, so two identical copies of one vanished file move it to the first and ingest
+    the second.
     """
     gone: dict[tuple[str, str], list[str]] = {}
     for source in to_delete:
@@ -457,7 +477,7 @@ def _pair_moves(
             prior.file_hash
             and prior.scheme_version >= SCHEME_VERSION
             and not prior.duplicated
-            and not predates_pages(prior)
+            and not _reread_for_pages(prior, record_pages)
         ):
             gone.setdefault((Path(source).name, prior.file_hash), []).append(source)
     if not gone:
@@ -501,6 +521,8 @@ def _indexed_state(prior: SourceInfo) -> str:
     """
     if prior.scheme_version < SCHEME_VERSION:
         return "stale_scheme"
+    if _needs_ocr_for_pages(prior):
+        return "unreadable"
     return "stale_pages" if predates_pages(prior) else "ingested"
 
 
@@ -519,7 +541,8 @@ def compute_states(
       its vectors were computed over differently cut text and are not comparable with
       new ones, so it needs re-ingesting all the same.
     - "stale_pages": an unchanged PDF indexed before page numbers were stored; a sync
-      reads it again to add them.
+      reads it again to add them. One that was read with OCR, which this install
+      lacks, is "unreadable" instead: no sync here can read it again.
     - "not_ingested": file not in index.
     - "unreadable": indexed, still on disk, but of a type this installation cannot read
       because an optional extra is absent (images need [ocr]). The scan never looked for

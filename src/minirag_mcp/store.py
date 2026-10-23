@@ -503,12 +503,19 @@ class Store:
             self._table.delete(clause)
             self._delete_signature(source)
             return
+        # An additive column this index could not gain reads as empty, and is written as
+        # nothing: the write must not fail on a column the table does not have.
+        absent = [c for c in self.missing_columns if c in _ADDITIVE_COLUMNS]
+        rows = [asdict(r) for r in records]
+        for row in rows:
+            for column in absent:
+                del row[column]
         (
             self._table.merge_insert(["id", "ingested_at"])
             .when_matched_update_all()
             .when_not_matched_insert_all()
             .when_not_matched_by_source_delete(clause)
-            .execute([asdict(r) for r in records])
+            .execute(rows)
         )
         self._sign(source, records)
 
@@ -971,6 +978,32 @@ class Store:
             **_label_fields(r),
             pages_recorded=_pages_recorded(rows),
         )
+
+    def unpaged_pdfs(self) -> dict[str, str]:
+        """PDF files with a chunk stored before page numbers were, each with its OCR
+        engine ("" when OCR read none of it). Asked of the index rather than listed from
+        every document, so `status` stays quick on a large one."""
+        present = set(self._table.schema.names)
+        clauses = ["source_type = 'file'", "lower(source) LIKE '%.pdf'"]
+        if "pages" in present:
+            clauses.append("pages IS NULL")
+        columns = ["source", *(["ocr_engine"] if "ocr_engine" in present else [])]
+        rows = (
+            self._table.search()
+            .where(" AND ".join(clauses))
+            .select(columns)
+            .limit(_LIST_LIMIT)
+            .to_arrow()
+        )
+        engines = (
+            rows.column("ocr_engine").to_pylist()
+            if "ocr_engine" in columns
+            else [""] * rows.num_rows
+        )
+        out: dict[str, str] = {}
+        for source, engine in zip(rows.column("source").to_pylist(), engines, strict=True):
+            out[source] = out.get(source) or engine or ""
+        return out
 
     def stale_chunk_count(self) -> int:
         """Chunks written by an older chunking scheme. Detected, never assumed.

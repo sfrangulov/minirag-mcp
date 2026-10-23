@@ -17,7 +17,7 @@ def _escape(text: str) -> str:
 
 def _content(page: str | Sequence[Line]) -> bytes:
     if isinstance(page, str):
-        return f"BT /F1 12 Tf 72 720 Td ({_escape(page)}) Tj ET".encode()
+        return f"BT /F1 12 Tf 72 720 Td ({_escape(page)}) Tj ET".encode("cp1252")
     ops = [f"BT /F1 12 Tf {_LEADING} TL 72 720 Td"]
     for line in page:
         if isinstance(line, tuple):
@@ -26,16 +26,16 @@ def _content(page: str | Sequence[Line]) -> bytes:
         else:
             ops.append(f"({_escape(line)}) Tj T*")
     ops.append("ET")
-    return " ".join(ops).encode()
+    return " ".join(ops).encode("cp1252")
 
 
 def build_pdf(pages: Sequence[str | Sequence[Line]]) -> bytes:
     """A valid single-font PDF. Each entry is one page: its text as a single line, or a
     list of lines; "" or [] is a page with no text.
 
-    Cyrillic cannot be encoded in the standard-font byte strings this builder
-    writes, so tests use ASCII markers; the OCR routing logic under test only
-    counts characters.
+    Text is written in the font's WinAnsi encoding, so Cyrillic cannot be set; tests
+    use ASCII markers, and a no-break space where they need one. The OCR routing logic
+    under test only counts characters.
     """
     objects: list[bytes] = []
 
@@ -43,7 +43,7 @@ def build_pdf(pages: Sequence[str | Sequence[Line]]) -> bytes:
         objects.append(body)
         return len(objects)  # object numbers are 1-based
 
-    font = add(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+    font = add(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>")
     page_ids = []
     kids_placeholder = add(b"")  # pages node, patched below
     for text in pages:

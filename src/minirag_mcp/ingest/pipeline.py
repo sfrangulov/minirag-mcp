@@ -276,7 +276,7 @@ class Pipeline:
         """Chunk, embed, label and store, replacing whatever `source` held before."""
         chunks = self._chunk(markdown, source=source, title=title, seed_title=seed_title)
         texts = [c.text for c in chunks]
-        chunk_pages = pages.chunk_pages(markdown, page_starts, texts)
+        chunk_pages = pages.chunk_pages(markdown, page_starts, chunks)
         vectors = self.embedder.embed_documents(texts)
         labels, label_problem = self._label(
             source=source,

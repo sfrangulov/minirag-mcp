@@ -112,6 +112,25 @@ def detect_category(markdown: str) -> str:
     return GENERIC
 
 
+def in_document_order(markdown: str, window: int = TRANSCRIPT_WINDOW_SECONDS) -> bool:
+    """Whether the sections `split_sections` cuts follow the order of their text.
+
+    Only a transcript whose clock goes back breaks it: its windows gather turns by time,
+    so a second sitting's first minutes land in the first sitting's windows.
+    """
+    if detect_category(markdown) != TRANSCRIPT:
+        return True
+    last = -1
+    for line in markdown.split("\n"):
+        match = TIMESTAMP_LINE.match(line)
+        if match:
+            start = _parse_timestamp(match.group(1)) // window
+            if start < last:
+                return False
+            last = start
+    return True
+
+
 def _parse_timestamp(text: str) -> int:
     parts = [int(p) for p in text.split(":")]
     while len(parts) < 3:

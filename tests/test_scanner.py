@@ -330,7 +330,7 @@ def test_a_pdf_indexed_before_page_numbers_is_read_again_and_listed_as_such(tmp_
     results would never carry a page."""
     from dataclasses import replace
 
-    pdf = tmp_path / "a.pdf"
+    pdf = tmp_path / "a.PDF"
     pdf.write_bytes(b"%PDF-fake")
     md = tmp_path / "b.md"
     md.write_text("unchanged")
@@ -360,3 +360,69 @@ def test_a_moved_pdf_from_before_page_numbers_is_read_again_rather_than_moved(tm
     diff = compute_diff(entries, [old], max_file_size=10**9, roots=[tmp_path])
     assert diff.moved == []
     assert diff.to_ingest == [pdf] and diff.to_delete == [old.source]
+
+
+def _scanned_before_pages(path):
+    from dataclasses import replace
+
+    return replace(
+        info(
+            str(path),
+            file_hash=file_sha256(path),
+            mtime=path.stat().st_mtime,
+            ocr_engine="rapidocr",
+        ),
+        pages_recorded=False,
+    )
+
+
+def test_a_pdf_read_with_ocr_is_kept_when_this_install_has_no_ocr(tmp_path, monkeypatch):
+    from minirag_mcp import ocr
+
+    pdf = tmp_path / "scan.pdf"
+    pdf.write_bytes(b"%PDF-fake")
+    indexed = [_scanned_before_pages(pdf)]
+    entries = scan_roots([tmp_path])
+
+    monkeypatch.setattr(ocr, "available", lambda: False)
+    diff = compute_diff(entries, indexed, max_file_size=10**9)
+    assert diff.to_ingest == [] and diff.unchanged == [] and diff.kept_scans == [pdf]
+    assert [s.state for s in compute_states(entries, indexed)] == ["unreadable"]
+
+    monkeypatch.setattr(ocr, "available", lambda: True)
+    diff = compute_diff(entries, indexed, max_file_size=10**9)
+    assert diff.to_ingest == [pdf] and diff.kept_scans == []
+    assert [s.state for s in compute_states(entries, indexed)] == ["stale_pages"]
+
+
+def test_a_moved_pdf_read_with_ocr_keeps_its_chunks_when_this_install_has_no_ocr(
+    tmp_path, monkeypatch
+):
+    from dataclasses import replace
+
+    from minirag_mcp import ocr
+
+    (tmp_path / "new").mkdir()
+    pdf = tmp_path / "new" / "scan.pdf"
+    pdf.write_bytes(b"%PDF-fake")
+    old = replace(_scanned_before_pages(pdf), source=str(tmp_path / "scan.pdf"))
+    monkeypatch.setattr(ocr, "available", lambda: False)
+    diff = compute_diff(scan_roots([tmp_path]), [old], max_file_size=10**9, roots=[tmp_path])
+    assert [m.path for m in diff.moved] == [pdf] and diff.to_ingest == []
+
+
+def test_pdfs_are_not_read_again_for_pages_an_index_has_no_column_for(tmp_path):
+    from dataclasses import replace
+
+    pdf = tmp_path / "a.pdf"
+    pdf.write_bytes(b"%PDF-fake")
+    indexed = [
+        replace(
+            info(str(pdf), file_hash=file_sha256(pdf), mtime=pdf.stat().st_mtime),
+            pages_recorded=False,
+        )
+    ]
+    entries = scan_roots([tmp_path])
+    assert compute_diff(entries, indexed, max_file_size=10**9).to_ingest == [pdf]
+    diff = compute_diff(entries, indexed, max_file_size=10**9, record_pages=False)
+    assert diff.to_ingest == [] and diff.unchanged == [pdf]

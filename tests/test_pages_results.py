@@ -12,7 +12,7 @@ from minirag_mcp.config import load_config
 from minirag_mcp.ingest import pages
 from minirag_mcp.ingest.pipeline import Pipeline
 from minirag_mcp.server import create_app
-from minirag_mcp.store import Store
+from minirag_mcp.store import TABLE, Store
 from pdf_builder import build_pdf
 
 RESULT_KEYS = {"text", "source", "title", "chunkIndex", "score", "distance", "parentId"}
@@ -174,7 +174,7 @@ async def test_a_pdf_whose_pages_could_not_be_told_is_not_read_again_and_again(
 ):
     env, flags = shells
     monkeypatch.setattr(pages, "page_count", lambda path: 7)
-    monkeypatch.setattr(pages, "text_pages", lambda path: [0, 1, 2, 3, 4, 5, 6])
+    monkeypatch.setattr(pages, "page_prints", lambda path: [])
     run_cli(["ingest", str(corpus), *flags], capsys)
     pdf = _hit(await call(env, fake_embedder, "query_documents", {"query": "indemnity"}), "pdf")
     assert "pages" not in pdf
@@ -193,3 +193,128 @@ def test_data_and_url_sources_are_never_counted_as_missing_pages(tmp_path, fake_
     store = Store(cfg.db_path, dim=fake_embedder.dim)
     assert [s.pages_recorded for s in store.list_sources()] == [False]
     assert not any(pages.predates_pages(s) for s in store.list_sources())
+    assert store.unpaged_pdfs() == {}
+
+
+async def test_a_pdf_named_in_capitals_is_a_pdf(corpus, shells, capsys, fake_embedder, tmp_path):
+    env, flags = shells
+    (corpus / "contract.pdf").rename(corpus / "CONTRACT.PDF")
+    run_cli(["ingest", str(corpus), *flags], capsys)
+    _age(tmp_path / "db", fake_embedder.dim)
+    assert (await call(env, fake_embedder, "status", {}))["unpagedSourceCount"] == 1
+    listed = (await call(env, fake_embedder, "list_files", {}))["files"]
+    assert {f["source"].rsplit("/", 1)[-1]: f["state"] for f in listed}["CONTRACT.PDF"] == (
+        "stale_pages"
+    )
+
+
+def test_status_counts_pdfs_without_pages_without_listing_every_document(
+    corpus, tmp_path, fake_embedder, monkeypatch
+):
+    from minirag_mcp.results import pages_status
+
+    cfg = load_config({"BASE_DIR": str(corpus), "DB_PATH": str(tmp_path / "db")})
+    store = Store(cfg.db_path, dim=fake_embedder.dim)
+    Pipeline(store, fake_embedder, cfg).ingest_file(corpus / "contract.pdf")
+    _age(cfg.db_path, fake_embedder.dim)
+    store = Store(cfg.db_path, dim=fake_embedder.dim)
+
+    def slow(*args, **kwargs):
+        raise AssertionError("status must not list every document to count these")
+
+    monkeypatch.setattr(Store, "list_sources", slow)
+    assert pages_status(store)["unpagedSourceCount"] == 1
+
+
+def test_the_cli_says_pp_for_a_range():
+    assert cli._on_pages("12-13") == " pp. 12-13"
+    assert cli._on_pages("12") == " p. 12"
+    assert cli._on_pages("") == ""
+
+
+# --- an upgrade on an install that cannot read what it indexed ----------------------
+
+LONG = "long enough text line to clear the default per-page threshold easily"
+
+
+async def test_a_pdf_read_with_ocr_is_kept_by_an_install_without_ocr(
+    tmp_path, capsys, monkeypatch, fake_embedder
+):
+    """Read again without OCR it would lose its scanned pages and then count as current;
+    a scan with no text layer at all would fail every sync."""
+    from minirag_mcp import ocr
+
+    root = tmp_path / "docs"
+    root.mkdir()
+    (root / "mixed.pdf").write_bytes(build_pdf([[LONG], ""]))
+    (root / "scan.pdf").write_bytes(build_pdf(["", ""]))
+    monkeypatch.setattr(cli, "_make_embedder", lambda cfg: fake_embedder)
+    env = {"BASE_DIR": str(root), "DB_PATH": str(tmp_path / "db")}
+    flags = ["--base-dir", env["BASE_DIR"], "--db-path", env["DB_PATH"]]
+    monkeypatch.setattr(ocr, "available", lambda: True)
+    monkeypatch.setattr(
+        ocr, "ocr_pdf", lambda path, config, todo: {i: f"Recognized page {i}" for i in todo}
+    )
+    code, out = run_cli(["sync", "--json", *flags], capsys)
+    assert code == 0 and json.loads(out)["counts"]["ingested"] == 2
+    _age(tmp_path / "db", fake_embedder.dim)
+
+    monkeypatch.setattr(ocr, "available", lambda: False)
+    code, out = run_cli(["sync", "--json", *flags], capsys)
+    report = json.loads(out)
+    assert code == 0
+    assert report["counts"]["ingested"] == 0 and report["counts"]["unreadable"] == 2
+    assert all("[ocr]" in e["error"] for e in report["errors"]), report["errors"]
+    store = Store(tmp_path / "db", dim=fake_embedder.dim)
+    assert all(
+        any("Recognized page" in c.text for c in store.all_chunks(str(root / name)))
+        for name in ("mixed.pdf", "scan.pdf")
+    )
+    listed = (await call(env, fake_embedder, "list_files", {}))["files"]
+    assert {f["state"] for f in listed} == {"unreadable"}
+    warning = (await call(env, fake_embedder, "status", {}))["pagesWarning"]
+    assert "2 of them were read with OCR" in warning
+
+    monkeypatch.setattr(ocr, "available", lambda: True)
+    code, out = run_cli(["sync", "--json", *flags], capsys)
+    assert code == 0 and json.loads(out)["counts"]["ingested"] == 2
+    store = Store(tmp_path / "db", dim=fake_embedder.dim)
+    assert all(c.pages for c in store.all_chunks(str(root / "scan.pdf")))
+
+
+# --- an index that could not gain the page column ----------------------------------
+
+
+def _no_new_columns(monkeypatch, db_path):
+    import lancedb
+
+    from store_helpers import _raise_commit_conflict
+
+    table_type = type(lancedb.connect(str(db_path)).open_table(TABLE))
+    monkeypatch.setattr(table_type, "add_columns", _raise_commit_conflict)
+
+
+@pytest.mark.filterwarnings("ignore:Could not add the pages column:RuntimeWarning")
+async def test_an_index_without_the_page_column_still_takes_writes_and_says_how_to_add_it(
+    corpus, shells, capsys, fake_embedder, monkeypatch, tmp_path
+):
+    env, flags = shells
+    run_cli(["ingest", str(corpus), *flags], capsys)
+    _age(tmp_path / "db", fake_embedder.dim)
+    _no_new_columns(monkeypatch, tmp_path / "db")
+
+    st = await call(env, fake_embedder, "status", {})
+    assert st["unpagedSourceCount"] == 1 and "write access" in st["pagesWarning"]
+
+    (corpus / "notes.md").write_text("# Notes\n\nRewritten after the upgrade.", encoding="utf-8")
+    code, out = run_cli(["sync", "--json", *flags], capsys)
+    report = json.loads(out)
+    assert code == 0, report
+    assert report["counts"]["ingested"] == 1 and report["counts"]["failed"] == 0
+
+    monkeypatch.undo()
+    monkeypatch.setattr(cli, "_make_embedder", lambda cfg: fake_embedder)
+    code, out = run_cli(["sync", "--json", *flags], capsys)
+    assert code == 0 and json.loads(out)["counts"]["ingested"] == 1
+    pdf = _hit(await call(env, fake_embedder, "query_documents", {"query": "indemnity"}), "pdf")
+    assert pdf["pages"]

@@ -17,7 +17,7 @@ from dataclasses import dataclass, replace
 from typing import Protocol
 
 from minirag_mcp.chunker.pack import join_parent, pack_section, shared_lines
-from minirag_mcp.chunker.sections import detect_category, split_sections
+from minirag_mcp.chunker.sections import detect_category, in_document_order, split_sections
 from minirag_mcp.chunker.tokens import CountTokens, estimate_tokens
 
 # Bumped whenever chunk boundaries or chunk text change meaning. Stored on every row so
@@ -38,6 +38,7 @@ __all__ = [
     "chunk_markdown",
     "detect_category",
     "estimate_tokens",
+    "in_document_order",
     "join_document",
     "join_parent",
     "shared_lines",
@@ -50,6 +51,11 @@ class Chunk:
 
     text: str
     parent_index: int
+    # Where the unit's own text begins: before it is context repeated in the unit — the
+    # seeded title, a breadcrumb, a time-window label, a table's header row. The own text
+    # is the document's own, but for whitespace, unless it is a heading that had no text
+    # of its own and was cleaned of its markup to stand in for it.
+    own_start: int = 0
 
 
 def _seed_title(body: str, title: str) -> str:
@@ -63,6 +69,21 @@ def _seed_title(body: str, title: str) -> str:
     left alone, which is also what keeps re-ingest idempotent.
     """
     return body if not title.strip() or title in body else f"# {title}\n\n{body}"
+
+
+def _past(text: str, start: int, seed: str) -> int:
+    """The offset after `seed` at `start` of `text`, ignoring whitespace; `start` when
+    the text does not begin with it."""
+    at = start
+    for ch in "".join(seed.split()):
+        while at < len(text) and text[at].isspace():
+            at += 1
+        if at >= len(text) or text[at] != ch:
+            return start
+        at += 1
+    while at < len(text) and text[at].isspace():
+        at += 1
+    return at
 
 
 def chunk_markdown(
@@ -80,16 +101,25 @@ def chunk_markdown(
     the caller has no real title, only a source id or a URL.
     """
     sections = split_sections(markdown, title=title)
+    seed = ""
     if sections:
-        sections[0] = replace(sections[0], body=_seed_title(sections[0].body, title))
+        seeded = _seed_title(sections[0].body, title)
+        if seeded != sections[0].body:
+            seed = f"# {title}"
+        sections[0] = replace(sections[0], body=seeded)
     chunks: list[Chunk] = []
     parent = 0
     for section in sections:
         units = pack_section(section, count_tokens, budget)
         if not units:
             continue
-        chunks += [Chunk(text=unit, parent_index=parent) for unit in units]
+        chunks += [
+            Chunk(text=unit.text, parent_index=parent, own_start=unit.own_start) for unit in units
+        ]
         parent += 1
+    if seed and chunks:
+        first = chunks[0]
+        chunks[0] = replace(first, own_start=_past(first.text, first.own_start, seed))
     return chunks
 
 
