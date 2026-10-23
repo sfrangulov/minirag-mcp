@@ -53,9 +53,10 @@ class Chunk:
     parent_index: int
     # Where the unit's own text begins: before it is context repeated in the unit — the
     # seeded title, a breadcrumb, a time-window label, a table's header row, even when the
-    # unit holds it as content. The own text is the document's own, but for whitespace;
-    # a heading cleaned of its markup to stand as text has none.
+    # unit holds it as content. The own text is the document's own, but for whitespace,
+    # unless `verbatim` is False: a heading cleaned of its markup, a piece of a word.
     own_start: int = 0
+    verbatim: bool = True
 
 
 def _seed_title(body: str, title: str) -> str:
@@ -101,7 +102,8 @@ def chunk_markdown(
         if not units:
             continue
         chunks += [
-            Chunk(text=unit.text, parent_index=parent, own_start=unit.own_start) for unit in units
+            Chunk(unit.text, parent, own_start=unit.own_start, verbatim=unit.verbatim)
+            for unit in units
         ]
         parent += 1
     return chunks

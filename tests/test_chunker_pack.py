@@ -362,10 +362,20 @@ def test_a_table_header_the_section_cut_repeats_is_never_own_text():
     assert not any("| Code | Batch | Location |" in own(c) for c in chunks)
 
 
-def test_a_heading_cleaned_to_stand_as_text_has_no_own_text():
+def test_a_heading_cleaned_to_stand_as_text_is_not_verbatim():
     chunks = chunk_markdown("# A\n\nText.\n\n## `config`\n\n## B\n\nMore.", count_tokens=count)
     [heading] = [c for c in chunks if "config" in c.text]
-    assert own(heading) == ""
+    assert not heading.verbatim
+    assert all(c.verbatim for c in chunks if c is not heading)
+
+
+def test_a_piece_cut_out_of_a_word_is_not_verbatim():
+    url = "https://example.com/" + "/".join(f"segment{i}" for i in range(80))
+    chunks = chunk_markdown(f"Intro words.\n\nLink: {url} ends here.", count_tokens=count)
+    cut = [c for c in chunks if not c.verbatim]
+    assert len(cut) > 1, "the address has to be cut inside itself to prove anything"
+    assert all("segment" in own(c) for c in cut)
+    assert [c.verbatim for c in chunks if "Intro" in c.text] == [True]
 
 
 def test_a_transcript_whose_clock_goes_back_is_not_in_document_order():

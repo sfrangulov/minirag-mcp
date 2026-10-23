@@ -268,6 +268,139 @@ def test_a_long_table_page_cut_before_its_footer_gets_no_wrong_page(tmp_path):
             assert label == expected, (label, chunk.text[:200])
 
 
+def test_a_piece_cut_out_of_a_long_address_is_not_placed_at_a_copy_on_another_page(tmp_path):
+    """The tail of an address too long for the budget is cut out of the middle of a word,
+    so it is not found where it is; the same characters standing as a word on page 2 look
+    unique."""
+    url = (
+        "https://docs.example.com/reference/api/v2/endpoints/customers/orders/invoices/"
+        "attachments/download?format=pdf&locale=en-US&session=abcdef0123456789"
+        "&tracking=newsletter_spring_campaign_2024&redirect=https%3A%2F%2Fportal.example.com"
+        "%2Faccount%2Fsettings%2Fnotifications%2Femail%2Fpreferences%2Fmarketing"
+        + "".join(f"%2Fsection{i}" for i in range(30))
+    )
+    alone = chunk_markdown(url, count_tokens=COUNT)
+    assert len(alone) > 1, "the address has to be cut to prove anything"
+    tail = alone[-1].text[alone[-1].own_start :]
+    path = _pdf(
+        tmp_path,
+        [
+            ["Page one intro sentence.", "", f"Link: {url}", "", "Page one outro sentence."],
+            ["Page two begins here.", "", f"Code {tail} is listed.", "", "Page two ends here."],
+        ],
+    )
+    for text, label in _chunk_pages(path):
+        if tail in text and "Code" not in text:
+            assert label in ("", "1"), (label, text)
+
+
+def _url_heavy(seed):
+    """Prose full of addresses, mail addresses and path words, eight pages of it."""
+    import random
+
+    rng = random.Random(seed)
+    words = "the supplier shall deliver goods to the customer within days of payment".split()
+    words += "invoice order notice term".split()
+    domains = ["example.com", "acme-trading.co.uk", "portal.example.org", "docs.vendor.io"]
+    paths = ["contacts", "support", "terms", "privacy", "orders", "invoices", "download"]
+    paths += ["en", "ru", "2024", "v2", "help"]
+
+    def address():
+        tail = "/".join(rng.choice(paths) for _ in range(rng.randint(1, 6)))
+        return f"https://{rng.choice(domains)}/{tail}"
+
+    def mail():
+        name = rng.choice(["ivan.petrov", "support", "billing", "o.smirnova"])
+        return f"{name}@{rng.choice(domains)}"
+
+    def line():
+        tokens = [rng.choice(words) for _ in range(rng.randint(3, 9))]
+        for _ in range(rng.randint(0, 2)):
+            at = rng.randrange(len(tokens) + 1)
+            extra = rng.choice([address(), mail(), rng.choice(paths), str(rng.randint(1, 40))])
+            tokens.insert(at, extra)
+        return " ".join(tokens) + "."
+
+    out = []
+    for number in range(1, 9):
+        lines = []
+        for _ in range(rng.randint(6, 14)):
+            lines.append(line())
+            if rng.random() < 0.3:
+                lines.append("")
+        out.append([*lines, "", f"Page {number}"])
+    return out
+
+
+def _placed_in_order(markdown, starts, chunks):
+    """Where each chunk is, found the plain way: its own text as a substring, first
+    after where the chunk before it ended. Only a reference for documents whose text is
+    distinctive enough for that to be right."""
+    flat = pages._Flat(markdown, starts)
+    out, cursor = [], 0
+    for chunk in chunks:
+        own = "".join(chunk.text[chunk.own_start :].split())
+        at = flat.text.find(own, cursor) if own else -1
+        out.append(flat.label(at, at + len(own)) if at >= 0 else None)
+        cursor = at + len(own) if at >= 0 else cursor
+    return out
+
+
+def test_documents_full_of_addresses_cut_to_small_budgets_get_no_wrong_page(tmp_path):
+    wrong, labelled, total = [], 0, 0
+    for seed in range(1, 13):
+        doc = parse_file(_pdf(tmp_path, _url_heavy(seed), name=f"n{seed}.pdf"))
+        for count in (estimate_tokens, COUNT):
+            for budget in (16, 24):
+                chunks = chunk_markdown(
+                    doc.markdown, count_tokens=count, title=doc.title, budget=budget
+                )
+                labels = pages.chunk_pages(doc.markdown, doc.page_starts, chunks)
+                reference = _placed_in_order(doc.markdown, doc.page_starts, chunks)
+                for chunk, label, where in zip(chunks, labels, reference, strict=True):
+                    total += 1
+                    labelled += bool(label)
+                    if label and where is not None and label != where:
+                        wrong.append((seed, budget, label, where, chunk.text[chunk.own_start :]))
+    assert wrong == []
+    assert labelled > total / 2
+
+
+def test_a_run_of_headings_with_nothing_under_them_does_not_shorten_the_search(tmp_path):
+    """Each heading line stands as a chunk that is not looked for. The text they hold
+    still lies between the chunks either side, so the next chunk is looked for that much
+    further on; otherwise a copy of its words in one of the headings, two pages early,
+    is all the search can see."""
+    cells = [
+        (x, 720 - 20 * r, f"c{r}{k}") for r in range(4) for k, x in enumerate((72, 200, 330, 460))
+    ]
+    heads = [f"# option number {n:03d} controls subsystem behaviour here" for n in range(150)]
+    heads[60] = "# enable verbose logging"
+    listing = [heads[i : i + 45] for i in range(0, 150, 45)]
+    listing[-1] = [*listing[-1], "enable verbose logging", "# end", "Closing remark omega."]
+    path = _pdf(tmp_path, [cells, ["Intro paragraph alpha for the listing."], *listing])
+    got = _chunk_pages(path)
+    [label] = [label for text, label in got if text.endswith("\n\nenable verbose logging")]
+    assert label in ("", "6")
+
+
+def test_a_chunk_running_from_converted_text_into_recognized_text_gets_no_range(tmp_path, fake_ocr):
+    """The recognized text of scanned page 1 is appended after page 3: a chunk holding
+    the end of one and the start of the other is on pages 3 and 1, which no range is."""
+    path = _pdf(
+        tmp_path,
+        [
+            "",
+            ["Alpha one is long enough to pass the threshold easily.", "# Intro", "Alpha text."],
+            ["Beta line on page three is long enough too.", "", "# Last section", "Short tail."],
+        ],
+    )
+    got = _chunk_pages(path, load_config({}, cwd=tmp_path))
+    [label] = [label for text, label in got if "Short tail" in text]
+    assert label in ("", "3")
+    assert not any(label == "1-3" for _, label in got)
+
+
 def test_a_page_of_bare_spaces_does_not_shift_the_pages_after_it(tmp_path):
     """markitdown strips each line's trailing whitespace, so the form feed that sits on
     a line of spaces is lost with them: counting form feeds puts Gamma on page 2."""
@@ -553,6 +686,39 @@ def test_out_of_order_chunks_are_placed_only_where_their_text_is_unique():
         _chunk("turn 0 of the first sitting."),
     ]
     assert pages.chunk_pages(markdown, _starts(markdown), chunks) == ["2", "1", ""]
+
+
+def test_chunks_that_hold_only_context_still_widen_the_search_by_it():
+    """Each heading below is held by a chunk only as context. Between the intro and the
+    last chunk lies all of it, with a copy of the last chunk's words on page 2."""
+    heads = [f"Heading line number {n:03d} of the long listing" for n in range(150)]
+    heads[40] = "Target words."
+    markdown = "Intro.\n\n\f" + "\n\n".join(heads[:75]) + "\n\n\f"
+    markdown += "\n\n".join(heads[75:]) + "\n\nTarget words."
+    chunks = [_chunk("Intro."), *(_chunk("", f"{h}\n\n") for h in heads), _chunk("Target words.")]
+    assert pages.chunk_pages(markdown, _starts(markdown), chunks)[-1] in ("", "3")
+
+
+def test_a_range_names_only_pages_that_follow_one_another():
+    markdown = "Tail of page three.\n\nRecognized words of page one."
+    starts = ((0, 3), (markdown.index("Recognized"), 1))
+    chunks = [_chunk(markdown)]
+    assert pages.chunk_pages(markdown, starts, chunks) == [""]
+
+
+def test_a_chunk_running_over_a_blank_page_spans_it(tmp_path):
+    """A page of bare spaces sends the page boundaries through the per-page check; the
+    blank page still sits between the two it separates."""
+    path = _pdf(
+        tmp_path,
+        [
+            ["# Part", "Clause starts on page one"],
+            " ",
+            ["and continues on page three.", "# Next", "More."],
+        ],
+    )
+    assert parse_file(path).markdown.count("\f") < 2
+    assert _page_of(_chunk_pages(path), "Clause starts") == "1-3"
 
 
 def test_text_on_an_unknown_page_gets_no_label():

@@ -172,14 +172,17 @@ def section_atoms(body: str) -> list[Atom]:
 class Packed(NamedTuple):
     """A retrieval unit, and where in it the unit's own text begins: everything before
     `own_start` is context repeated from elsewhere (a breadcrumb, a table's header row,
-    the note on a split fence)."""
+    the note on a split fence). `verbatim` is False when the own text is not the
+    document's as it stands: a heading cleaned of its markup, or a piece of a word cut
+    to fit the budget."""
 
     text: str
     own_start: int
+    verbatim: bool = True
 
 
-def _owning(text: str, own: str) -> Packed:
-    return Packed(text, len(text) - len(own))
+def _owning(text: str, own: str, verbatim: bool = True) -> Packed:
+    return Packed(text, len(text) - len(own), verbatim)
 
 
 def _skip(text: str, start: int, count: int) -> int:
@@ -210,7 +213,9 @@ def without_leading(units: Sequence[Packed], context: str) -> list[Packed]:
     for unit in units:
         mine = len("".join(unit.text[unit.own_start :].split()))
         take = min(left, mine)
-        out.append(Packed(unit.text, _skip(unit.text, unit.own_start, take)) if take else unit)
+        out.append(
+            unit._replace(own_start=_skip(unit.text, unit.own_start, take)) if take else unit
+        )
         left -= take
     return out
 
@@ -263,21 +268,23 @@ def _greedy(pieces: Sequence[str], glue: str, wrap, count_tokens: CountTokens, b
     return out
 
 
-def _force_split(text: str, wrap, count_tokens: CountTokens, budget: int) -> list[str]:
+def _force_split(text: str, wrap, count_tokens: CountTokens, budget: int) -> list[tuple[str, bool]]:
     """Last resort for one piece that does not fit: split at whitespace, then anywhere.
 
     This is what a single table row longer than the whole budget goes through. The row
     is never cut for the *reader* — the parent section still holds it intact — but its
     retrieval units have to fit the encoder, and a truncated vector would drop the tail
     entirely rather than merely index it separately.
+
+    Each piece comes with whether it is whole words: one cut out of a word is not.
     """
-    out: list[str] = []
+    out: list[tuple[str, bool]] = []
     for piece in _greedy(text.split(" "), " ", wrap, count_tokens, budget):
         if count_tokens(wrap(piece)) <= budget and piece:
-            out.append(piece)
+            out.append((piece, True))
         else:
-            out += _greedy(list(piece), "", wrap, count_tokens, budget)
-    return [p for p in out if p.strip()]
+            out += [(cut, False) for cut in _greedy(list(piece), "", wrap, count_tokens, budget)]
+    return [(p, whole) for p, whole in out if p.strip()]
 
 
 def _split_fence(prefix: str, code: str, count_tokens: CountTokens, budget: int) -> list[Packed]:
@@ -293,13 +300,13 @@ def _split_fence(prefix: str, code: str, count_tokens: CountTokens, budget: int)
     def wrap(text: str) -> str:
         return _render(prefix, "", f"{FENCE_SPLIT_NOTE}\n{text}")
 
-    pieces: list[str] = []
+    pieces: list[tuple[str, bool]] = []
     for rough in _greedy(code.split("\n"), "\n", wrap, count_tokens, budget):
         if rough.strip() and count_tokens(wrap(rough)) <= budget:
-            pieces.append(rough)
+            pieces.append((rough, True))
         else:
             pieces += _force_split(rough, wrap, count_tokens, budget)
-    return [_owning(wrap(piece), piece) for piece in pieces]
+    return [_owning(wrap(piece), piece, whole) for piece, whole in pieces]
 
 
 def _resolve_headers(
@@ -362,8 +369,8 @@ def pack_section(section: Section, count_tokens: CountTokens, budget: int) -> li
             units.append(_owning(rendered, body))
         else:
             units.extend(
-                _owning(_render(prefix, header, piece), piece)
-                for piece in _force_split(
+                _owning(_render(prefix, header, piece), piece, whole)
+                for piece, whole in _force_split(
                     body, lambda t: _render(prefix, header, t), count_tokens, budget
                 )
             )
@@ -383,7 +390,7 @@ def pack_section(section: Section, count_tokens: CountTokens, budget: int) -> li
         run.append(atom)
     flush()
     if not section.verbatim:
-        return [Packed(unit.text, len(unit.text)) for unit in units]
+        return [unit._replace(verbatim=False) for unit in units]
     return without_leading(units, section.repeated)
 
 

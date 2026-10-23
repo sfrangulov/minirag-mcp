@@ -40,11 +40,12 @@ _BLANK_LINES = re.compile(r"\n{2,}")
 # Characters markitdown adds to a page's text: the pipes and dashes of a Markdown table.
 _TABLE_MARKUP = frozenset("|-")
 # How far past the end of the chunk before it a chunk's own text may start, in
-# non-whitespace characters, on top of four times its own length, the length of any
-# chunks in between that could not be placed, and how far apart the copies of an
-# ambiguous chunk before it lay. What legitimately lies between two consecutive chunks
-# is what neither of them holds as its own: headings carried in a breadcrumb, a table's
-# header row.
+# non-whitespace characters, on top of four times its own length, the context it
+# repeats, the whole text of every chunk in between that could not be placed, and how
+# far apart the copies of an ambiguous chunk before it lay. What lies between two
+# consecutive chunks is what neither of them holds as its own: headings carried in a
+# breadcrumb, a table's header row. Too short a window is what lets a copy of a
+# chunk's text pass for unique while the text itself lies beyond it.
 _WINDOW = 4096
 
 
@@ -167,7 +168,14 @@ def _pdf_page_starts(path: Path, markdown: str) -> PageStarts:
                 index + 1,
             )
             return ()
-    return tuple((start, index + 1) for (start, _), index in zip(blocks, with_text, strict=True))
+    # A page without text starts where the next page with text does, so a range over it
+    # still reads as consecutive pages.
+    out: list[tuple[int, int]] = []
+    previous = -1
+    for (start, _), index in zip(blocks, with_text, strict=True):
+        out += [(start, page + 1) for page in range(previous + 1, index + 1)]
+        previous = index
+    return tuple(out)
 
 
 def stripped(text: str, starts: PageStarts) -> PageStarts:
@@ -230,11 +238,14 @@ class _Flat:
         last = bisect_right(self.keys, hi - 1) - 1
         if first < 0:
             return ""
-        touched = self.numbers[first : last + 1]
+        touched = list(dict.fromkeys(self.numbers[first : last + 1]))
         if UNKNOWN in touched:
             return ""
-        low, high = min(touched), max(touched)
-        return str(low) if low == high else f"{low}-{high}"
+        # A range claims every page between its ends, in reading order: text that runs
+        # from page 3 into recognized text appended from page 1 is on no such range.
+        if any(b != a + 1 for a, b in zip(touched, touched[1:], strict=False)):
+            return ""
+        return str(touched[0]) if len(touched) == 1 else f"{touched[0]}-{touched[-1]}"
 
 
 def chunk_pages(markdown: str, starts: PageStarts, chunks: Sequence[Chunk]) -> list[str]:
@@ -242,7 +253,8 @@ def chunk_pages(markdown: str, starts: PageStarts, chunks: Sequence[Chunk]) -> l
     where that is not certain.
 
     A chunk's own text is the document's text but for whitespace, so it is looked for
-    exactly, as whole words. Chunks normally follow the document, so each is looked for
+    exactly, as whole words; one that is not (a cleaned heading, a piece of a word) is
+    not looked for at all. Chunks normally follow the document, so each is looked for
     from the earliest place the one before it can have ended, and no further than a
     chunk can have drifted. A transcript whose clock goes back is cut out of order, so
     there the whole document is searched and no chunk's place bears on another's.
@@ -259,16 +271,17 @@ def chunk_pages(markdown: str, starts: PageStarts, chunks: Sequence[Chunk]) -> l
     slack = 0
     for chunk in chunks:
         own = "".join(chunk.text[chunk.own_start :].split())
-        if not own:
-            out.append("")
-            continue
-        if ordered:
-            found = flat.find(own, cursor, cursor + _WINDOW + 4 * len(own) + slack)
-        else:
-            found = flat.find(own, 0, len(flat.text))
+        context = len("".join(chunk.text[: chunk.own_start].split()))
+        found = []
+        if own and chunk.verbatim:
+            if ordered:
+                reach = _WINDOW + 4 * len(own) + context + slack
+                found = flat.find(own, cursor, cursor + reach)
+            else:
+                found = flat.find(own, 0, len(flat.text))
         if not found:
             out.append("")
-            slack += len(own)
+            slack += context + len(own)
             continue
         labels = {flat.label(at, at + len(own)) for at in found}
         out.append(labels.pop() if len(labels) == 1 else "")
