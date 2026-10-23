@@ -94,6 +94,44 @@ claude mcp add minirag --scope user --env BASE_DIR=/absolute/path/to/docs \
   -- uvx minirag-mcp
 ```
 
+### Claude Desktop (one-click)
+
+A Claude Desktop extension, `minirag-mcp.mcpb`, installs without `uv`, a terminal
+or a JSON file: open it (double-click, or **Settings > Extensions > Advanced
+settings > Install Extension…**), pick the **Documents folder**, then ask Claude to
+"sync minirag". It is not published yet; build it from a clone (`npx`, so Node.js,
+runs the official packer):
+
+```bash
+uv run python mcpb/build.py                         # writes dist/minirag-mcp.mcpb
+uv run python mcpb/smoke.py dist/minirag-mcp.mcpb   # install and start it as Desktop does
+```
+
+- Runs on Apple Silicon Macs with macOS 14 or later and on 64-bit Intel/AMD Windows.
+  Intel Macs and Windows on ARM cannot install it: `lancedb` publishes no package
+  for them.
+- Installing downloads the Python dependencies, about 650 MB on disk. The index
+  lives in a hidden `.minirag` folder inside the documents folder. The `[ocr]` and
+  `[classify]` extras are not included.
+- The file is unsigned: Desktop warns before installing it, and an organization
+  that requires signed extensions refuses it.
+
+**Verified:** the official `mcpb` CLI validates and packs it, and `mcpb/smoke.py`
+passes on an Apple Silicon Mac and, in CI (`.github/workflows/bundle.yml`), on
+GitHub's macOS (Apple Silicon) and Windows x64 runners. That script repeats outside
+the app what Claude Desktop 3.6556 does with such a file — unpack it into a folder
+whose path has a space, run `uv sync --quiet` there, start the server with the
+manifest's arguments, the picked folder and only the environment variables Desktop
+passes on — and checks `initialize`, the tool list and `status`; `--search` also
+indexes and finds a document (run on the Mac only). It uses uv 0.9.7, which Desktop
+downloads when a machine has no uv. **Not verified:** installing through the
+Desktop app itself, on macOS or Windows — the install dialog, the folder picker,
+the extension appearing under Connectors. The first start after installing took
+4–9 seconds on the CI runners but about 50 on the development Mac, loading native
+libraries for the first time (later starts: about 2); whether Desktop waits that
+long is untested. If the extension shows as failed right after installing, turn it
+off and on in **Settings > Extensions**.
+
 ### Claude Desktop
 
 Edit the config file — create it if it does not exist:

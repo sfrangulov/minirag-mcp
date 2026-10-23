@@ -1,0 +1,56 @@
+{
+  "manifest_version": "0.4",
+  "name": "minirag-mcp",
+  "display_name": "minirag",
+  "description": "Search a folder of your own documents from Claude. Indexing and search run on your computer.",
+  "long_description": "Point minirag at a folder of documents (PDF, Word, PowerPoint, Excel, HTML, EPUB, Markdown, plain text, meeting transcripts) and Claude can search it: semantic similarity plus a keyword boost for exact terms, names and codes, with every answer traceable to the file it came from.\n\nNothing is uploaded. Documents are converted and indexed on this computer, and the index is stored next to them in a hidden `.minirag` folder. Installing downloads the extension's Python dependencies; after that, the only network traffic is the one-time download of the embedding model (about 220 MB, on the first sync) and a web page you explicitly ask it to fetch.\n\n**First use:** ask Claude to \"sync minirag\", wait for the sync to finish, then ask questions about your documents.",
+  "author": {
+    "name": "Sergei Frangulov",
+    "url": "https://github.com/sfrangulov"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sfrangulov/minirag-mcp"
+  },
+  "homepage": "https://github.com/sfrangulov/minirag-mcp",
+  "documentation": "https://github.com/sfrangulov/minirag-mcp#readme",
+  "support": "https://github.com/sfrangulov/minirag-mcp/issues",
+  "server": {
+    "type": "uv",
+    "entry_point": "server/main.py",
+    "mcp_config": {
+      "command": "uv",
+      "args": ["run", "--directory", "${__dirname}", "--frozen", "python", "server/main.py"],
+      "env": {
+        "BASE_DIR": "${user_config.documents_folder}"
+      }
+    }
+  },
+  "user_config": {
+    "documents_folder": {
+      "type": "directory",
+      "title": "Documents folder",
+      "description": "The folder to make searchable. Everything inside it, including subfolders, can be indexed; nothing outside it can be read.",
+      "required": true
+    }
+  },
+  "tools": [
+    { "name": "sync_start", "description": "Index new and changed documents in the folder, and drop deleted ones" },
+    { "name": "sync_status", "description": "Report the progress of a sync" },
+    { "name": "query_documents", "description": "Search the documents by meaning and by exact terms" },
+    { "name": "find_mentions", "description": "List every document that mentions a word or phrase" },
+    { "name": "read_chunk_neighbors", "description": "Read the passages around a search hit" },
+    { "name": "read_file", "description": "Read a whole indexed document" },
+    { "name": "list_files", "description": "List the documents in the folder and whether each is indexed" },
+    { "name": "ingest_file", "description": "Index or re-index one file" },
+    { "name": "ingest_data", "description": "Index text supplied in the conversation" },
+    { "name": "ingest_url", "description": "Fetch a web page and index it" },
+    { "name": "delete_file", "description": "Remove a document from the index (the file itself is untouched)" },
+    { "name": "status", "description": "Report the configuration and the state of the index" }
+  ],
+  "keywords": ["rag", "search", "documents", "local", "pdf", "knowledge base"],
+  "license": "MIT AND Apache-2.0",
+  "compatibility": {
+    "platforms": ["darwin", "win32"]
+  }
+}
