@@ -25,6 +25,10 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
+          # For the repository's own environment, which has no upper bound and would
+          # otherwise take a runner Python newer than onnxruntime publishes for. The
+          # bundle carries its own bound and does not see this setting.
+          python-version: "3.13"
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
