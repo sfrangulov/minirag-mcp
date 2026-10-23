@@ -28,6 +28,7 @@ dependencies = [
     # UTF-8 is decoded by its detection. markitdown declares it with no floor; 3.0 is
     # the floor of the converter ingest/vtt.py is adapted from.
     "charset-normalizer>=3.0",
+    "pathspec>=0.12",
 ]
 
 [project.scripts]

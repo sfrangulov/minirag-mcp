@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from minirag_mcp.chunker import SCHEME_VERSION
+from minirag_mcp.ingest import ignore
 from minirag_mcp.ingest.parser import IMAGE_EXTENSIONS, SUPPORTED_EXTENSIONS, supported_extensions
 from minirag_mcp.ingest.pipeline import file_sha256
 from minirag_mcp.scope import is_under
@@ -117,7 +118,10 @@ def _contained(real: Path, real_roots: Sequence[Path]) -> bool:
 
 
 def scan_roots(
-    roots: Sequence[Path], blind: list[tuple[Path, str | None]] | None = None
+    roots: Sequence[Path],
+    blind: list[tuple[Path, str | None]] | None = None,
+    ignored: list[Path] | None = None,
+    rule_roots: Sequence[Path] | None = None,
 ) -> list[ScanEntry]:
     """Recursively scan roots for files with whitelisted extensions.
 
@@ -145,6 +149,12 @@ def scan_roots(
     caller comparing the result with the index must not read the absence of files under
     them as deletion.
 
+    Each walk honours the `.miniragignore` of the configured root it lies under:
+    `rule_roots`, which default to `roots` and differ only when a folder inside a root
+    is scanned on its own. A folder a rule excludes is not walked at all. When `ignored`
+    is given, it collects every excluded file and folder, a folder once; an unreadable
+    ignore file raises `IgnoreFileError`.
+
     Returns entries sorted by path.
     """
     real_roots = [Path(r).resolve() for r in roots]
@@ -156,18 +166,33 @@ def scan_roots(
         if blind is not None:
             blind.append((Path(error.filename), error.strerror or str(error)))
 
+    def excluded(rules: ignore.Rules | None, base: Path, p: Path, is_dir: bool) -> bool:
+        if rules is None or not rules.excludes(p.relative_to(base).as_posix(), is_dir):
+            return False
+        if ignored is not None:
+            ignored.append(p)
+        return True
+
     for root in roots:
+        base = ignore.owner(Path(root), rule_roots or roots) or Path(root)
+        rules = ignore.load(base)
         for dirpath, dirnames, filenames in os.walk(root, onerror=note):
             if blind is not None and dirpath == os.fspath(root) and not dirnames and not filenames:
                 blind.append((Path(root), None))
             dirnames[:] = sorted(
-                d for d in dirnames if not d.startswith(".") and d not in SKIP_DIRS
+                d
+                for d in dirnames
+                if not d.startswith(".")
+                and d not in SKIP_DIRS
+                and not excluded(rules, base, Path(dirpath) / d, True)
             )
             for name in sorted(filenames):
                 if name.startswith(".") or name.startswith(OFFICE_LOCK_PREFIX):
                     continue
                 p = Path(dirpath) / name
                 if p.suffix.lower() not in exts:
+                    continue
+                if excluded(rules, base, p, False):
                     continue
                 # Dedupe by resolved path to handle overlapping roots
                 resolved = p.resolve()

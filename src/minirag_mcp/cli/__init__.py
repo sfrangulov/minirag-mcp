@@ -15,6 +15,7 @@ from minirag_mcp import __version__
 from minirag_mcp.chunker import SCHEME_VERSION
 from minirag_mcp.config import Config, ConfigError, load_config
 from minirag_mcp.embedder import Embedder, EmbedderUnavailableError, UnknownModelError
+from minirag_mcp.ingest.ignore import IGNORE_FILE, excluded_by
 from minirag_mcp.ingest.pipeline import IngestResult, Pipeline
 from minirag_mcp.ingest.scanner import scan_roots
 from minirag_mcp.labels import LabelerSource
@@ -23,6 +24,7 @@ from minirag_mcp.lock import SyncLockBusy
 from minirag_mcp.results import (
     DEFAULT_FIND_LIMIT,
     QueryError,
+    ignore_status,
     ingest_reply,
     join_document,
     labels_status,
@@ -202,7 +204,14 @@ def ingest(
         for raw in paths:
             p = resolve_in_roots(raw, cfg.roots, require_absolute=False)
             blind: list[tuple[Path, str | None]] = []
-            candidates = [e.path for e in scan_roots([p], blind=blind)] if p.is_dir() else [p]
+            if p.is_dir() and (by := excluded_by(p, cfg.roots)) is not None:
+                failures.append({"source": str(p), "error": f"{p} is excluded by {by}"})
+                continue
+            candidates = (
+                [e.path for e in scan_roots([p], blind=blind, rule_roots=cfg.roots)]
+                if p.is_dir()
+                else [p]
+            )
             failures += [
                 {
                     "source": str(folder),
@@ -553,6 +562,8 @@ def list_cmd(
     _emit(payload, json, human or "no files found")
     for folder in payload["unlistedFolders"]:
         print(f"warn: {folder['path']}: {folder['message']}", file=sys.stderr)
+    if n := payload.get("ignored"):
+        print(f"note: {n} file(s) and folder(s) excluded by {IGNORE_FILE}", file=sys.stderr)
     _warn_filter(payload)
 
 
@@ -584,6 +595,7 @@ def status(
         "hybridWeight": cfg.hybrid_weight,
         "chunkScheme": SCHEME_VERSION,
         **ocr_status(),
+        **ignore_status(cfg.roots),
     }
     # An index that cannot be opened is reported, not raised: the server's `status` does
     # the same, and both are what a broken setup is diagnosed with.

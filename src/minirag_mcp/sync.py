@@ -14,6 +14,7 @@ from minirag_mcp.config import Config
 from minirag_mcp.ingest.pipeline import Pipeline
 from minirag_mcp.ingest.scanner import compute_diff, scan_roots
 from minirag_mcp.lock import SyncLock, sync_lock
+from minirag_mcp.scope import is_under
 from minirag_mcp.store import Store
 
 
@@ -43,6 +44,7 @@ class SyncJob:
             # different shape. For the same reason `relabelled` is here whether or not
             # the corpus has a classify.toml.
             "relabelled": 0,
+            "ignored": 0,
             "unreadable": 0,
             "failed": 0,
         }
@@ -104,7 +106,8 @@ def _run_sync_unlocked(
             on_event(msg)
 
     blind: list[tuple[Path, str | None]] = []
-    entries = scan_roots(list(roots), blind=blind)
+    ignored: list[Path] = []
+    entries = scan_roots(list(roots), blind=blind, ignored=ignored)
     diff = compute_diff(
         entries,
         store.list_sources(),
@@ -123,6 +126,7 @@ def _run_sync_unlocked(
         "moved": 0,
         "deleted": 0,
         "relabelled": 0,
+        "ignored": sum(1 for p in ignored if scope is None or is_under(str(p), str(scope))),
         "unreadable": len(diff.unreadable),
         "failed": 0,
     }

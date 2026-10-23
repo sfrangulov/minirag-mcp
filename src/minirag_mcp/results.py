@@ -16,6 +16,7 @@ from pathlib import Path
 from minirag_mcp import literal, ocr
 from minirag_mcp.chunker import join_parent, shared_lines
 from minirag_mcp.config import Config
+from minirag_mcp.ingest import ignore
 from minirag_mcp.ingest.pipeline import IngestResult
 from minirag_mcp.ingest.scanner import FileState, compute_states, scan_roots
 from minirag_mcp.labels.filters import (
@@ -151,6 +152,23 @@ def scheme_status(store: Store) -> dict:
             f"{stale} chunk(s) predate the current chunking scheme. {RESYNC_HINT}"
         )
     return out
+
+
+def ignore_status(roots: Sequence[Path]) -> dict:
+    """The `.miniragignore` half of `status`, identical for the server and the CLI.
+
+    Absent when no root has one, so a corpus without rules sees the status it always had.
+    """
+    files = []
+    for root in roots:
+        try:
+            rules = ignore.load(root)
+        except ignore.IgnoreFileError as e:
+            files.append({"file": str(Path(root) / ignore.IGNORE_FILE), "error": str(e)})
+            continue
+        if rules is not None:
+            files.append({"file": str(rules.file), "rules": rules.count})
+    return {"ignoreFiles": files} if files else {}
 
 
 def ocr_status() -> dict:
@@ -614,9 +632,11 @@ def list_payload(
         raise QueryError(f"sort must be 'date', got {sort!r}")
     label_filter, labeler = _parse_filter(store, labels, date_from, date_to, label_source)
     blind: list[tuple[Path, str | None]] = []
-    entries = scan_roots(roots, blind=blind)
+    ignored: list[Path] = []
+    entries = scan_roots(roots, blind=blind, ignored=ignored)
     if scopes:
         entries = [e for e in entries if any(is_under(str(e.path), p) for p in scopes)]
+        ignored = [p for p in ignored if any(is_under(str(p), s) for s in scopes)]
         blind = [
             (folder, error)
             for folder, error in blind
@@ -653,6 +673,8 @@ def list_payload(
         for st in states
     ]
     payload: dict = {"files": rows, "unlistedFolders": folders}
+    if ignored:
+        payload["ignored"] = len(ignored)
     if label_filter is not None and labeler is not None:
         counts = filter_counts(label_filter, infos, labeler.taxonomy, roots)
         pending = [

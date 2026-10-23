@@ -22,6 +22,7 @@ from minirag_mcp.labels import LabelerSource
 from minirag_mcp.labels.model import default_model_factory
 from minirag_mcp.results import (
     DEFAULT_FIND_LIMIT,
+    ignore_status,
     ingest_reply,
     join_document,
     labels_status,
@@ -141,6 +142,10 @@ def create_app(
         problem had left a facet unanswered. It stays 0 without a classify.toml.
         A labelling problem appears in errors with its message prefixed
         "labels:"; it is not a failure.
+
+        ignored counts the files and folders a .miniragignore rule excluded
+        from the scan, a folder once; a file indexed before its rule was
+        added is deleted from the index and counted under deleted.
 
         unreadable counts indexed sources this installation cannot read
         because an optional extra is absent (images need [ocr]); each one
@@ -423,6 +428,9 @@ def create_app(
         Indexed files under one are listed as "unlisted": still indexed and
         searchable, not checked against the disk.
 
+        `ignored`, present when a .miniragignore rule excluded anything,
+        counts the files and folders it left out, a folder once.
+
         `labels`, `dateFrom` and `dateTo` filter as in query_documents;
         sort="date" lists newest first, documents without a date last. Rows
         carry `labels` and `date` when present.
@@ -478,6 +486,9 @@ def create_app(
         when it is above zero, schemeWarning explains that those chunks need
         a re-sync to be rebuilt.
 
+        ignoreFiles, present when a root has a .miniragignore: each file with
+        its number of rules, or the error that stops scanning under its root.
+
         ocr names the OCR engine this install can use, or is "unavailable"
         when the optional extra is missing — scanned PDFs and images cannot
         be indexed then, and ocrHint says what to install.
@@ -497,6 +508,7 @@ def create_app(
             "hybridWeight": config.hybrid_weight,
             "chunkScheme": SCHEME_VERSION,
             **ocr_status(),
+            **ignore_status(config.roots),
         }
         try:
             c = ctx()

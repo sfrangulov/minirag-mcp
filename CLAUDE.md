@@ -94,6 +94,7 @@ src/minirag_mcp/
   ingest/vtt.py       WebVTT -> transcript turns, bypassing markitdown
   ingest/pipeline.py  parse -> chunk -> embed -> store (replace by source)
   ingest/scanner.py   recursive walk, extension whitelist, sha256 sync diff
+  ingest/ignore.py    .miniragignore: gitignore rules per root, loud when unreadable
   chunker/            structural split (code fences atomic) then semantic merge
   embedder.py         fastembed, lazy model load, unit-normalized vectors
   store.py            LanceDB: vectors + BM25 FTS over text and title, hybrid search

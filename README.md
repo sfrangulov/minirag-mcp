@@ -257,6 +257,39 @@ Two more ways to get content in without a file on disk:
   `ALLOW_PRIVATE_URLS` says otherwise — see
   [Security and Operation](#security-and-operation).
 
+### Excluding files
+
+A `.miniragignore` at the top of a document root keeps files out of the index, in
+`.gitignore` syntax, matched against paths relative to that root:
+
+```gitignore
+# drafts and anything personal
+drafts/
+/personal/
+*.tmp.docx
+!important.tmp.docx
+```
+
+It applies everywhere the disk is read:
+
+- `sync`, `list_files` and `minirag-mcp ingest <folder>` leave excluded files out.
+  A folder a rule excludes is not walked at all.
+- A file indexed before its rule was added is deleted from the index by the next
+  sync and counted under `deleted`.
+- `ingest_file` (and `minirag-mcp ingest <file>`) refuses an excluded file and
+  names the rule file. Indexing it anyway would only last until the next sync.
+
+What a rule excluded is counted, never dropped silently:
+
+- `sync` reports it as `ignored`, and `list_files` does too when anything was
+  excluded. A folder counts once.
+- `status` lists each `.miniragignore` with its number of rules, as `ignoreFiles`.
+
+An ignore file that exists but cannot be read stops the scan of its root with an
+error. Scanning past it would index exactly what it was written to keep out.
+Hidden files and folders, Office lock files (`~$…`), `node_modules`,
+`__pycache__` and virtualenvs are skipped with or without one.
+
 ## OCR for scanned documents
 
 A scanned PDF is a picture of a page. `markitdown` finds no text in it, so the
