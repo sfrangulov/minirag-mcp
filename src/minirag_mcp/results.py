@@ -134,6 +134,18 @@ def scheme_status(store: Store) -> dict:
     return out
 
 
+def fts_status(store: Store) -> dict:
+    """The keyword-search half of `status`, identical for the server and the CLI."""
+    out: dict = {"ftsLanguage": store.fts_language}
+    if store.fts_index_language != store.fts_language:
+        out["ftsWarning"] = (
+            f"RAG_FTS_LANGUAGE is {store.fts_language}, but the keyword index still stems "
+            f"{store.fts_index_language}: it could not be rebuilt on open. Reopen the index "
+            f"with write access and no concurrent writer to rebuild it."
+        )
+    return out
+
+
 def pages_status(store: Store) -> dict:
     """The page-number half of `status`, identical for the server and the CLI.
 

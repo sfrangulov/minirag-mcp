@@ -17,6 +17,7 @@ from lancedb.index import FTS
 
 from minirag_mcp import literal
 from minirag_mcp.chunker import SCHEME_VERSION, join_document, join_parent
+from minirag_mcp.config import DEFAULT_FTS_LANGUAGE
 from minirag_mcp.lookalike import NUM_PERM, LookAlike, Signature, SignatureIndex, signature
 from minirag_mcp.scope import is_under, sql_clause, sql_str
 
@@ -27,6 +28,9 @@ _SIGN_BATCH = 64
 # Columns carrying BM25 indexes. `title` is indexed because for many document sets the
 # filename is where the document code and subject live, and nowhere else.
 FTS_COLUMNS = ("text", "title")
+# The stemmer language the FTS indexes were last built with. LanceDB does not expose it
+# back, and without a record a changed RAG_FTS_LANGUAGE could not be told from an old one.
+FTS_LANGUAGE_FILENAME = ".fts-language"
 _LIST_LIMIT = 2**31 - 1  # LanceDB scalar queries default to limit 10 — always set explicitly
 RRF_K = 60  # standard RRF damping constant
 GAP_FACTOR = 2.0  # relevance_cutoff boundary must exceed mean gap by this factor
@@ -295,8 +299,29 @@ class IndexOpenError(Exception):
     """The index folder cannot be created or opened."""
 
 
+def _read_fts_language(db_path: Path) -> str | None:
+    try:
+        value = (db_path / FTS_LANGUAGE_FILENAME).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return value or None
+
+
+def _write_fts_language(db_path: Path, language: str) -> None:
+    try:
+        (db_path / FTS_LANGUAGE_FILENAME).write_text(language + "\n", encoding="utf-8")
+    except OSError as e:
+        warnings.warn(
+            f"The BM25 indexes at {db_path} were built with the {language} stemmer, but "
+            f"recording that in {FTS_LANGUAGE_FILENAME} failed: {e}. Search is unaffected; "
+            f"the next open cannot tell which stemmer they use and may rebuild them again.",
+            RuntimeWarning,
+            stacklevel=4,
+        )
+
+
 class Store:
-    def __init__(self, db_path: Path, dim: int):
+    def __init__(self, db_path: Path, dim: int, fts_language: str = DEFAULT_FTS_LANGUAGE):
         try:
             db_path.mkdir(parents=True, exist_ok=True)
         except OSError as e:
@@ -319,6 +344,10 @@ class Store:
         self.dim = dim
         # FTS columns this instance could not index (see _ensure_fts_indices)
         self.missing_fts_indices: tuple[str, ...] = ()
+        # The stemmer configured, and the one the FTS indexes really use. They differ only
+        # while a language change could not be written (see _ensure_fts_indices).
+        self.fts_language = fts_language
+        self.fts_index_language = fts_language
         # Columns this instance could not add to an older index (see _ensure_scheme_columns)
         self.missing_columns: tuple[str, ...] = ()
         # False only when an older index is missing the chunking-scheme columns and they
@@ -426,19 +455,30 @@ class Store:
             )
 
     def _ensure_fts_indices(self, db_path: Path) -> None:
-        """Create any FTS index the table is missing — best effort, never fatal.
+        """Create any FTS index the table is missing, and rebuild the ones built with
+        another stemmer language — best effort, never fatal.
 
         Creating an FTS index on an empty table is supported (verified against
         lancedb 0.36), so a fresh table gets both here. Running this on open as well
         means an index built by an older version — `text` only — gains `title` search
         without a re-ingest of the corpus.
 
-        That upgrade is a write, and opening a database must not require write access:
-        a read-only copy would raise "Permission denied", and two processes opening the
+        The stemmer is fixed when an index is built, and LanceDB applies it to rows
+        added later too, so a changed RAG_FTS_LANGUAGE reaches an existing index only
+        through a rebuild. The language is recorded in FTS_LANGUAGE_FILENAME because
+        LanceDB does not report it; an index with no record was built by `FTS()`, whose
+        language is English. A rebuild re-reads every row and needs no embedding: under
+        a second for 165,000 chunks.
+
+        Both are writes, and opening a database must not require write access: a
+        read-only copy would raise "Permission denied", and two processes opening the
         same un-upgraded database race on the same commit ("Retryable commit conflict").
         Both are stepped over with a warning. Searching `fts_columns=["text", "title"]`
         against a table that only has the `text` index works — LanceDB searches the
         indexes it has — so the only cost is that titles stay out of keyword results.
+        An index that could not be rebuilt keeps answering in its old language, which
+        `fts_index_language` reports, and the record is left as it was so the next
+        open retries.
 
         Warnings go through `warnings.warn`, never `print`: stdout is the MCP stdio
         channel and anything written there corrupts the protocol.
@@ -447,23 +487,49 @@ class Store:
             indexed = {col for idx in self._table.list_indices() for col in idx.columns}
         except Exception:  # unreadable index manifest: treat every column as missing
             indexed = set()
+        recorded = _read_fts_language(db_path)
+        built = recorded or (DEFAULT_FTS_LANGUAGE if indexed else self.fts_language)
+        stale = built != self.fts_language
+        config = FTS(language=self.fts_language)
         missing: list[str] = []
+        created = rebuilt = not_rebuilt = 0
         for column in FTS_COLUMNS:
-            if column in indexed:
+            if column in indexed and not stale:
                 continue
             try:
-                self._table.create_index(column, config=FTS())
+                self._table.create_index(column, config=config, replace=True)
             except Exception as e:
-                missing.append(column)
-                warnings.warn(
-                    f"Could not create the BM25 index on the {column!r} column of the index "
-                    f"at {db_path}: {e}. Search still works, but {column} content is not "
-                    f"keyword-searchable until the index exists — reopen the database with "
-                    f"write access (and no concurrent writer) to retry.",
-                    RuntimeWarning,
-                    stacklevel=3,
-                )
+                if column in indexed:
+                    not_rebuilt += 1
+                    warnings.warn(
+                        f"Could not rebuild the BM25 index on the {column!r} column of the "
+                        f"index at {db_path} for RAG_FTS_LANGUAGE={self.fts_language}: {e}. "
+                        f"Keyword search still works, but with the {built} stemmer until the "
+                        f"index is rebuilt — reopen the database with write access (and no "
+                        f"concurrent writer) to retry.",
+                        RuntimeWarning,
+                        stacklevel=3,
+                    )
+                else:
+                    missing.append(column)
+                    warnings.warn(
+                        f"Could not create the BM25 index on the {column!r} column of the "
+                        f"index at {db_path}: {e}. Search still works, but {column} content "
+                        f"is not keyword-searchable until the index exists — reopen the "
+                        f"database with write access (and no concurrent writer) to retry.",
+                        RuntimeWarning,
+                        stacklevel=3,
+                    )
+            else:
+                if column in indexed:
+                    rebuilt += 1
+                else:
+                    created += 1
         self.missing_fts_indices = tuple(missing)
+        if not_rebuilt:
+            self.fts_index_language = built
+        elif (created or rebuilt) and recorded != self.fts_language:
+            _write_fts_language(db_path, self.fts_language)
 
     def _check_dim(self, db_path: Path, dim: int) -> None:
         """Fail early and clearly when an existing index has a different vector width.

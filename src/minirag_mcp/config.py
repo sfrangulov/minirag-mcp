@@ -15,6 +15,29 @@ DEFAULT_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 DEFAULT_MAX_FILE_SIZE = 104_857_600  # 100 MB
 DEFAULT_HYBRID_WEIGHT = 0.6
 GROUPING_MODES = ("similar", "related")
+DEFAULT_FTS_LANGUAGE = "English"
+# The stemmers LanceDB's FTS accepts (verified against lancedb 0.36). It refuses any
+# other spelling, case included, so a setting is matched against these and replaced.
+FTS_LANGUAGES = (
+    "Arabic",
+    "Danish",
+    "Dutch",
+    "English",
+    "Finnish",
+    "French",
+    "German",
+    "Greek",
+    "Hungarian",
+    "Italian",
+    "Norwegian",
+    "Portuguese",
+    "Romanian",
+    "Russian",
+    "Spanish",
+    "Swedish",
+    "Tamil",
+    "Turkish",
+)
 _TRUE = frozenset({"1", "true", "yes", "on"})
 _FALSE = frozenset({"0", "false", "no", "off", ""})  # an empty value reads as "not set"
 
@@ -38,6 +61,7 @@ class Config:
     allow_private_urls: bool
     ocr_lang: str = "eslav"
     ocr_min_chars_per_page: int = 25
+    fts_language: str = DEFAULT_FTS_LANGUAGE
 
 
 def _resolve(p: str) -> Path:
@@ -149,6 +173,13 @@ def load_config(
     if not ocr_lang:
         raise ConfigError("RAG_OCR_LANG must be a non-empty language code, e.g. 'eslav'")
 
+    fts_raw = env.get("RAG_FTS_LANGUAGE", DEFAULT_FTS_LANGUAGE).strip()
+    fts_language = next((lang for lang in FTS_LANGUAGES if lang.lower() == fts_raw.lower()), None)
+    if fts_language is None:
+        raise ConfigError(
+            f"RAG_FTS_LANGUAGE must be one of {', '.join(FTS_LANGUAGES)}, got {fts_raw!r}"
+        )
+
     return Config(
         roots=roots,
         db_path=db_path,
@@ -169,4 +200,5 @@ def load_config(
         allow_private_urls=_bool(env, "ALLOW_PRIVATE_URLS"),
         ocr_lang=ocr_lang,
         ocr_min_chars_per_page=_int(env, "RAG_OCR_MIN_CHARS_PER_PAGE", 25, 0),
+        fts_language=fts_language,
     )

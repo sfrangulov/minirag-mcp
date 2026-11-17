@@ -24,6 +24,7 @@ from minirag_mcp.lock import SyncLockBusy
 from minirag_mcp.results import (
     DEFAULT_FIND_LIMIT,
     QueryError,
+    fts_status,
     ignore_status,
     ingest_reply,
     labels_status,
@@ -128,7 +129,7 @@ def _load(
     try:
         cfg = _load_cfg(base_dir, db_path, cache_dir, model_name)
         emb = _make_embedder(cfg)
-        store = Store(cfg.db_path, dim=emb.dim)
+        store = Store(cfg.db_path, dim=emb.dim, fts_language=cfg.fts_language)
         return cfg, store, Pipeline(store, emb, cfg, labels=_label_source(cfg))
     except ConfigError as e:
         _fail(str(e))
@@ -626,10 +627,11 @@ def status(
     # An index that cannot be opened is reported, not raised: the server's `status` does
     # the same, and both are what a broken setup is diagnosed with.
     try:
-        store = Store(cfg.db_path, dim=_make_embedder(cfg).dim)
+        store = Store(cfg.db_path, dim=_make_embedder(cfg).dim, fts_language=cfg.fts_language)
         payload["chunkCount"] = store.chunk_count()
         payload["sourceCount"] = store.source_count()
         payload.update(scheme_status(store))
+        payload.update(fts_status(store))
         payload.update(signature_status(store))
         payload.update(pages_status(store))
         payload.update(labels_status(_label_source(cfg), store))
