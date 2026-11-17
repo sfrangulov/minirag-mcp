@@ -23,6 +23,7 @@ from minirag_mcp.labels import LabelerSource
 from minirag_mcp.labels.model import default_model_factory
 from minirag_mcp.results import (
     DEFAULT_FIND_LIMIT,
+    fts_status,
     ignore_status,
     ingest_reply,
     labels_status,
@@ -79,7 +80,7 @@ def create_app(
             emb = (
                 embedder if embedder is not None else Embedder(config.model_name, config.cache_dir)
             )
-            store = Store(config.db_path, dim=emb.dim)
+            store = Store(config.db_path, dim=emb.dim, fts_language=config.fts_language)
             labels = LabelerSource(
                 config.roots, config.cache_dir, model_factory or default_model_factory
             )
@@ -519,6 +520,10 @@ def create_app(
         when it is above zero, schemeWarning explains that those chunks need
         a re-sync to be rebuilt.
 
+        ftsLanguage is the stemmer keyword search uses (RAG_FTS_LANGUAGE).
+        ftsWarning, present only when the keyword index could not be rebuilt
+        after that setting changed, names the stemmer it still uses.
+
         unsignedSourceCount, present when above zero, counts indexed documents
         without the signature that finds their look-alikes, so no result names
         theirs; lookAlikesWarning says a sync computes them.
@@ -556,6 +561,7 @@ def create_app(
             out["chunkCount"] = c.store.chunk_count()
             out["sourceCount"] = c.store.source_count()
             out.update(scheme_status(c.store))
+            out.update(fts_status(c.store))
             out.update(signature_status(c.store))
             out.update(pages_status(c.store))
             out.update(labels_status(c.labels, c.store))
