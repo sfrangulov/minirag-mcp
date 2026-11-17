@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import stat
 import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -235,13 +236,16 @@ class Labeler:
             return INSTALL_HINT
         spec = self.taxonomy.model
         if spec is not None and spec.path is not None:
+            # stat(), not exists()/is_file(): from Python 3.14 those return False on a
+            # PermissionError, so an unreadable folder would be reported as a missing file.
             try:
-                if not spec.path.exists():
-                    return f"the classify model file {spec.path} does not exist"
-                if not spec.path.is_file():
-                    return f"the classify model file {spec.path} is not a file"
+                mode = spec.path.stat().st_mode
+            except (FileNotFoundError, NotADirectoryError):
+                return f"the classify model file {spec.path} does not exist"
             except OSError as e:
                 return f"the classify model file {spec.path} cannot be checked: {e.strerror or e}"
+            if not stat.S_ISREG(mode):
+                return f"the classify model file {spec.path} is not a file"
         failure = self._last_failure
         if failure is not None and failure[1] == self._conditions():
             return failure[0]
