@@ -1067,3 +1067,43 @@ def test_a_job_reports_the_same_count_keys_before_and_after_it_runs(env):
     seed(root)
     counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
     assert set(sync_mod.SyncJob(job_id="x").counts) == set(counts)
+
+
+def _unindexed(store):
+    return {
+        i.name: store._table.index_stats(i.name).num_unindexed_rows
+        for i in store._table.list_indices()
+    }
+
+
+# LanceDB indexes only the rows present when an index is built; later rows are searched
+# by brute force, scored per data fragment and returned out of score order.
+def test_sync_leaves_no_row_outside_the_keyword_indexes(env):
+    cfg, store, pipeline, root = env
+    seed(root)
+    run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    assert _unindexed(store) and set(_unindexed(store).values()) == {0}
+
+
+def test_a_sync_with_nothing_to_do_still_indexes_earlier_rows(env):
+    cfg, store, pipeline, root = env
+    seed(root)
+    for path in (root / "a.md", root / "sub" / "b.md"):
+        pipeline.ingest_file(path)
+    assert set(_unindexed(store).values()) != {0}
+    counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    assert counts["skipped"] == 2 and errors == []
+    assert set(_unindexed(store).values()) == {0}
+
+
+def test_an_index_update_failure_is_reported_not_raised(env, monkeypatch):
+    cfg, store, pipeline, root = env
+    seed(root)
+
+    def broken(*a, **kw):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(type(store._table), "optimize", broken)
+    counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    assert counts["ingested"] == 2
+    assert any("disk full" in e["error"] for e in errors)

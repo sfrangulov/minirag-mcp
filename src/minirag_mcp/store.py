@@ -531,6 +531,27 @@ class Store:
         elif (created or rebuilt) and recorded != self.fts_language:
             _write_fts_language(db_path, self.fts_language)
 
+    def update_indices(self) -> str | None:
+        """Fold rows written since the search indexes were built into them; the problem,
+        if any, as text.
+
+        LanceDB indexes only the rows present when an index is built. Rows added later
+        are searched by brute force, scored with statistics that depend on how the rows
+        happen to be split into data fragments, and returned out of score order — and
+        every ingest writes a fragment of its own, while the FTS indexes are built on the
+        empty table. `optimize` also compacts those fragments.
+        """
+        try:
+            stale = any(
+                self._table.index_stats(i.name).num_unindexed_rows
+                for i in self._table.list_indices()
+            )
+            if stale:
+                self._table.optimize()
+        except Exception as e:
+            return f"could not update the search indexes of {self.db_path}: {e}"
+        return None
+
     def _check_dim(self, db_path: Path, dim: int) -> None:
         """Fail early and clearly when an existing index has a different vector width.
 
