@@ -89,3 +89,21 @@ def outside_root(db: Path, root: Path) -> Path:
 
 def corpus_files(corpus: Path = CORPUS) -> list[str]:
     return sorted(p.relative_to(corpus).as_posix() for p in corpus.rglob("*.txt"))
+
+
+def sample_ids(questions: list[Question], fraction: float = 0.2) -> list[str]:
+    """A type-proportional sample, evenly spaced within each type, at least one per type.
+
+    The leaderboard's overall mixes types in the full set's proportions; a sample that
+    keeps them estimates that mix, and its questions are scored for every published
+    system too, so the comparison is on the same questions.
+    """
+    by_type: dict[str, list[Question]] = defaultdict(list)
+    for q in questions:
+        by_type[q.question_type].append(q)
+    ids = []
+    for group in by_type.values():
+        n = len(group)
+        k = max(1, round(n * fraction))
+        ids += [group[int((i + 0.5) * n / k)].question_id for i in range(k)]
+    return sorted(ids)

@@ -59,3 +59,20 @@ def test_gate_fires_on_an_mrr_drop_over_two_hundredths():
 
 def test_gate_ignores_a_per_type_drop_alone():
     assert not gate(_summary(80.0, 0.6, per_type=40.0), _summary(80.0, 0.6, per_type=50.0))
+
+
+def test_deep_recall_bounds_what_reordering_can_win():
+    filler = [f"dsid_{i:032x}" for i in range(1, 60)]
+    row = {
+        "question_type": "basic",
+        "gold": [A],
+        "ranked": filler[:20],
+        "default": filler[:3],
+        "pool": 40,
+        "pool_recall": 100.0,
+        "deep": filler[:29] + [A] + filler[29:],
+    }
+    m = summarize([row])["overall"]
+    assert m["recall@10"] == 0.0
+    assert m["deep_recall@20"] == 0.0 and m["deep_recall@50"] == 100.0
+    assert m["recall_pool"] == 100.0 and m["pool_docs"] == 40

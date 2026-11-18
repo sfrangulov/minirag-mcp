@@ -127,3 +127,17 @@ def test_materialize_keeps_the_tree(tmp_path):
     dest = tmp_path / "sub"
     materialize(src, [f"slack/c/{A}__x.txt"], dest)
     assert (dest / "slack" / "c" / f"{A}__x.txt").read_text(encoding="utf-8") == "hello"
+
+
+def test_sample_ids_keep_the_type_mix():
+    from common import sample_ids
+
+    qs = _questions({"basic": 175, "semantic": 125, "high_level": 10, "misc": 2})
+    ids = sample_ids(qs)
+    by_type = {q.question_id: q.question_type for q in qs}
+    counts = {
+        t: sum(1 for i in ids if by_type[i] == t)
+        for t in ("basic", "semantic", "high_level", "misc")
+    }
+    assert counts == {"basic": 35, "semantic": 25, "high_level": 2, "misc": 1}
+    assert ids == sample_ids(qs) and len(set(ids)) == len(ids)

@@ -26,6 +26,9 @@ from subset import SEED, TOTAL, materialize, subset, subset_hash
 
 BASELINE = HERE / "baseline.json"
 KS = (5, 10, 20)
+# How deep a reranker could look: recall at these depths bounds what reordering can win.
+DEEP_KS = (10, 20, 50, 100)
+DEEP_TOP_K = 1000
 RECALL_DROP = 1.0
 MRR_DROP = 0.02
 
@@ -49,6 +52,22 @@ def reciprocal_rank(ranked: list[str], gold) -> float:
     return next((1.0 / (i + 1) for i, d in enumerate(ranked) if d in gold), 0.0)
 
 
+def _deep(store, emb, cfg, question: str, top_k: int) -> list[str]:
+    """Past `MAX_TOP_K`: the fused candidates a reranker could reorder."""
+    from minirag_mcp.results import aggregate_sources
+
+    results = store.search(
+        question,
+        emb.embed_query(question),
+        top_k=top_k,
+        hybrid_weight=cfg.hybrid_weight,
+        max_distance=cfg.max_distance,
+        grouping=cfg.grouping,
+        max_files=cfg.max_files,
+    )
+    return ranked_docs({"sources": aggregate_sources(results, cfg.roots)})
+
+
 def measure(store, emb, cfg, questions) -> list[dict]:
     from minirag_mcp.results import run_query
 
@@ -56,15 +75,19 @@ def measure(store, emb, cfg, questions) -> list[dict]:
     for q in questions:
         if not q.expected_doc_ids:
             continue
-        wide = ranked_docs(run_query(store, emb, cfg, q.question, top_k=100))
+        pool = ranked_docs(run_query(store, emb, cfg, q.question, top_k=100))
         default = ranked_docs(run_query(store, emb, cfg, q.question, top_k=8))
+        deep = _deep(store, emb, cfg, q.question, DEEP_TOP_K)
         rows.append(
             {
                 "question_id": q.question_id,
                 "question_type": q.question_type,
                 "gold": list(q.expected_doc_ids),
-                "ranked": wide[: max(KS)],
+                "ranked": pool[: max(KS)],
+                "pool": len(pool),
+                "pool_recall": recall_at(pool, q.expected_doc_ids, len(pool) or 1),
                 "default": default,
+                "deep": deep[: max(DEEP_KS)],
             }
         )
     return rows
@@ -79,6 +102,13 @@ def _metrics(rows: list[dict]) -> dict:
     out["recall_default_call"] = round(
         sum(recall_at(r["default"], r["gold"], len(r["default"]) or 1) for r in rows) / n, 2
     )
+    if rows and "deep" in rows[0]:
+        out["pool_docs"] = round(sum(r["pool"] for r in rows) / n, 1)
+        out["recall_pool"] = round(sum(r["pool_recall"] for r in rows) / n, 2)
+        for k in DEEP_KS:
+            out[f"deep_recall@{k}"] = round(
+                sum(recall_at(r["deep"], r["gold"], k) for r in rows) / n, 2
+            )
     return out
 
 
@@ -129,7 +159,9 @@ def _open(db: Path, corpus: Path):
 def _print(summary: dict, baseline: dict | None = None) -> None:
     def line(name: str, m: dict, b: dict | None) -> str:
         cells = []
-        for key in ("recall@5", "recall@10", "recall@20", "mrr", "recall_default_call"):
+        keys = ("recall@5", "recall@10", "recall@20", "mrr", "recall_default_call")
+        keys += tuple(k for k in ("recall_pool", "deep_recall@50", "deep_recall@100") if k in m)
+        for key in keys:
             delta = f" ({m[key] - b[key]:+.2f})" if b and key in b else ""
             cells.append(f"{key} {m[key]}{delta}")
         return f"{name:<28} n={m['n']:<4} " + "  ".join(cells)

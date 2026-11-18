@@ -79,3 +79,18 @@ def test_runs_cannot_leave_commands_running_in_the_background():
     from run import run_env
 
     assert run_env()["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] == "1"
+
+
+def test_utilization_is_the_last_reported_weekly_share(tmp_path):
+    from run import utilization
+
+    def event(u):
+        return {
+            "type": "rate_limit_event",
+            "rate_limit_info": {"unifiedWindows": {"seven_day": {"utilization": u}}},
+        }
+
+    _write(tmp_path / "q.jsonl", [event(0.46), {"type": "assistant"}, event(0.47)])
+    assert utilization(tmp_path / "q.jsonl") == 0.47
+    _write(tmp_path / "r.jsonl", [{"type": "result"}])
+    assert utilization(tmp_path / "r.jsonl") is None

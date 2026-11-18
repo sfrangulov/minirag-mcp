@@ -30,7 +30,17 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from answers import final_result
-from common import BENCH, CORPUS, INDEX, REPO, Question, load_questions, outside_root, pilot_ids
+from common import (
+    BENCH,
+    CORPUS,
+    INDEX,
+    REPO,
+    Question,
+    load_questions,
+    outside_root,
+    pilot_ids,
+    sample_ids,
+)
 
 ARMS = ("minirag", "files")
 MODEL = "claude-opus-5-5"
@@ -113,6 +123,24 @@ def limited(result: dict | None) -> bool:
     if not result or not result.get("is_error"):
         return False
     return bool(LIMIT_RE.search(json.dumps(result)))
+
+
+def utilization(transcript: Path) -> float | None:
+    """The account's seven-day usage as the last rate-limit event of a run reported it."""
+    last = None
+    if not transcript.exists():
+        return None
+    for line in transcript.read_text(encoding="utf-8").splitlines():
+        if '"rate_limit_event"' not in line:
+            continue
+        try:
+            info = json.loads(line).get("rate_limit_info") or {}
+        except json.JSONDecodeError:
+            continue
+        window = (info.get("unifiedWindows") or {}).get("seven_day") or {}
+        if window.get("utilization") is not None:
+            last = float(window["utilization"])
+    return last
 
 
 def done(raw: Path, qid: str) -> bool:
@@ -219,6 +247,8 @@ def run_one(cmd: list[str], raw: Path, qid: str, limit: int = TIME_LIMIT) -> dic
 def select_ids(questions: list[Question], spec: str) -> list[str]:
     if spec == "pilot":
         return pilot_ids(questions)
+    if spec == "sample":
+        return sample_ids(questions)
     if spec == "all":
         return [q.question_id for q in questions]
     wanted = spec.split(",")
@@ -235,6 +265,12 @@ def main() -> int:
     ap.add_argument("--ids", default="pilot")
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--parallel", type=int, default=4)
+    ap.add_argument(
+        "--max-utilization",
+        type=float,
+        required=True,
+        help="stop once the account's seven-day usage reaches this share (0-1)",
+    )
     ap.add_argument("--model", default=MODEL)
     ap.add_argument("--db", type=Path, default=INDEX)
     ap.add_argument("--corpus", type=Path, default=CORPUS)
@@ -275,6 +311,7 @@ def main() -> int:
     todo = [qid for qid in ids if not done(raw, qid)]
     print(f"{args.arm}: {len(ids) - len(todo)} done, {len(todo)} to run", flush=True)
     stop = threading.Event()
+    over = threading.Event()
     streak = [0]
     lock = threading.Lock()
 
@@ -299,11 +336,21 @@ def main() -> int:
                 return
             streak[0] = 0
             state = "timeout" if result is None else ("error" if result.get("is_error") else "ok")
-            print(f"{qid}: {state} in {time.monotonic() - started:.0f}s", flush=True)
+            used = utilization(raw / f"{qid}.jsonl")
+            print(
+                f"{qid}: {state} in {time.monotonic() - started:.0f}s, week at {used}", flush=True
+            )
+            if used is not None and used >= args.max_utilization:
+                print(f"weekly usage {used} reached the cap {args.max_utilization}", flush=True)
+                over.set()
+                stop.set()
 
     with ThreadPoolExecutor(max_workers=args.parallel) as pool:
         list(pool.map(work, todo))
     left = [qid for qid in ids if not done(raw, qid)]
+    if over.is_set():
+        print(f"stopped at the weekly usage cap; {len(left)} left; resume with a higher cap")
+        return 3
     if stop.is_set():
         print(f"stopped on usage limits; {len(left)} left; re-run the same command to resume")
         return 2

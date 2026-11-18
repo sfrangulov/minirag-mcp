@@ -55,10 +55,11 @@ or memory of a personal Codex setup reaches a judge prompt.
 ```bash
 uv run python evals/enterpriserag/bulk_index.py --verify 300     # equivalence, minutes
 uv run python evals/enterpriserag/bulk_index.py                  # full index, ~10 h on 18 cores
-uv run python evals/enterpriserag/recall.py --full                # retrieval only
+uv run python evals/enterpriserag/recall.py --full                # retrieval only, and the
+                                                                  # reranker ceiling (deep_recall@k)
 R=evals/enterpriserag/runs/<name>
-uv run python evals/enterpriserag/run.py --arm minirag --ids all --out $R
-uv run python evals/enterpriserag/run.py --arm files   --ids all --out $R
+uv run python evals/enterpriserag/run.py --arm minirag --ids sample --max-utilization 0.56 --out $R
+uv run python evals/enterpriserag/run.py --arm files   --ids sample --max-utilization 0.56 --out $R
 uv run python evals/enterpriserag/answers.py $R minirag; uv run python evals/enterpriserag/answers.py $R files
 uv run python evals/enterpriserag/score.py metrics $R minirag
 uv run python evals/enterpriserag/score.py metrics $R files
@@ -66,7 +67,20 @@ uv run python evals/enterpriserag/score.py comparative $R
 uv run python evals/enterpriserag/report.py $R
 ```
 
-`--ids pilot` runs two questions of every type (20); `score.py calibrate $R` re-judges
+`--ids sample` is 100 questions in the full set's type proportions; `--ids all` is 500
+and `--ids pilot` two of every type. `--max-utilization` is required: every run reports
+the account's seven-day usage, and the runner stops once it reaches the cap — the agent
+runs share the weekly limit of the account doing other work. Run the arms one after the
+other, on an otherwise idle machine and never during indexing: the files arm's searches
+scan 3.2 GB and time out under contention, which measures the machine, not the agent.
+
+On a sample, `report.py` also rescored every published system on the same questions from
+its published per-question results, so the comparison is on identical questions without
+re-judging anything. Over all 500 those rescorings reproduce the published leaderboard to
+the hundredth.
+
+The judge runs on the ChatGPT plan's limits too: one hour of calibration (about 1,500
+calls) used up a Plus plan's five-hour window. `score.py calibrate $R` re-judges
 three published systems' answers on the run's questions and reports agreement with their
 published scores, which says how far our judge's numbers can sit next to the leaderboard's.
 

@@ -36,6 +36,39 @@ def leaderboard() -> tuple[list[dict], str]:
     return rows, fetched
 
 
+def on_questions(ids: list[str]) -> list[dict]:
+    """Every published system scored on these questions, from its per-question results."""
+    import re
+
+    from common import load_questions
+    from score import aggregate
+
+    space = DATA_DIR / "space"
+    names = dict(
+        re.findall(
+            r'^([a-z0-9_]+):\s*\n\s+display_name:\s*"([^"]+)"',
+            (space / "systems.yaml").read_text(encoding="utf-8"),
+            re.M,
+        )
+    )
+    gold = {q.question_id: q.expected_doc_ids for q in load_questions()}
+    rows = []
+    for key, name in names.items():
+        results = json.loads((space / f"results_{key}.json").read_text(encoding="utf-8"))
+        a = aggregate(results, ids, gold)
+        rows.append(
+            {
+                "model": name,
+                "overall_score": a["overall"],
+                "correctness": a["correctness"],
+                "completeness": a["completeness"],
+                "recall": a["recall"],
+                "invalid_extra_docs": a["invalid_extra_docs"],
+            }
+        )
+    return rows
+
+
 def _f(x) -> str:
     return "—" if x is None or x == "" else f"{float(x):.2f}"
 
@@ -100,8 +133,18 @@ def main() -> int:
         if (run / arm / "judge_stats.json").exists()
     }
     board, fetched = leaderboard()
+    ids = json.loads((run / "ids.json").read_text(encoding="utf-8"))
     summary = {"ours": ours, "answers": stats, "judge": judge, "leaderboard_fetched": fetched}
-    parts = [f"# EnterpriseRAG-Bench run `{run.name}`", "", table(ours, board), ""]
+    parts = [f"# EnterpriseRAG-Bench run `{run.name}`", ""]
+    if len(ids) < 500:
+        parts += [
+            f"On this run's {len(ids)} questions, every published system rescored from its "
+            "published per-question results:",
+            "",
+            table(ours, on_questions(ids)),
+            "",
+        ]
+    parts += ["Full leaderboard (all 500 questions):", "", table(ours, board), ""]
     parts.append(f"Leaderboard rows as fetched on {fetched}; ours in bold.")
     for name in ("comparative.json", "calibration/agreement.json"):
         if (run / name).exists():
