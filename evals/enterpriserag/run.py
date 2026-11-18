@@ -171,10 +171,30 @@ def prewarm(server_bin: Path, db: Path, base_dir: Path, limit: float = 300.0) ->
     return time.monotonic() - started
 
 
+def run_env() -> dict[str, str]:
+    # A command past its timeout is otherwise moved to the background, where it outlives
+    # the run: in the first pilot twenty orphaned `grep -r` scans of the whole corpus
+    # starved every later question.
+    return dict(os.environ, MCP_TIMEOUT=MCP_TIMEOUT_MS, CLAUDE_CODE_DISABLE_BACKGROUND_TASKS="1")
+
+
+def _stop(proc: subprocess.Popen) -> None:
+    """SIGTERM first, so Claude Code ends the shells it started in groups of their own."""
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+        proc.wait(timeout=15)
+    except (subprocess.TimeoutExpired, ProcessLookupError):
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait()
+
+
 def run_one(cmd: list[str], raw: Path, qid: str, limit: int = TIME_LIMIT) -> dict | None:
     cwd = Path(tempfile.mkdtemp(prefix="minirag-erb-run-"))
     transcript = raw / f"{qid}.jsonl"
-    env = dict(os.environ, MCP_TIMEOUT=MCP_TIMEOUT_MS)
+    env = run_env()
     try:
         with transcript.open("w", encoding="utf-8") as out:
             proc = subprocess.Popen(
@@ -188,8 +208,7 @@ def run_one(cmd: list[str], raw: Path, qid: str, limit: int = TIME_LIMIT) -> dic
             try:
                 proc.wait(timeout=limit)
             except subprocess.TimeoutExpired:
-                os.killpg(proc.pid, signal.SIGKILL)
-                proc.wait()
+                _stop(proc)
                 (raw / f"{qid}.timeout").write_text(str(limit))
                 return None
     finally:

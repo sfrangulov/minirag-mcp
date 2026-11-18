@@ -73,3 +73,9 @@ def test_a_usage_limit_is_not_an_answer(tmp_path):
     assert not limited({"type": "result", "is_error": True, "result": "Tool failed"})
     _write(tmp_path / "q.jsonl", [hit])
     assert not done(tmp_path, "q")
+
+
+def test_runs_cannot_leave_commands_running_in_the_background():
+    from run import run_env
+
+    assert run_env()["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] == "1"
