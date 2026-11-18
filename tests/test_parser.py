@@ -634,3 +634,20 @@ def test_pdf_markitdown_content_survives_when_pdfminer_diverges(tmp_path, monkey
     doc = parser.parse_file(_pdf(tmp_path, [LONG]), load_config({}, cwd=tmp_path))
     assert "long enough" in doc.markdown
     assert doc.ocr_engine == ""
+
+
+# markitdown guesses a text file's charset from its first 4 KB; a UTF-8 file whose
+# first non-ASCII character comes later was decoded as ASCII and refused outright.
+@pytest.mark.parametrize("suffix", [".txt", ".md", ".markdown"])
+def test_utf8_text_with_a_late_non_ascii_character_converts(tmp_path, suffix):
+    f = tmp_path / f"notes{suffix}"
+    f.write_text("# Notes\n\n" + "plain ascii line\n" * 400 + "Lina Fernández — done\n", "utf-8")
+    assert "Lina Fernández — done" in parse_file(f).markdown
+
+
+def test_cp1251_text_still_converts(tmp_path):
+    f = tmp_path / "приказ.txt"
+    f.write_bytes(
+        "Приказ о командировке сотрудника отдела продаж в Казань.\n".encode("cp1251") * 20
+    )
+    assert "командировке" in parse_file(f).markdown
