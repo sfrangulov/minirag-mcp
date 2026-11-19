@@ -143,17 +143,23 @@ def test_sample_ids_keep_the_type_mix():
     assert ids == sample_ids(qs) and len(set(ids)) == len(ids)
 
 
-def test_e5_prefixes_wrap_documents_and_queries(monkeypatch):
-    from common import apply_e5_prefixes
+def test_core_env_passes_through_only_core_variables(monkeypatch):
+    from common import CORE_ENV, core_env
 
-    from minirag_mcp.embedder import Embedder
+    for name in CORE_ENV:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("EMBED_URL", "http://127.0.0.1:8080/v1/embeddings")
+    monkeypatch.setenv("HOME", "/x")
+    env = core_env(BASE_DIR="/c", DB_PATH="/d")
+    assert env == {
+        "BASE_DIR": "/c",
+        "DB_PATH": "/d",
+        "EMBED_URL": "http://127.0.0.1:8080/v1/embeddings",
+    }
 
-    seen = []
-    monkeypatch.setattr(Embedder, "embed_documents", lambda self, texts: seen.append(texts) or [])
-    monkeypatch.setattr(Embedder, "embed_query", lambda self, text: seen.append(text) or [])
-    monkeypatch.setattr(Embedder, "_e5_prefixed", False, raising=False)
-    apply_e5_prefixes()
-    apply_e5_prefixes()
-    Embedder.embed_documents(None, ["a", "b"])
-    Embedder.embed_query(None, "q")
-    assert seen == [["passage: a", "passage: b"], "query: q"]
+
+def test_core_env_lets_a_fixed_value_win_over_the_environment(monkeypatch):
+    from common import core_env
+
+    monkeypatch.setenv("CHUNK_TOKEN_BUDGET", "100")
+    assert core_env(CHUNK_TOKEN_BUDGET="300") == {"CHUNK_TOKEN_BUDGET": "300"}

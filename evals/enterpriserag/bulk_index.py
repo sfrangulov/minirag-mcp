@@ -17,7 +17,6 @@ requires it to find nothing to do.
 from __future__ import annotations
 
 import argparse
-import functools
 import json
 import multiprocessing as mp
 import sys
@@ -26,7 +25,7 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 
-from common import CORPUS, INDEX, corpus_files, load_questions, outside_root
+from common import CORPUS, INDEX, core_env, corpus_files, load_questions, open_index, outside_root
 from subset import materialize, subset
 
 _pipeline = None
@@ -42,33 +41,19 @@ class _Collect:
         self.records = list(records)
 
 
-def _env(corpus: str, db: str, model: str | None) -> dict:
-    env = {"BASE_DIR": corpus, "DB_PATH": db}
-    if model:
-        env["MODEL_NAME"] = model
-    return env
-
-
-def _init(corpus: str, db: str, threads: int, model: str | None, prefixes: bool) -> None:
+def _init(corpus: str, db: str, threads: int, scheme, token_budget: int) -> None:
+    """A worker embeds and chunks the way the index records, never the way the
+    environment would now."""
     global _pipeline
-    import fastembed
+    from dataclasses import replace
 
-    import minirag_mcp.embedder as embedder_mod
     from minirag_mcp.config import load_config
-    from minirag_mcp.embedder import Embedder
+    from minirag_mcp.handle import make_embedder
     from minirag_mcp.ingest.pipeline import Pipeline
 
+    cfg = replace(load_config(core_env(BASE_DIR=corpus, DB_PATH=db)), token_budget=token_budget)
     # Several processes share the cores; each onnxruntime session gets a slice of them.
-    embedder_mod.TextEmbedding = functools.partial(fastembed.TextEmbedding, threads=threads)
-    from common import apply_embedding_endpoint
-
-    apply_embedding_endpoint()
-    if prefixes:
-        from common import apply_e5_prefixes
-
-        apply_e5_prefixes()
-    cfg = load_config(_env(corpus, db, model))
-    _pipeline = Pipeline(_Collect(), Embedder(cfg.model_name, cfg.cache_dir), cfg)
+    _pipeline = Pipeline(_Collect(), make_embedder(cfg, scheme, threads=threads), cfg)
 
 
 def _ingest(path: str):
@@ -79,17 +64,14 @@ def _ingest(path: str):
     return path, _pipeline.store.records, None
 
 
-def _open_store(corpus: Path, db: Path, model: str | None = None):
-    from minirag_mcp.config import load_config
-    from minirag_mcp.embedder import Embedder
-    from minirag_mcp.store import Store
-
-    cfg = load_config(_env(str(corpus), str(db), model))
-    emb = Embedder(cfg.model_name, cfg.cache_dir)
-    return cfg, emb, Store(cfg.db_path, dim=emb.dim, fts_language=cfg.fts_language)
-
-
 def _flush(store, batch: list) -> None:
+    """Write `batch` under the store's own write guards (rebuild in progress, generation)."""
+    from minirag_mcp.store import _refused_while_rebuilt
+
+    _refused_while_rebuilt(_write_batch)(store, batch)
+
+
+def _write_batch(store, batch: list) -> None:
     from minirag_mcp.chunker import join_document
     from minirag_mcp.lookalike import signature
 
@@ -115,13 +97,17 @@ def build(
     threads: int,
     batch_files: int,
     log,
-    model: str | None = None,
-    prefixes: bool = False,
+    fixed: dict[str, str] | None = None,
 ) -> dict:
+    """`fixed` sets product variables over the environment's (CHUNK_TOKEN_BUDGET)."""
     from minirag_mcp.ingest.scanner import scan_roots
 
     corpus = corpus.resolve()
-    cfg, _, store = _open_store(corpus, db, model)
+    handle = open_index(db, corpus, **(fixed or {}))
+    # RebuildPendingError while the folder holds an index of another configuration.
+    store = handle.ingest_pipeline().store
+    index = handle.get()
+    cfg = index.config
     done = {s.source for s in store.list_sources()} if store.chunk_count() else set()
     # The scanner's own walk, so the file set and the row order are the ones sync writes:
     # BM25 ties between near-duplicates break by row order.
@@ -139,9 +125,20 @@ def build(
     errors = [{"source": p, "error": "larger than MAX_FILE_SIZE"} for p in oversized]
     started = time.monotonic()
     batch: list = []
+    if todo:
+        # Fixes the model a fresh index is built with before the first row is written.
+        handle.ensure_probe()
     ctx = mp.get_context("spawn")
     with ctx.Pool(
-        workers, initializer=_init, initargs=(str(corpus), str(db), threads, model, prefixes)
+        workers,
+        initializer=_init,
+        initargs=(
+            str(corpus),
+            str(db),
+            threads,
+            index.identity.embedding,
+            index.identity.chunking.token_budget,
+        ),
     ) as pool:
         for path, records, err in pool.imap(_ingest, todo, chunksize=8):
             if err:
@@ -165,6 +162,11 @@ def build(
     if batch:
         _flush(store, batch)
     counts["load_seconds"] = round(time.monotonic() - started, 1)
+    # The documents table is written from the stored chunk text, as `sync` writes it.
+    _, problems = store.backfill_documents()
+    for problem in problems:
+        errors.append(problem)
+        counts["failed"] += 1
     if problem := store.update_indices():
         errors.append({"source": str(db), "error": problem})
         counts["failed"] += 1
@@ -195,9 +197,7 @@ def _signatures(db: Path) -> dict:
 def verify(corpus: Path, n: int, workers: int, threads: int) -> int:
     import numpy as np
 
-    from minirag_mcp.ingest.pipeline import Pipeline
     from minirag_mcp.results import run_query
-    from minirag_mcp.sync import run_sync
 
     questions = load_questions()
     rel = subset(corpus_files(corpus), questions[:5], total=n, seed=7)
@@ -206,8 +206,10 @@ def verify(corpus: Path, n: int, workers: int, threads: int) -> int:
     materialize(corpus, rel, root)
     root = root.resolve()
 
-    cfg, emb, store_a = _open_store(root, work / "a")
-    counts, errs = run_sync(Pipeline(store_a, emb, cfg), store_a, cfg.roots, cfg.max_file_size)
+    handle_a = open_index(work / "a", root)
+    counts, errs, _ = handle_a.run_sync(None)
+    index_a = handle_a.get()
+    cfg, emb, store_a = index_a.config, index_a.embedder, index_a.store
     print(f"stock sync: {counts} errors {len(errs)}")
     result = build(root, work / "b", workers, threads, batch_files=50, log=sys.stdout)
     print(f"bulk build: {result['counts']} errors {len(result['errors'])}")
@@ -228,14 +230,16 @@ def verify(corpus: Path, n: int, workers: int, threads: int) -> int:
     if sa != sb:
         problems.append(f"signatures differ: {len(sa)} vs {len(sb)} sources")
 
-    _, emb_b, store_b = _open_store(root, work / "b")
+    handle_b = open_index(work / "b", root)
+    index_b = handle_b.get()
+    emb_b, store_b = index_b.embedder, index_b.store
     for q in questions[:40]:
         ra = [s["source"] for s in run_query(store_a, emb, cfg, q.question, top_k=50)["sources"]]
         rb = [s["source"] for s in run_query(store_b, emb_b, cfg, q.question, top_k=50)["sources"]]
         if ra != rb:
             problems.append(f"{q.question_id}: ranked sources differ")
 
-    resync, errs = run_sync(Pipeline(store_b, emb_b, cfg), store_b, cfg.roots, cfg.max_file_size)
+    resync, errs, _ = handle_b.run_sync(None)
     if resync["ingested"] or resync["deleted"] or resync["moved"] or resync["skipped"] != len(rel):
         problems.append(f"stock sync over the bulk index was not a no-op: {resync}")
 

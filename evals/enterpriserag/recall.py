@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import platform
 import sys
 import tempfile
@@ -22,7 +21,18 @@ from datetime import UTC, datetime
 from importlib.metadata import version
 from pathlib import Path
 
-from common import CORPUS, HERE, INDEX, RUNS, corpus_files, dsid_of, load_questions, outside_root
+from common import (
+    CORPUS,
+    HERE,
+    INDEX,
+    RUNS,
+    core_env,
+    corpus_files,
+    dsid_of,
+    load_questions,
+    open_index,
+    outside_root,
+)
 from subset import SEED, TOTAL, materialize, subset, subset_hash
 
 BASELINE = HERE / "baseline.json"
@@ -53,8 +63,9 @@ def reciprocal_rank(ranked: list[str], gold) -> float:
     return next((1.0 / (i + 1) for i, d in enumerate(ranked) if d in gold), 0.0)
 
 
-def _deep(store, emb, cfg, question: str, top_k: int) -> list[str]:
-    """Past `MAX_TOP_K`: the fused candidates a reranker could reorder."""
+def _deep(store, emb, cfg, question: str, top_k: int, reranker=None) -> list[str]:
+    """Past `MAX_TOP_K`: the fused candidates a reranker could reorder, which with one
+    configured are reordered as a query would."""
     from minirag_mcp.results import aggregate_sources
 
     results = store.search(
@@ -62,23 +73,26 @@ def _deep(store, emb, cfg, question: str, top_k: int) -> list[str]:
         emb.embed_query(question),
         top_k=top_k,
         hybrid_weight=cfg.hybrid_weight,
+        document_weight=cfg.document_weight,
         max_distance=cfg.max_distance,
         grouping=cfg.grouping,
         max_files=cfg.max_files,
+        reranker=reranker.scores if reranker else None,
+        rerank_top=cfg.rerank_top,
     )
     return ranked_docs({"sources": aggregate_sources(results, cfg.roots)})
 
 
-def measure(store, emb, cfg, questions) -> list[dict]:
+def measure(store, emb, cfg, questions, reranker=None) -> list[dict]:
     from minirag_mcp.results import run_query
 
     rows = []
     for q in questions:
         if not q.expected_doc_ids:
             continue
-        pool = ranked_docs(run_query(store, emb, cfg, q.question, top_k=100))
-        default = ranked_docs(run_query(store, emb, cfg, q.question, top_k=8))
-        deep = _deep(store, emb, cfg, q.question, DEEP_TOP_K)
+        pool = ranked_docs(run_query(store, emb, cfg, q.question, top_k=100, reranker=reranker))
+        default = ranked_docs(run_query(store, emb, cfg, q.question, top_k=8, reranker=reranker))
+        deep = _deep(store, emb, cfg, q.question, DEEP_TOP_K, reranker)
         rows.append(
             {
                 "question_id": q.question_id,
@@ -142,24 +156,28 @@ def fingerprint(cfg) -> dict:
         "fastembed": version("fastembed"),
         "lancedb": version("lancedb"),
         "model": cfg.model_name,
+        "token_budget": cfg.token_budget,
+        "document_weight": cfg.document_weight,
+        "rerank_model": cfg.rerank_endpoint.name if cfg.rerank_endpoint else None,
         "minirag": version("minirag-mcp"),
     }
 
 
-def _open(db: Path, corpus: Path, hybrid_weight: float | None = None, model: str | None = None):
-    from minirag_mcp.config import load_config
-    from minirag_mcp.embedder import Embedder
-    from minirag_mcp.store import Store
-
-    env = {"BASE_DIR": str(corpus), "DB_PATH": str(db)}
+def _open(db: Path, corpus: Path, hybrid_weight: float | None = None, **fixed: str):
+    """The index through the product's handle: its config, embedder, store and the rerank
+    endpoint the environment configures (None without one)."""
     if hybrid_weight is not None:
-        env["RAG_HYBRID_WEIGHT"] = str(hybrid_weight)
-    if model:
-        env["MODEL_NAME"] = model
-    cfg = load_config(env)
-    emb = Embedder(cfg.model_name, cfg.cache_dir)
-    store = Store(cfg.db_path, dim=emb.dim, fts_language=cfg.fts_language)
-    return cfg, emb, store
+        fixed["RAG_HYBRID_WEIGHT"] = str(hybrid_weight)
+    index = open_index(db, corpus, **fixed).get()
+    return index.config, index.embedder, index.store, index.reranker
+
+
+def _tag(cfg, reranked: bool, endpoint: bool) -> str:
+    return (
+        f"{cfg.model_name.split('/')[-1]}-b{cfg.token_budget}-dw{cfg.document_weight:g}"
+        + ("-rr" if reranked else "")
+        + ("-endpoint" if endpoint else "")
+    )
 
 
 def _print(summary: dict, baseline: dict | None = None) -> None:
@@ -178,8 +196,8 @@ def _print(summary: dict, baseline: dict | None = None) -> None:
 
 
 def run_full(db: Path, corpus: Path, hybrid_weight: float | None = None) -> int:
-    cfg, emb, store = _open(outside_root(db, corpus), corpus, hybrid_weight)
-    rows = measure(store, emb, cfg, load_questions())
+    cfg, emb, store, reranker = _open(outside_root(db, corpus), corpus, hybrid_weight)
+    rows = measure(store, emb, cfg, load_questions(), reranker)
     summary = summarize(rows)
     out = RUNS / datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     out.mkdir(parents=True, exist_ok=True)
@@ -192,17 +210,11 @@ def run_full(db: Path, corpus: Path, hybrid_weight: float | None = None) -> int:
     return 0
 
 
-def run_subset(corpus: Path, update: bool, model: str | None = None, prefixes: bool = False) -> int:
+def run_subset(corpus: Path, update: bool, budget: int | None = None) -> int:
     from bulk_index import build
-    from common import apply_embedding_endpoint
 
-    endpoint = apply_embedding_endpoint()
-    experiment = bool(model or prefixes or endpoint)
-    if prefixes:
-        from common import apply_e5_prefixes
-
-        apply_e5_prefixes()
-
+    fixed = {"CHUNK_TOKEN_BUDGET": str(budget)} if budget else {}
+    experiment = bool(budget or core_env())
     questions = load_questions()
     rel = subset(corpus_files(corpus), questions, total=TOTAL, seed=SEED)
     work = Path(tempfile.mkdtemp(prefix="minirag-erb-subset-"))
@@ -218,25 +230,26 @@ def run_subset(corpus: Path, update: bool, model: str | None = None, prefixes: b
         threads=2,
         batch_files=1000,
         log=sys.stderr,
-        model=model,
-        prefixes=prefixes,
+        fixed=fixed,
     )
     if result["errors"] or result["counts"]["ingested"] != len(rel):
         print(
             f"subset index incomplete: {result['counts']}, {result['errors'][:3]}", file=sys.stderr
         )
         return 1
-    cfg, emb, store = _open(db, root, model=model)
-    summary = summarize(measure(store, emb, cfg, questions))
+    cfg, emb, store, reranker = _open(db, root, **fixed)
+    summary = summarize(measure(store, emb, cfg, questions, reranker))
     current = {"summary": summary, "fingerprint": fingerprint(cfg), "subset": subset_hash(rel)}
     if experiment:
         current["experiment"] = {
+            "env": core_env(**fixed),
             "model": cfg.model_name,
-            "e5_prefixes": prefixes,
-            "embedding_endpoint": os.environ.get("ERB_EMBED_URL"),
+            "token_budget": cfg.token_budget,
+            "document_weight": cfg.document_weight,
+            "reranker": cfg.rerank_endpoint.name if cfg.rerank_endpoint else None,
+            "embedding_endpoint": "EMBED_URL" in core_env(),
         }
-        tag = cfg.model_name.split("/")[-1] + ("-prefixed" if prefixes else "")
-        tag += "-endpoint" if endpoint else ""
+        tag = _tag(cfg, reranker is not None, "EMBED_URL" in core_env())
         RUNS.mkdir(parents=True, exist_ok=True)
         out = RUNS / f"subset_{tag}.json"
         out.write_text(json.dumps(current, indent=2) + "\n", encoding="utf-8")
@@ -269,11 +282,11 @@ def main() -> int:
     ap.add_argument("--db", type=Path, default=INDEX)
     ap.add_argument("--corpus", type=Path, default=CORPUS)
     ap.add_argument("--update-baseline", action="store_true")
-    ap.add_argument("--model", help="--subset only: another MODEL_NAME, kept out of the baseline")
     ap.add_argument(
-        "--e5-prefixes",
-        action="store_true",
-        help='--subset only: embed with "query: " / "passage: " (multilingual-e5)',
+        "--budget",
+        type=int,
+        help="--subset only: CHUNK_TOKEN_BUDGET for the build and the measurement, "
+        "kept out of the baseline",
     )
     ap.add_argument(
         "--hybrid-weight",
@@ -283,7 +296,7 @@ def main() -> int:
     args = ap.parse_args()
     if args.full:
         return run_full(args.db, args.corpus, args.hybrid_weight)
-    return run_subset(args.corpus, args.update_baseline, args.model, args.e5_prefixes)
+    return run_subset(args.corpus, args.update_baseline, args.budget)
 
 
 if __name__ == "__main__":

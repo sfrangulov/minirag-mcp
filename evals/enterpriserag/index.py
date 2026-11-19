@@ -17,7 +17,7 @@ import sys
 import time
 from pathlib import Path
 
-from common import CORPUS, INDEX, REPO, outside_root
+from common import CORPUS, INDEX, REPO, open_index, outside_root
 
 SERVER_BIN = REPO / ".venv" / "bin" / "minirag-mcp"
 
@@ -53,10 +53,8 @@ def git_commit() -> str:
 def write_report(result: dict, db: Path, out: Path) -> dict:
     from importlib.metadata import version
 
-    from minirag_mcp.store import Store
-
     counts = result["counts"]
-    store = Store(db, dim=384)
+    store = open_index(db, db.parent).get().store
     report = {
         "counts": counts,
         "failed_examples": result.get("errors", [])[:20],

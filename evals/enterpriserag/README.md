@@ -98,6 +98,28 @@ fusion. It fails when overall document recall@10 drops by more than 1 point or M
 more than 0.02; per-type deltas are printed but do not gate (one question in a small
 category is 2.5–5 points). A different environment fingerprint is printed as a warning.
 
+## Experiments
+
+The stand runs the production retrieval path, so an experiment is configuration, not a
+patch: the product's own variables pass through (`MODEL_NAME`, `CHUNK_TOKEN_BUDGET`,
+`RAG_HYBRID_WEIGHT`, `RAG_DOCUMENT_WEIGHT`, `RAG_RERANK_TOP`, `RAG_FTS_LANGUAGE`,
+`EMBED_URL`, `EMBED_ENDPOINT_MODEL`, `RERANK_URL`, `RERANK_MODEL`,
+`ENDPOINT_API_KEY_FILE`). A `--subset` run with any of them set, or with `--budget`, is
+written to `runs/subset_<model>-b<budget>-dw<weight>[-rr][-endpoint].json` and never
+touches `baseline.json`.
+
+```bash
+EMBED_URL=http://127.0.0.1:8080/v1/embeddings EMBED_ENDPOINT_MODEL=multilingual-e5-large \
+RERANK_URL=http://127.0.0.1:8091/v1/rerank RERANK_MODEL=bge-reranker-v2-m3 \
+  uv run python evals/enterpriserag/recall.py --subset
+uv run python evals/enterpriserag/recall.py --subset --budget 300
+```
+
+`--budget N` (subset only) sets `CHUNK_TOKEN_BUDGET` for both the index build and the
+measurement, since a different budget is a different index. `rerank_full.py` reads
+`RERANK_URL` and `RERANK_MODEL` the same way. `baseline.json` predates these defaults and
+is re-taken after the final pipeline is checked as a whole.
+
 ## Why a parallel indexer
 
 Stock `sync` ingests one file at a time on one core: 3.3 files/s on this corpus, about

@@ -1,12 +1,13 @@
 """A cross-encoder over the first-stage chunks, on the full corpus (issue g7q.7).
 
 For each question: store.search(top_k=50) with production fusion, then the 50 chunk texts
-are rescored by a reranker behind an OpenAI-style /v1/rerank endpoint (ERB_RERANK_URL,
-e.g. llama.cpp serving bge-reranker-v2-m3). Documents are ranked by first occurrence in
-the reranked chunks, then the rest of the saved deep ranking. Optionally fused with the
-whole-document BM25 table from doc_bm25.py.
+are rescored by the product's own reranker (RERANK_URL and RERANK_MODEL, a llama.cpp
+/v1/rerank route serving e.g. bge-reranker-v2-m3, through RerankEndpoint).
+Documents are ranked by first occurrence in the reranked chunks, then the rest of the
+saved deep ranking. Optionally fused with the whole-document BM25 table from doc_bm25.py.
 
-  ERB_RERANK_URL=http://127.0.0.1:8091/v1/rerank uv run python evals/enterpriserag/rerank_full.py \
+  RERANK_URL=http://127.0.0.1:8091/v1/rerank RERANK_MODEL=bge-reranker-v2-m3 \
+  uv run python evals/enterpriserag/rerank_full.py \
       evals/enterpriserag/runs/<hybrid stamp>/recall.json
 """
 
@@ -18,8 +19,6 @@ import sys
 import time
 from pathlib import Path
 
-import requests
-
 sys.path.insert(0, str(Path(__file__).parent))
 from common import CORPUS, dsid_of, load_questions  # noqa: E402
 from doc_bm25 import KS, docs_db, recall_at, rr, rrf  # noqa: E402
@@ -30,10 +29,10 @@ def main() -> None:
     run = json.load(open(sys.argv[1]))
     rows = run["rows"]
     db = Path(os.environ.get("ERB_INDEX", str(CORPUS.parent / "index" / "lancedb")))
-    cfg, emb, store = _open(db, CORPUS)
+    cfg, emb, store, reranker = _open(db, CORPUS)
+    if reranker is None:
+        sys.exit("RERANK_URL and RERANK_MODEL must be set")
     questions = {q.question_id: q for q in load_questions()}
-    url = os.environ["ERB_RERANK_URL"]
-    s = requests.Session()
     import lancedb
 
     dtab = lancedb.connect(str(docs_db())).open_table("docs")
@@ -42,12 +41,9 @@ def main() -> None:
     for n, r in enumerate(rows, 1):
         text = questions[r["question_id"]].question
         res = store.search(text, emb.embed_query(text), top_k=50, hybrid_weight=cfg.hybrid_weight)
-        resp = s.post(url, json={"query": text, "documents": [x.text for x in res]}, timeout=300)
-        resp.raise_for_status()
-        order = sorted(resp.json()["results"], key=lambda x: -x["relevance_score"])
-        reranked = list(
-            dict.fromkeys(d for d in (dsid_of(res[x["index"]].source) for x in order) if d)
-        )
+        scores = reranker.scores(text, [x.text for x in res])
+        order = sorted(range(len(res)), key=lambda i: -scores[i])
+        reranked = list(dict.fromkeys(d for d in (dsid_of(res[i].source) for i in order) if d))
         first = list(dict.fromkeys(d for d in (dsid_of(x.source) for x in res) if d))
         try:
             hits = (
