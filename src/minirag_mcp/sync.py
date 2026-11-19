@@ -258,6 +258,12 @@ class SyncManager:
         self._job: SyncJob | None = None
         self._thread: threading.Thread | None = None
 
+    @property
+    def running(self) -> bool:
+        """Whether this manager's latest job is pending or running."""
+        job = self._job
+        return job is not None and job.state in ("pending", "running")
+
     def start(self, scope: Path | None = None) -> str:
         """Start a background sync, or raise if one is already running.
 

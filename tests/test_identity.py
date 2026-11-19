@@ -40,6 +40,7 @@ from minirag_mcp.identity import (
     recover_swap,
     staging_dir,
     swap_in,
+    update_identity,
     write_identity,
 )
 from minirag_mcp.lock import sync_lock
@@ -388,6 +389,30 @@ def test_the_identity_lock_sits_beside_the_index_and_covers_every_change(tmp_pat
         ("db.next -> db", True),
     ]
     assert lock_file.is_file()
+
+
+def test_an_update_lands_only_on_the_generation_it_was_read_from(tmp_path, monkeypatch):
+    """A swapped-in identity is never overwritten with fields of the one it replaced."""
+    db = tmp_path / "db"
+    lock_file = tmp_path / ".db.identity.lock"
+    write_identity(db, IDENT)
+    locked: list[bool] = []
+    real_replace = os.replace
+
+    def spy(src, dst):
+        locked.append(_lock_taken(lock_file))
+        real_replace(src, dst)
+
+    monkeypatch.setattr(identity_mod.os, "replace", spy)
+    assert update_identity(db, 1, fts_language="English") == replace(IDENT, fts_language="English")
+    assert read_identity(db) == replace(IDENT, fts_language="English")
+    assert locked == [True]
+    write_identity(db, replace(IDENT, generation=2))
+    assert update_identity(db, 1, fts_language="German") is None
+    assert read_identity(db) == replace(IDENT, generation=2)
+    shutil.rmtree(db)
+    assert update_identity(db, 2, fts_language="German") is None
+    assert not db.exists()
 
 
 def test_an_existing_identity_is_returned_without_taking_the_lock(tmp_path):

@@ -15,7 +15,12 @@ from minirag_mcp import __version__
 from minirag_mcp.chunker import join_document
 from minirag_mcp.config import Config, ConfigError, load_config
 from minirag_mcp.embedder import EmbedderUnavailableError, UnknownModelError
-from minirag_mcp.handle import IndexHandle, OpenIndex
+from minirag_mcp.handle import (
+    IndexHandle,
+    IndexUnavailableError,
+    OpenIndex,
+    RebuildPendingError,
+)
 from minirag_mcp.ingest.ignore import IGNORE_FILE, IgnoredFileError, excluded_by
 from minirag_mcp.ingest.pipeline import IngestResult, Pipeline
 from minirag_mcp.ingest.scanner import scan_roots
@@ -134,7 +139,15 @@ def _load(
     except UnknownModelError as e:
         _fail(f"{e} — see fastembed's supported models")
         raise AssertionError from e  # unreachable
-    except (DimensionMismatchError, IndexOpenError) as e:
+    except (DimensionMismatchError, IndexOpenError, IndexUnavailableError) as e:
+        _fail(str(e))
+        raise AssertionError from e  # unreachable
+
+
+def _ingest_pipeline(handle: IndexHandle) -> Pipeline:
+    try:
+        return handle.ingest_pipeline()
+    except (RebuildPendingError, IndexUnavailableError) as e:
         _fail(str(e))
         raise AssertionError from e  # unreachable
 
@@ -210,7 +223,7 @@ def ingest(
 ):
     """Ingest files or directories (recursive)."""
     cfg, handle, _ = _load(base_dir, db_path, cache_dir, model_name)
-    pipeline = handle.ingest_pipeline()
+    pipeline = _ingest_pipeline(handle)
     files: list[Path] = []
     # Already held to the rules by their scan; only files named directly are checked again.
     scanned: set[Path] = set()
@@ -276,7 +289,7 @@ def ingest_url(
 ):
     """Fetch an http(s) URL and index it."""
     _, handle, _ = _load(base_dir, db_path, cache_dir, model_name)
-    pipeline = handle.ingest_pipeline()
+    pipeline = _ingest_pipeline(handle)
     try:
         with pipeline.job() as report:
             r = pipeline.ingest_url(url, source=source, title=title)

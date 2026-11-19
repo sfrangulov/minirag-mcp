@@ -5,6 +5,7 @@ import pytest
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
+from conftest import stamp_identity
 from minirag_mcp import ocr
 from minirag_mcp.chunker import SCHEME_VERSION
 from minirag_mcp.config import load_config
@@ -452,6 +453,7 @@ async def test_status_tells_the_user_to_re_sync_a_stale_index(tmp_path, fake_emb
     root = tmp_path / "docs"
     root.mkdir()
     cfg = load_config({"BASE_DIR": str(root)}, cwd=root)
+    stamp_identity(cfg, fake_embedder)
     store = Store(cfg.db_path, dim=fake_embedder.dim)
     store.replace_source(
         "/old.md",

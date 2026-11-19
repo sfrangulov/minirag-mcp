@@ -18,6 +18,7 @@ from minirag_mcp import __version__, literal, ocr
 from minirag_mcp.chunker import SCHEME_VERSION, shared_lines
 from minirag_mcp.config import Config
 from minirag_mcp.endpoints import RerankEndpoint
+from minirag_mcp.identity import IndexState
 from minirag_mcp.ingest import ignore
 from minirag_mcp.ingest.pipeline import IngestResult
 from minirag_mcp.ingest.scanner import FileState, compute_states, scan_roots
@@ -45,7 +46,7 @@ from minirag_mcp.store import (
 )
 
 if TYPE_CHECKING:
-    from minirag_mcp.handle import IndexHandle
+    from minirag_mcp.handle import IndexHandle, OpenIndex
 
 EMPTY_INDEX_NOTICE = (
     "Nothing is indexed yet, so no query can match. Index the document roots first: "
@@ -323,11 +324,30 @@ def ocr_status() -> dict:
     }
 
 
+def identity_status(opened: OpenIndex, state: IndexState, why: str) -> dict:
+    """What the open index was built with, which its queries follow, and what a rebuild
+    would change while one is pending."""
+    recorded = opened.identity
+    out: dict = {
+        "indexGeneration": recorded.generation,
+        "embedding": {
+            "model": recorded.embedding.model,
+            "prefixes": recorded.embedding.prefixes,
+            "dim": recorded.embedding.dim,
+            "backend": getattr(opened.embedder, "backend", "in-process"),
+        },
+        "chunkBudget": recorded.chunking.token_budget,
+    }
+    if state is IndexState.REBUILD_PENDING:
+        out["rebuildReasons"] = why.split("; ")
+    return out
+
+
 def status_payload(config: Config, handle: IndexHandle) -> dict:
     """`status` for a valid configuration, the same in both shells.
 
-    An index that cannot be opened is reported as `indexError`, not raised: `status` is
-    what a broken setup is diagnosed with.
+    An index that cannot be opened is reported as `indexError`, with `indexState`
+    "unavailable", not raised: `status` is what a broken setup is diagnosed with.
     """
     out: dict = {
         "version": __version__,
@@ -339,8 +359,14 @@ def status_payload(config: Config, handle: IndexHandle) -> dict:
         **ocr_status(),
         **ignore_status(config.roots),
     }
+    state, why = handle.state()
+    out["indexState"] = state.value
+    if state is IndexState.UNAVAILABLE:
+        out["indexError"] = why
+        return out
     try:
         opened = handle.get()
+        out.update(identity_status(opened, state, why))
         out["chunkCount"] = opened.store.chunk_count()
         out["sourceCount"] = opened.store.source_count()
         out.update(embedding_status(opened.embedder))
@@ -352,6 +378,7 @@ def status_payload(config: Config, handle: IndexHandle) -> dict:
         out.update(pages_status(opened.store))
         out.update(labels_status(opened.labels, opened.store))
     except Exception as e:
+        out["indexState"] = IndexState.UNAVAILABLE.value
         out["indexError"] = str(e)
     return out
 

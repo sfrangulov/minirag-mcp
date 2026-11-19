@@ -393,6 +393,18 @@ def create_identity(db_path: Path, identity: IndexIdentity) -> IndexIdentity:
         return _link_new(db_path, identity)
 
 
+def update_identity(db_path: Path, generation: int, **changes) -> IndexIdentity | None:
+    """Replace fields of `db_path`'s identity if it still holds `generation`; the identity
+    then recorded, or None when another generation (or none) is in place."""
+    with _identity_lock(db_path):
+        current = read_identity(db_path)
+        if current is None or current.generation != generation:
+            return None
+        updated = replace(current, **changes)
+        write_identity(db_path, updated)
+        return updated
+
+
 def is_legacy_index(db_path: Path) -> bool:
     return (db_path / _LEGACY_TABLE).is_dir() and not os.path.lexists(db_path / INDEX_FILE)
 

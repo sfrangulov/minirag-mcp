@@ -169,6 +169,9 @@ def create_app(
         and why; a full sync asks again. `warnings`, present only when there
         is something to say, notes that the embedding endpoint is unreachable
         and the in-process model embedded instead: same vectors, slower.
+
+        Refused while the index needs a rebuild (status: indexState "rebuild
+        pending"), until an unscoped sync_start rebuilds it.
         """
         h = live()
         pipeline = h.ingest_pipeline()
@@ -183,8 +186,9 @@ def create_app(
         format is one of "text", "markdown", or "html" (default "text").
         source is a stable identifier you pick, not a filesystem path —
         re-using it replaces the previously ingested content for that id,
-        so reuse the same source to update an item. `labelProblem` and
-        `warnings` are as in ingest_file.
+        so reuse the same source to update an item. `labelProblem`,
+        `warnings` and the refusal while a rebuild is pending are as in
+        ingest_file.
         """
         h = live()
         return ingest_reply(
@@ -203,7 +207,8 @@ def create_app(
         reaches the network — every other tool works purely against local
         files and the local index. source defaults to the URL itself; pass
         one to control the index key or to update a previously ingested URL.
-        `labelProblem` and `warnings` are as in ingest_file.
+        `labelProblem`, `warnings` and the refusal while a rebuild is pending
+        are as in ingest_file.
         """
         h = live()
         return ingest_reply(
@@ -517,6 +522,16 @@ def create_app(
         configuration is invalid, includes configError instead, and every
         other tool raises an error referencing it until the configuration is
         fixed.
+
+        indexState is "ready", "rebuild pending", "syncing" or "unavailable".
+        indexGeneration, embedding (model, prefixes, dim, backend) and
+        chunkBudget say what the index was built with, which every query
+        follows; `model` is what the configuration asks for. When the two
+        differ the index is "rebuild pending": rebuildReasons lists what an
+        unscoped sync_start would change, and until then the index answers
+        from its existing vectors and refuses ingests. An index that cannot
+        be opened (a minirag 1.x index, an unreadable index.json, a model
+        that cannot be loaded here) is "unavailable", and indexError says why.
 
         chunkScheme is the chunking scheme the index is being written with.
         staleChunkCount counts chunks still stored under an older scheme —

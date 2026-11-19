@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -10,12 +12,30 @@ import pytest
 
 import minirag_mcp.handle as handle_mod
 from conftest import FakeEmbedder
-from minirag_mcp.config import load_config
+from minirag_mcp.chunker import SCHEME_VERSION
+from minirag_mcp.config import default_db_path, load_config
 from minirag_mcp.embedder import E5_LARGE, MINILM, Embedder, UnknownModelError
 from minirag_mcp.endpoints import EmbeddingEndpoint, Endpoint
-from minirag_mcp.handle import IndexHandle, configured_scheme, make_embedder
-from minirag_mcp.identity import EmbeddingScheme
-from minirag_mcp.store import IndexOpenError
+from minirag_mcp.handle import (
+    IndexHandle,
+    IndexUnavailableError,
+    RebuildPendingError,
+    configured_scheme,
+    make_embedder,
+)
+from minirag_mcp.identity import (
+    INDEX_FILE,
+    ChunkingScheme,
+    EmbeddingScheme,
+    IndexIdentity,
+    IndexState,
+    previous_dir,
+    read_identity,
+    staging_dir,
+    write_identity,
+)
+from minirag_mcp.results import run_query
+from minirag_mcp.store import ChunkRecord, IndexOpenError, Store
 from minirag_mcp.sync import SyncManager
 
 UNUSED_URL = "http://127.0.0.1:9/v1/embeddings"
@@ -27,6 +47,34 @@ def cfg(tmp_path, **env):
 
 def endpoint_cfg(tmp_path, **env):
     return replace(cfg(tmp_path, **env), embed_endpoints={E5_LARGE: Endpoint(UNUSED_URL, "e5")})
+
+
+def handle(tmp_path, embedder, **env) -> IndexHandle:
+    return IndexHandle(cfg(tmp_path, **env), embedder_factory=lambda s: embedder)
+
+
+def rec(source, i, text):
+    return ChunkRecord(
+        id=f"{source}#{i}",
+        source=source,
+        source_type="file",
+        title="T",
+        chunk_index=i,
+        text=text,
+        vector=[0.1] * 8,
+        file_hash="h",
+        mtime=1.0,
+        ingested_at="2026-11-19T00:00:00+00:00",
+    )
+
+
+def recorded(config, scheme: EmbeddingScheme) -> IndexIdentity:
+    """`config`'s index stamped as built with `scheme`."""
+    identity = IndexIdentity.fresh(
+        scheme, ChunkingScheme(SCHEME_VERSION, config.token_budget), config.fts_language
+    )
+    write_identity(config.db_path, identity)
+    return identity
 
 
 @pytest.fixture
@@ -219,3 +267,291 @@ def test_classify_url_selects_the_served_model(tmp_path, fake_embedder):
 
     plain = IndexHandle(cfg(tmp_path), embedder_factory=lambda scheme: fake_embedder)
     assert plain.get().labels.backend == "in-process"
+
+
+def test_a_fresh_folder_is_stamped_with_the_configured_scheme(tmp_path, fake_embedder):
+    h = handle(tmp_path, fake_embedder)
+    h.get()
+    ident = read_identity(h.config.db_path)
+    assert (ident.generation, ident.embedding, ident.probe) == (
+        1,
+        EmbeddingScheme("fake", 8, "none"),
+        (),
+    )
+    assert ident.chunking == ChunkingScheme(SCHEME_VERSION, h.config.token_budget)
+    assert ident.fts_language == h.config.fts_language and ident.document_table is True
+    assert h.get().identity == ident
+    assert h.state() == (IndexState.READY, "")
+    assert h.configured() == (
+        EmbeddingScheme("fake", 8, "none"),
+        ChunkingScheme(SCHEME_VERSION, h.config.token_budget),
+    )
+
+
+def test_a_fresh_folder_is_stamped_before_its_table_is_created(
+    tmp_path, fake_embedder, monkeypatch
+):
+    """A crash between the two must not leave a folder that reads as a 1.x index."""
+    stamped_first: list[bool] = []
+    real = handle_mod.Store
+
+    def spy(db_path, **kwargs):
+        stamped_first.append(read_identity(db_path) is not None)
+        return real(db_path, **kwargs)
+
+    monkeypatch.setattr(handle_mod, "Store", spy)
+    handle(tmp_path, fake_embedder).get()
+    assert stamped_first == [True]
+
+
+def test_a_1x_index_is_refused_and_left_untouched(tmp_path, fake_embedder):
+    db = tmp_path / "db"
+    Store(db, dim=8).replace_source("/a.md", [rec("/a.md", 0, "x")])
+    before = sorted(p.relative_to(db) for p in db.rglob("*"))
+    h = handle(tmp_path, fake_embedder, DB_PATH=str(db))
+    with pytest.raises(
+        IndexUnavailableError, match=re.escape(str(default_db_path(h.config.roots)))
+    ):
+        h.get()
+    state, why = h.state()
+    assert state is IndexState.UNAVAILABLE and "1.x" in why
+    assert sorted(p.relative_to(db) for p in db.rglob("*")) == before
+
+
+def test_an_unreadable_identity_is_unavailable_and_never_overwritten(tmp_path, fake_embedder):
+    h = handle(tmp_path, fake_embedder)
+    db = h.config.db_path
+    db.mkdir(parents=True)
+    (db / INDEX_FILE).write_text("{", encoding="utf-8")
+    with pytest.raises(IndexUnavailableError, match=re.escape(str(db / INDEX_FILE))):
+        h.get()
+    state, why = h.state()
+    assert state is IndexState.UNAVAILABLE and str(db / INDEX_FILE) in why
+    assert (db / INDEX_FILE).read_text(encoding="utf-8") == "{"
+    assert sorted(p.name for p in db.iterdir()) == [INDEX_FILE]
+
+
+def test_an_interrupted_swap_is_finished_on_open(tmp_path, fake_embedder):
+    """Opening the missing folder as it is would answer "nothing indexed"."""
+    db = cfg(tmp_path).db_path
+    handle(tmp_path, fake_embedder, DB_PATH=str(previous_dir(db))).ingest_pipeline().ingest_data(
+        "Old text.", source="old"
+    )
+    staged = handle(tmp_path, fake_embedder, DB_PATH=str(staging_dir(db)))
+    staged.ingest_pipeline().ingest_data("Rebuilt text.", source="rebuilt")
+    write_identity(staging_dir(db), replace(read_identity(staging_dir(db)), generation=2))
+    assert not db.exists()
+
+    opened = handle(tmp_path, fake_embedder).get()
+    assert opened.identity.generation == 2
+    assert [s.source for s in opened.store.list_sources()] == ["rebuilt"]
+    assert not staging_dir(db).exists()
+
+
+def _recording_queries(models: dict) -> list[str]:
+    seen: list[str] = []
+    for name, model in models.items():
+        real = model.embed_query
+        model.embed_query = lambda text, real=real, name=name: seen.append(name) or real(text)
+    return seen
+
+
+def test_a_changed_model_is_pending_and_queries_use_the_recorded_model(tmp_path):
+    models = {MINILM: FakeEmbedder(MINILM, salt="a"), E5_LARGE: FakeEmbedder(E5_LARGE, salt="b")}
+
+    def factory(scheme):
+        return models[scheme.model]
+
+    a = IndexHandle(cfg(tmp_path, MODEL_NAME=MINILM), embedder_factory=factory)
+    a.get().pipeline.ingest_data("budget review", source="s")
+    b = IndexHandle(cfg(tmp_path), embedder_factory=factory)  # the default model, e5
+    state, why = b.state()
+    assert state is IndexState.REBUILD_PENDING and f"model {MINILM} -> {E5_LARGE}" in why
+    assert b.configured()[0] == EmbeddingScheme(E5_LARGE, 8, "none")
+    opened = b.get()
+    assert opened.embedder is models[MINILM]
+    assert opened.identity.embedding == EmbeddingScheme(MINILM, 8, "none")
+    seen = _recording_queries(models)
+    assert run_query(opened.store, opened.embedder, b.config, "budget review")["sources"]
+    assert seen == [MINILM]
+
+
+def test_a_pending_index_embeds_through_the_recorded_models_endpoint(
+    tmp_path, fake_llama, tokenizer_file
+):
+    fake_llama.dim = 1024
+    config = replace(
+        cfg(tmp_path, MODEL_NAME=MINILM),
+        embed_endpoints={E5_LARGE: Endpoint(fake_llama.url("/v1/embeddings"), "e5")},
+    )
+    recorded(config, EmbeddingScheme(E5_LARGE, 1024, "e5"))
+    h = IndexHandle(config)
+    state, why = h.state()
+    assert state is IndexState.REBUILD_PENDING
+    assert why == f"model {E5_LARGE} -> {MINILM}; query/passage prefixes e5 -> none"
+    opened = h.get()
+    assert (opened.embedder.model_name, opened.embedder.backend) == (E5_LARGE, "endpoint")
+    run_query(opened.store, opened.embedder, config, "budget review")
+    [request] = [r for r in fake_llama.requests if r.path == "/v1/embeddings"]
+    assert request.body["input"] == ["query: budget review"]
+
+
+def test_a_changed_budget_is_pending_with_a_chunking_reason(tmp_path, fake_embedder):
+    a = handle(tmp_path, fake_embedder)
+    a.ingest_pipeline().ingest_data("Alpha body.", source="s")
+    bigger = a.config.token_budget + 90
+    b = handle(tmp_path, fake_embedder, CHUNK_TOKEN_BUDGET=str(bigger))
+    assert b.state() == (
+        IndexState.REBUILD_PENDING,
+        f"chunk budget {a.config.token_budget} -> {bigger} tokens",
+    )
+    assert b.get().identity.chunking.token_budget == a.config.token_budget
+    assert b.configured()[1] == ChunkingScheme(SCHEME_VERSION, bigger)
+
+
+def test_a_pending_index_refuses_ingests_and_still_deletes(tmp_path, fake_embedder):
+    a = handle(tmp_path, fake_embedder)
+    a.ingest_pipeline().ingest_data("Alpha body.", source="s")
+    bigger = a.config.token_budget + 90
+    b = handle(tmp_path, fake_embedder, CHUNK_TOKEN_BUDGET=str(bigger))
+    with pytest.raises(RebuildPendingError) as refused:
+        b.ingest_pipeline()
+    assert "index needs a rebuild: run an unscoped sync" in str(refused.value)
+    assert f"chunk budget {a.config.token_budget} -> {bigger} tokens" in str(refused.value)
+    assert b.get().store.delete_source("s") > 0
+    assert a.ingest_pipeline() is a.get().pipeline
+
+
+def test_a_changed_fts_language_is_rebuilt_in_place_and_not_pending(tmp_path, fake_embedder):
+    a = handle(tmp_path, fake_embedder)
+    a.ingest_pipeline().ingest_data("Подписание договоров с поставщиками.", source="s")
+    before = read_identity(a.config.db_path)
+    assert before.fts_language == "English"
+    b = handle(tmp_path, fake_embedder, RAG_FTS_LANGUAGE="Russian")
+    assert b.state() == (IndexState.READY, "")
+    opened = b.get()
+    assert opened.store.fts_index_language == "Russian"
+    assert opened.identity == replace(before, fts_language="Russian")
+    assert read_identity(b.config.db_path) == opened.identity
+
+
+def test_an_fts_language_that_cannot_be_recorded_warns_and_still_opens(
+    tmp_path, fake_embedder, monkeypatch
+):
+    a = handle(tmp_path, fake_embedder)
+    a.get()
+
+    def refused(*args, **kwargs):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(handle_mod, "update_identity", refused)
+    b = handle(tmp_path, fake_embedder, RAG_FTS_LANGUAGE="Russian")
+    with pytest.warns(RuntimeWarning, match="Permission denied"):
+        opened = b.get()
+    assert opened.store.fts_index_language == "Russian"
+    assert read_identity(b.config.db_path).fts_language == "English"
+
+
+def test_a_recorded_model_that_cannot_be_built_is_unavailable(tmp_path):
+    config = cfg(tmp_path)
+    recorded(config, EmbeddingScheme("x/unknown", 8, "none"))
+    before = (config.db_path / INDEX_FILE).read_bytes()
+    h = IndexHandle(config)
+    with pytest.raises(IndexUnavailableError, match="x/unknown"):
+        h.get()
+    state, why = h.state()
+    assert state is IndexState.UNAVAILABLE and "x/unknown" in why
+    assert (config.db_path / INDEX_FILE).read_bytes() == before
+    assert not (config.db_path / "chunks.lance").exists()
+
+
+def test_a_recorded_model_of_another_width_here_is_unavailable(tmp_path):
+    config = cfg(tmp_path)
+    recorded(config, EmbeddingScheme(MINILM, 16, "none"))
+    h = IndexHandle(config, embedder_factory=lambda s: FakeEmbedder(s.model))
+    with pytest.raises(IndexUnavailableError) as refused:
+        h.get()
+    assert MINILM in str(refused.value) and "16" in str(refused.value)
+    assert "8-dimensional" in str(refused.value)
+    assert h.state()[0] is IndexState.UNAVAILABLE
+
+
+class _Blocking(FakeEmbedder):
+    """Holds every document embedding until released."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered, self.released = threading.Event(), threading.Event()
+
+    def embed_documents(self, texts):
+        self.entered.set()
+        assert self.released.wait(30)
+        return super().embed_documents(texts)
+
+
+def test_a_running_sync_makes_the_index_syncing(tmp_path):
+    (tmp_path / "a.md").write_text("# Alpha\n\nAlpha body about tokens.")
+    emb = _Blocking()
+    h = handle(tmp_path, emb)
+    assert h.sync.running is False
+    job = h.sync.start(None)
+    assert emb.entered.wait(30)
+    assert h.sync.running is True
+    assert h.state() == (IndexState.SYNCING, "")
+    emb.released.set()
+    assert _finished(h.sync, job) == "succeeded"
+    assert h.sync.running is False
+    assert h.state() == (IndexState.READY, "")
+
+
+def test_state_never_raises(tmp_path, fake_embedder):
+    db = tmp_path / "db"
+    db.write_text("not a folder")
+    h = handle(tmp_path, fake_embedder, DB_PATH=str(db))
+    state, why = h.state()
+    assert state is IndexState.UNAVAILABLE and "DB_PATH" in why
+
+    def unknown(scheme):
+        raise UnknownModelError("Model 'nobody/x' is not in the fastembed registry.")
+
+    h = IndexHandle(cfg(tmp_path), embedder_factory=unknown)
+    assert h.state() == (
+        IndexState.UNAVAILABLE,
+        "Model 'nobody/x' is not in the fastembed registry.",
+    )
+
+
+def test_a_failed_pipeline_build_closes_the_endpoint_client(tmp_path, built, closed, monkeypatch):
+    def broken(*args, **kwargs):
+        raise RuntimeError("no pipeline")
+
+    monkeypatch.setattr(handle_mod, "Pipeline", broken)
+    h = IndexHandle(endpoint_cfg(tmp_path))
+    with pytest.raises(RuntimeError, match="no pipeline"):
+        h.get()
+    assert len(built) == 1 and closed == [built[0].endpoint]
+
+
+def test_close_closes_the_clients_of_both_embedders_of_a_pending_index(tmp_path, built, closed):
+    ep = Endpoint(UNUSED_URL, "e5")
+    config = replace(cfg(tmp_path, MODEL_NAME=MINILM), embed_endpoints={E5_LARGE: ep, MINILM: ep})
+    recorded(config, EmbeddingScheme(E5_LARGE, 1024, "e5"))
+    h = IndexHandle(config)
+    assert h.get().embedder.model_name == E5_LARGE
+    assert sorted(e.model_name for e in built) == sorted([E5_LARGE, MINILM])
+    h.close()
+    assert sorted(map(id, closed)) == sorted(id(e.endpoint) for e in built)
+
+
+def test_status_of_an_open_index_gone_unavailable_reports_only_why(tmp_path, fake_embedder):
+    from minirag_mcp.results import status_payload
+
+    h = handle(tmp_path, fake_embedder)
+    h.ingest_pipeline().ingest_data("Alpha body.", source="s")
+    (h.config.db_path / INDEX_FILE).write_text("{", encoding="utf-8")
+    st = status_payload(h.config, h)
+    assert st["indexState"] == "unavailable"
+    assert str(h.config.db_path / INDEX_FILE) in st["indexError"]
+    assert not {"chunkCount", "indexGeneration", "embedding"} & set(st)
+    with pytest.raises(IndexUnavailableError, match=re.escape(str(h.config.db_path / INDEX_FILE))):
+        h.ingest_pipeline()

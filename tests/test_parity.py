@@ -18,7 +18,7 @@ import minirag_mcp.cli as cli
 import minirag_mcp.embedder as embedder_mod
 from conftest import FakeEmbedder
 from lookalike_texts import MINUTES, REGULATION_V1, REGULATION_V2
-from minirag_mcp.config import load_config
+from minirag_mcp.config import default_db_path, load_config
 from minirag_mcp.embedder import Embedder
 from minirag_mcp.labels import Labeler
 from minirag_mcp.labels.model import ModelError
@@ -70,6 +70,101 @@ async def test_status_is_identical_in_both_shells(
     assert not is_error and code == 0
     assert (st["sourceCount"], "indexError" in st) == (1, False)
     assert json.loads(out) == st
+
+
+async def test_status_reports_the_identity_the_same_in_both_shells(
+    root, tmp_path, capsys, monkeypatch, fake_embedder
+):
+    monkeypatch.setattr(cli, "_make_embedder", lambda cfg: fake_embedder)
+    env = {"BASE_DIR": str(root), "DB_PATH": str(tmp_path / "db")}
+    assert run_cli(["sync", *_flags(env)], capsys)[0] == 0
+    _, st = await call_mcp(env, "status", {}, fake_embedder)
+    code, out, _ = run_cli(["status", *_flags(env), "--json"], capsys)
+    assert code == 0 and json.loads(out) == st
+    assert (st["indexState"], st["indexGeneration"], st["chunkBudget"]) == (
+        "ready",
+        1,
+        load_config(env).token_budget,
+    )
+    assert st["embedding"] == {
+        "model": "fake",
+        "prefixes": "none",
+        "dim": 8,
+        "backend": "in-process",
+    }
+    assert "rebuildReasons" not in st and "indexError" not in st
+
+
+async def test_both_shells_refuse_a_1x_index_naming_the_v2_path(
+    root, tmp_path, capsys, monkeypatch, fake_embedder
+):
+    monkeypatch.setattr(cli, "_make_embedder", lambda cfg: fake_embedder)
+    db = tmp_path / "old"
+    Store(db, dim=fake_embedder.dim)
+    before = sorted(p.relative_to(db) for p in db.rglob("*"))
+    env = {"BASE_DIR": str(root), "DB_PATH": str(db)}
+    v2 = str(default_db_path(load_config(env).roots))
+    is_error, text = await call_mcp(env, "query_documents", {"query": "alpha"}, fake_embedder)
+    code, _, err = run_cli(["query", "alpha", *_flags(env)], capsys)
+    refusal = _last_error(err)
+    assert is_error and code == 1
+    assert v2 in refusal and "1.x" in refusal and text.endswith(refusal)
+    _, st = await call_mcp(env, "status", {}, fake_embedder)
+    code, out, _ = run_cli(["status", *_flags(env), "--json"], capsys)
+    assert code == 0 and json.loads(out) == st
+    assert (st["indexState"], st["indexError"]) == ("unavailable", refusal)
+    assert "chunkCount" not in st and "indexGeneration" not in st
+    assert sorted(p.relative_to(db) for p in db.rglob("*")) == before
+
+
+async def test_both_shells_refuse_an_ingest_into_a_pending_index_the_same_way(
+    root, tmp_path, capsys, monkeypatch, fake_embedder, public_dns
+):
+    """It answers from its existing vectors and lets a document be deleted, but takes no
+    ingest until an unscoped sync rebuilds it."""
+    import minirag_mcp.ingest.pipeline as pmod
+    from minirag_mcp.ingest.parser import ParsedDoc
+
+    monkeypatch.setattr(pmod, "parse_url", lambda url, **kw: ParsedDoc("# R\n\nNotes.", "R"))
+    monkeypatch.setattr(cli, "_make_embedder", lambda cfg: fake_embedder)
+    (root / "sub" / "b.md").write_text("# Beta\n\nBeta body about tokens.")
+    a_md, b_md = str(root / "sub" / "a.md"), str(root / "sub" / "b.md")
+    env = {"BASE_DIR": str(root), "DB_PATH": str(tmp_path / "db")}
+    assert run_cli(["sync", *_flags(env)], capsys)[0] == 0
+    budget = load_config(env).token_budget
+    bigger = budget + 90
+    monkeypatch.setenv("CHUNK_TOKEN_BUDGET", str(bigger))
+    env["CHUNK_TOKEN_BUDGET"] = str(bigger)
+    reason = f"chunk budget {budget} -> {bigger} tokens"
+
+    async with Client(create_app(load_config(env), embedder=fake_embedder)) as c:
+        refused = [
+            await c.call_tool("ingest_file", {"filePath": a_md}, raise_on_error=False),
+            await c.call_tool("ingest_data", {"data": "x", "source": "s"}, raise_on_error=False),
+            await c.call_tool("ingest_url", {"url": "https://example.com/p"}, raise_on_error=False),
+        ]
+        found = (await c.call_tool("query_documents", {"query": "alpha"})).data
+        st = (await c.call_tool("status", {})).data
+    cli_refusals = []
+    for args in (["ingest", a_md], ["ingest-url", "https://example.com/q"]):
+        code, _, err = run_cli([*args, *_flags(env)], capsys)
+        assert code == 1
+        cli_refusals.append(_last_error(err))
+    code_s, out_s, _ = run_cli(["status", *_flags(env), "--json"], capsys)
+    code_q, out_q, _ = run_cli(["query", "beta", *_flags(env), "--json"], capsys)
+    _, deleted = await call_mcp(env, "delete_file", {"filePath": a_md}, fake_embedder)
+    code_d, out_d, _ = run_cli(["delete", b_md, *_flags(env), "--json"], capsys)
+
+    [refusal] = set(cli_refusals)
+    assert "index needs a rebuild: run an unscoped sync" in refusal and reason in refusal
+    assert all(r.is_error and r.content[0].text.endswith(refusal) for r in refused)
+    assert code_s == 0 and json.loads(out_s) == st
+    assert (st["indexState"], st["rebuildReasons"]) == ("rebuild pending", [reason])
+    assert st["chunkBudget"] == budget
+    assert found["sources"][0]["source"] == a_md
+    assert code_q == 0 and json.loads(out_q)["sources"][0]["source"] == b_md
+    assert deleted["deletedChunks"] > 0
+    assert code_d == 0 and json.loads(out_d)["deletedChunks"] > 0
 
 
 async def test_an_empty_query_is_refused_by_both(
