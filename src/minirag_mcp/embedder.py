@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import math
 import threading
 import time
 import warnings
 from collections.abc import Callable, Sequence
+from importlib.resources import files
 from pathlib import Path
 
 from fastembed import TextEmbedding
@@ -25,9 +27,22 @@ MINILM = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 E5_LARGE = "intfloat/multilingual-e5-large"
 MODEL_WINDOWS: dict[str, int] = {E5_LARGE: 512, MINILM: 128}
 DEFAULT_BUDGETS: dict[str, int] = {E5_LARGE: 110, MINILM: 110}
+# Looser than PROBE_COSINE: a quantized GGUF is the same model with slightly other
+# vectors, and an unrelated model sits near 0.
+REFERENCE_PROBE_COSINE = 0.99
 PASSAGE_PREFIX = "passage: "
 QUERY_PREFIX = "query: "
 ENDPOINT_RETRY_SECONDS = 60.0
+
+
+def _load_reference_probes() -> dict[str, tuple[float, ...]]:
+    raw = json.loads(files("minirag_mcp").joinpath("probes.json").read_text(encoding="utf-8"))
+    return {model: tuple(vector) for model, vector in raw.items()}
+
+
+# PROBE_TEXT as the product embeds a document, made by fastembed in-process
+# (scripts/generate_probes.py; a slow test checks the file).
+REFERENCE_PROBES: dict[str, tuple[float, ...]] = _load_reference_probes()
 
 
 def known_model(model_name: str) -> bool:
@@ -159,7 +174,7 @@ class Embedder:
         self._failed_at = 0.0
         # Backends whose probe matched; the endpoint's is dropped when it falls back.
         self._verified: set[str] = set()
-        self._probe_error: str | None = None
+        self._probe_errors: dict[str, str] = {}
 
     def __getstate__(self) -> dict:
         return {name: getattr(self, name) for name in self._CONFIG}
@@ -199,63 +214,98 @@ class Embedder:
 
     @property
     def probe_error(self) -> str | None:
-        """Why the live backend does not serve this model; None while it matches or while
-        nothing is expected."""
-        return self._probe_error
+        """Why a backend does not serve this model; None while all match or while nothing
+        is expected."""
+        with self._state_lock:
+            return next(iter(self._probe_errors.values()), None)
 
     def expect_probe(self, probe: Sequence[float]) -> None:
         """Check every backend against `probe` before its first embedding; empty disarms."""
         self._expected = tuple(probe) or None
         with self._state_lock:
             self._verified.clear()
-            self._probe_error = None
+            self._probe_errors.clear()
 
     def probe_vector(self) -> list[float]:
         """PROBE_TEXT embedded as a document, prefix included, by the live backend."""
-        return self.embed_documents([PROBE_TEXT], check=False)[0]
+        return self._embed([self._probe_text()], query=False, check=False)[0]
+
+    def endpoint_probe(self) -> list[float] | None:
+        """The endpoint's vector for the probe text; None when there is no endpoint or it
+        is unreachable. The model is never loaded."""
+        if self.endpoint is None:
+            return None
+        try:
+            [vector] = self.endpoint.embed([self._fit_window(self._probe_text())])
+        except EndpointError:
+            return None
+        self._check_width([vector])
+        return vector
+
+    def reference_error(self, vector: Sequence[float]) -> str | None:
+        """Why `vector`, this embedder's live probe, is not the model's reference probe;
+        None when it is, or when no reference ships for the model."""
+        reference = REFERENCE_PROBES.get(self.model_name)
+        if reference is None:
+            return None
+        c = cosine(vector, reference)
+        if c >= REFERENCE_PROBE_COSINE:
+            return None
+        served = self._served("endpoint" if self.backend == "endpoint" else "in-process")
+        return (
+            f"{served} does not serve {self.model_name}: its vector for the probe text is not "
+            f"the reference one for that model (cosine {c:.4f} < {REFERENCE_PROBE_COSINE}). "
+            f"Point it at {self.model_name}; until then nothing is written to this index."
+        )
+
+    def has_reference(self) -> bool:
+        return self.model_name in REFERENCE_PROBES
 
     def verify(self) -> None:
         """Check a configured, reachable endpoint against the expected probe now. An
-        unreachable one is left to the fallback's own check; the model is never loaded."""
-        if self.endpoint is None or self._expected is None:
+        unreachable one falls back as an embed would, and the fallback checks itself; the
+        model is never loaded."""
+        if self.endpoint is None or self._expected is None or not self._endpoint_due():
             return
         try:
             self._check_endpoint()
-        except EndpointError:
-            with self._state_lock:
-                self._probe_error = None
+        except EndpointError as e:
+            if self.allow_fallback:
+                self._fall_back(e)
 
     def _probe_text(self) -> str:
         return PASSAGE_PREFIX + PROBE_TEXT if self.prefixes == "e5" else PROBE_TEXT
 
+    def _served(self, backend: str) -> str:
+        if backend == "in-process":
+            return f"fastembed's {self.model_name}"
+        endpoint = self.endpoint.endpoint
+        return f"The endpoint {endpoint.url} (router model {endpoint.name!r})"
+
     def _check_endpoint(self) -> None:
         [vector] = self.endpoint.embed([self._fit_window(self._probe_text())])
         self._check_width([vector])
-        endpoint = self.endpoint.endpoint
-        self._compare(vector, f"The endpoint {endpoint.url} (router model {endpoint.name!r})")
-        with self._state_lock:
-            self._verified.add("endpoint")
+        self._compare(vector, "endpoint")
 
     def _check_local(self, model: TextEmbedding) -> None:
         [vector] = model.embed([self._probe_text()])
-        self._compare(_unit([float(x) for x in vector]), f"fastembed's {self.model_name}")
-        with self._state_lock:
-            self._verified.add("in-process")
+        self._compare(_unit([float(x) for x in vector]), "in-process")
 
-    def _compare(self, live: Sequence[float], served: str) -> None:
+    def _compare(self, live: Sequence[float], backend: str) -> None:
         c = cosine(live, self._expected)
         if c >= PROBE_COSINE:
             with self._state_lock:
-                self._probe_error = None
+                self._probe_errors.pop(backend, None)
+                self._verified.add(backend)
             return
         message = (
-            f"{served} does not serve {self.model_name}: its vector for the probe text "
-            "differs from the one recorded when this index was built "
+            f"{self._served(backend)} does not serve {self.model_name}: its vector for the "
+            "probe text differs from the one recorded when this index was built "
             f"(cosine {c:.4f} < {PROBE_COSINE}). Point it at {self.model_name}; until "
             "then this index is unavailable."
         )
         with self._state_lock:
-            self._probe_error = message
+            self._probe_errors[backend] = message
         raise ProbeMismatchError(message)
 
     @property
@@ -388,12 +438,12 @@ class Embedder:
                 return text[:end]
         return ""
 
-    def embed_documents(self, texts: Sequence[str], *, check: bool = True) -> list[list[float]]:
+    def embed_documents(self, texts: Sequence[str]) -> list[list[float]]:
         if not texts:
             return []
         if self.prefixes == "e5":
             texts = [PASSAGE_PREFIX + t for t in texts]
-        return self._embed(list(texts), query=False, check=check)
+        return self._embed(list(texts), query=False)
 
     def embed_query(self, text: str) -> list[float]:
         if self.prefixes == "e5":
@@ -448,6 +498,7 @@ class Embedder:
         with self._state_lock:
             first = self._warning is None
             self._verified.discard("endpoint")
+            self._probe_errors.pop("endpoint", None)
             self._warning = message
             self._failed_at = time.monotonic()
         # Python's default filter shows a given text once per process, so a long-running

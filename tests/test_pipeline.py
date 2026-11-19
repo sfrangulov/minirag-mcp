@@ -515,10 +515,13 @@ def test_a_smaller_budget_produces_more_chunks(tmp_path, fake_embedder):
 
 def test_the_store_hook_runs_before_every_write(tmp_path, fake_embedder):
     cfg = load_config({"BASE_DIR": str(tmp_path)}, cwd=tmp_path)
-    calls = []
-    p = Pipeline(
-        Store(tmp_path / "db", dim=8), fake_embedder, cfg, before_store=lambda: calls.append(1)
-    )
+    store = Store(tmp_path / "db", dim=8)
+    held: list[list[str]] = []
+
+    def hook():
+        held.append([c.text for c in store.all_chunks("s")])
+
+    p = Pipeline(store, fake_embedder, cfg, before_store=hook)
     p.ingest_data("one", source="s")
     p.ingest_data("two", source="s")
-    assert len(calls) == 2 and p.before_store is not None
+    assert held == [[], ["one"]] and p.before_store is hook

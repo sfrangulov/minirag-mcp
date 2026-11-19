@@ -98,6 +98,12 @@ class FakeEmbedder:
     def verify(self) -> None:
         pass
 
+    def reference_error(self, vector: Sequence[float]) -> str | None:
+        return None
+
+    def has_reference(self) -> bool:
+        return True
+
 
 @pytest.fixture
 def fake_embedder() -> FakeEmbedder:
@@ -502,3 +508,15 @@ def dead_url() -> str:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
     return f"http://127.0.0.1:{port}"
+
+
+@pytest.fixture(autouse=True)
+def reference_probes(monkeypatch) -> dict:
+    """The reference table, holding the vectors the fakes serve (the stub fastembed and
+    `fake_llama`'s unsalted ones), so a fake counts as the model it stands in for."""
+    table = {
+        embedder_mod.E5_LARGE: tuple(FakeEmbedder(dim=1024)._vec("passage: " + PROBE_TEXT)),
+        embedder_mod.MINILM: tuple(FakeEmbedder(dim=384)._vec(PROBE_TEXT)),
+    }
+    monkeypatch.setattr(embedder_mod, "REFERENCE_PROBES", table)
+    return table

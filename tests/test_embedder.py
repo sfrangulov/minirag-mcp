@@ -1,7 +1,9 @@
+import json
 import math
 import pickle
 import re
 import threading
+from importlib.resources import files
 
 import pytest
 from tokenizers import Tokenizer, pre_tokenizers
@@ -534,14 +536,51 @@ def test_the_probe_is_checked_again_when_the_endpoint_comes_back(
 ):
     monkeypatch.setattr(embedder_mod, "ENDPOINT_RETRY_SECONDS", 0.0)
     emb = armed(tmp_path, fake_llama)
+    emb.embed_documents(["alpha"])  # the endpoint is verified
     fake_llama.fail["/v1/embeddings"] = (503, "Loading model")
     with pytest.warns(RuntimeWarning, match="503"):
-        emb.embed_documents(["alpha"])
+        emb.embed_documents(["beta"])
     del fake_llama.fail["/v1/embeddings"]
     fake_llama.vector_salt = "other"
     with pytest.raises(ProbeMismatchError):
-        emb.embed_documents(["beta"])
+        emb.embed_documents(["gamma"])
     assert emb.probe_error is not None
+
+
+def test_a_mismatch_of_the_fallback_survives_verify_with_the_endpoint_down(
+    tmp_path, fake_llama, stub_text_embedding, tokenizer_file
+):
+    emb = e5(tmp_path, fake_llama)
+    emb.expect_probe([1.0] + [0.0] * 1023)
+    fake_llama.fail["/v1/embeddings"] = (503, "Loading model")
+    with pytest.warns(RuntimeWarning, match="503"), pytest.raises(ProbeMismatchError):
+        emb.embed_documents(["alpha"])
+    seen = len(fake_llama.requests)
+    emb.verify()
+    emb.verify()
+    assert emb.probe_error is not None and "fastembed's" in emb.probe_error
+    assert len(fake_llama.requests) == seen, "an endpoint that just failed was tried again"
+
+
+def test_verify_records_an_unreachable_endpoint_as_a_fallback(
+    tmp_path, dead_url, stub_text_embedding, tokenizer_file
+):
+    emb = dead(tmp_path, dead_url)
+    emb.expect_probe([1.0] + [0.0] * 1023)
+    with pytest.warns(RuntimeWarning, match="unreachable"):
+        emb.verify()
+    assert emb.backend == "in-process (endpoint unreachable)" and emb.probe_error is None
+
+
+def test_the_reference_probe_of_a_model_is_refused_loudly_when_another_is_served(
+    tmp_path, fake_llama, tokenizer_file
+):
+    emb = e5(tmp_path, fake_llama)
+    assert emb.reference_error(emb.probe_vector()) is None
+    fake_llama.vector_salt = "other"
+    why = emb.reference_error(emb.probe_vector())
+    assert fake_llama.url("/v1/embeddings") in why and "'e5'" in why and E5_LARGE in why
+    assert Embedder("x/unreferenced", tmp_path).reference_error([1.0]) is None
 
 
 def test_a_fallback_model_is_verified_before_use(
@@ -573,5 +612,33 @@ def test_verify_checks_the_endpoint_and_never_loads_the_model(
         emb.verify()
     gone = dead(tmp_path, dead_url)
     gone.expect_probe([1.0] + [0.0] * 1023)
-    gone.verify()
+    with pytest.warns(RuntimeWarning, match="unreachable"):
+        gone.verify()
     assert gone.probe_error is None and stub_text_embedding.model_names == []
+
+
+def _shipped() -> dict[str, list[float]]:
+    return json.loads(files("minirag_mcp").joinpath("probes.json").read_text(encoding="utf-8"))
+
+
+def test_the_shipped_reference_probes_cover_the_known_models():
+    shipped = _shipped()
+    assert {m: len(v) for m, v in shipped.items()} == {E5_LARGE: 1024, MINILM: 384}
+    assert all(abs(math.sqrt(sum(x * x for x in v)) - 1) < 1e-3 for v in shipped.values())
+
+
+@pytest.mark.slow
+def test_the_shipped_reference_probes_match_the_cached_models(monkeypatch):
+    import importlib.util
+    from pathlib import Path
+
+    import platformdirs
+
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    script = Path(__file__).parent.parent / "scripts" / "generate_probes.py"
+    spec = importlib.util.spec_from_file_location("generate_probes", script)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    fresh = module.compute(platformdirs.user_cache_path("minirag-mcp") / "models")
+    for model, vector in _shipped().items():
+        assert embedder_mod.cosine(vector, fresh[model]) > 0.9999, model

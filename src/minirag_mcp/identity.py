@@ -201,6 +201,9 @@ def _parse(path: Path, data: object) -> IndexIdentity:
         isinstance(x, int | float) and not isinstance(x, bool) for x in probe
     ):
         raise _Malformed("embedding.probe is not a list of numbers")
+    width = _get(embedding, "dim", int, "embedding.")
+    if len(probe) not in (0, width):
+        raise _Malformed(f"embedding.probe has {len(probe)} numbers, not the {width} of dim")
     return IndexIdentity(
         format=fmt,
         minirag=minirag,

@@ -47,13 +47,14 @@ from minirag_mcp.lock import sync_lock
 from minirag_mcp.store import IndexOpenError, Store
 
 EMB = EmbeddingScheme(E5_LARGE, 1024, "e5")
+PROBE = tuple((i - 512) / 1024 for i in range(1024))
 CHUNK = ChunkingScheme(SCHEME_VERSION, 110)
 IDENT = IndexIdentity(
     format=FORMAT,
     minirag="2.0.0a1",
     generation=1,
     embedding=EMB,
-    probe=(0.25, -0.5, 0.125),
+    probe=PROBE,
     chunking=CHUNK,
     fts_language="Russian",
     document_table=True,
@@ -62,7 +63,7 @@ LAYOUT = {
     "format": 2,
     "minirag": "2.0.0a1",
     "generation": 1,
-    "embedding": {"model": E5_LARGE, "dim": 1024, "prefixes": "e5", "probe": [0.25, -0.5, 0.125]},
+    "embedding": {"model": E5_LARGE, "dim": 1024, "prefixes": "e5", "probe": list(PROBE)},
     "chunking": {"scheme_version": SCHEME_VERSION, "token_budget": 110},
     "fts_language": "Russian",
     "document_table": True,
@@ -809,3 +810,12 @@ def test_rebuild_running_needs_both_the_staging_dir_and_the_lock(tmp_path, monke
         assert rebuild_running(db)
     assert not rebuild_running(db)
     assert probed == [db, db]
+
+
+@pytest.mark.parametrize("probe", [[0.5] * 3, [0.5] * 1025])
+def test_a_probe_of_the_wrong_width_is_malformed(tmp_path, probe):
+    layout = json.loads(json.dumps(LAYOUT))
+    layout["embedding"]["probe"] = probe
+    (tmp_path / INDEX_FILE).write_text(json.dumps(layout), encoding="utf-8")
+    with pytest.raises(IdentityError, match="embedding.probe has"):
+        read_identity(tmp_path)

@@ -388,8 +388,8 @@ def test_a_pending_index_embeds_through_the_recorded_models_endpoint(
     opened = h.get()
     assert (opened.embedder.model_name, opened.embedder.backend) == (E5_LARGE, "endpoint")
     run_query(opened.store, opened.embedder, config, "budget review")
-    [request] = [r for r in fake_llama.requests if r.path == "/v1/embeddings"]
-    assert request.body["input"] == ["query: budget review"]
+    sent = [r.body["input"] for r in fake_llama.requests if r.path == "/v1/embeddings"]
+    assert sent[-1] == ["query: budget review"]
 
 
 def test_a_changed_budget_is_pending_with_a_chunking_reason(tmp_path, fake_embedder):
@@ -628,11 +628,10 @@ def test_an_endpoint_serving_another_model_is_unavailable_naming_both(
 
 
 def test_an_open_index_turns_unavailable_when_the_endpoint_changes_model(
-    fake_llama, tmp_path, tokenizer_file, monkeypatch
+    fake_llama, tmp_path, tokenizer_file
 ):
     import minirag_mcp.embedder as embedder_mod
 
-    monkeypatch.setattr(embedder_mod, "ENDPOINT_RETRY_SECONDS", 0.0)
     h = _served(tmp_path, fake_llama)
     pipeline = h.get().pipeline
     pipeline.ingest_data("x", source="s")
@@ -649,3 +648,41 @@ def test_an_open_index_turns_unavailable_when_the_endpoint_changes_model(
 def test_the_store_hook_is_the_handles_probe_recorder(tmp_path, fake_embedder):
     h = handle(tmp_path, fake_embedder)
     assert h.get().pipeline.before_store == h.ensure_probe
+
+
+def test_a_same_width_wrong_model_is_refused_on_a_fresh_folder(
+    fake_llama, tmp_path, tokenizer_file
+):
+    fake_llama.vector_salt = "bge-m3"
+    h = _served(tmp_path, fake_llama)
+    with pytest.raises(IndexUnavailableError) as refused:
+        h.get().pipeline.ingest_data("x", source="s")
+    why = str(refused.value)
+    assert E5_LARGE in why and "'e5'" in why and fake_llama.url("/v1/embeddings") in why
+    assert read_identity(h.config.db_path).probe == ()
+    assert h.get().store.get_source("s") is None
+    fake_llama.vector_salt = ""
+    h.get().pipeline.ingest_data("x", source="s")
+    assert read_identity(h.config.db_path).probe
+
+
+def test_a_wrong_model_that_appears_after_open_is_refused_before_the_probe_is_recorded(
+    fake_llama, tmp_path, tokenizer_file
+):
+    h = _served(tmp_path, fake_llama)
+    pipeline = h.get().pipeline
+    fake_llama.vector_salt = "bge-m3"
+    with pytest.raises(IndexUnavailableError, match=E5_LARGE):
+        pipeline.ingest_data("x", source="s")
+    assert read_identity(h.config.db_path).probe == ()
+    assert h.get().store.get_source("s") is None
+
+
+def test_a_model_without_a_reference_warns_once_and_is_recorded(
+    fake_llama, tmp_path, tokenizer_file, reference_probes
+):
+    reference_probes.clear()
+    h = _served(tmp_path, fake_llama)
+    with pytest.warns(RuntimeWarning, match="cannot be verified"):
+        h.get().pipeline.ingest_data("x", source="s")
+    assert read_identity(h.config.db_path).probe

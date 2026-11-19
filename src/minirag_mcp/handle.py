@@ -199,8 +199,8 @@ class IndexHandle:
             chunking = replace(config, token_budget=identity.chunking.token_budget)
             if identity.probe:
                 embedder.expect_probe(identity.probe)
-                if getattr(embedder, "endpoint", None) is not None:
-                    self._verify_at_open(embedder)
+            if identity.probe and getattr(embedder, "endpoint", None) is not None:
+                self._verify_at_open(embedder)
             pipeline = Pipeline(
                 store, embedder, chunking, labels=self._labels, before_store=self.ensure_probe
             )
@@ -214,6 +214,7 @@ class IndexHandle:
 
     @staticmethod
     def _verify_at_open(embedder) -> None:
+        """An endpoint serving another model than the index records is unavailable at open."""
         try:
             embedder.verify()
         except ProbeMismatchError as e:
@@ -237,6 +238,16 @@ class IndexHandle:
                 embedder.expect_probe(current.probe)
             else:
                 vector = tuple(embedder.probe_vector())
+                if why := embedder.reference_error(vector):
+                    raise IndexUnavailableError(why)
+                if getattr(embedder, "endpoint", None) is not None and not embedder.has_reference():
+                    warnings.warn(
+                        f"No reference probe ships for {embedder.model_name}, so the model "
+                        f"the endpoint serves cannot be verified; this index records "
+                        "whatever it serves as that model.",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
                 if update_identity(db, current.generation, probe=vector) is None:
                     return
                 embedder.expect_probe(vector)
