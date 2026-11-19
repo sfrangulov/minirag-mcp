@@ -125,8 +125,9 @@ is re-taken after the final pipeline is checked as a whole.
 Stock `sync` ingests one file at a time on one core: 3.3 files/s on this corpus, about
 40 hours. `bulk_index.py` runs the real `Pipeline.ingest_file` in worker processes and
 writes in batches. `--verify` builds the same subset both ways and requires identical
-rows, signatures and query results, and a stock `sync` over the bulk-built index that
-finds nothing to do.
+chunk rows, signatures, documents rows (what the document BM25 bonus ranks), recorded
+identity and probe, and identical results for 40 queries under the production fusion,
+and a stock `sync` over the bulk-built index that finds nothing to do.
 
 ## Caveats
 

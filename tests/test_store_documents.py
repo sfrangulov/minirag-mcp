@@ -586,3 +586,21 @@ def test_a_read_only_index_without_the_table_opens_and_searches(tmp_path):
         assert s2.undocumented_sources() == ["/a.md"]
     finally:
         _chmod_tree(db, 0o755, 0o644)
+
+
+def test_add_sources_writes_chunks_that_the_backfill_documents(store):
+    store.add_sources([("a.md", [rec("a.md", 0, "alpha"), rec("a.md", 1, "beta")])])
+    assert store.chunk_count() == 2
+    assert store.undocumented_sources() == ["a.md"]
+    assert store.backfill_documents() == (1, [])
+    assert len(rows(store)["a.md"]) == 1
+
+
+def test_add_sources_is_refused_by_the_write_check(store):
+    def refuse():
+        raise RuntimeError("replaced")
+
+    store.write_check = refuse
+    with pytest.raises(RuntimeError, match="replaced"):
+        store.add_sources([("a.md", [rec("a.md", 0, "alpha")])])
+    assert store.chunk_count() == 0

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -159,7 +160,102 @@ def test_core_env_passes_through_only_core_variables(monkeypatch):
 
 
 def test_core_env_lets_a_fixed_value_win_over_the_environment(monkeypatch):
-    from common import core_env
+    from common import CORE_ENV, core_env
+
+    for name in CORE_ENV:
+        monkeypatch.delenv(name, raising=False)
 
     monkeypatch.setenv("CHUNK_TOKEN_BUDGET", "100")
     assert core_env(CHUNK_TOKEN_BUDGET="300") == {"CHUNK_TOKEN_BUDGET": "300"}
+
+
+def _fake_embedder():
+    import importlib.util
+
+    path = Path(__file__).resolve().parents[2] / "tests" / "conftest.py"
+    spec = importlib.util.spec_from_file_location("minirag_test_conftest", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    from minirag_mcp.embedder import MINILM
+
+    return module.FakeEmbedder(MINILM, dim=384)
+
+
+def test_bulk_built_index_equals_a_stock_sync_including_documents(tmp_path, monkeypatch):
+    from bulk_index import _Collect, compare_indexes
+    from common import CORE_ENV
+
+    from minirag_mcp.ingest.pipeline import Pipeline
+    from minirag_mcp.ingest.scanner import scan_roots
+
+    for name in CORE_ENV:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    for i in range(4):
+        (corpus / f"doc{i}.md").write_text(
+            f"# Title {i}\n\nAlpha {i} text.\n\n## Part\n\n" + f"beta gamma {i} " * 40,
+            encoding="utf-8",
+        )
+    corpus = corpus.resolve()
+    fake = _fake_embedder()
+
+    def handle(db):
+        from minirag_mcp.config import load_config
+        from minirag_mcp.handle import IndexHandle
+
+        cfg = load_config(
+            {"BASE_DIR": str(corpus), "DB_PATH": str(db), "MODEL_NAME": fake.model_name}
+        )
+        return IndexHandle(cfg, embedder_factory=lambda scheme: fake)
+
+    stock = handle(tmp_path / "a")
+    stock.run_sync(None)
+
+    bulk = handle(tmp_path / "b")
+    store = bulk.ingest_pipeline().store
+    index = bulk.get()
+    collected = []
+    for entry in scan_roots(list(index.config.roots)):
+        sink = _Collect()
+        Pipeline(sink, fake, index.config).ingest_file(entry.path, rules_checked=True)
+        collected.append((str(entry.path), sink.records))
+    bulk.ensure_probe()
+    store.add_sources(collected)
+    assert store.backfill_documents()[1] == []
+
+    assert compare_indexes(tmp_path / "a", tmp_path / "b") == []
+
+
+def test_compare_indexes_sees_a_missing_documents_row(tmp_path, monkeypatch):
+    """The comparison is what verify relies on: a bulk index without documents rows differs."""
+    from bulk_index import _Collect, compare_indexes
+
+    from minirag_mcp.config import load_config
+    from minirag_mcp.handle import IndexHandle
+    from minirag_mcp.ingest.pipeline import Pipeline
+    from minirag_mcp.ingest.scanner import scan_roots
+
+    monkeypatch.delenv("MODEL_NAME", raising=False)
+    corpus = (tmp_path / "corpus").resolve()
+    corpus.mkdir()
+    (corpus / "a.md").write_text("# A\n\nsome text here\n", encoding="utf-8")
+    fake = _fake_embedder()
+
+    def handle(db):
+        cfg = load_config(
+            {"BASE_DIR": str(corpus), "DB_PATH": str(db), "MODEL_NAME": fake.model_name}
+        )
+        return IndexHandle(cfg, embedder_factory=lambda scheme: fake)
+
+    handle(tmp_path / "a").run_sync(None)
+    bulk = handle(tmp_path / "b")
+    store = bulk.ingest_pipeline().store
+    sink = _Collect()
+    (entry,) = scan_roots(list(bulk.get().config.roots))
+    Pipeline(sink, fake, bulk.get().config).ingest_file(entry.path, rules_checked=True)
+    bulk.ensure_probe()
+    store.add_sources([(str(entry.path), sink.records)])
+    assert any("document" in p for p in compare_indexes(tmp_path / "a", tmp_path / "b"))

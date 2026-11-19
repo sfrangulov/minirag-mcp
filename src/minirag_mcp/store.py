@@ -783,6 +783,28 @@ class Store:
         self._sign(source, records)
 
     @_refused_while_rebuilt
+    def add_sources(self, batch: Sequence[tuple[str, Sequence[ChunkRecord]]]) -> None:
+        """Append the chunks and signatures of sources that have none yet, in one commit.
+
+        For a bulk load into an index that holds none of these sources: unlike
+        `replace_source` it deletes nothing, and it writes no documents rows, which
+        `backfill_documents` writes from the stored chunks afterwards.
+        """
+        absent = [c for c in self.missing_columns if c in _ADDITIVE_COLUMNS]
+        rows = []
+        entries = []
+        for source, records in batch:
+            for r in records:
+                row = asdict(r)
+                for column in absent:
+                    del row[column]
+                rows.append(row)
+            ordered = sorted(records, key=lambda r: r.chunk_index)
+            entries.append((source, ordered[0].ingested_at, signature(join_document(ordered))))
+        self._table.add(rows)
+        self._put_signatures(entries)
+
+    @_refused_while_rebuilt
     def move_source(self, old: str, new: str, *, mtime: float) -> int:
         """Re-path a source's chunks in one commit, keeping their text and vectors.
 

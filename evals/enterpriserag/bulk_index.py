@@ -9,9 +9,10 @@ LanceDB commits per file. Here worker processes run the real `Pipeline.ingest_fi
 (parser, chunker, embedder untouched) against a store that only collects the rows, and
 the parent writes them in large batches, signatures included.
 
-`--verify N` builds the same N-file subset both ways and compares every row, the
-signatures and query results, then runs stock `sync` over the bulk-built index and
-requires it to find nothing to do.
+`--verify N` builds the same N-file subset both ways and compares every chunk row, the
+signatures, the documents rows, the recorded identity and probe, and the results of 40
+queries under the production fusion (document weight included), then runs stock `sync`
+over the bulk-built index and requires it to find nothing to do.
 """
 
 from __future__ import annotations
@@ -22,7 +23,6 @@ import multiprocessing as mp
 import sys
 import tempfile
 import time
-from dataclasses import asdict
 from pathlib import Path
 
 from common import CORPUS, INDEX, core_env, corpus_files, load_questions, open_index, outside_root
@@ -62,32 +62,6 @@ def _ingest(path: str):
     except Exception as e:
         return path, None, f"{type(e).__name__}: {e}"
     return path, _pipeline.store.records, None
-
-
-def _flush(store, batch: list) -> None:
-    """Write `batch` under the store's own write guards (rebuild in progress, generation)."""
-    from minirag_mcp.store import _refused_while_rebuilt
-
-    _refused_while_rebuilt(_write_batch)(store, batch)
-
-
-def _write_batch(store, batch: list) -> None:
-    from minirag_mcp.chunker import join_document
-    from minirag_mcp.lookalike import signature
-
-    absent = [c for c in store.missing_columns]
-    rows = []
-    entries = []
-    for source, records in batch:
-        for r in records:
-            row = asdict(r)
-            for column in absent:
-                row.pop(column, None)
-            rows.append(row)
-        ordered = sorted(records, key=lambda r: r.chunk_index)
-        entries.append((source, ordered[0].ingested_at, signature(join_document(ordered))))
-    store._table.add(rows)
-    store._put_signatures(entries)
 
 
 def build(
@@ -149,7 +123,7 @@ def build(
             counts["ingested"] += 1
             counts["chunks"] += len(records)
             if len(batch) >= batch_files:
-                _flush(store, batch)
+                store.add_sources(batch)
                 batch = []
                 rate = counts["ingested"] / (time.monotonic() - started)
                 left = (len(todo) - counts["ingested"] - counts["failed"]) / rate / 3600
@@ -160,7 +134,7 @@ def build(
                     flush=True,
                 )
     if batch:
-        _flush(store, batch)
+        store.add_sources(batch)
     counts["load_seconds"] = round(time.monotonic() - started, 1)
     # The documents table is written from the stored chunk text, as `sync` writes it.
     _, problems = store.backfill_documents()
@@ -194,9 +168,66 @@ def _signatures(db: Path) -> dict:
     return {r["source"]: list(r["signature"]) for r in rows}
 
 
-def verify(corpus: Path, n: int, workers: int, threads: int) -> int:
+def _documents(db: Path) -> dict:
+    import lancedb
+
+    conn = lancedb.connect(str(db))
+    if "documents" not in conn.table_names():
+        return {}
+    return {r["source"]: r for r in conn.open_table("documents").to_arrow().to_pylist()}
+
+
+def compare_indexes(a_db: Path, b_db: Path) -> list[str]:
+    """What differs between two indexes of the same corpus: chunk rows, look-alike
+    signatures, the whole-document rows the document BM25 bonus ranks, the identity
+    recorded in index.json, and the probe both must carry."""
     import numpy as np
 
+    from minirag_mcp.identity import read_identity
+
+    problems = []
+    a, b = _rows(a_db), _rows(b_db)
+    if a.keys() != b.keys():
+        problems.append(f"row ids differ: {len(a.keys() - b.keys())} / {len(b.keys() - a.keys())}")
+    skip = {"vector", "ingested_at"}
+    for key in a.keys() & b.keys():
+        ra, rb = a[key], b[key]
+        diff = [c for c in ra if c not in skip and ra[c] != rb.get(c)]
+        if diff:
+            problems.append(f"{key}: columns differ {diff}")
+        if not np.allclose(ra["vector"], rb["vector"], atol=1e-5):
+            problems.append(f"{key}: vectors differ")
+    sa, sb = _signatures(a_db), _signatures(b_db)
+    if sa != sb:
+        problems.append(f"signatures differ: {len(sa)} vs {len(sb)} sources")
+    da, db_ = _documents(a_db), _documents(b_db)
+    if not da:
+        problems.append("the stock index has no documents rows")
+    if da.keys() != db_.keys():
+        problems.append(
+            f"document rows differ: {len(da.keys() - db_.keys())} / {len(db_.keys() - da.keys())}"
+        )
+    for key in da.keys() & db_.keys():
+        diff = [c for c in da[key] if c != "ingested_at" and da[key][c] != db_[key].get(c)]
+        if diff:
+            problems.append(f"{key}: document columns differ {diff}")
+    ia, ib = read_identity(a_db), read_identity(b_db)
+    if ia is None or ib is None:
+        problems.append("an index has no index.json")
+    else:
+        if not ia.probe or not ib.probe:
+            problems.append("an index records no probe")
+        elif not np.allclose(ia.probe, ib.probe, atol=1e-5):
+            problems.append("probes differ")
+        for field in ("format", "embedding", "chunking", "fts_language", "document_table"):
+            if getattr(ia, field) != getattr(ib, field):
+                problems.append(
+                    f"identity {field} differs: {getattr(ia, field)} / {getattr(ib, field)}"
+                )
+    return problems
+
+
+def verify(corpus: Path, n: int, workers: int, threads: int) -> int:
     from minirag_mcp.results import run_query
 
     questions = load_questions()
@@ -214,22 +245,8 @@ def verify(corpus: Path, n: int, workers: int, threads: int) -> int:
     result = build(root, work / "b", workers, threads, batch_files=50, log=sys.stdout)
     print(f"bulk build: {result['counts']} errors {len(result['errors'])}")
 
-    problems = []
-    a, b = _rows(work / "a"), _rows(work / "b")
-    if a.keys() != b.keys():
-        problems.append(f"row ids differ: {len(a.keys() - b.keys())} / {len(b.keys() - a.keys())}")
-    skip = {"vector", "ingested_at"}
-    for key in a.keys() & b.keys():
-        ra, rb = a[key], b[key]
-        diff = [c for c in ra if c not in skip and ra[c] != rb.get(c)]
-        if diff:
-            problems.append(f"{key}: columns differ {diff}")
-        if not np.allclose(ra["vector"], rb["vector"], atol=1e-5):
-            problems.append(f"{key}: vectors differ")
-    sa, sb = _signatures(work / "a"), _signatures(work / "b")
-    if sa != sb:
-        problems.append(f"signatures differ: {len(sa)} vs {len(sb)} sources")
-
+    problems = compare_indexes(work / "a", work / "b")
+    a = _rows(work / "a")
     handle_b = open_index(work / "b", root)
     index_b = handle_b.get()
     emb_b, store_b = index_b.embedder, index_b.store

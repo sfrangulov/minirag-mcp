@@ -17,6 +17,7 @@ import json
 import os
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -32,6 +33,10 @@ def main() -> None:
     cfg, emb, store, reranker = _open(db, CORPUS)
     if reranker is None:
         sys.exit("RERANK_URL and RERANK_MODEL must be set")
+    # A measurement: the first reranker error ends the run (`scores` raises, and the 60 s
+    # back-off after it would otherwise turn later questions into silent first-stage rows).
+    # The product's 10 s cap is for queries; a full-corpus first stage can take longer.
+    reranker.endpoint = replace(reranker.endpoint, timeout=300.0)
     questions = {q.question_id: q for q in load_questions()}
     import lancedb
 
@@ -42,6 +47,8 @@ def main() -> None:
         text = questions[r["question_id"]].question
         res = store.search(text, emb.embed_query(text), top_k=50, hybrid_weight=cfg.hybrid_weight)
         scores = reranker.scores(text, [x.text for x in res])
+        if len(scores) != len(res):
+            sys.exit(f"{r['question_id']}: {len(scores)} rerank scores for {len(res)} chunks")
         order = sorted(range(len(res)), key=lambda i: -scores[i])
         reranked = list(dict.fromkeys(d for d in (dsid_of(res[i].source) for i in order) if d))
         first = list(dict.fromkeys(d for d in (dsid_of(x.source) for x in res) if d))
