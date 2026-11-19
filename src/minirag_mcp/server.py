@@ -134,6 +134,11 @@ def create_app(
         its own documents, so it is usually 0. A problem appears in errors
         prefixed "lookAlikes:"; it is not a failure.
 
+        Each sync also writes, from the same stored text, the row that ranks
+        a document as a whole in search, for every document left without
+        one; a problem appears in errors prefixed "documents:" and is not a
+        failure.
+
         ignored counts the files and folders a .miniragignore rule excluded
         from the scan, a folder once; a file indexed before its rule was
         added is deleted from the index and counted under deleted.
@@ -215,7 +220,8 @@ def create_app(
         dateFrom: str | None = None,
         dateTo: str | None = None,
     ) -> dict:
-        """Hybrid search: semantic similarity plus a keyword boost for exact terms.
+        """Hybrid search: semantic similarity plus a keyword boost for exact terms
+        and one for passages of documents that match the query as a whole.
 
         Returns `results` — ranked chunks with text, source, title,
         chunkIndex, score and parentId — `sources`, the distinct
@@ -522,6 +528,10 @@ def create_app(
         unsignedSourceCount, present when above zero, counts indexed documents
         without the signature that finds their look-alikes, so no result names
         theirs; lookAlikesWarning says a sync computes them.
+
+        undocumentedSourceCount, present when above zero, counts indexed
+        documents without the row that lets search rank them as whole
+        documents; documentsWarning says a sync builds them.
 
         unpagedSourceCount, present when above zero, counts PDFs indexed
         before page numbers were stored, whose results carry no `pages`;

@@ -215,6 +215,24 @@ def signature_status(store: Store) -> dict:
     }
 
 
+def documents_status(store: Store) -> dict:
+    """The whole-document half of `status`, identical for the server and the CLI.
+
+    Absent when every indexed document has its row, so an index that is up to date sees
+    the status it always had.
+    """
+    undocumented = len(store.undocumented_sources())
+    if not undocumented:
+        return {}
+    return {
+        "undocumentedSourceCount": undocumented,
+        "documentsWarning": f"{undocumented} indexed document(s) have no row in the "
+        "whole-document keyword index, so search cannot rank them as whole documents. A "
+        "sync (sync_start, or `minirag-mcp sync`) builds them from the stored text, reading "
+        "and embedding nothing again.",
+    }
+
+
 def add_look_alikes(rows: Sequence[dict], store: Store, roots: Sequence[Path]) -> None:
     """Give each document row with look-alikes a `lookAlikes` list; leave the rest as is.
 
@@ -291,6 +309,7 @@ def status_payload(config: Config, handle: IndexHandle) -> dict:
         out.update(scheme_status(opened.store))
         out.update(fts_status(opened.store))
         out.update(signature_status(opened.store))
+        out.update(documents_status(opened.store))
         out.update(pages_status(opened.store))
         out.update(labels_status(opened.labels, opened.store))
     except Exception as e:
@@ -417,6 +436,7 @@ def run_query(
         embedder.embed_query(query),
         top_k=min(top_k, MAX_TOP_K),
         hybrid_weight=config.hybrid_weight,
+        document_weight=config.document_weight,
         scopes=scopes,
         max_distance=config.max_distance,
         grouping=config.grouping,

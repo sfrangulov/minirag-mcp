@@ -23,7 +23,7 @@ from minirag_mcp.embedder import Embedder
 from minirag_mcp.labels import Labeler
 from minirag_mcp.labels.model import ModelError
 from minirag_mcp.server import create_app
-from minirag_mcp.store import SIGNATURE_TABLE, Store
+from minirag_mcp.store import DOCUMENT_TABLE, SIGNATURE_TABLE, Store
 
 
 @pytest.fixture
@@ -638,3 +638,26 @@ async def test_status_reports_unsigned_documents_the_same_way_in_both(
     assert code == 0 and json.loads(out)["counts"]["signed"] == 3
     _, st = await call_mcp(env, "status", {}, fake_embedder)
     assert "unsignedSourceCount" not in st
+
+
+async def test_status_reports_undocumented_documents_the_same_way_in_both(
+    lookalike_root, tmp_path, capsys, monkeypatch, fake_embedder
+):
+    monkeypatch.setattr(cli, "_make_embedder", lambda cfg: fake_embedder)
+    env = {"BASE_DIR": str(lookalike_root), "DB_PATH": str(tmp_path / "db")}
+    run_cli(["sync", *_flags(env)], capsys)
+    _, st = await call_mcp(env, "status", {}, fake_embedder)
+    assert "undocumentedSourceCount" not in st and "documentsWarning" not in st
+
+    Store(tmp_path / "db", dim=fake_embedder.dim)._db.open_table(DOCUMENT_TABLE).delete("true")
+    _, st = await call_mcp(env, "status", {}, fake_embedder)
+    code, out, _ = run_cli(["status", *_flags(env), "--json"], capsys)
+    cli_st = json.loads(out)
+    assert code == 0
+    assert st["undocumentedSourceCount"] == cli_st["undocumentedSourceCount"] == 3
+    assert st["documentsWarning"] == cli_st["documentsWarning"]
+
+    code, _, _ = run_cli(["sync", *_flags(env)], capsys)
+    assert code == 0
+    _, st = await call_mcp(env, "status", {}, fake_embedder)
+    assert "undocumentedSourceCount" not in st

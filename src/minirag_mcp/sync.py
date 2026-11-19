@@ -226,6 +226,10 @@ def _run_sync_unlocked(
     )
     counts["signed"] += signed
     errors.extend(sign_errors)
+    # Likewise for document rows, and before `update_indices`, which folds the rows it
+    # writes into the documents index.
+    _, document_errors = store.backfill_documents((str(scope),) if scope else (), on_event=on_event)
+    errors.extend(document_errors)
 
     # Also on a run that changed nothing: an index written before this existed is
     # brought up to date by its next sync.

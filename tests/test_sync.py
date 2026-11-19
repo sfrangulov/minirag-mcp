@@ -12,7 +12,7 @@ from minirag_mcp.chunker import SCHEME_VERSION
 from minirag_mcp.config import load_config
 from minirag_mcp.ingest.pipeline import Pipeline
 from minirag_mcp.lock import SyncLock, SyncLockBusy, sync_lock
-from minirag_mcp.store import ChunkRecord, Store
+from minirag_mcp.store import DOCUMENT_TABLE, ChunkRecord, Store
 from minirag_mcp.sync import SyncBusyError, SyncManager, run_sync
 
 
@@ -1116,3 +1116,60 @@ def test_an_index_update_failure_is_reported_not_raised(env, monkeypatch):
     counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
     assert counts["ingested"] == 2
     assert any("disk full" in e["error"] for e in errors)
+
+
+def _without_document_rows(env):
+    """An index whose chunks were written with no `documents` row beside them."""
+    cfg, store, pipeline, root = env
+    seed(root)
+    (root / "sub" / "c.md").write_text("# C\n\nCharlie body text for the corpus.")
+    counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    assert counts["ingested"] == 3 and errors == []
+    store._db.open_table(DOCUMENT_TABLE).delete("true")
+    return store
+
+
+def test_sync_builds_missing_document_rows(env, monkeypatch):
+    cfg, _, _, root = env
+    store = _without_document_rows(env)
+    monkeypatch.setattr(
+        "minirag_mcp.ingest.pipeline.parse_file",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("a backfill must not parse")),
+    )
+    pipeline = Pipeline(store, _NoEmbedder(), cfg)
+    assert len(store.undocumented_sources()) == 3
+
+    events = []
+    counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size, on_event=events.append)
+
+    assert errors == [] and counts["skipped"] == 3 and counts["ingested"] == 0
+    assert f"documented {root / 'a.md'}" in events
+    assert store.undocumented_sources() == []
+    documents = store._db.open_table(DOCUMENT_TABLE)
+    assert {
+        i.name: documents.index_stats(i.name).num_unindexed_rows for i in documents.list_indices()
+    } == {"text_idx": 0, "title_idx": 0}
+
+
+def test_a_scoped_sync_builds_document_rows_only_inside_its_scope(env):
+    cfg, _, _, root = env
+    store = _without_document_rows(env)
+    pipeline = Pipeline(store, _NoEmbedder(), cfg)
+    run_sync(pipeline, store, cfg.roots, cfg.max_file_size, scope=root / "sub")
+    assert store.undocumented_sources() == [str(root / "a.md")]
+
+
+def test_a_document_backfill_failure_is_reported_not_raised(env, monkeypatch):
+    cfg, _, _, root = env
+    store = _without_document_rows(env)
+    pipeline = Pipeline(store, _NoEmbedder(), cfg)
+
+    def conflict(*args, **kwargs):
+        raise RuntimeError("Retryable commit conflict for version 7")
+
+    monkeypatch.setattr(store, "_put_documents", conflict)
+    counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    assert counts["failed"] == 0
+    [error] = errors
+    assert error["error"].startswith("documents: ") and "commit conflict" in error["error"]
+    assert len(store.undocumented_sources()) == 3

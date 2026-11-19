@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import re
 import warnings
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import pytest
@@ -31,6 +32,7 @@ from minirag_mcp.results import (
     QueryError,
     aggregate_sources,
     display_path,
+    documents_status,
     labels_status,
     list_payload,
     run_query,
@@ -517,3 +519,58 @@ def test_status_and_a_filter_name_a_model_file_that_is_not_there(
         label_source=source,
     )
     assert got["filterNotice"].endswith(f"which cannot run here: {reason}")
+
+
+def test_status_counts_sources_without_a_document_row(tmp_path, root, store, fake_embedder):
+    index(store, fake_embedder, root, "a.md", {})
+    assert documents_status(store) == {}
+
+    path = root / "b.md"
+    path.write_text("budget review")
+    store._table.add([asdict(record(str(path), {}, "", "", text="budget review"))])
+    status = documents_status(store)
+    assert status["undocumentedSourceCount"] == 1
+    assert "sync" in status["documentsWarning"]
+
+    store.backfill_documents()
+    assert documents_status(store) == {}
+
+
+class _Fixed:
+    """Embeds every query as the same vector, so the keyword-free ranking is known."""
+
+    dim = 8
+
+    def embed_query(self, text):
+        return [0.0, 1.0] + [0.0] * 6
+
+
+def test_a_query_ranks_with_the_configured_document_weight(tmp_path, root, store):
+    """/a.md holds both query terms only as a whole document; /b.md's chunk is nearest."""
+    near, apart = [0.0, 1.0] + [0.0] * 6, [1.0, 0.0] + [0.0] * 6
+    for name, texts, vector in (
+        ("b.md", ["gamma delta"], near),
+        ("a.md", ["alpha", "beta"], apart),
+    ):
+        source = str(root / name)
+        store.replace_source(
+            source,
+            [
+                replace(
+                    record(source, {}, "", "", text=text, vector=vector),
+                    id=f"{source}#{i}",
+                    chunk_index=i,
+                )
+                for i, text in enumerate(texts)
+            ],
+        )
+
+    def first(document_weight):
+        config = replace(
+            make_config(root, tmp_path), hybrid_weight=0.0, document_weight=document_weight
+        )
+        payload = run_query(store, _Fixed(), config, "alpha beta")
+        return Path(payload["sources"][0]["source"]).name
+
+    assert first(0.0) == "b.md"
+    assert first(0.5) == "a.md"
