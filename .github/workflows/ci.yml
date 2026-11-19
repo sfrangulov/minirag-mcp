@@ -47,7 +47,8 @@ jobs:
           /tmp/smoke/bin/minirag-mcp status --base-dir .
 
   slow:
-    # Downloads a ~220 MB embedding model: never on push or pull_request.
+    # Downloads the embedding models, ~2.5 GB (e5-large and MiniLM): never on push or
+    # pull_request.
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     runs-on: ubuntu-latest
     env:

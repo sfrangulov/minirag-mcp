@@ -65,15 +65,31 @@ class QueryError(ValueError):
     """A query that cannot run as given."""
 
 
-def ingest_reply(r: IngestResult) -> dict:
+def embedding_status(embedder) -> dict:
+    """Which backend embeds, and while the endpoint is unreachable, why not it."""
+    out = {"embeddingBackend": getattr(embedder, "backend", "in-process")}
+    if warning := getattr(embedder, "warning", None):
+        out["embeddingWarning"] = warning
+    return out
+
+
+def embedder_notes(embedder) -> list[str]:
+    """The embedder's warning as a reply's `warnings`; empty while nothing is wrong."""
+    warning = getattr(embedder, "warning", None)
+    return [warning] if warning else []
+
+
+def ingest_reply(r: IngestResult, notes: Sequence[str] = ()) -> dict:
     """One ingested document as the ingest tools and commands report it.
 
-    `labelProblem` appears only when labels are missing, so a corpus without a
-    classify.toml sees the reply it always had.
+    `labelProblem` and `warnings` appear only when there is something to say, so a
+    corpus without a classify.toml sees the reply it always had.
     """
     out = {"source": r.source, "chunkCount": r.chunk_count, "title": r.title}
     if r.label_problem:
         out["labelProblem"] = r.label_problem
+    if notes:
+        out["warnings"] = list(notes)
     return out
 
 
@@ -376,7 +392,11 @@ def run_query(
         "results": [result_dict(r) for r in results],
         "sources": aggregate_sources(results, config.roots),
         "parents": parent_map(results),
+        # Read after the query was embedded: that embedding is what may have fallen back.
+        "embeddingBackend": getattr(embedder, "backend", "in-process"),
     }
+    if notes := embedder_notes(embedder):
+        payload["warnings"] = notes
     add_look_alikes(payload["sources"], store, config.roots)
     if label_filter is not None and labeler is not None:
         payload["filterCounts"] = filter_counts(

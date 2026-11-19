@@ -15,6 +15,7 @@ from minirag_mcp import __version__
 from minirag_mcp.chunker import SCHEME_VERSION, join_document
 from minirag_mcp.config import Config, ConfigError, load_config
 from minirag_mcp.embedder import Embedder, EmbedderUnavailableError, UnknownModelError
+from minirag_mcp.endpoints import EmbeddingEndpoint
 from minirag_mcp.ingest.ignore import IGNORE_FILE, IgnoredFileError, excluded_by
 from minirag_mcp.ingest.pipeline import IngestResult, Pipeline
 from minirag_mcp.ingest.scanner import scan_roots
@@ -24,6 +25,8 @@ from minirag_mcp.lock import SyncLockBusy
 from minirag_mcp.results import (
     DEFAULT_FIND_LIMIT,
     QueryError,
+    embedder_notes,
+    embedding_status,
     fts_status,
     ignore_status,
     ingest_reply,
@@ -61,8 +64,9 @@ ModelNameOpt = Annotated[
 ]
 
 
-def _make_embedder(cfg: Config) -> Embedder:
-    return Embedder(cfg.model_name, cfg.cache_dir)  # patched in tests
+def _make_embedder(cfg: Config) -> Embedder:  # patched in tests
+    ep = cfg.embed_endpoints.get(cfg.model_name)
+    return Embedder(cfg.model_name, cfg.cache_dir, endpoint=EmbeddingEndpoint(ep) if ep else None)
 
 
 def _make_model_factory() -> Callable | None:
@@ -253,7 +257,8 @@ def ingest(
                 done.append(pipeline.ingest_file(f, rules_checked=f in scanned))
             except Exception as e:  # per-file failures never abort the batch
                 failures.append({"source": str(f), "error": str(e)})
-    payload = {"ingested": [ingest_reply(r) for r in done], "failed": failures}
+    notes = embedder_notes(pipeline.embedder)
+    payload = {"ingested": [ingest_reply(r, notes) for r in done], "failed": failures}
     human = "\n".join([f"ingested {len(done)} file(s):"] + [f"  {r.source}" for r in done])
     _emit(payload, json, human)
     for fail in failures:
@@ -282,7 +287,8 @@ def ingest_url(
             r = pipeline.ingest_url(url, source=source, title=title)
     except Exception as e:
         _fail(str(e))
-    _emit(ingest_reply(r), json, f"ingested {r.source} ({r.chunk_count} chunks)")
+    reply = ingest_reply(r, embedder_notes(pipeline.embedder))
+    _emit(reply, json, f"ingested {r.source} ({r.chunk_count} chunks)")
     _warn_labelling(pipeline, report.problems)
 
 
@@ -627,9 +633,11 @@ def status(
     # An index that cannot be opened is reported, not raised: the server's `status` does
     # the same, and both are what a broken setup is diagnosed with.
     try:
-        store = Store(cfg.db_path, dim=_make_embedder(cfg).dim, fts_language=cfg.fts_language)
+        emb = _make_embedder(cfg)
+        store = Store(cfg.db_path, dim=emb.dim, fts_language=cfg.fts_language)
         payload["chunkCount"] = store.chunk_count()
         payload["sourceCount"] = store.source_count()
+        payload.update(embedding_status(emb))
         payload.update(scheme_status(store))
         payload.update(fts_status(store))
         payload.update(signature_status(store))

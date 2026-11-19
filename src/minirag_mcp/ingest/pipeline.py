@@ -215,7 +215,8 @@ class Pipeline:
             markdown,
             count_tokens=self._count_tokens,
             title=title if seed_title else "",
-            budget=self.config.token_budget,
+            # The passage prefix is embedded with every chunk, so it takes from the budget.
+            budget=self.config.token_budget - getattr(self.embedder, "prefix_tokens", 0),
         )
         if not chunks:
             raise EmptyDocumentError(f"No text content extracted from {source}")

@@ -85,6 +85,16 @@ class _Client:
         # A sync thread and query threads may share one client.
         self._lock = threading.Lock()
 
+    def __getstate__(self) -> dict:
+        state = self.__dict__.copy()
+        del state["_lock"]
+        state["_session"] = None
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        self.__dict__.update(state)
+        self._lock = threading.Lock()
+
     def _post(self, body: dict) -> dict:
         with self._lock:
             if self._session is None:

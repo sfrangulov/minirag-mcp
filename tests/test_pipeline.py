@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import pytest
 
 from conftest import FakeEmbedder
@@ -31,6 +33,17 @@ def test_ingest_file_roundtrip(pipe):
     assert info.source_type == "file"
     assert info.file_hash == file_sha256(f)
     assert info.mtime == f.stat().st_mtime
+
+
+def test_chunks_leave_room_for_the_passage_prefix(tmp_path):
+    class Prefixed(FakeEmbedder):
+        prefixes, prefix_tokens = "e5", 5
+
+    cfg = replace(load_config({"BASE_DIR": str(tmp_path)}, cwd=tmp_path), token_budget=40)
+    p = Pipeline(Store(tmp_path / "db", dim=8), Prefixed(), cfg)
+    p.ingest_data(" ".join(f"word{i}." for i in range(300)), source="s")
+    counts = [Prefixed().count_tokens(c.text) for c in p.store.all_chunks("s")]
+    assert len(counts) > 1 and max(counts) <= 35
 
 
 def test_reingest_replaces(pipe):

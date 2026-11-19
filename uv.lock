@@ -1428,6 +1428,7 @@ dependencies = [
     { name = "cyclopts" },
     { name = "fastembed" },
     { name = "fastmcp" },
+    { name = "huggingface-hub" },
     { name = "lancedb" },
     { name = "markitdown", extra = ["docx", "pdf", "pptx", "xlsx"] },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
@@ -1441,7 +1442,6 @@ dependencies = [
 
 [package.optional-dependencies]
 classify = [
-    { name = "huggingface-hub" },
     { name = "llama-cpp-python" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
@@ -1468,7 +1468,7 @@ requires-dist = [
     { name = "cyclopts", specifier = ">=4.0" },
     { name = "fastembed", specifier = ">=0.8" },
     { name = "fastmcp", specifier = ">=3.4" },
-    { name = "huggingface-hub", marker = "extra == 'classify'", specifier = ">=0.20" },
+    { name = "huggingface-hub", specifier = ">=0.20" },
     { name = "lancedb", specifier = ">=0.36" },
     { name = "llama-cpp-python", marker = "extra == 'classify'", specifier = ">=0.3.36" },
     { name = "markitdown", extras = ["pdf", "docx", "pptx", "xlsx"], specifier = ">=0.1.7" },

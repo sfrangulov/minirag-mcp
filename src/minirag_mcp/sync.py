@@ -238,6 +238,10 @@ def _run_sync_unlocked(
         taxonomy = str(pipeline.labels.path) if pipeline.labels else ""
         errors.extend({"source": taxonomy, "error": f"labels: {p}"} for p in report.problems)
 
+    # Not a failure: while the endpoint is unreachable, the in-process model embeds.
+    if warning := getattr(pipeline.embedder, "warning", None):
+        errors.append({"source": str(store.db_path), "error": f"embedding: {warning}"})
+
     return counts, errors
 
 

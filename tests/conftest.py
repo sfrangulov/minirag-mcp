@@ -16,7 +16,12 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import pytest
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from tokenizers.pre_tokenizers import Whitespace
+from tokenizers.processors import TemplateProcessing
 
+import minirag_mcp.embedder as embedder_mod
 from minirag_mcp import security
 from minirag_mcp.labels.model import ModelError
 from minirag_mcp.labels.taxonomy import ModelSpec
@@ -41,6 +46,12 @@ class FakeEmbedder:
     segmentation, but the same *shape* — monotonic in length, and never zero — which is
     all the packer's budget arithmetic depends on.
     """
+
+    prefixes = "none"
+    backend = "in-process"
+    warning: str | None = None
+    prefix_tokens = 0
+    max_tokens = 128
 
     def __init__(self, model_name: str = "fake", dim: int = 8, salt: str = "") -> None:
         self.model_name = model_name
@@ -70,6 +81,79 @@ class FakeEmbedder:
 @pytest.fixture
 def fake_embedder() -> FakeEmbedder:
     return FakeEmbedder()
+
+
+def stub_tokenizer() -> Tokenizer:
+    """Whole words, plus the two special tokens a BERT-style template wraps them in."""
+    tokenizer = Tokenizer(WordLevel(vocab={"[UNK]": 0, "[CLS]": 1, "[SEP]": 2}, unk_token="[UNK]"))
+    tokenizer.pre_tokenizer = Whitespace()
+    tokenizer.post_processor = TemplateProcessing(
+        single="[CLS] $A [SEP]", special_tokens=[("[CLS]", 1), ("[SEP]", 2)]
+    )
+    return tokenizer
+
+
+class TokenizerFile:
+    """The tokenizer.json `hf_hub_download` hands the embedder, and every call made for it.
+    `write` swaps in another tokenizer."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.calls: list[dict] = []
+        self.write(stub_tokenizer())
+
+    def write(self, tokenizer: Tokenizer) -> None:
+        tokenizer.save(str(self.path))
+
+    def download(self, **kwargs) -> str:
+        self.calls.append(kwargs)
+        return str(self.path)
+
+
+@pytest.fixture
+def tokenizer_file(tmp_path, monkeypatch) -> TokenizerFile:
+    folder = tmp_path / "stub-tokenizer"
+    folder.mkdir()
+    file = TokenizerFile(folder / "tokenizer.json")
+    monkeypatch.setattr(embedder_mod, "hf_hub_download", file.download)
+    return file
+
+
+class TextEmbeddingRecord:
+    """What reached fastembed: each model built, with its threads, and each batch embedded."""
+
+    def __init__(self) -> None:
+        self.model_names: list[str] = []
+        self.threads: list[int | None] = []
+        self.batches: list[list[str]] = []
+
+
+@pytest.fixture
+def stub_text_embedding(monkeypatch) -> TextEmbeddingRecord:
+    """fastembed's `TextEmbedding` without an ONNX session. Its vectors are the ones
+    `fake_llama` serves for the same text, so both backends agree, as the real ones do."""
+    real = embedder_mod.TextEmbedding
+    record = TextEmbeddingRecord()
+
+    class Stub:
+        list_supported_models = staticmethod(real.list_supported_models)
+
+        def __init__(self, model_name: str, cache_dir=None, threads=None, **kwargs) -> None:
+            record.model_names.append(model_name)
+            record.threads.append(threads)
+            self.dim = next(
+                int(m["dim"]) for m in real.list_supported_models() if m["model"] == model_name
+            )
+
+        def embed(self, texts):
+            record.batches.append(list(texts))
+            fake = FakeEmbedder(dim=self.dim)
+            return [[3 * x for x in fake._vec(t)] for t in texts]
+
+        query_embed = embed
+
+    monkeypatch.setattr(embedder_mod, "TextEmbedding", Stub)
+    return record
 
 
 class FakeChoiceModel:

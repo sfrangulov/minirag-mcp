@@ -16,6 +16,7 @@ from minirag_mcp import __version__
 from minirag_mcp.chunker import SCHEME_VERSION, join_document
 from minirag_mcp.config import Config, ConfigError, load_config
 from minirag_mcp.embedder import Embedder
+from minirag_mcp.endpoints import EmbeddingEndpoint
 from minirag_mcp.ingest.ignore import scope_excluded_by
 from minirag_mcp.ingest.pipeline import Pipeline
 from minirag_mcp.instructions import build_instructions
@@ -23,6 +24,8 @@ from minirag_mcp.labels import LabelerSource
 from minirag_mcp.labels.model import default_model_factory
 from minirag_mcp.results import (
     DEFAULT_FIND_LIMIT,
+    embedder_notes,
+    embedding_status,
     fts_status,
     ignore_status,
     ingest_reply,
@@ -77,9 +80,15 @@ def create_app(
         if config is None or config_error is not None:
             raise ToolError(f"Configuration error: {config_error or 'no configuration'}")
         if holder["ctx"] is None:
-            emb = (
-                embedder if embedder is not None else Embedder(config.model_name, config.cache_dir)
-            )
+            if embedder is not None:
+                emb = embedder
+            else:
+                ep = config.embed_endpoints.get(config.model_name)
+                emb = Embedder(
+                    config.model_name,
+                    config.cache_dir,
+                    endpoint=EmbeddingEndpoint(ep) if ep else None,
+                )
             store = Store(config.db_path, dim=emb.dim, fts_language=config.fts_language)
             labels = LabelerSource(
                 config.roots, config.cache_dir, model_factory or default_model_factory
@@ -183,11 +192,13 @@ def create_app(
         Re-ingesting an already-indexed file discards its old chunks and
         replaces them with freshly parsed ones. With a classify.toml,
         `labelProblem` says which labels the document was stored without,
-        and why; a full sync asks again.
+        and why; a full sync asks again. `warnings`, present only when there
+        is something to say, notes that the embedding endpoint is unreachable
+        and the in-process model embedded instead: same vectors, slower.
         """
         c = ctx()
         path = resolve_in_roots(filePath, c.config.roots)
-        return ingest_reply(c.pipeline.ingest_file(path))
+        return ingest_reply(c.pipeline.ingest_file(path), embedder_notes(c.embedder))
 
     @mcp.tool
     @guard
@@ -197,11 +208,13 @@ def create_app(
         format is one of "text", "markdown", or "html" (default "text").
         source is a stable identifier you pick, not a filesystem path —
         re-using it replaces the previously ingested content for that id,
-        so reuse the same source to update an item. `labelProblem` is as
-        in ingest_file.
+        so reuse the same source to update an item. `labelProblem` and
+        `warnings` are as in ingest_file.
         """
+        c = ctx()
         return ingest_reply(
-            ctx().pipeline.ingest_data(data, source=source, fmt=format, title=title)
+            c.pipeline.ingest_data(data, source=source, fmt=format, title=title),
+            embedder_notes(c.embedder),
         )
 
     @mcp.tool
@@ -215,9 +228,12 @@ def create_app(
         reaches the network — every other tool works purely against local
         files and the local index. source defaults to the URL itself; pass
         one to control the index key or to update a previously ingested URL.
-        `labelProblem` is as in ingest_file.
+        `labelProblem` and `warnings` are as in ingest_file.
         """
-        return ingest_reply(ctx().pipeline.ingest_url(url, source=source, title=title))
+        c = ctx()
+        return ingest_reply(
+            c.pipeline.ingest_url(url, source=source, title=title), embedder_notes(c.embedder)
+        )
 
     @mcp.tool
     @guard
@@ -270,6 +286,11 @@ def create_app(
 
         When nothing matches because nothing could — an empty index, or a
         scope no indexed document is under — `notice` says which.
+
+        `embeddingBackend` says what embedded the query: "endpoint",
+        "in-process", or "in-process (endpoint unreachable)". `warnings`,
+        present only when there is something to say, explains the last:
+        the results are the same, only slower to come.
 
         Cite what you take, so the user can verify it, in whatever
         language you answer: end with a Sources list, one line per
@@ -520,6 +541,10 @@ def create_app(
         when it is above zero, schemeWarning explains that those chunks need
         a re-sync to be rebuilt.
 
+        embeddingBackend is what embeds: "endpoint", "in-process", or
+        "in-process (endpoint unreachable)", when embeddingWarning says why
+        and when the endpoint is tried again.
+
         ftsLanguage is the stemmer keyword search uses (RAG_FTS_LANGUAGE).
         ftsWarning, present only when the keyword index could not be rebuilt
         after that setting changed, names the stemmer it still uses.
@@ -560,6 +585,7 @@ def create_app(
             c = ctx()
             out["chunkCount"] = c.store.chunk_count()
             out["sourceCount"] = c.store.source_count()
+            out.update(embedding_status(c.embedder))
             out.update(scheme_status(c.store))
             out.update(fts_status(c.store))
             out.update(signature_status(c.store))

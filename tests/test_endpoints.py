@@ -1,3 +1,4 @@
+import pickle
 import re
 import socket
 
@@ -139,3 +140,14 @@ def test_a_closed_client_opens_a_new_session_on_next_use(fake_llama):
     assert client._session is None
     assert len(client.embed(["a"])) == 1
     assert client._session is not first
+
+
+def test_clients_survive_pickling(fake_llama):
+    embedding = EmbeddingEndpoint(ep(fake_llama))
+    before = embedding.embed(["a", "b"])  # the session now exists
+    clone = pickle.loads(pickle.dumps(embedding))
+    assert clone.embed(["a", "b"]) == before and clone.endpoint == embedding.endpoint
+
+    rerank = RerankEndpoint(ep(fake_llama, "/v1/rerank"))
+    scores = rerank.scores("alpha beta", ["alpha", "gamma"])
+    assert pickle.loads(pickle.dumps(rerank)).scores("alpha beta", ["alpha", "gamma"]) == scores

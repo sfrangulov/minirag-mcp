@@ -16,6 +16,7 @@ from fastmcp import Client
 
 import minirag_mcp.cli as cli
 import minirag_mcp.embedder as embedder_mod
+from conftest import FakeEmbedder
 from lookalike_texts import MINUTES, REGULATION_V1, REGULATION_V2
 from minirag_mcp.config import load_config
 from minirag_mcp.embedder import Embedder
@@ -164,6 +165,64 @@ async def test_a_model_that_cannot_load_is_reported_by_both(root, tmp_path, caps
     code, _, err = run_cli(["query", "alpha", *_flags(env)], capsys)
     assert is_error and "could not be loaded" in text
     assert code == 1 and "could not be loaded" in err
+
+
+async def test_both_shells_report_the_embedding_backend(
+    root, tmp_path, capsys, monkeypatch, fake_llama
+):
+    monkeypatch.setenv("EMBED_URL", fake_llama.url("/v1/embeddings"))
+    monkeypatch.setenv("EMBED_ENDPOINT_MODEL", "e5")
+    env = {
+        "BASE_DIR": str(root),
+        "DB_PATH": str(tmp_path / "db"),
+        "CACHE_DIR": str(tmp_path / "models"),
+        **{k: os.environ[k] for k in ("EMBED_URL", "EMBED_ENDPOINT_MODEL")},
+    }
+    is_error, st = await call_mcp(env, "status", {}, None)
+    code, out, _ = run_cli(["status", *_flags(env), "--json"], capsys)
+    cli_st = json.loads(out)
+    assert not is_error and code == 0 and "indexError" not in st
+    assert st["embeddingBackend"] == "endpoint" and "embeddingWarning" not in st
+    assert {k: v for k, v in cli_st.items() if k.startswith("embedding")} == {
+        k: v for k, v in st.items() if k.startswith("embedding")
+    }
+    assert fake_llama.requests == []  # status asks the endpoint nothing
+
+
+async def test_both_shells_pass_on_an_embedding_fallback(
+    root, tmp_path, capsys, monkeypatch, public_dns
+):
+    import minirag_mcp.ingest.pipeline as pmod
+    from minirag_mcp.ingest.parser import ParsedDoc
+
+    monkeypatch.setattr(pmod, "parse_url", lambda url, **kw: ParsedDoc("# R\n\nNotes.", "R"))
+    fallen = FakeEmbedder()
+    fallen.backend, fallen.warning = "in-process (endpoint unreachable)", "W"
+    monkeypatch.setattr(cli, "_make_embedder", lambda cfg: fallen)
+    env = {"BASE_DIR": str(root), "DB_PATH": str(tmp_path / "db")}
+    async with Client(create_app(load_config(env), embedder=fallen)) as c:
+        replies = [
+            (await c.call_tool("ingest_file", {"filePath": str(root / "sub" / "a.md")})).data,
+            (await c.call_tool("ingest_data", {"data": "x", "source": "s"})).data,
+            (await c.call_tool("ingest_url", {"url": "https://example.com/p"})).data,
+        ]
+        found = (await c.call_tool("query_documents", {"query": "alpha"})).data
+        st = (await c.call_tool("status", {})).data
+    _, out, _ = run_cli(["ingest", str(root / "sub" / "a.md"), *_flags(env), "--json"], capsys)
+    replies.append(json.loads(out)["ingested"][0])
+    _, out, _ = run_cli(["ingest-url", "https://example.com/q", *_flags(env), "--json"], capsys)
+    replies.append(json.loads(out))
+    _, out, _ = run_cli(["query", "alpha", *_flags(env), "--json"], capsys)
+    cli_found = json.loads(out)
+    _, out, _ = run_cli(["status", *_flags(env), "--json"], capsys)
+    cli_st = json.loads(out)
+    assert [r["warnings"] for r in replies] == [["W"]] * 5
+    for payload in (found, cli_found):
+        assert payload["embeddingBackend"] == "in-process (endpoint unreachable)"
+        assert payload["warnings"] == ["W"]
+    for status in (st, cli_st):
+        assert status["embeddingBackend"] == "in-process (endpoint unreachable)"
+        assert status["embeddingWarning"] == "W"
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root reads a chmod 000 folder anyway")

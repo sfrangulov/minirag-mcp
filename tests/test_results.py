@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import FakeModelFactory
+from conftest import FakeEmbedder, FakeModelFactory
 from label_helpers import L, record
 from minirag_mcp.config import Config
 from minirag_mcp.labels import LabelerSource
@@ -292,7 +292,7 @@ def test_an_unfiltered_query_has_exactly_the_old_keys(
             "budget review",
             label_source=source,
         )
-        assert set(payload) == {"results", "sources", "parents"}
+        assert set(payload) == {"results", "sources", "parents", "embeddingBackend"}
     # Labels were stored, so the source row shows them; the shell keys stay unchanged.
     assert "labels" in payload["sources"][0]
 
@@ -350,6 +350,44 @@ def test_a_filtered_listing_keeps_matches_and_counts_unread_files_as_unlabelled(
     # c.md and pilot/d.md are indexed without a type; new.md is unread.
     assert payload["filterCounts"]["unlabelled"] == 3
     assert "filterNotice" not in payload
+
+
+def test_a_query_names_its_embedding_backend_and_warns_on_a_fallback(
+    tmp_path, root, store, fake_embedder
+):
+    index(store, fake_embedder, root, "a.md", {})
+    payload = run_query(store, fake_embedder, make_config(root, tmp_path), "budget review")
+    assert payload["embeddingBackend"] == "in-process" and "warnings" not in payload
+    fallen = FakeEmbedder()
+    fallen.backend = "in-process (endpoint unreachable)"
+    fallen.warning = "W"
+    payload = run_query(store, fallen, make_config(root, tmp_path), "budget review")
+    assert payload["embeddingBackend"] == "in-process (endpoint unreachable)"
+    assert payload["warnings"] == ["W"]
+
+
+def test_a_query_reads_the_backend_after_embedding(tmp_path, root, store, fake_embedder):
+    """The query's own embedding is what falls back, so the flag must describe it."""
+
+    class FallsBack(FakeEmbedder):
+        def embed_query(self, text):
+            self.backend, self.warning = "in-process (endpoint unreachable)", "W"
+            return super().embed_query(text)
+
+    payload = run_query(store, FallsBack(), make_config(root, tmp_path), "budget review")
+    assert payload["embeddingBackend"] == "in-process (endpoint unreachable)"
+    assert payload["warnings"] == ["W"]
+
+
+def test_an_embedder_without_backend_flags_reads_as_in_process(tmp_path, root, store):
+    class Bare:
+        dim = 8
+
+        def embed_query(self, text):
+            return FakeEmbedder().embed_query(text)
+
+    payload = run_query(store, Bare(), make_config(root, tmp_path), "budget review")
+    assert payload["embeddingBackend"] == "in-process" and "warnings" not in payload
 
 
 def test_a_listing_without_a_filter_has_exactly_the_old_keys(tmp_path, root, store, fake_embedder):

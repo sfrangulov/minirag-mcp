@@ -58,6 +58,15 @@ def test_run_sync_collects_per_file_errors(env, monkeypatch):
     assert errors and "boom" in errors[0]["error"]
 
 
+def test_an_embedding_fallback_is_reported_but_not_a_failure(env):
+    cfg, store, pipeline, root = env
+    seed(root)
+    pipeline.embedder.warning = "W"
+    counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    assert {"source": str(store.db_path), "error": "embedding: W"} in errors
+    assert counts["failed"] == 0 and counts["ingested"] == 2
+
+
 def test_manager_lifecycle(env):
     cfg, store, pipeline, root = env
     seed(root)
