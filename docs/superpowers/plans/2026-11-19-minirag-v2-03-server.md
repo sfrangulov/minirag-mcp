@@ -865,6 +865,10 @@ git commit -m "feat(server): index argument on every tool, list_indexes, results
 
 ### Task 5: The index rule in the server instructions
 
+> **Carried in (2026-11-19):** the instructions also get one line for struck-through text
+> (plan 2 Task 1, superseded form): `~~...~~` marks deleted text; never cite it as current.
+> Keep the total under the pinned budget.
+
 **Files:**
 - Modify: `src/minirag_mcp/instructions.py`
 - Test: `tests/test_instructions.py`

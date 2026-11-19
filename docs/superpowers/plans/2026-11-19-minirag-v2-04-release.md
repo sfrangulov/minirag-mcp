@@ -234,6 +234,13 @@ git commit -m "build(release): pre-release parts for bump-my-version" -m "Co-Aut
 
 ### Task 3: README v2 section, reference sections, stale-fact sweep
 
+> **Carried in from plan 1's review (2026-11-19):** `server.json` still defaults `MODEL_NAME`
+> to MiniLM (move to e5 or drop the default); stale "~220 MB" slow-suite text in CLAUDE.md and
+> tests/conftest.py, and the labels/model.py docstring calling huggingface_hub an optional
+> extra; document that DB_PATH must not be a mount point (rebuild swaps rename the folder) and
+> make no power-loss durability claims (macOS fsync is not F_FULLFSYNC). The owner granted full
+> rights on 2026-11-19: steps that wait for the owner's go-ahead proceed without waiting.
+
 **Files:**
 - Modify: `README.md` (banner below the badges; new `## v2 (pre-release)` before `## Requirements`; Configuration, MCP Tools, CLI and Chunking sections; fixes from the sweep)
 

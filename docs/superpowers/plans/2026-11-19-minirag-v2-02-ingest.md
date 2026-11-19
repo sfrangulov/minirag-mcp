@@ -55,6 +55,13 @@
 
 ### Task 1: Struck-through `.docx` text is dropped at parse time
 
+> **Superseded (owner, 2026-11-19):** struck-through text is still text — keep it. Instead of
+> dropping it: keep markitdown's `~~...~~`, make the markers survive chunk splits (a chunk
+> boundary inside a struck run closes `~~` at the end of one chunk and reopens it at the start
+> of the next), and add one line to the server instructions (`~~...~~` marks deleted text;
+> never cite it as current). Tests: a struck run split across two chunks yields balanced
+> markers in both; a struck run is still found by keyword search. See bd minirag-mcp-g7q.12.
+
 **Files:**
 - Modify: `src/minirag_mcp/ingest/parser.py` (`parse_file`, the markitdown branch)
 - Test: `tests/test_parser.py`
@@ -791,3 +798,16 @@ bd close minirag-mcp-g7q.6
 ```
 
 Then follow CLAUDE.md's session-completion protocol (quality gates, `git pull --rebase`, `git push`, `git status` up to date).
+
+
+### Task 10: Measure the parser-noise items on the ruler and fix the ones that move retrieval
+
+> Added 2026-11-19 (spec section 5: "fixed only if the ruler shows they move retrieval" had no
+> task). Items (bd minirag-mcp-g7q.12): boilerplate and table-header titles; transcript block
+> headers repeated per chunk; PDF table-of-contents leader dots spliced into words; spreadsheet
+> `Unnamed: N` / `NaN` noise and the sheet name inside cells; mixed Latin/Cyrillic look-alikes
+> after OCR (largely fixed by Tesseract, Task 3). For each: build the variant on a copy of the
+> owner's index (private ruler, bd memory `solidcore-ruler`; scripts measure.py/score.py there),
+> measure hit@10/MRR on both fields with the sign test, and implement only the items that gain
+> significantly (TDD, one commit each). Record every number, kept or dropped, in the
+> g7q.12 notes; nothing private goes into the repo.
