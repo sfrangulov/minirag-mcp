@@ -145,12 +145,15 @@ def fingerprint(cfg) -> dict:
     }
 
 
-def _open(db: Path, corpus: Path):
+def _open(db: Path, corpus: Path, hybrid_weight: float | None = None):
     from minirag_mcp.config import load_config
     from minirag_mcp.embedder import Embedder
     from minirag_mcp.store import Store
 
-    cfg = load_config({"BASE_DIR": str(corpus), "DB_PATH": str(db)})
+    env = {"BASE_DIR": str(corpus), "DB_PATH": str(db)}
+    if hybrid_weight is not None:
+        env["RAG_HYBRID_WEIGHT"] = str(hybrid_weight)
+    cfg = load_config(env)
     emb = Embedder(cfg.model_name, cfg.cache_dir)
     store = Store(cfg.db_path, dim=emb.dim, fts_language=cfg.fts_language)
     return cfg, emb, store
@@ -171,8 +174,8 @@ def _print(summary: dict, baseline: dict | None = None) -> None:
         print(line(t, m, baseline and baseline["by_type"].get(t)))
 
 
-def run_full(db: Path, corpus: Path) -> int:
-    cfg, emb, store = _open(outside_root(db, corpus), corpus)
+def run_full(db: Path, corpus: Path, hybrid_weight: float | None = None) -> int:
+    cfg, emb, store = _open(outside_root(db, corpus), corpus, hybrid_weight)
     rows = measure(store, emb, cfg, load_questions())
     summary = summarize(rows)
     out = RUNS / datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -231,9 +234,14 @@ def main() -> int:
     ap.add_argument("--db", type=Path, default=INDEX)
     ap.add_argument("--corpus", type=Path, default=CORPUS)
     ap.add_argument("--update-baseline", action="store_true")
+    ap.add_argument(
+        "--hybrid-weight",
+        type=float,
+        help="override RAG_HYBRID_WEIGHT (1 keyword only, 0 vector only) to see each side",
+    )
     args = ap.parse_args()
     if args.full:
-        return run_full(args.db, args.corpus)
+        return run_full(args.db, args.corpus, args.hybrid_weight)
     return run_subset(args.corpus, args.update_baseline)
 
 
