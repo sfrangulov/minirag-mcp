@@ -103,6 +103,24 @@ class SearchResult:
     rerank_score: float | None = None
 
 
+# The served reranker has 2048-token slots; this many characters of Russian or English
+# stay under that with the query. One passage over the limit fails the whole call.
+RERANK_PASSAGE_CHARS = 4000
+
+
+def _passage(text: str) -> str:
+    """`text` cut to RERANK_PASSAGE_CHARS at whitespace; only what the cross-encoder sees."""
+    if len(text) <= RERANK_PASSAGE_CHARS:
+        return text
+    cut = text[:RERANK_PASSAGE_CHARS]
+    head, sep, _ = cut.rpartition(" ")
+    for ws in ("\n", "\t"):
+        h, s2, _ = cut.rpartition(ws)
+        if len(h) > len(head):
+            head, sep = h, s2
+    return head if sep and head else cut
+
+
 def _rerank(
     results: list[SearchResult],
     query_text: str,
@@ -111,7 +129,7 @@ def _rerank(
 ) -> list[SearchResult]:
     head, tail = results[:rerank_top], results[rerank_top:]
     try:
-        scores = [float(x) for x in reranker(query_text, [r.text for r in head])]
+        scores = [float(x) for x in reranker(query_text, [_passage(r.text) for r in head])]
     except Exception:
         return results
     if len(scores) != len(head):

@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import math
 import threading
+import time
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import requests
@@ -24,6 +25,8 @@ class Endpoint:
 
 
 EMBED_BATCH = 32
+RERANK_TIMEOUT = 10.0
+RERANK_RETRY_SECONDS = 60.0
 _BODY_CHARS = 300
 
 
@@ -135,19 +138,30 @@ def _unit(vector: list[float]) -> list[float]:
 
 
 class RerankEndpoint(_Client):
+    """Reranking sits on the path of every query, so a hung server must cost one short
+    wait and then nothing: after a failure the endpoint is not called for
+    RERANK_RETRY_SECONDS."""
+
     def __init__(self, endpoint: Endpoint) -> None:
-        super().__init__(endpoint)
+        super().__init__(replace(endpoint, timeout=min(endpoint.timeout, RERANK_TIMEOUT)))
         self.last_error: str | None = None
+        self._failed_at: float | None = None
 
     def scores(self, query: str, passages: Sequence[str]) -> list[float]:
         if not passages:
             return []
+        if self._failed_at is not None:
+            wait = RERANK_RETRY_SECONDS - (time.monotonic() - self._failed_at)
+            if wait > 0:
+                raise EndpointError(f"{self.last_error}; not retried for another {wait:.0f} s")
         try:
             result = self._scores(query, list(passages))
         except EndpointError as exc:
             self.last_error = str(exc)
-            raise
+            self._failed_at = time.monotonic()
+            raise EndpointError(f"{exc}; not retried for {RERANK_RETRY_SECONDS:g} s") from exc
         self.last_error = None
+        self._failed_at = None
         return result
 
     def _scores(self, query: str, passages: list[str]) -> list[float]:

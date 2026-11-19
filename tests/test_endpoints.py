@@ -4,6 +4,7 @@ import socket
 
 import pytest
 
+import minirag_mcp.endpoints as endpoints
 from conftest import FakeEmbedder
 from minirag_mcp.endpoints import (
     EmbeddingEndpoint,
@@ -81,13 +82,18 @@ def test_rerank_scores_come_back_in_input_order_unnormalized(fake_llama):
     assert rr.last_error is None
 
 
-def test_a_rerank_failure_is_remembered_until_a_success(fake_llama):
+def test_a_rerank_failure_is_remembered_until_a_success(fake_llama, monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr(endpoints.time, "monotonic", lambda: now[0])
     fake_llama.fail["/v1/rerank"] = (503, "loading")
     rr = RerankEndpoint(ep(fake_llama, "/v1/rerank"))
     with pytest.raises(EndpointError):
         rr.scores("q", ["a"])
     assert "503" in rr.last_error
     fake_llama.fail.clear()
+    with pytest.raises(EndpointError, match="not retried"):
+        rr.scores("q", ["a"])
+    now[0] += endpoints.RERANK_RETRY_SECONDS
     rr.scores("q", ["a"])
     assert rr.last_error is None
 

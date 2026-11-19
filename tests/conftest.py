@@ -9,6 +9,7 @@ import math
 import re
 import socket
 import threading
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -373,6 +374,8 @@ class _LlamaHandler(BaseHTTPRequestHandler):
             Seen(self.command, parts.path, parts.query, dict(self.headers.items()), body)
         )
         route = parts.path
+        if llama.delay:
+            time.sleep(llama.delay)
         if route in llama.fail:
             status, text = llama.fail[route]
             self._send(status, text.encode("utf-8"), "text/plain")
@@ -456,6 +459,7 @@ class FakeLlama:
         self.props: dict = {}
         self.token_count: int | None = None
         self.split_letters = False
+        self.delay = 0.0  # seconds every reply waits
 
     def url(self, path: str = "") -> str:
         return f"http://127.0.0.1:{self.port}{path}"

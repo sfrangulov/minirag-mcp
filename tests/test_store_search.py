@@ -387,3 +387,20 @@ def test_max_files_applies_after_reranking(store):
     got = store.search("x", V(0.0), top_k=5, hybrid_weight=0.0, max_files=1, reranker=prefer_cook)
     assert plain[0].source == "/auth.md"
     assert {g.source for g in got} == {"/cook.md"}
+
+
+def test_an_oversize_passage_is_capped_at_a_word_boundary_and_the_result_is_whole(tmp_path):
+    from minirag_mcp.store import RERANK_PASSAGE_CHARS
+
+    long = "word " * 2000
+    s = Store(tmp_path / "dbl", dim=8)
+    s.replace_source("/l.md", [rec("/l.md", 0, long, V(0.0))])
+    seen = []
+
+    def spy(query, texts):
+        seen.extend(texts)
+        return [0.0] * len(texts)
+
+    (got,) = s.search("q", V(0.0), top_k=1, reranker=spy)
+    assert len(seen[0]) <= RERANK_PASSAGE_CHARS and seen[0].endswith("word")
+    assert got.text == long

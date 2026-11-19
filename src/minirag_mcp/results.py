@@ -103,10 +103,13 @@ class _Recorder:
 
     def __call__(self, query: str, passages: list[str]) -> list[float]:
         try:
-            return self._reranker.scores(query, passages)
+            scores = self._reranker.scores(query, passages)
+            if len(scores) != len(passages):
+                raise ValueError(f"{len(scores)} scores for {len(passages)} passages")
         except Exception as e:
             self.error = str(e)
             raise
+        return scores
 
 
 def ingest_reply(r: IngestResult, notes: Sequence[str] = ()) -> dict:

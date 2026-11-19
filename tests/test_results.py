@@ -634,3 +634,81 @@ def test_without_a_reranker_reranked_is_false(tmp_path, root, store, fake_embedd
     payload = run_query(store, fake_embedder, make_config(root, tmp_path), "review plan")
     assert payload["reranked"] is False and "warnings" not in payload
     assert rerank_status(None) == {"reranker": "off"}
+
+
+def test_an_oversize_passage_is_capped_in_the_request_and_reranking_succeeds(
+    tmp_path, root, store, fake_embedder, fake_llama
+):
+    path = root / "big.md"
+    path.write_text("x")
+    text = "review " * 3000
+    store.replace_source(
+        str(path),
+        [
+            record(
+                str(path),
+                {},
+                text=text,
+                vector=fake_embedder.embed_documents([text])[0],
+                mtime=path.stat().st_mtime,
+            )
+        ],
+    )
+    rr = RerankEndpoint(Endpoint(fake_llama.url("/v1/rerank"), "rr"))
+    payload = run_query(store, fake_embedder, make_config(root, tmp_path), "review", reranker=rr)
+    (sent,) = [r for r in fake_llama.requests if r.path == "/v1/rerank"]
+    assert all(len(d) <= 4000 for d in sent.body["documents"])
+    assert payload["reranked"] is True and payload["results"][0]["text"] == text
+
+
+def test_a_wrong_score_count_is_flagged_not_silent(tmp_path, root, store, fake_embedder):
+    _two_chunks(store, fake_embedder, root)
+
+    class Short:
+        last_error = None
+
+        def scores(self, query, passages):
+            return [1.0]
+
+    payload = run_query(
+        store, fake_embedder, make_config(root, tmp_path), "review", reranker=Short()
+    )
+    assert payload["reranked"] is False
+    assert payload["warnings"][0].startswith("Reranking was skipped")
+
+
+def test_a_hung_reranker_costs_one_short_wait_then_is_not_called_until_the_window_passes(
+    tmp_path, root, store, fake_embedder, fake_llama, monkeypatch
+):
+    import time
+
+    import minirag_mcp.endpoints as endpoints
+
+    _two_chunks(store, fake_embedder, root)
+    monkeypatch.setattr(endpoints, "RERANK_TIMEOUT", 0.3)
+    now = [1000.0]
+    monkeypatch.setattr(endpoints.time, "monotonic", lambda: now[0])
+    rr = RerankEndpoint(Endpoint(fake_llama.url("/v1/rerank"), "rr"))  # default 120 s
+    cfg = make_config(root, tmp_path)
+    fake_llama.delay = 1.5
+
+    started = time.perf_counter()
+    first = run_query(store, fake_embedder, cfg, "review plan", reranker=rr)
+    assert time.perf_counter() - started < 1.2
+    assert first["reranked"] is False and first["results"]
+    assert first["warnings"][0].startswith("Reranking was skipped")
+    assert "not retried for 60 s" in first["warnings"][0]
+    calls = len(fake_llama.requests)
+
+    fake_llama.delay = 0.0
+    now[0] += 30
+    second = run_query(store, fake_embedder, cfg, "review plan", reranker=rr)
+    assert len(fake_llama.requests) == calls
+    assert second["reranked"] is False
+    assert "not retried for another 30 s" in second["warnings"][0]
+    assert rr.last_error and "30 s" not in rr.last_error
+
+    now[0] += 31
+    third = run_query(store, fake_embedder, cfg, "review plan", reranker=rr)
+    assert len(fake_llama.requests) == calls + 1
+    assert third["reranked"] is True and "warnings" not in third
