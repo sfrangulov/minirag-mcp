@@ -524,6 +524,8 @@ def create_app(
         ftsLanguage is the stemmer keyword search uses (RAG_FTS_LANGUAGE).
         ftsWarning, present only when the keyword index could not be rebuilt
         after that setting changed, names the stemmer it still uses.
+        documentFtsWarning, present only when an index of the whole-document
+        ranking could not be created, names the columns it lacks.
 
         unsignedSourceCount, present when above zero, counts indexed documents
         without the signature that finds their look-alikes, so no result names

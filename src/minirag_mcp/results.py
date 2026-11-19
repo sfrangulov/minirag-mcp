@@ -163,6 +163,13 @@ def fts_status(store: Store) -> dict:
             f"{store.fts_index_language}: it could not be rebuilt on open. Reopen the index "
             f"with write access and no concurrent writer to rebuild it."
         )
+    if missing := store.missing_document_fts_indices:
+        columns = ", ".join(repr(c) for c in missing)
+        out["documentFtsWarning"] = (
+            f"The whole-document keyword index has no BM25 index on {columns}: it could not "
+            "be created. Search still works, but ranks documents as a whole without it. "
+            "Reopen the index with write access and no concurrent writer to create it."
+        )
     return out
 
 

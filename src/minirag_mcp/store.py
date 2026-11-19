@@ -262,6 +262,14 @@ class _Unit(NamedTuple):
     parent_id: str
 
 
+class _DocumentGaps(NamedTuple):
+    # Indexed sources without a row of the stamp their chunks carry, each with that
+    # stamp, or None when they carry more than one: two first ingests raced.
+    undocumented: dict[str, str | None]
+    # (source, stamp) of each row whose source has no chunks left.
+    orphans: list[tuple[str, str]]
+
+
 class _StoredChunk(NamedTuple):
     """The fields of a stored chunk that a documents row is built from."""
 
@@ -346,6 +354,14 @@ def _indexed_columns(table) -> set[str]:
         return set()
 
 
+def _uncreated_index_warning(column: str, where: str, consequence: str, e: Exception) -> str:
+    return (
+        f"Could not create the BM25 index on the {column!r} column of {where}: {e}. Search "
+        f"still works, but {consequence} until the index exists — reopen the database with "
+        f"write access (and no concurrent writer) to retry."
+    )
+
+
 def _read_fts_language(db_path: Path) -> str | None:
     try:
         value = (db_path / FTS_LANGUAGE_FILENAME).read_text(encoding="utf-8").strip()
@@ -385,8 +401,10 @@ class Store:
         # locking the moment those two disagreed.
         self.db_path = db_path
         self.dim = dim
-        # FTS columns this instance could not index (see _ensure_fts_indices)
+        # FTS columns this instance could not index (see _ensure_fts_indices), in the
+        # chunks table and in the documents table
         self.missing_fts_indices: tuple[str, ...] = ()
+        self.missing_document_fts_indices: tuple[str, ...] = ()
         # The stemmer configured, and the one the FTS indexes really use. They differ only
         # while a language change could not be written (see _ensure_fts_indices).
         self.fts_language = fts_language
@@ -561,6 +579,7 @@ class Store:
         stale = built != self.fts_language
         config = FTS(language=self.fts_language)
         missing: list[str] = []
+        document_missing: list[str] = []
         created = rebuilt = not_rebuilt = 0
         for (table, where), indexed in zip(tables, indexed_by, strict=True):
             chunks = table is self._table
@@ -582,18 +601,14 @@ class Store:
                             stacklevel=3,
                         )
                     else:
-                        consequence = (
-                            f"{column} content is not keyword-searchable"
-                            if chunks
-                            else f"documents are not ranked as a whole by their {column}"
-                        )
                         if chunks:
                             missing.append(column)
+                            consequence = f"{column} content is not keyword-searchable"
+                        else:
+                            document_missing.append(column)
+                            consequence = f"documents are not ranked as a whole by their {column}"
                         warnings.warn(
-                            f"Could not create the BM25 index on the {column!r} column of "
-                            f"{where}: {e}. Search still works, but {consequence} until the "
-                            f"index exists — reopen the database with write access (and no "
-                            f"concurrent writer) to retry.",
+                            _uncreated_index_warning(column, where, consequence, e),
                             RuntimeWarning,
                             stacklevel=3,
                         )
@@ -603,6 +618,7 @@ class Store:
                     else:
                         created += 1
         self.missing_fts_indices = tuple(missing)
+        self.missing_document_fts_indices = tuple(document_missing)
         if not_rebuilt:
             self.fts_index_language = built
         elif (created or rebuilt) and recorded != self.fts_language:
@@ -1042,8 +1058,23 @@ class Store:
                     DOCUMENT_TABLE, schema=_document_schema(), exist_ok=True
                 )
                 config = FTS(language=self.fts_index_language)
+                missing = []
                 for column in FTS_COLUMNS:
-                    table.create_index(column, config=config, replace=True)
+                    try:
+                        table.create_index(column, config=config, replace=True)
+                    except Exception as index_error:
+                        missing.append(column)
+                        warnings.warn(
+                            _uncreated_index_warning(
+                                column,
+                                f"the documents table of the index at {self.db_path}",
+                                f"documents are not ranked as a whole by their {column}",
+                                index_error,
+                            ),
+                            RuntimeWarning,
+                            stacklevel=4,
+                        )
+                self.missing_document_fts_indices = tuple(missing)
                 self._documents = table
         return self._documents
 
@@ -1140,10 +1171,10 @@ class Store:
         except Exception as e:
             self._warn_documents(f"delete the document row of {_named(sources)}", e)
 
-    def _undocumented(self) -> dict[str, str | None]:
-        """Indexed sources without a row of the stamp their chunks carry, each with that
-        stamp, or None when they carry more than one: two first ingests raced."""
+    def _document_gaps(self) -> _DocumentGaps:
         documented: set[tuple[str, str]] = set()
+        # Read before the chunks: a row is written only after its chunks, so a row whose
+        # source has no chunks in the later read has really lost them.
         # A documents table that cannot be read leaves every document undocumented, never
         # takes status or sync down with it.
         try:
@@ -1172,33 +1203,57 @@ class Store:
             .group_by("source")
             .aggregate([("ingested_at", "min"), ("ingested_at", "max")])
         )
-        out: dict[str, str | None] = {}
+        undocumented: dict[str, str | None] = {}
+        indexed: set[str] = set()
         for row in meta.to_pylist():
+            indexed.add(row["source"])
             low, high = row["ingested_at_min"], row["ingested_at_max"]
             stamp = low if low == high else None
             if stamp is None or (row["source"], stamp) not in documented:
-                out[row["source"]] = stamp
-        return out
+                undocumented[row["source"]] = stamp
+        orphans = sorted(pair for pair in documented if pair[0] not in indexed)
+        return _DocumentGaps(undocumented, orphans)
 
     def undocumented_sources(self) -> list[str]:
         """Indexed sources without a current documents row."""
-        return sorted(self._undocumented())
+        return sorted(self._document_gaps().undocumented)
 
     def backfill_documents(
         self,
         scopes: tuple[str, ...] = (),
         on_event: Callable[[str], None] | None = None,
     ) -> tuple[int, list[dict]]:
-        """Write the documents row of every source in `scopes` that has no current one.
+        """Write the documents row of every source in `scopes` that has no current one,
+        and delete the rows in `scopes` whose source has no chunks left.
 
         From the stored chunk text, as `backfill_signatures` signs: nothing is parsed or
         embedded again. A source whose chunks carry two stamps is left alone; the sync's
         diff re-reads such a source, and that ingest writes its row.
         """
+
+        def in_scope(source: str) -> bool:
+            return not scopes or any(is_under(source, p) for p in scopes)
+
+        gaps = self._document_gaps()
+        errors: list[dict] = []
+        if orphans := [(s, stamp) for s, stamp in gaps.orphans if in_scope(s)]:
+            try:
+                self._delete_orphans(orphans)
+            except Exception as e:
+                errors.append(
+                    {
+                        "source": str(self.db_path),
+                        "error": f"documents: {type(e).__name__}: {e}; {len(orphans)} row(s) "
+                        "of documents no longer indexed left in the whole-document ranking, "
+                        "which the next sync retries",
+                    }
+                )
+            else:
+                if on_event:
+                    for source in dict.fromkeys(s for s, _ in orphans):
+                        on_event(f"removed the document row of {source}")
         todo = sorted(
-            s
-            for s, stamp in self._undocumented().items()
-            if stamp is not None and (not scopes or any(is_under(s, p) for p in scopes))
+            s for s, stamp in gaps.undocumented.items() if stamp is not None and in_scope(s)
         )
         written_count = 0
         for start in range(0, len(todo), _SIGN_BATCH):
@@ -1208,18 +1263,30 @@ class Store:
                 )
             except Exception as e:  # every later batch would fail the same way
                 return written_count, [
+                    *errors,
                     {
                         "source": str(self.db_path),
                         "error": f"documents: {type(e).__name__}: {e}; "
                         f"{len(todo) - written_count} document(s) left without the row "
                         "that ranks them as a whole, which the next sync retries",
-                    }
+                    },
                 ]
             written_count += len(written)
             if on_event:
                 for source in written:
                     on_event(f"documented {source}")
-        return written_count, []
+        return written_count, errors
+
+    def _delete_orphans(self, orphans: Sequence[tuple[str, str]]) -> None:
+        """Delete exactly these (source, stamp) rows: a row a re-ingest of the same path
+        wrote since they were read carries a new stamp and stays."""
+        clause = " OR ".join(
+            f"(source = '{sql_str(source)}' AND ingested_at = '{sql_str(stamp)}')"
+            for source, stamp in orphans
+        )
+        table = self._document_table(create=False)
+        if table is not None:
+            table.delete(clause)
 
     def _stored_documents(self, sources: Sequence[str]) -> list[dict]:
         present = set(self._table.schema.names)

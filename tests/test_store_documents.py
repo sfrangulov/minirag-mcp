@@ -5,8 +5,10 @@ import os
 from dataclasses import asdict
 
 import pytest
+from lancedb.table import LanceTable
 
 from minirag_mcp.chunker import join_document
+from minirag_mcp.results import fts_status
 from minirag_mcp.store import DOCUMENT_TABLE, FTS_LANGUAGE_FILENAME, ChunkRecord, Store
 
 STAMP = "2026-11-19T00:00:00+00:00"
@@ -301,6 +303,8 @@ def test_the_bonus_never_adds_a_chunk_the_filter_excluded(tmp_path):
         filter_sql="label_keys LIKE '%|type=spec|%'",
     )
     assert ranked(got) == [("/in/x.md", 0)]
+    # The label filter does not narrow the documents ranking: /out/y.md still ranks first.
+    assert got[0].score == pytest.approx(0.4 / 61 + 0.6 / 61 + 1.0 / 62)
 
 
 def test_backfill_fills_rows_for_chunks_written_without_them(tmp_path):
@@ -469,6 +473,92 @@ def test_a_table_the_open_could_not_create_is_created_with_its_indexes_by_a_writ
     documents = s._db.open_table(DOCUMENT_TABLE)
     assert {c for i in documents.list_indices() for c in i.columns} == {"text", "title"}
     assert doc_hits(s, "договоры") == ["/c.md"]
+
+
+def test_a_row_whose_chunks_are_gone_is_deleted_by_the_backfill(store):
+    """What a failed `_delete_documents` leaves: a row that would take a document rank."""
+    store.replace_source("/a.md", [rec("/a.md", 0, "alpha")])
+    store.replace_source("/b.md", [rec("/b.md", 0, "beta")])
+    store._table.delete("source = '/a.md'")
+    events = []
+    assert store.backfill_documents(on_event=events.append) == (0, [])
+    assert list(rows(store)) == ["/b.md"]
+    assert events == ["removed the document row of /a.md"]
+
+
+def test_an_orphan_row_outside_the_scope_is_kept(store):
+    store.replace_source("/a/x.md", [rec("/a/x.md", 0, "x")])
+    store.replace_source("/b/y.md", [rec("/b/y.md", 0, "y")])
+    store._table.delete("source IN ('/a/x.md', '/b/y.md')")
+    assert store.backfill_documents(scopes=("/a",)) == (0, [])
+    assert list(rows(store)) == ["/b/y.md"]
+
+
+def test_a_row_written_after_the_orphan_was_seen_is_kept(store, monkeypatch):
+    """A re-ingest of the path between the backfill's reads and its delete."""
+    store.replace_source("/a.md", [rec("/a.md", 0, "old text")])
+    store._table.delete("source = '/a.md'")
+    real = store._document_gaps
+
+    def reingest_after_reading():
+        gaps = real()
+        store.replace_source("/a.md", [rec("/a.md", 0, "new text", stamp=LATER)])
+        return gaps
+
+    monkeypatch.setattr(store, "_document_gaps", reingest_after_reading)
+    store.backfill_documents()
+    assert [(r["text"], r["ingested_at"]) for r in rows(store)["/a.md"]] == [("new text", LATER)]
+
+
+def test_an_orphan_delete_failure_is_reported_and_the_rows_still_written(store, monkeypatch):
+    store.replace_source("/a.md", [rec("/a.md", 0, "alpha")])
+    store._table.delete("source = '/a.md'")
+    store._table.add([asdict(rec("/b.md", 0, "beta"))])
+
+    def conflict(*args, **kwargs):
+        raise RuntimeError("Retryable commit conflict for version 7")
+
+    monkeypatch.setattr(store._documents, "delete", conflict)
+    written, errors = store.backfill_documents()
+    assert written == 1 and sorted(rows(store)) == ["/a.md", "/b.md"]
+    [error] = errors
+    assert error["error"].startswith("documents: ") and "commit conflict" in error["error"]
+
+
+def _refusing_document_indexes(monkeypatch, columns):
+    real = LanceTable.create_index
+
+    def refuse(self, column, *args, **kwargs):
+        if self.name == DOCUMENT_TABLE and column in columns:
+            raise RuntimeError("Permission denied")
+        return real(self, column, *args, **kwargs)
+
+    monkeypatch.setattr(LanceTable, "create_index", refuse)
+
+
+def test_a_document_index_that_could_not_be_created_is_in_the_status(tmp_path, monkeypatch):
+    _refusing_document_indexes(monkeypatch, {"title"})
+    with pytest.warns(RuntimeWarning, match="documents table"):
+        s = Store(tmp_path / "db", dim=8)
+    assert (s.missing_document_fts_indices, s.missing_fts_indices) == (("title",), ())
+    assert "'title'" in fts_status(s)["documentFtsWarning"]
+
+    monkeypatch.undo()
+    reopened = Store(tmp_path / "db", dim=8)
+    assert reopened.missing_document_fts_indices == ()
+    assert "documentFtsWarning" not in fts_status(reopened)
+
+
+def test_a_document_index_the_first_write_could_not_create_is_in_the_status(tmp_path, monkeypatch):
+    monkeypatch.setattr(Store, "_open_documents", lambda self, db_path: None)
+    s = Store(tmp_path / "db", dim=8)
+    assert "documentFtsWarning" not in fts_status(s)
+    _refusing_document_indexes(monkeypatch, {"text", "title"})
+    with pytest.warns(RuntimeWarning, match="documents table"):
+        s.replace_source("/a.md", [rec("/a.md", 0, "alpha")])
+    assert list(rows(s)) == ["/a.md"]
+    assert s.missing_document_fts_indices == ("text", "title")
+    assert "'text', 'title'" in fts_status(s)["documentFtsWarning"]
 
 
 def _chmod_tree(root, dir_mode: int, file_mode: int) -> None:
