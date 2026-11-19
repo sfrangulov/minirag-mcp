@@ -14,7 +14,7 @@ from __future__ import annotations
 import threading
 import warnings
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from minirag_mcp.chunker import SCHEME_VERSION
 from minirag_mcp.config import Config
@@ -140,13 +140,6 @@ class IndexHandle:
     def sync(self) -> SyncManager:
         return self._opened().sync
 
-    def configured(self) -> tuple[EmbeddingScheme, ChunkingScheme]:
-        """The schemes the configuration asks for, which a rebuild would apply."""
-        return (
-            _scheme_of(self._opened().configured),
-            ChunkingScheme(SCHEME_VERSION, self.config.token_budget),
-        )
-
     def state(self) -> tuple[IndexState, str]:
         """The index's state and why; never raises. An index that cannot be opened is
         unavailable, with the open's error as the reason."""
@@ -181,7 +174,8 @@ class IndexHandle:
                 config.db_path, dim=identity.embedding.dim, fts_language=config.fts_language
             )
             identity = self._record_fts_language(identity, store)
-            pipeline = Pipeline(store, embedder, config, labels=self._labels)
+            chunking = replace(config, token_budget=identity.chunking.token_budget)
+            pipeline = Pipeline(store, embedder, chunking, labels=self._labels)
             reranker = RerankEndpoint(config.rerank_endpoint) if config.rerank_endpoint else None
         except BaseException:
             for made in built:
@@ -220,23 +214,20 @@ class IndexHandle:
                 "available here, or point DB_PATH at another folder to build a new index."
             )
 
+        embedder = None
         try:
             embedder = self._make(recorded)
-        except UnknownModelError as e:
-            raise unavailable(f"which cannot be loaded here: {str(e).rstrip('.')}") from e
-        try:
             width = embedder.dim
-        except UnknownModelError as e:
-            self._release(embedder)
-            raise unavailable(f"which cannot be loaded here: {str(e).rstrip('.')}") from e
-        except BaseException:
-            self._release(embedder)
+            if width != recorded.dim:
+                raise unavailable(
+                    f"at {recorded.dim} dimensions, but it makes {width}-dimensional vectors here"
+                )
+        except BaseException as e:
+            if embedder is not None:
+                self._release(embedder)
+            if isinstance(e, UnknownModelError):
+                raise unavailable(f"which cannot be loaded here: {str(e).rstrip('.')}") from e
             raise
-        if width != recorded.dim:
-            self._release(embedder)
-            raise unavailable(
-                f"at {recorded.dim} dimensions, but it makes {width}-dimensional vectors here"
-            )
         return embedder
 
     def _record_fts_language(self, identity: IndexIdentity, store: Store) -> IndexIdentity:

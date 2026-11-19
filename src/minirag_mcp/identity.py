@@ -51,6 +51,8 @@ PROBE_TEXT = (
 )
 # The table every 1.x index holds; 1.x is frozen, so this name is too.
 _LEGACY_TABLE = "chunks.lance"
+# Between the `differences` phrases of a `rebuild pending` reason, none of which holds it.
+REASON_SEPARATOR = "; "
 
 
 @dataclass(frozen=True)
@@ -485,7 +487,7 @@ def index_state(config: Config, embedder) -> tuple[IndexState, str]:
         ChunkingScheme(SCHEME_VERSION, config.token_budget),
     )
     if found:
-        return IndexState.REBUILD_PENDING, "; ".join(found)
+        return IndexState.REBUILD_PENDING, REASON_SEPARATOR.join(found)
     return IndexState.READY, ""
 
 

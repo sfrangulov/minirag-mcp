@@ -282,10 +282,6 @@ def test_a_fresh_folder_is_stamped_with_the_configured_scheme(tmp_path, fake_emb
     assert ident.fts_language == h.config.fts_language and ident.document_table is True
     assert h.get().identity == ident
     assert h.state() == (IndexState.READY, "")
-    assert h.configured() == (
-        EmbeddingScheme("fake", 8, "none"),
-        ChunkingScheme(SCHEME_VERSION, h.config.token_budget),
-    )
 
 
 def test_a_fresh_folder_is_stamped_before_its_table_is_created(
@@ -367,7 +363,6 @@ def test_a_changed_model_is_pending_and_queries_use_the_recorded_model(tmp_path)
     b = IndexHandle(cfg(tmp_path), embedder_factory=factory)  # the default model, e5
     state, why = b.state()
     assert state is IndexState.REBUILD_PENDING and f"model {MINILM} -> {E5_LARGE}" in why
-    assert b.configured()[0] == EmbeddingScheme(E5_LARGE, 8, "none")
     opened = b.get()
     assert opened.embedder is models[MINILM]
     assert opened.identity.embedding == EmbeddingScheme(MINILM, 8, "none")
@@ -406,7 +401,6 @@ def test_a_changed_budget_is_pending_with_a_chunking_reason(tmp_path, fake_embed
         f"chunk budget {a.config.token_budget} -> {bigger} tokens",
     )
     assert b.get().identity.chunking.token_budget == a.config.token_budget
-    assert b.configured()[1] == ChunkingScheme(SCHEME_VERSION, bigger)
 
 
 def test_a_pending_index_refuses_ingests_and_still_deletes(tmp_path, fake_embedder):
@@ -555,3 +549,40 @@ def test_status_of_an_open_index_gone_unavailable_reports_only_why(tmp_path, fak
     assert not {"chunkCount", "indexGeneration", "embedding"} & set(st)
     with pytest.raises(IndexUnavailableError, match=re.escape(str(h.config.db_path / INDEX_FILE))):
         h.ingest_pipeline()
+
+
+LONG = " ".join(
+    f"Sentence {i} " + " ".join(f"w{i}x{j}" for j in range(10)) + "." for i in range(40)
+)
+
+
+def test_an_index_is_chunked_at_its_recorded_budget(tmp_path, fake_embedder):
+    """A pending index's pipeline must not add chunks cut at the configured budget."""
+    small = 32
+    a = handle(tmp_path, fake_embedder, CHUNK_TOKEN_BUDGET=str(small))
+    a.ingest_pipeline().ingest_data(LONG, source="recorded")
+    b = handle(tmp_path, fake_embedder)
+    assert b.config.token_budget > small
+    assert b.state()[0] is IndexState.REBUILD_PENDING
+    b.get().pipeline.ingest_data(LONG, source="pending")
+    other = handle(tmp_path, fake_embedder, DB_PATH=str(tmp_path / "other"))
+    other.ingest_pipeline().ingest_data(LONG, source="configured")
+
+    def chunks(h, source):
+        return len(h.get().store.all_chunks(source))
+
+    assert chunks(b, "pending") == chunks(b, "recorded")
+    assert chunks(b, "pending") != chunks(other, "configured")
+
+
+@pytest.mark.parametrize("model, dim", [("x/unknown", 8), (MINILM, 16)])
+def test_a_recorded_embedder_refused_at_open_has_its_client_closed(
+    tmp_path, built, closed, model, dim
+):
+    ep = Endpoint(UNUSED_URL, "e5")
+    config = replace(cfg(tmp_path), embed_endpoints={E5_LARGE: ep, model: ep})
+    recorded(config, EmbeddingScheme(model, dim, "none"))
+    with pytest.raises(IndexUnavailableError, match=re.escape(model)):
+        IndexHandle(config).get()
+    assert [e.model_name for e in built] == [E5_LARGE, model]
+    assert sorted(map(id, closed)) == sorted(id(e.endpoint) for e in built)

@@ -18,7 +18,7 @@ from minirag_mcp import __version__, literal, ocr
 from minirag_mcp.chunker import SCHEME_VERSION, shared_lines
 from minirag_mcp.config import Config
 from minirag_mcp.endpoints import RerankEndpoint
-from minirag_mcp.identity import IndexState
+from minirag_mcp.identity import REASON_SEPARATOR, IndexState
 from minirag_mcp.ingest import ignore
 from minirag_mcp.ingest.pipeline import IngestResult
 from minirag_mcp.ingest.scanner import FileState, compute_states, scan_roots
@@ -339,7 +339,7 @@ def identity_status(opened: OpenIndex, state: IndexState, why: str) -> dict:
         "chunkBudget": recorded.chunking.token_budget,
     }
     if state is IndexState.REBUILD_PENDING:
-        out["rebuildReasons"] = why.split("; ")
+        out["rebuildReasons"] = why.split(REASON_SEPARATOR)
     return out
 
 
