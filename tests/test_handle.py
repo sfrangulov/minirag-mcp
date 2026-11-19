@@ -14,7 +14,13 @@ import minirag_mcp.handle as handle_mod
 from conftest import FakeEmbedder
 from minirag_mcp.chunker import SCHEME_VERSION
 from minirag_mcp.config import default_db_path, load_config
-from minirag_mcp.embedder import E5_LARGE, MINILM, Embedder, UnknownModelError
+from minirag_mcp.embedder import (
+    E5_LARGE,
+    MINILM,
+    Embedder,
+    ProbeMismatchError,
+    UnknownModelError,
+)
 from minirag_mcp.endpoints import EmbeddingEndpoint, Endpoint
 from minirag_mcp.handle import (
     IndexHandle,
@@ -30,11 +36,13 @@ from minirag_mcp.identity import (
     EmbeddingScheme,
     IndexIdentity,
     IndexState,
+    begin_staging,
     previous_dir,
     read_identity,
     staging_dir,
     write_identity,
 )
+from minirag_mcp.lock import sync_lock
 from minirag_mcp.results import run_query
 from minirag_mcp.store import ChunkRecord, IndexBusyError, IndexOpenError, Store
 from minirag_mcp.sync import SyncManager
@@ -701,22 +709,32 @@ def test_a_model_without_a_reference_warns_once_and_is_recorded(
 
 
 def test_the_rebuilt_generation_embeds_with_the_rebuilds_embedder(
-    tmp_path, fake_llama, tokenizer_file, built, closed
+    tmp_path, fake_llama, tokenizer_file, built, closed, reference_probes
 ):
-    """Not a second copy of the model it loaded; the one it replaces has its client closed."""
+    """The one the handle built for the configuration, not another copy of that model; the
+    one it replaces has its client closed."""
     fake_llama.dim = 1024
     (tmp_path / "a.md").write_text("# Alpha\n\nAlpha body about budgets.")
-    ep = {E5_LARGE: Endpoint(fake_llama.url("/v1/embeddings"), "e5")}
-    IndexHandle(replace(cfg(tmp_path, CHUNK_TOKEN_BUDGET="32"), embed_endpoints=ep)).run_sync(None)
+    config = replace(
+        cfg(tmp_path), embed_endpoints={E5_LARGE: Endpoint(fake_llama.url("/v1/embeddings"), "e5")}
+    )
+    unprefixed = EmbeddingScheme(E5_LARGE, 1024, "none")
+    shipped = dict(reference_probes)
+    reference_probes.clear()
+    with pytest.warns(RuntimeWarning, match="cannot be verified"):
+        IndexHandle(config, embedder_factory=lambda s: make_embedder(config, unprefixed)).run_sync(
+            None
+        )
+    reference_probes.update(shipped)
     built.clear()
     closed.clear()
-    h = IndexHandle(replace(cfg(tmp_path), embed_endpoints=ep))
+    h = IndexHandle(config)
     replaced = h.get().embedder
 
     _, _, info = h.run_sync(None)
 
-    assert info.kind == "reingest" and len(built) == 2 and built[0] is replaced
-    assert h.get().embedder is built[1] and h.get().identity.generation == 2
+    assert info.kind == "reembed" and len(built) == 2 and built[1] is replaced
+    assert h.get().embedder is built[0] and h.get().identity.generation == 2
     assert closed == [replaced.endpoint]
 
 
@@ -734,3 +752,121 @@ def test_the_hook_refuses_a_write_when_the_identity_it_reads_is_another_generati
     with pytest.raises(IndexBusyError, match="replaced by a rebuilt index"):
         opened.store.delete_source("s")
     assert read_identity(db).probe == ()
+
+
+def test_a_probe_another_process_records_is_checked_before_the_next_query(
+    fake_llama, tmp_path, tokenizer_file
+):
+    """A server opened a fresh folder, so it held no probe to check; a terminal sync then
+    recorded one. The server's next call checks its endpoint against that probe."""
+    server = _served(tmp_path, fake_llama)
+    server.get()
+    _served(tmp_path, fake_llama).ingest_pipeline().ingest_data("Budgets.", source="b")
+    fake_llama.vector_salt = "bge-m3"
+    with pytest.raises(IndexUnavailableError, match=E5_LARGE):
+        server.get()
+    assert server.state()[0] is IndexState.UNAVAILABLE
+
+
+def test_a_write_prepared_before_another_process_recorded_the_probe_is_checked(
+    fake_llama, tmp_path, tokenizer_file
+):
+    """Its vectors were made before the embedder was armed with that probe."""
+    server = _served(tmp_path, fake_llama)
+    pipeline = server.ingest_pipeline()
+    terminal = _served(tmp_path, fake_llama)
+    terminal.ingest_pipeline().ingest_data("Budgets.", source="b")
+    fake_llama.vector_salt = "bge-m3"
+    with pytest.raises(IndexUnavailableError, match=E5_LARGE):
+        pipeline.ingest_data("Written by another model.", source="a")
+    assert terminal.get().store.get_source("a") is None
+
+
+def test_two_first_writers_record_one_probe(tmp_path):
+    """The second to measure arms itself with the probe the first recorded."""
+    first, second = FakeEmbedder(), FakeEmbedder()
+    a, b = handle(tmp_path, first), handle(tmp_path, second)
+    pipeline = a.ingest_pipeline()
+    b.get()
+    recorded = first.probe_vector()
+
+    def measured_while_the_other_records() -> list[float]:
+        b.ingest_pipeline().ingest_data("Beta.", source="b")
+        return [x + 1e-4 for x in recorded]  # the same model, rounded another way
+
+    first.probe_vector = measured_while_the_other_records
+    pipeline.ingest_data("Alpha.", source="a")
+    assert read_identity(a.config.db_path).probe == pytest.approx(recorded)
+    assert first.expected_probe == pytest.approx(recorded)
+
+
+def test_every_ingest_checks_the_endpoint_before_it_starts(fake_llama, tmp_path, tokenizer_file):
+    """A router restarted with its preset pointing at another model of the same width
+    answers without a failure, within the interval an embedding would wait out."""
+    h = _served(tmp_path, fake_llama)
+    h.ingest_pipeline().ingest_data("Budgets.", source="s")
+    fake_llama.vector_salt = "bge-m3"
+    with pytest.raises(IndexUnavailableError, match=E5_LARGE):
+        h.ingest_pipeline()
+
+
+def test_every_sync_checks_the_endpoint_before_it_starts(fake_llama, tmp_path, tokenizer_file):
+    h = _served(tmp_path, fake_llama)
+    h.ingest_pipeline().ingest_data("Budgets.", source="s")
+    (tmp_path / "a.md").write_text("# Alpha\n\nAlpha body about budgets.")
+    fake_llama.vector_salt = "bge-m3"
+    with pytest.raises(IndexUnavailableError, match=E5_LARGE):
+        h.run_sync(None)
+    assert Store(h.config.db_path, dim=1024).get_source(str(tmp_path / "a.md")) is None
+
+
+def test_an_index_is_available_again_once_its_endpoint_is_back(
+    fake_llama, tmp_path, tokenizer_file, stub_text_embedding, reference_probes, monkeypatch
+):
+    """A mismatch of the in-process fallback, met while the endpoint was down, says nothing
+    about the endpoint that serves again."""
+    import minirag_mcp.embedder as embedder_mod
+
+    reference_probes.clear()
+    fake_llama.vector_salt = "gguf"  # recorded through the endpoint; fastembed differs
+    h = _served(tmp_path, fake_llama)
+    with pytest.warns(RuntimeWarning, match="cannot be verified"):
+        h.ingest_pipeline().ingest_data("Budgets.", source="s")
+    opened = h.get()
+    fake_llama.fail["/v1/embeddings"] = (503, "Loading model")
+    with pytest.warns(RuntimeWarning, match="503"), pytest.raises(ProbeMismatchError):
+        run_query(opened.store, opened.embedder, h.config, "budgets")
+    assert h.state()[0] is IndexState.UNAVAILABLE
+    del fake_llama.fail["/v1/embeddings"]
+    monkeypatch.setattr(embedder_mod, "ENDPOINT_RETRY_SECONDS", 0.0)
+    assert h.state() == (IndexState.READY, "")
+    run_query(h.get().store, h.get().embedder, h.config, "budgets")
+
+
+def test_a_rebuild_by_another_process_makes_the_index_syncing(tmp_path, fake_embedder):
+    h = handle(tmp_path, fake_embedder)
+    h.get()
+    db = h.config.db_path
+    with sync_lock(db):
+        begin_staging(db)
+        assert h.state() == (IndexState.SYNCING, "")
+    assert h.state() == (IndexState.READY, "")
+
+
+def test_a_budget_only_rebuild_embeds_with_the_serving_embedder(
+    tmp_path, fake_llama, tokenizer_file, built, closed
+):
+    """The embedding scheme is unchanged, so the model it serves with is the one it needs."""
+    fake_llama.dim = 1024
+    (tmp_path / "a.md").write_text("# Alpha\n\nAlpha body about budgets.")
+    ep = {E5_LARGE: Endpoint(fake_llama.url("/v1/embeddings"), "e5")}
+    IndexHandle(replace(cfg(tmp_path, CHUNK_TOKEN_BUDGET="32"), embed_endpoints=ep)).run_sync(None)
+    built.clear()
+    closed.clear()
+    h = IndexHandle(replace(cfg(tmp_path), embed_endpoints=ep))
+    serving = h.get().embedder
+
+    _, _, info = h.run_sync(None)
+
+    assert info.kind == "reingest" and built == [serving] and closed == []
+    assert h.get().embedder is serving and h.get().identity.generation == 2

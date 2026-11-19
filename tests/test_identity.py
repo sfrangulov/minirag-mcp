@@ -346,7 +346,7 @@ def test_a_stamp_that_passed_its_checks_before_a_swap_cannot_land_inside_it(tmp_
         t.start()
     for t in threads:
         t.join(30)
-    assert outcome["A"] is None
+    assert outcome["A"] == []
     assert outcome["B"] in (replace(IDENT, generation=1), replace(IDENT, generation=2))
     assert (generation(db), marker(db)) == (2, "rebuilt")
     assert (generation(previous_dir(db)), marker(previous_dir(db))) == (1, "serving")

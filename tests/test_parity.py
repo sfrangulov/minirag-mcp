@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 from pathlib import Path
 
 import pytest
@@ -427,6 +428,67 @@ async def test_reranked_queries_are_identical_in_both_shells(
     is_error, st = await call_mcp(env, "status", {}, fake_embedder)
     _, out, _ = run_cli(["status", *_flags(env), "--json"], capsys)
     assert st["reranker"] == "endpoint" and json.loads(out) == st
+
+
+async def test_a_skipped_reranker_is_reported_by_both_shells(
+    root, tmp_path, capsys, monkeypatch, fake_embedder, dead_url
+):
+    """The human output of the CLI too: a reply's `warnings` are not left to --json."""
+    monkeypatch.setattr(cli, "_make_embedder", lambda cfg: fake_embedder)
+    monkeypatch.setenv("RERANK_URL", dead_url + "/v1/rerank")
+    monkeypatch.setenv("RERANK_MODEL", "rr")
+    env = {
+        "BASE_DIR": str(root),
+        "DB_PATH": str(tmp_path / "db"),
+        **{k: os.environ[k] for k in ("RERANK_URL", "RERANK_MODEL")},
+    }
+    assert run_cli(["sync", *_flags(env)], capsys)[0] == 0
+    _, found = await call_mcp(env, "query_documents", {"query": "alpha"}, fake_embedder)
+    code, out, err = run_cli(["query", "alpha", *_flags(env)], capsys)
+
+    def unaddressed(text: str) -> str:
+        return re.sub(r"0x[0-9a-f]+", "0x", text)
+
+    [warning] = found["warnings"]
+    assert warning.startswith("Reranking was skipped") and dead_url in warning
+    assert code == 0 and "alpha" in out.lower()
+    assert unaddressed(f"warn: {warning}") in [unaddressed(line) for line in err.splitlines()]
+
+
+async def test_the_human_output_of_an_ingest_carries_its_warnings(
+    root, tmp_path, capsys, monkeypatch, public_dns
+):
+    import minirag_mcp.ingest.pipeline as pmod
+    from minirag_mcp.ingest.parser import ParsedDoc
+
+    monkeypatch.setattr(pmod, "parse_url", lambda url, **kw: ParsedDoc("# R\n\nNotes.", "R"))
+    fallen = FakeEmbedder()
+    fallen.backend, fallen.warning = "in-process (endpoint unreachable)", "W"
+    monkeypatch.setattr(cli, "_make_embedder", lambda cfg: fallen)
+    env = {"BASE_DIR": str(root), "DB_PATH": str(tmp_path / "db")}
+    for args in (["ingest", str(root / "sub" / "a.md")], ["ingest-url", "https://example.com/q"]):
+        code, _, err = run_cli([*args, *_flags(env)], capsys)
+        assert code == 0 and err.splitlines().count("warn: W") == 1, args
+
+
+async def test_both_shells_refuse_a_delete_while_the_index_is_rebuilt(
+    root, tmp_path, capsys, monkeypatch, fake_embedder
+):
+    from minirag_mcp.identity import begin_staging
+    from minirag_mcp.lock import sync_lock
+
+    monkeypatch.setattr(cli, "_make_embedder", lambda cfg: fake_embedder)
+    env = {"BASE_DIR": str(root), "DB_PATH": str(tmp_path / "db")}
+    assert run_cli(["sync", *_flags(env)], capsys)[0] == 0
+    a_md = str(root / "sub" / "a.md")
+    with sync_lock(Path(env["DB_PATH"])):
+        begin_staging(Path(env["DB_PATH"]))
+        is_error, text = await call_mcp(env, "delete_file", {"filePath": a_md}, fake_embedder)
+        code, out, err = run_cli(["delete", a_md, *_flags(env)], capsys)
+
+    refusal = _last_error(err)
+    assert is_error and code == 1 and out == ""
+    assert "is being rebuilt into" in refusal and text.endswith(refusal)
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root reads a chmod 000 folder anyway")

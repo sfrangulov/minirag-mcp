@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import re
 import shutil
@@ -557,8 +558,8 @@ def test_no_sync_of_the_new_index_starts_before_the_rebuild_returns(corpus, mode
     outcomes: list[str] = []
     real = rebuild_mod.swap_in
 
-    def swap(db) -> None:
-        real(db)
+    def swap(db) -> list[Path]:
+        left = real(db)
         for start in (lambda: other.run_sync(None), lambda: other.start_sync(None)):
             try:
                 start()
@@ -566,6 +567,7 @@ def test_no_sync_of_the_new_index_starts_before_the_rebuild_returns(corpus, mode
                 outcomes.append("refused")
             else:
                 outcomes.append("started")
+        return left
 
     monkeypatch.setattr(rebuild_mod, "swap_in", swap)
     b = handle(corpus, models)
@@ -819,7 +821,11 @@ def test_a_rebuild_that_fails_mid_build_leaves_the_previous_index_as_it_was(corp
     assert info.generation == 3 and read_identity(previous_dir(db)).generation == 2
 
 
-def test_a_delete_of_previous_stopped_midway_never_blocks_a_rebuild(corpus, models, monkeypatch):
+def test_a_kill_while_the_replaced_previous_is_deleted_keeps_the_rebuild(
+    corpus, models, monkeypatch
+):
+    """The delete of the index kept from the swap before takes seconds; the rebuild is in
+    place before it starts, so a kill there never throws the rebuild away."""
     built(corpus, models)
     handle(corpus, models).run_sync(None)
     db = handle(corpus, models).config.db_path
@@ -836,12 +842,148 @@ def test_a_delete_of_previous_stopped_midway_never_blocks_a_rebuild(corpus, mode
         handle(corpus, models, MODEL_NAME=MINILM).run_sync(None)
     monkeypatch.setattr(shutil, "rmtree", real)
 
-    _, _, info = handle(corpus, models, MODEL_NAME=MINILM).run_sync(None)
-    assert info.generation == 3 and read_identity(previous_dir(db)).generation == 2
+    assert read_identity(db).generation == 3 and read_identity(db).embedding.model == MINILM
+    assert read_identity(previous_dir(db)).generation == 2
+    _, _, info = handle(corpus, models).run_sync(None)
+    assert info.generation == 4 and read_identity(previous_dir(db)).generation == 3
     assert sorted(p.name for p in db.parent.iterdir() if p.name.startswith(db.name)) == [
         db.name,
         previous_dir(db).name,
     ]
+
+
+def test_a_previous_that_cannot_be_deleted_is_reported_and_the_rebuild_kept(
+    corpus, models, monkeypatch
+):
+    built(corpus, models)
+    handle(corpus, models).run_sync(None)
+    db = handle(corpus, models).config.db_path
+    real = shutil.rmtree
+
+    def undeletable(path, *args, **kwargs) -> None:
+        if Path(path).name.startswith(previous_dir(db).name):
+            if not kwargs.get("ignore_errors", args[0] if args else False):
+                raise PermissionError(errno.EACCES, "Permission denied", str(path))
+            return
+        real(path, *args, **kwargs)
+
+    monkeypatch.setattr(shutil, "rmtree", undeletable)
+    counts, errors, info = handle(corpus, models, MODEL_NAME=MINILM).run_sync(None)
+
+    assert info.generation == 3 and read_identity(db).generation == 3
+    assert read_identity(previous_dir(db)).generation == 2
+    [trash] = [p for p in db.parent.iterdir() if p.name.endswith(".trash")]
+    assert read_identity(trash).generation == 1
+    [error] = errors
+    assert error["source"] == str(trash) and "could not be deleted" in error["error"]
+    assert counts["failed"] == 0
+
+
+def test_a_swap_that_fails_keeps_the_previous_index(corpus, models, monkeypatch):
+    """`<db>.previous` is dropped only by a swap that succeeded."""
+    built(corpus, models)
+    handle(corpus, models).run_sync(None)
+    db = handle(corpus, models).config.db_path
+    kept = read_identity(previous_dir(db))
+    real = identity_mod.os.rename
+
+    def rename(src, dst) -> None:
+        if Path(src) == staging_dir(db):
+            raise OSError(errno.EXDEV, "Cross-device link", str(src))
+        real(src, dst)
+
+    monkeypatch.setattr(identity_mod.os, "rename", rename)
+    with pytest.raises(OSError, match="Cross-device"):
+        handle(corpus, models, MODEL_NAME=MINILM).run_sync(None)
+    monkeypatch.setattr(identity_mod.os, "rename", real)
+
+    assert read_identity(db).generation == 2 and read_identity(previous_dir(db)) == kept
+    assert not [p for p in db.parent.iterdir() if p.name.endswith(".trash")]
+
+
+def test_a_rebuild_says_what_it_rebuilds_before_it_starts(corpus, models):
+    """A changed default turns a routine sync into a reingest of hours."""
+    built(corpus, models)
+    events: list[str] = []
+    h = handle(corpus, models)
+    h.run_sync(None, on_event=events.append)
+    reason = f"model {MINILM} -> {E5_LARGE}"
+    assert events[0].startswith(f"rebuilding {h.config.db_path} (reembed: {reason})")
+
+
+def test_a_running_rebuild_names_its_kind_and_reasons_in_sync_status(corpus, models):
+    built(corpus, models)
+    serving = handle(corpus, models)
+    jobs: list[str] = []
+    started = threading.Event()
+    seen: dict = {}
+
+    def during() -> None:
+        assert started.wait(30)
+        seen.update(serving.sync.status(jobs[0]).to_dict())
+
+    models[E5_LARGE] = Hooked(E5_LARGE, salt="e5", during=during)
+    jobs.append(serving.start_sync(None))
+    started.set()
+    serving.sync.wait()
+
+    assert seen["state"] == "running"
+    assert seen["rebuild"] == {
+        "kind": "reembed",
+        "reasons": [f"model {MINILM} -> {E5_LARGE}"],
+        "generation": None,
+        "reembedded": None,
+        "restored": None,
+    }
+    assert serving.sync.status(jobs[0]).to_dict()["rebuild"]["generation"] == 2
+
+
+def test_a_reembed_embeds_the_stored_text_with_the_new_schemes_prefixes(
+    tmp_path, fake_llama, tokenizer_file, reference_probes
+):
+    """Through the embedder `make_embedder` builds for the scheme, as a real rebuild does:
+    a factory that hands out one embedder per model would never show a prefix lost."""
+    from dataclasses import replace
+
+    from minirag_mcp.endpoints import Endpoint
+    from minirag_mcp.handle import make_embedder
+    from minirag_mcp.identity import EmbeddingScheme
+
+    fake_llama.dim = 1024
+    root = tmp_path / "docs"
+    root.mkdir()
+    (root / "a.md").write_text("# Alpha\n\nAlpha body about budgets and reviews.")
+    config = replace(
+        load_config({"BASE_DIR": str(root), "DB_PATH": str(tmp_path / "db")}, cwd=root),
+        embed_endpoints={E5_LARGE: Endpoint(fake_llama.url("/v1/embeddings"), "e5")},
+    )
+    unprefixed = EmbeddingScheme(E5_LARGE, 1024, "none")
+    shipped = dict(reference_probes)
+    reference_probes.clear()
+    with pytest.warns(RuntimeWarning, match="cannot be verified"):
+        IndexHandle(config, embedder_factory=lambda s: make_embedder(config, unprefixed)).run_sync(
+            None
+        )
+    reference_probes.update(shipped)
+    h = IndexHandle(config)
+    texts = [r["text"] for r in chunk_rows(h)]
+    fake_llama.requests.clear()
+
+    _, _, info = h.run_sync(None)
+
+    assert info.kind == "reembed"
+    assert info.reasons == ("query/passage prefixes none -> e5",)
+    sent = [t for r in fake_llama.requests for t in r.body["input"]]
+    assert sorted(t for t in sent if not t.startswith("passage: " + "minirag index probe")) == [
+        "passage: " + t for t in sorted(texts)
+    ]
+    rows = chunk_rows(h)
+    expected = [FakeEmbedder(dim=1024)._vec("passage: " + r["text"]) for r in rows]
+    assert np.allclose([r["vector"] for r in rows], expected, atol=1e-6)
+    fake_llama.requests.clear()
+    opened = h.get()
+    run_query(opened.store, opened.embedder, h.config, "budgets")
+    assert [t for r in fake_llama.requests for t in r.body["input"]][-1] == "query: budgets"
 
 
 def test_a_short_copy_is_never_swapped_in(corpus, models):
@@ -868,9 +1010,10 @@ def test_a_rebuild_whose_new_generation_cannot_be_opened_still_reports_it(
     def boom(pool, reranker):
         raise RuntimeError("cannot open it now")
 
-    def swap(db) -> None:
-        real(db)
+    def swap(db) -> list[Path]:
+        left = real(db)
         b._build = boom
+        return left
 
     monkeypatch.setattr(rebuild_mod, "swap_in", swap)
     counts, errors, info = b.run_sync(None)

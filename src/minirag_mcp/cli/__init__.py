@@ -36,7 +36,7 @@ from minirag_mcp.results import (
     status_payload,
 )
 from minirag_mcp.security import SecurityError, resolve_in_roots
-from minirag_mcp.store import DimensionMismatchError, IndexOpenError
+from minirag_mcp.store import DimensionMismatchError, IndexBusyError, IndexOpenError
 
 app = App(name="minirag-mcp", version=__version__)
 
@@ -203,6 +203,12 @@ def _warn_filter(payload: dict) -> None:
         print(f"warn: {payload['filterNotice']}", file=sys.stderr)
 
 
+def _warn(notes: list[str]) -> None:
+    """A reply's `warnings`, which the JSON output carries in the reply itself."""
+    for note in notes:
+        print(f"warn: {note}", file=sys.stderr)
+
+
 def _warn_labelling(pipeline: Pipeline, problems: list[str]) -> None:
     """A job's labelling problems, in the shape `sync` reports them. Not failures."""
     taxonomy = pipeline.labels.path if pipeline.labels else ""
@@ -267,6 +273,8 @@ def ingest(
     payload = {"ingested": [ingest_reply(r, notes) for r in done], "failed": failures}
     human = "\n".join([f"ingested {len(done)} file(s):"] + [f"  {r.source}" for r in done])
     _emit(payload, json, human)
+    if done:
+        _warn(notes)
     for fail in failures:
         print(f"warn: {fail['source']}: {fail['error']}", file=sys.stderr)
     _warn_labelling(pipeline, report.problems)
@@ -296,6 +304,7 @@ def ingest_url(
         _fail(str(e))
     reply = ingest_reply(r, handle.notes())
     _emit(reply, json, f"ingested {r.source} ({r.chunk_count} chunks)")
+    _warn(reply.get("warnings", []))
     _warn_labelling(pipeline, report.problems)
 
 
@@ -397,6 +406,7 @@ def query(
     else:
         human = "no results" + (f" — {payload['notice']}" if "notice" in payload else "")
     _emit(payload, json, human)
+    _warn(payload.get("warnings", []))
     _warn_filter(payload)
 
 
@@ -658,7 +668,11 @@ def delete(
         key = source
     else:
         _fail("provide a path or --source")
-    deleted = opened.store.delete_source(key)
+    try:
+        deleted = opened.store.delete_source(key)
+    except IndexBusyError as e:  # a rebuild runs, or swapped another index in meanwhile
+        _fail(str(e))
+        raise AssertionError from e  # unreachable
     if deleted == 0:
         _fail(f"source not found in index: {key}")
     _emit({"source": key, "deletedChunks": deleted}, json, f"deleted {deleted} chunk(s) of {key}")

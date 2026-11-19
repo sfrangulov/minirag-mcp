@@ -23,6 +23,8 @@ from minirag_mcp.handle import (
 )
 from minirag_mcp.identity import (
     FORMAT,
+    LEFT_BEHIND,
+    REASON_SEPARATOR,
     ChunkingScheme,
     EmbeddingScheme,
     IndexIdentity,
@@ -52,12 +54,14 @@ def rebuild(
     current: OpenIndex,
     make: EmbedderFactory,
     on_event: Callable[[str], None] | None,
+    on_start: Callable[[RebuildInfo], None] | None = None,
 ) -> tuple[dict[str, int], list[dict], RebuildInfo]:
     """Rebuild `current` with the configured schemes and swap the result in place: the
     sync's counts and errors, and what was rebuilt.
 
-    The caller holds the sync lock. A failure before the swap propagates, and `current`
-    keeps serving as it was.
+    Before any work, `on_event` hears what is rebuilt and why, and `on_start` gets the
+    kind and reasons, its counts still None. The caller holds the sync lock. A failure
+    before the swap propagates, and `current` keeps serving as it was.
     """
     config = current.config
     db = config.db_path
@@ -67,10 +71,22 @@ def rebuild(
     chunking = ChunkingScheme(SCHEME_VERSION, config.token_budget)
     reasons = tuple(differences(current.identity, scheme, chunking))
     kind = rebuild_kind(current.identity, scheme, chunking)
-    probe = tuple(new.probe_vector())
-    if why := new.reference_error(probe):
-        raise IndexUnavailableError(why)
-    warn_unverifiable(new, "the rebuilt index")
+    if on_event:
+        on_event(
+            f"rebuilding {db} ({kind}: {REASON_SEPARATOR.join(reasons)}); it answers from "
+            "what it holds until the rebuilt index replaces it"
+        )
+    if on_start:
+        on_start(RebuildInfo(kind, reasons, None, None, None))
+    recorded = read_identity(db)
+    if recorded is not None and recorded.embedding == scheme and recorded.probe:
+        # The model is the one the index was built with, and is checked against its probe.
+        probe = recorded.probe
+    else:
+        probe = tuple(new.probe_vector())
+        if why := new.reference_error(probe):
+            raise IndexUnavailableError(why)
+        warn_unverifiable(new, "the rebuilt index")
     new.expect_probe(probe)
 
     staging = begin_staging(db)
@@ -106,7 +122,7 @@ def rebuild(
             ),
         )
         sealed = True
-        swap_in(db)
+        errors += [{"source": str(left), "error": LEFT_BEHIND} for left in swap_in(db)]
     except BaseException:
         # A sealed staging folder is a complete index, which a swap stopped midway needs.
         if not sealed:

@@ -8,8 +8,11 @@ The one race left is two writers indexing the same new file at once: both
 insert, and the next sync finds the doubled source and reads it again. What
 two simultaneous syncs would cost is wasted work (both walk and re-index the
 same corpus) and a user with no way to tell that it is happening. So
-single-file ingests and every read path stay unlocked; only the whole-corpus
-sync takes this.
+single-file ingests, deletes and every read path never take this; only the
+whole-corpus sync does. A write is refused while a rebuild runs, which a store
+tells from the rebuild's staging folder and this lock together
+(`identity.rebuild_running`), and it is ordered against a swap by the separate
+identity lock (`identity.writing`).
 
 The lock is an exclusive, non-blocking `flock` on `<db_path>/.sync.lock`. While
 held, the file contains the holder's PID and start time as JSON, so a contender
@@ -40,8 +43,9 @@ Known limitations:
   silently local to each client, or not work at all. Two machines syncing one
   `DB_PATH` on a share can therefore both win the lock. Local disks only.
 - **Advisory.** Nothing stops a process that does not ask for the lock from
-  writing to the index. That is deliberate: it is what keeps `ingest_file` and
-  queries unblocked.
+  writing to the index. That is deliberate: queries are never blocked, and a
+  single-file ingest or delete waits for no ordinary sync; it is refused only
+  while a rebuild runs, since the rebuilt index would replace what it wrote.
 """
 
 from __future__ import annotations

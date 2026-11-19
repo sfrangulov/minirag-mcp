@@ -117,9 +117,10 @@ class LegacyIndexError(Exception):
 class RebuildInfo:
     kind: str
     reasons: tuple[str, ...]
-    generation: int
-    reembedded: int
-    restored: int
+    # None while the rebuild runs.
+    generation: int | None
+    reembedded: int | None
+    restored: int | None
 
     def to_dict(self) -> dict:
         return {
@@ -293,6 +294,12 @@ def write_identity(db_path: Path, identity: IndexIdentity) -> None:
         raise
 
 
+# Why a folder `swap_in` returns is still there.
+LEFT_BEHIND = (
+    "could not be deleted: it holds the index kept by the swap before last, which nothing "
+    "uses any more. Delete it to free its disk space."
+)
+
 # What link(2) answers on a filesystem without hard links (FAT, exFAT, some shares).
 _NO_HARD_LINKS = frozenset({errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENOSYS})
 
@@ -423,6 +430,21 @@ def update_identity(db_path: Path, generation: int, **changes) -> IndexIdentity 
         return updated
 
 
+def record_probe(db_path: Path, generation: int, probe: Sequence[float]) -> IndexIdentity | None:
+    """Record `probe` in `db_path`'s identity unless one is recorded already; the identity
+    then recorded, whose probe is this one or the one another writer recorded first. None
+    when another generation (or none) is in place."""
+    with _identity_lock(db_path):
+        current = read_identity(db_path)
+        if current is None or current.generation != generation:
+            return None
+        if current.probe:
+            return current
+        updated = replace(current, probe=tuple(probe))
+        write_identity(db_path, updated)
+        return updated
+
+
 def is_legacy_index(db_path: Path) -> bool:
     return (db_path / _LEGACY_TABLE).is_dir() and not os.path.lexists(db_path / INDEX_FILE)
 
@@ -527,23 +549,22 @@ def _check_previous(previous: Path) -> None:
         )
 
 
-def _drop_previous(db_path: Path) -> None:
-    """Delete `previous_dir(db_path)`, and what earlier deletes of it left behind.
-
-    It is renamed first, so a delete that stops midway leaves a trash folder, never a
-    `previous` without INDEX_FILE, which `_check_previous` would refuse at every later
-    swap.
-    """
+def _trash_dirs(db_path: Path) -> list[Path]:
     previous = previous_dir(db_path)
-    for trash in previous.parent.glob(f"{glob.escape(previous.name)}.*.trash"):
+    return sorted(previous.parent.glob(f"{glob.escape(previous.name)}.*.trash"))
+
+
+def _empty_trash(db_path: Path) -> list[Path]:
+    """Delete what swaps of `db_path` moved aside; what could not be deleted.
+
+    Best effort: the swap is done, and a folder nothing reads any more must not fail it.
+    """
+    left = []
+    for trash in _trash_dirs(db_path):
         shutil.rmtree(trash, ignore_errors=True)
-    if not os.path.lexists(previous):
-        return
-    # Again: what is there may have changed since the first look.
-    _check_previous(previous)
-    trash = previous.with_name(f"{previous.name}.{uuid.uuid4().hex}.trash")
-    os.rename(previous, trash)
-    shutil.rmtree(trash)
+        if os.path.lexists(trash):
+            left.append(trash)
+    return left
 
 
 def _holds_generation(db_path: Path, generation: int) -> bool:
@@ -574,12 +595,15 @@ def _rollback_failed(db_path: Path, error: OSError, undo: OSError) -> str:
     )
 
 
-def swap_in(db_path: Path) -> None:
-    """Put the index built in `staging_dir(db_path)` in place, one generation up.
+def swap_in(db_path: Path) -> list[Path]:
+    """Put the index built in `staging_dir(db_path)` in place, one generation up; the
+    folders holding the index kept there before that could not be deleted (`LEFT_BEHIND`).
 
-    The replaced index becomes `previous_dir(db_path)`, and the one kept there before is
-    dropped. Between the two renames `db_path` does not exist; `recover_swap` finishes a
-    swap whose process died there.
+    The replaced index becomes `previous_dir(db_path)`. The one kept there before is moved
+    aside first and deleted only once the new index is in place, which takes seconds: a
+    process killed meanwhile leaves the swap done. A swap that fails puts it back. Between
+    the renames of `db_path` it does not exist; `recover_swap` finishes a swap whose
+    process died there.
     """
     staging, previous = staging_dir(db_path), previous_dir(db_path)
     staged = read_identity(staging)
@@ -597,24 +621,43 @@ def swap_in(db_path: Path) -> None:
     current = read_identity(db_path)
     generation = max(staged.generation, current.generation if current else 0) + 1
     write_identity(staging, replace(staged, generation=generation))
-    _drop_previous(db_path)
     with _identity_lock(db_path):
-        had_index = os.path.lexists(db_path)
-        if had_index:
-            os.rename(db_path, previous)
+        kept = None
+        if os.path.lexists(previous):
+            # Again: what is there may have changed since the first look.
+            _check_previous(previous)
+            kept = previous.with_name(f"{previous.name}.{uuid.uuid4().hex}.trash")
+            os.rename(previous, kept)
         try:
-            os.rename(staging, db_path)
-        except OSError as e:
-            # Unlocked (see _identity_lock), another process's recover_swap can move the
-            # staged index in between the renames.
-            if _holds_generation(db_path, generation):
-                return
-            if had_index:
-                try:
-                    os.rename(previous, db_path)
-                except OSError as undo:
-                    raise _open_failure(_rollback_failed(db_path, e, undo)) from e
+            _rename_in(db_path, generation)
+        except BaseException:
+            if kept is not None and not os.path.lexists(previous):
+                with contextlib.suppress(OSError):
+                    os.rename(kept, previous)
             raise
+    return _empty_trash(db_path)
+
+
+def _rename_in(db_path: Path, generation: int) -> None:
+    """The renames of `swap_in`, under its lock: `db_path` to `previous_dir`, then
+    `staging_dir` to `db_path`, undoing the first when the second fails."""
+    staging, previous = staging_dir(db_path), previous_dir(db_path)
+    had_index = os.path.lexists(db_path)
+    if had_index:
+        os.rename(db_path, previous)
+    try:
+        os.rename(staging, db_path)
+    except OSError as e:
+        # Unlocked (see _identity_lock), another process's recover_swap can move the
+        # staged index in between the renames.
+        if _holds_generation(db_path, generation):
+            return
+        if had_index:
+            try:
+                os.rename(previous, db_path)
+            except OSError as undo:
+                raise _open_failure(_rollback_failed(db_path, e, undo)) from e
+        raise
 
 
 def _finish_swap(db_path: Path) -> bool:

@@ -32,7 +32,12 @@ DEFAULT_BUDGETS: dict[str, int] = {E5_LARGE: 110, MINILM: 110}
 REFERENCE_PROBE_COSINE = 0.99
 PASSAGE_PREFIX = "passage: "
 QUERY_PREFIX = "query: "
+# Also how long a passing check of the endpoint stands: a router restarted with its preset
+# pointing at another model of the same width answers without ever failing.
 ENDPOINT_RETRY_SECONDS = 60.0
+# A query waits this long for the endpoint, then falls back; a document batch waits the
+# endpoint's own timeout.
+QUERY_TIMEOUT = 10.0
 
 
 def _load_reference_probes() -> dict[str, tuple[float, ...]]:
@@ -125,7 +130,9 @@ class Embedder:
 
     Both backends see the same text: the model's prefixes, and for the endpoint a cut to
     the window where fastembed would truncate. An unreachable endpoint falls back to the
-    in-process model, loudly, and is tried again every ENDPOINT_RETRY_SECONDS.
+    in-process model, loudly, and is tried again every ENDPOINT_RETRY_SECONDS. With a
+    probe expected, each backend is checked before its first embedding, and the endpoint
+    again once ENDPOINT_RETRY_SECONDS have passed since its last check.
     """
 
     # What a pickled copy carries. A loaded model, the tokenizers, the locks, the HTTP
@@ -172,8 +179,8 @@ class Embedder:
         self._state_lock = threading.Lock()
         self._warning: str | None = None
         self._failed_at = 0.0
-        # Backends whose probe matched; the endpoint's is dropped when it falls back.
-        self._verified: set[str] = set()
+        # When each backend's probe last matched; the endpoint's is dropped when it falls back.
+        self._verified: dict[str, float] = {}
         self._probe_errors: dict[str, str] = {}
 
     def __getstate__(self) -> dict:
@@ -214,10 +221,15 @@ class Embedder:
 
     @property
     def probe_error(self) -> str | None:
-        """Why a backend does not serve this model; None while all match or while nothing
-        is expected."""
+        """Why the backend that embeds now does not serve this model; None while it does, or
+        while nothing is expected. The other backend's mismatch is kept for when it embeds
+        again."""
         with self._state_lock:
-            return next(iter(self._probe_errors.values()), None)
+            return self._probe_errors.get(self._live())
+
+    def _live(self) -> str:
+        """The backend an embedding goes to now; the caller holds `_state_lock`."""
+        return "endpoint" if self.endpoint is not None and self._warning is None else "in-process"
 
     def expect_probe(self, probe: Sequence[float]) -> None:
         """Check every backend against `probe` before its first embedding; empty disarms."""
@@ -229,18 +241,6 @@ class Embedder:
     def probe_vector(self) -> list[float]:
         """PROBE_TEXT embedded as a document, prefix included, by the live backend."""
         return self._embed([self._probe_text()], query=False, check=False)[0]
-
-    def endpoint_probe(self) -> list[float] | None:
-        """The endpoint's vector for the probe text; None when there is no endpoint or it
-        is unreachable. The model is never loaded."""
-        if self.endpoint is None:
-            return None
-        try:
-            [vector] = self.endpoint.embed([self._fit_window(self._probe_text())])
-        except EndpointError:
-            return None
-        self._check_width([vector])
-        return vector
 
     def reference_error(self, vector: Sequence[float]) -> str | None:
         """Why `vector`, this embedder's live probe, is not the model's reference probe;
@@ -282,10 +282,20 @@ class Embedder:
         endpoint = self.endpoint.endpoint
         return f"The endpoint {endpoint.url} (router model {endpoint.name!r})"
 
-    def _check_endpoint(self) -> None:
-        [vector] = self.endpoint.embed([self._fit_window(self._probe_text())])
+    def _check_endpoint(self, timeout: float | None = None) -> None:
+        [vector] = self.endpoint.embed([self._fit_window(self._probe_text())], timeout=timeout)
         self._check_width([vector])
+        with self._state_lock:
+            # It answered, so it is what embeds now, whatever its vector says.
+            self._warning = None
         self._compare(vector, "endpoint")
+
+    def _checked(self, backend: str) -> bool:
+        with self._state_lock:
+            at = self._verified.get(backend)
+        if at is None:
+            return False
+        return backend == "in-process" or time.monotonic() - at < ENDPOINT_RETRY_SECONDS
 
     def _check_local(self, model: TextEmbedding) -> None:
         [vector] = model.embed([self._probe_text()])
@@ -296,7 +306,7 @@ class Embedder:
         if c >= PROBE_COSINE:
             with self._state_lock:
                 self._probe_errors.pop(backend, None)
-                self._verified.add(backend)
+                self._verified[backend] = time.monotonic()
             return
         message = (
             f"{self._served(backend)} does not serve {self.model_name}: its vector for the "
@@ -454,10 +464,11 @@ class Embedder:
         check = check and self._expected is not None
         if self.endpoint is not None and self._endpoint_due():
             fitted = [self._fit_window(t) for t in texts]
+            timeout = QUERY_TIMEOUT if query else None
             try:
-                if check and "endpoint" not in self._verified:
-                    self._check_endpoint()
-                vectors = self.endpoint.embed(fitted)
+                if check and not self._checked("endpoint"):
+                    self._check_endpoint(timeout)
+                vectors = self.endpoint.embed(fitted, timeout=timeout)
             except EndpointError as e:
                 if not self.allow_fallback:
                     raise
@@ -476,7 +487,7 @@ class Embedder:
                 f"The embedding endpoint {self.endpoint.endpoint.url} is unreachable, so "
                 f"{self.model_name} was to run in-process, and that failed too. {e}"
             ) from e
-        if check and "in-process" not in self._verified:
+        if check and not self._checked("in-process"):
             self._check_local(model)
         raw = model.query_embed(texts) if query else model.embed(texts)
         return [_unit([float(x) for x in v]) for v in raw]
@@ -497,7 +508,7 @@ class Embedder:
         )
         with self._state_lock:
             first = self._warning is None
-            self._verified.discard("endpoint")
+            self._verified.pop("endpoint", None)
             self._probe_errors.pop("endpoint", None)
             self._warning = message
             self._failed_at = time.monotonic()
