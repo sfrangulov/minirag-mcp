@@ -161,7 +161,16 @@ def _label_problem(doc: DocLabels) -> str | None:
 
 
 class Pipeline:
-    def __init__(self, store: Store, embedder, config: Config, labels: LabelerSource | None = None):
+    def __init__(
+        self,
+        store: Store,
+        embedder,
+        config: Config,
+        labels: LabelerSource | None = None,
+        *,
+        before_store: Callable[[], None] | None = None,
+    ):
+        self.before_store = before_store
         self.store = store
         self.embedder = embedder
         self.config = config
@@ -309,6 +318,8 @@ class Pipeline:
             )
             for i, (chunk, vec) in enumerate(zip(chunks, vectors, strict=True))
         ]
+        if self.before_store is not None:
+            self.before_store()
         self.store.replace_source(source, records)
         return IngestResult(
             source=source, chunk_count=len(records), title=title, label_problem=label_problem

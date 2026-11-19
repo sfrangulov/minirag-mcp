@@ -18,6 +18,7 @@ from minirag_mcp.embedder import (
     MODEL_WINDOWS,
     Embedder,
     EmbedderUnavailableError,
+    ProbeMismatchError,
     UnknownModelError,
     _unit,
     default_budget,
@@ -26,6 +27,7 @@ from minirag_mcp.embedder import (
     prefix_rule,
 )
 from minirag_mcp.endpoints import EmbeddingEndpoint, Endpoint, EndpointError
+from minirag_mcp.identity import PROBE_TEXT
 
 
 def test_dim_from_registry_without_download(tmp_path):
@@ -486,3 +488,90 @@ def test_pickling_keeps_the_configuration_and_drops_the_fallback(
     assert clone.allow_fallback and clone.backend == "endpoint" and clone.warning is None
     strict = pickle.loads(pickle.dumps(dead(tmp_path, dead_url, allow_fallback=False)))
     assert strict.allow_fallback is False
+
+
+def armed(tmp_path, fake_llama, **kwargs) -> Embedder:
+    """An embedder expecting the vector `fake_llama` serves for the probe text."""
+    emb = e5(tmp_path, fake_llama, **kwargs)
+    emb.expect_probe(emb.probe_vector())
+    fake_llama.requests.clear()
+    return emb
+
+
+def test_the_probe_is_the_probe_text_embedded_as_a_document(tmp_path, fake_llama, tokenizer_file):
+    emb = e5(tmp_path, fake_llama)
+    vector = emb.probe_vector()
+    assert inputs(fake_llama) == [["passage: " + PROBE_TEXT]] and len(vector) == 1024
+
+
+def test_a_matching_endpoint_is_probed_once_before_its_first_embedding(
+    tmp_path, fake_llama, tokenizer_file
+):
+    emb = armed(tmp_path, fake_llama)
+    emb.embed_documents(["alpha"])
+    emb.embed_query("beta")
+    assert inputs(fake_llama) == [["passage: " + PROBE_TEXT], ["passage: alpha"], ["query: beta"]]
+    assert emb.probe_error is None
+
+
+def test_an_endpoint_serving_another_model_is_refused_before_it_embeds_anything(
+    tmp_path, fake_llama, tokenizer_file
+):
+    emb = armed(tmp_path, fake_llama)
+    fake_llama.vector_salt = "other"
+    with pytest.raises(ProbeMismatchError) as refused:
+        emb.embed_documents(["alpha"])
+    message = str(refused.value)
+    assert fake_llama.url("/v1/embeddings") in message and "'e5'" in message
+    assert f"does not serve {E5_LARGE}" in message and "< 0.999" in message
+    assert emb.probe_error == message
+    assert inputs(fake_llama) == [["passage: " + PROBE_TEXT]]
+    assert emb.backend == "endpoint" and emb.warning is None
+
+
+def test_the_probe_is_checked_again_when_the_endpoint_comes_back(
+    tmp_path, fake_llama, stub_text_embedding, tokenizer_file, monkeypatch
+):
+    monkeypatch.setattr(embedder_mod, "ENDPOINT_RETRY_SECONDS", 0.0)
+    emb = armed(tmp_path, fake_llama)
+    fake_llama.fail["/v1/embeddings"] = (503, "Loading model")
+    with pytest.warns(RuntimeWarning, match="503"):
+        emb.embed_documents(["alpha"])
+    del fake_llama.fail["/v1/embeddings"]
+    fake_llama.vector_salt = "other"
+    with pytest.raises(ProbeMismatchError):
+        emb.embed_documents(["beta"])
+    assert emb.probe_error is not None
+
+
+def test_a_fallback_model_is_verified_before_use(
+    tmp_path, dead_url, stub_text_embedding, tokenizer_file
+):
+    emb = dead(tmp_path, dead_url)
+    emb.expect_probe([1.0] + [0.0] * 1023)
+    with pytest.warns(RuntimeWarning, match="unreachable"), pytest.raises(ProbeMismatchError) as e:
+        emb.embed_documents(["alpha"])
+    assert "fastembed's " + E5_LARGE in str(e.value)
+    assert stub_text_embedding.batches == [["passage: " + PROBE_TEXT]]
+
+
+def test_the_expected_probe_survives_pickling(tmp_path, fake_llama, tokenizer_file):
+    emb = armed(tmp_path, fake_llama)
+    fake_llama.vector_salt = "other"
+    clone = pickle.loads(pickle.dumps(emb))
+    with pytest.raises(ProbeMismatchError):
+        clone.embed_documents(["alpha"])
+
+
+def test_verify_checks_the_endpoint_and_never_loads_the_model(
+    tmp_path, fake_llama, dead_url, stub_text_embedding, tokenizer_file
+):
+    emb = armed(tmp_path, fake_llama)
+    emb.verify()
+    fake_llama.vector_salt = "other"
+    with pytest.raises(ProbeMismatchError):
+        emb.verify()
+    gone = dead(tmp_path, dead_url)
+    gone.expect_probe([1.0] + [0.0] * 1023)
+    gone.verify()
+    assert gone.probe_error is None and stub_text_embedding.model_names == []

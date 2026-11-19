@@ -19,6 +19,7 @@ from tokenizers import Tokenizer
 from minirag_mcp.chunker import DEFAULT_TOKEN_BUDGET, MODEL_MAX_TOKENS
 from minirag_mcp.chunker.tokens import estimate_tokens
 from minirag_mcp.endpoints import EmbeddingEndpoint, EndpointError
+from minirag_mcp.identity import PROBE_COSINE, PROBE_TEXT
 
 MINILM = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 E5_LARGE = "intfloat/multilingual-e5-large"
@@ -54,6 +55,10 @@ class UnknownModelError(Exception):
 
 class EmbedderUnavailableError(Exception):
     """The embedding model could not be loaded, so nothing can be searched or ingested."""
+
+
+class ProbeMismatchError(EmbedderUnavailableError):
+    """The live model's vector for the probe text is not the one recorded in the index."""
 
 
 def cosine(a: Sequence[float], b: Sequence[float]) -> float:
@@ -110,7 +115,15 @@ class Embedder:
 
     # What a pickled copy carries. A loaded model, the tokenizers, the locks, the HTTP
     # session and the fallback state belong to one process and are rebuilt lazily.
-    _CONFIG = ("model_name", "cache_dir", "endpoint", "prefixes", "threads", "allow_fallback")
+    _CONFIG = (
+        "model_name",
+        "cache_dir",
+        "endpoint",
+        "prefixes",
+        "threads",
+        "allow_fallback",
+        "_expected",
+    )
 
     def __init__(
         self,
@@ -128,6 +141,7 @@ class Embedder:
         self.prefixes = prefixes if prefixes is not None else prefix_rule(model_name)
         self.threads = threads
         self.allow_fallback = allow_fallback
+        self._expected: tuple[float, ...] | None = None
         self._reset()
 
     def _reset(self) -> None:
@@ -143,6 +157,9 @@ class Embedder:
         self._state_lock = threading.Lock()
         self._warning: str | None = None
         self._failed_at = 0.0
+        # Backends whose probe matched; the endpoint's is dropped when it falls back.
+        self._verified: set[str] = set()
+        self._probe_error: str | None = None
 
     def __getstate__(self) -> dict:
         return {name: getattr(self, name) for name in self._CONFIG}
@@ -179,6 +196,67 @@ class Embedder:
     @property
     def warning(self) -> str | None:
         return self._warning
+
+    @property
+    def probe_error(self) -> str | None:
+        """Why the live backend does not serve this model; None while it matches or while
+        nothing is expected."""
+        return self._probe_error
+
+    def expect_probe(self, probe: Sequence[float]) -> None:
+        """Check every backend against `probe` before its first embedding; empty disarms."""
+        self._expected = tuple(probe) or None
+        with self._state_lock:
+            self._verified.clear()
+            self._probe_error = None
+
+    def probe_vector(self) -> list[float]:
+        """PROBE_TEXT embedded as a document, prefix included, by the live backend."""
+        return self.embed_documents([PROBE_TEXT], check=False)[0]
+
+    def verify(self) -> None:
+        """Check a configured, reachable endpoint against the expected probe now. An
+        unreachable one is left to the fallback's own check; the model is never loaded."""
+        if self.endpoint is None or self._expected is None:
+            return
+        try:
+            self._check_endpoint()
+        except EndpointError:
+            with self._state_lock:
+                self._probe_error = None
+
+    def _probe_text(self) -> str:
+        return PASSAGE_PREFIX + PROBE_TEXT if self.prefixes == "e5" else PROBE_TEXT
+
+    def _check_endpoint(self) -> None:
+        [vector] = self.endpoint.embed([self._fit_window(self._probe_text())])
+        self._check_width([vector])
+        endpoint = self.endpoint.endpoint
+        self._compare(vector, f"The endpoint {endpoint.url} (router model {endpoint.name!r})")
+        with self._state_lock:
+            self._verified.add("endpoint")
+
+    def _check_local(self, model: TextEmbedding) -> None:
+        [vector] = model.embed([self._probe_text()])
+        self._compare(_unit([float(x) for x in vector]), f"fastembed's {self.model_name}")
+        with self._state_lock:
+            self._verified.add("in-process")
+
+    def _compare(self, live: Sequence[float], served: str) -> None:
+        c = cosine(live, self._expected)
+        if c >= PROBE_COSINE:
+            with self._state_lock:
+                self._probe_error = None
+            return
+        message = (
+            f"{served} does not serve {self.model_name}: its vector for the probe text "
+            "differs from the one recorded when this index was built "
+            f"(cosine {c:.4f} < {PROBE_COSINE}). Point it at {self.model_name}; until "
+            "then this index is unavailable."
+        )
+        with self._state_lock:
+            self._probe_error = message
+        raise ProbeMismatchError(message)
 
     @property
     def prefix_tokens(self) -> int:
@@ -310,22 +388,25 @@ class Embedder:
                 return text[:end]
         return ""
 
-    def embed_documents(self, texts: Sequence[str]) -> list[list[float]]:
+    def embed_documents(self, texts: Sequence[str], *, check: bool = True) -> list[list[float]]:
         if not texts:
             return []
         if self.prefixes == "e5":
             texts = [PASSAGE_PREFIX + t for t in texts]
-        return self._embed(list(texts), query=False)
+        return self._embed(list(texts), query=False, check=check)
 
     def embed_query(self, text: str) -> list[float]:
         if self.prefixes == "e5":
             text = QUERY_PREFIX + text
         return self._embed([text], query=True)[0]
 
-    def _embed(self, texts: list[str], *, query: bool) -> list[list[float]]:
+    def _embed(self, texts: list[str], *, query: bool, check: bool = True) -> list[list[float]]:
+        check = check and self._expected is not None
         if self.endpoint is not None and self._endpoint_due():
             fitted = [self._fit_window(t) for t in texts]
             try:
+                if check and "endpoint" not in self._verified:
+                    self._check_endpoint()
                 vectors = self.endpoint.embed(fitted)
             except EndpointError as e:
                 if not self.allow_fallback:
@@ -345,6 +426,8 @@ class Embedder:
                 f"The embedding endpoint {self.endpoint.endpoint.url} is unreachable, so "
                 f"{self.model_name} was to run in-process, and that failed too. {e}"
             ) from e
+        if check and "in-process" not in self._verified:
+            self._check_local(model)
         raw = model.query_embed(texts) if query else model.embed(texts)
         return [_unit([float(x) for x in v]) for v in raw]
 
@@ -364,6 +447,7 @@ class Embedder:
         )
         with self._state_lock:
             first = self._warning is None
+            self._verified.discard("endpoint")
             self._warning = message
             self._failed_at = time.monotonic()
         # Python's default filter shows a given text once per process, so a long-running

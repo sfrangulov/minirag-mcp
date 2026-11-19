@@ -26,7 +26,13 @@ import minirag_mcp.embedder as embedder_mod
 from minirag_mcp import security
 from minirag_mcp.chunker import SCHEME_VERSION
 from minirag_mcp.config import Config
-from minirag_mcp.identity import ChunkingScheme, EmbeddingScheme, IndexIdentity, create_identity
+from minirag_mcp.identity import (
+    PROBE_TEXT,
+    ChunkingScheme,
+    EmbeddingScheme,
+    IndexIdentity,
+    create_identity,
+)
 from minirag_mcp.labels.model import ModelError
 from minirag_mcp.labels.taxonomy import ModelSpec
 
@@ -80,6 +86,17 @@ class FakeEmbedder:
 
     def embed_query(self, text: str) -> list[float]:
         return self._vec(text)
+
+    probe_error: str | None = None
+
+    def probe_vector(self) -> list[float]:
+        return self._vec(PROBE_TEXT)
+
+    def expect_probe(self, probe: Sequence[float]) -> None:
+        self.expected_probe = tuple(probe)
+
+    def verify(self) -> None:
+        pass
 
 
 @pytest.fixture

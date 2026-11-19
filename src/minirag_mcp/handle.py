@@ -18,7 +18,13 @@ from dataclasses import dataclass, replace
 
 from minirag_mcp.chunker import SCHEME_VERSION
 from minirag_mcp.config import Config
-from minirag_mcp.embedder import Embedder, UnknownModelError, prefix_rule
+from minirag_mcp.embedder import (
+    Embedder,
+    EmbedderUnavailableError,
+    ProbeMismatchError,
+    UnknownModelError,
+    prefix_rule,
+)
 from minirag_mcp.endpoints import EmbeddingEndpoint, RerankEndpoint
 from minirag_mcp.identity import (
     INDEX_FILE,
@@ -131,6 +137,8 @@ class IndexHandle:
             config.roots, config.cache_dir, model_factory, needs_extra=not served
         )
         self._lock = threading.Lock()
+        self._probe_lock = threading.Lock()
+        self._probe_recorded = False
         self._current: _Opened | None = None
 
     def get(self) -> OpenIndex:
@@ -152,12 +160,26 @@ class IndexHandle:
             return IndexState.UNAVAILABLE, str(e)
 
     def _opened(self) -> _Opened:
-        if (current := self._current) is not None:
-            return current
-        with self._lock:
-            if self._current is None:
-                self._current = self._build()
-            return self._current
+        if (current := self._current) is None:
+            with self._lock:
+                if self._current is None:
+                    self._current = self._build()
+                current = self._current
+        self._refuse_mismatch(current.index.embedder)
+        return current
+
+    @staticmethod
+    def _refuse_mismatch(embedder) -> None:
+        """An endpoint that stopped serving the index's model keeps the index unavailable
+        until a check passes again."""
+        if embedder.probe_error is None:
+            return
+        try:
+            embedder.verify()
+        except EmbedderUnavailableError:
+            pass
+        if embedder.probe_error is not None:
+            raise IndexUnavailableError(embedder.probe_error)
 
     def _build(self) -> _Opened:
         config = self.config
@@ -175,7 +197,13 @@ class IndexHandle:
             )
             identity = self._record_fts_language(identity, store)
             chunking = replace(config, token_budget=identity.chunking.token_budget)
-            pipeline = Pipeline(store, embedder, chunking, labels=self._labels)
+            if identity.probe:
+                embedder.expect_probe(identity.probe)
+                if getattr(embedder, "endpoint", None) is not None:
+                    self._verify_at_open(embedder)
+            pipeline = Pipeline(
+                store, embedder, chunking, labels=self._labels, before_store=self.ensure_probe
+            )
             reranker = RerankEndpoint(config.rerank_endpoint) if config.rerank_endpoint else None
         except BaseException:
             for made in built:
@@ -183,6 +211,36 @@ class IndexHandle:
             raise
         index = OpenIndex(config, store, embedder, pipeline, self._labels, identity, reranker)
         return _Opened(index, SyncManager(pipeline, store, config), configured)
+
+    @staticmethod
+    def _verify_at_open(embedder) -> None:
+        try:
+            embedder.verify()
+        except ProbeMismatchError as e:
+            raise IndexUnavailableError(str(e)) from e
+
+    def ensure_probe(self) -> None:
+        """Called before every write: records the probe when the index has none, so the
+        first write into a fresh index fixes which model it was built with, and arms the
+        embedder with it. Refuses the write while the served model is not the recorded one."""
+        opened = self._opened()
+        if self._probe_recorded:
+            return
+        embedder, db = opened.index.embedder, self.config.db_path
+        with self._probe_lock:
+            if self._probe_recorded:
+                return
+            current = read_identity(db)
+            if current is None or current.generation != opened.index.identity.generation:
+                return
+            if current.probe:
+                embedder.expect_probe(current.probe)
+            else:
+                vector = tuple(embedder.probe_vector())
+                if update_identity(db, current.generation, probe=vector) is None:
+                    return
+                embedder.expect_probe(vector)
+            self._probe_recorded = True
 
     def _identity(self, embedding: EmbeddingScheme, chunking: ChunkingScheme) -> IndexIdentity:
         """The recorded identity; a folder without one is stamped with these schemes before
@@ -284,6 +342,7 @@ class IndexHandle:
         """
         with self._lock:
             current, self._current = self._current, None
+            self._probe_recorded = False
         if current is not None:
             self._release(current.index.embedder)
             if current.configured is not current.index.embedder:

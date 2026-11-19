@@ -511,3 +511,14 @@ def test_a_smaller_budget_produces_more_chunks(tmp_path, fake_embedder):
         store = Store(tmp_path / f"db-{budget}", dim=fake_embedder.dim)
         counts.append(Pipeline(store, fake_embedder, cfg).ingest_file(f).chunk_count)
     assert counts[1] > counts[0]
+
+
+def test_the_store_hook_runs_before_every_write(tmp_path, fake_embedder):
+    cfg = load_config({"BASE_DIR": str(tmp_path)}, cwd=tmp_path)
+    calls = []
+    p = Pipeline(
+        Store(tmp_path / "db", dim=8), fake_embedder, cfg, before_store=lambda: calls.append(1)
+    )
+    p.ingest_data("one", source="s")
+    p.ingest_data("two", source="s")
+    assert len(calls) == 2 and p.before_store is not None

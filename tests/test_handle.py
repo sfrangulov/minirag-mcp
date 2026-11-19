@@ -25,6 +25,7 @@ from minirag_mcp.handle import (
 )
 from minirag_mcp.identity import (
     INDEX_FILE,
+    PROBE_TEXT,
     ChunkingScheme,
     EmbeddingScheme,
     IndexIdentity,
@@ -586,3 +587,65 @@ def test_a_recorded_embedder_refused_at_open_has_its_client_closed(
         IndexHandle(config).get()
     assert [e.model_name for e in built] == [E5_LARGE, model]
     assert sorted(map(id, closed)) == sorted(id(e.endpoint) for e in built)
+
+
+def _served(tmp_path, fake_llama) -> IndexHandle:
+    fake_llama.dim = 1024
+    config = replace(
+        cfg(tmp_path),
+        embed_endpoints={E5_LARGE: Endpoint(fake_llama.url("/v1/embeddings"), "e5")},
+    )
+    return IndexHandle(config)
+
+
+def test_the_first_ingest_records_the_probe(tmp_path, fake_embedder):
+    h = handle(tmp_path, fake_embedder)
+    h.get().pipeline.ingest_data("x", source="s")
+    assert read_identity(h.config.db_path).probe == pytest.approx(fake_embedder._vec(PROBE_TEXT))
+
+
+def test_a_matching_endpoint_is_ready(fake_llama, tmp_path, tokenizer_file):
+    first = _served(tmp_path, fake_llama)
+    first.get().pipeline.ingest_data("x", source="s")
+    first.close()
+    again = _served(tmp_path, fake_llama)
+    assert again.state() == (IndexState.READY, "")
+    again.get().pipeline.ingest_data("y", source="t")
+
+
+def test_an_endpoint_serving_another_model_is_unavailable_naming_both(
+    fake_llama, tmp_path, tokenizer_file
+):
+    first = _served(tmp_path, fake_llama)
+    first.get().pipeline.ingest_data("x", source="s")
+    first.close()
+    fake_llama.vector_salt = "other"
+    h = _served(tmp_path, fake_llama)
+    state, why = h.state()
+    assert state is IndexState.UNAVAILABLE and E5_LARGE in why and "'e5'" in why
+    with pytest.raises(IndexUnavailableError):
+        h.get()
+
+
+def test_an_open_index_turns_unavailable_when_the_endpoint_changes_model(
+    fake_llama, tmp_path, tokenizer_file, monkeypatch
+):
+    import minirag_mcp.embedder as embedder_mod
+
+    monkeypatch.setattr(embedder_mod, "ENDPOINT_RETRY_SECONDS", 0.0)
+    h = _served(tmp_path, fake_llama)
+    pipeline = h.get().pipeline
+    pipeline.ingest_data("x", source="s")
+    fake_llama.vector_salt = "other"
+    with pytest.raises(embedder_mod.ProbeMismatchError):
+        pipeline.ingest_data("y", source="t")
+    assert h.state()[0] is IndexState.UNAVAILABLE
+    with pytest.raises(IndexUnavailableError):
+        h.get()
+    fake_llama.vector_salt = ""
+    assert h.state() == (IndexState.READY, "")
+
+
+def test_the_store_hook_is_the_handles_probe_recorder(tmp_path, fake_embedder):
+    h = handle(tmp_path, fake_embedder)
+    assert h.get().pipeline.before_store == h.ensure_probe
