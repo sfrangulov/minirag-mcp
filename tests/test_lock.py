@@ -13,6 +13,7 @@ deadlock. Spawn costs a fresh interpreter per child and buys determinism.
 from __future__ import annotations
 
 import errno
+import fcntl
 import json
 import multiprocessing
 import os
@@ -24,7 +25,7 @@ import pytest
 
 from minirag_mcp.config import load_config
 from minirag_mcp.ingest.pipeline import Pipeline
-from minirag_mcp.lock import LOCK_FILENAME, SyncLock, SyncLockBusy, sync_lock
+from minirag_mcp.lock import LOCK_FILENAME, SyncLock, SyncLockBusy, is_held, sync_lock
 from minirag_mcp.store import Store
 
 MP = multiprocessing.get_context("spawn")
@@ -191,6 +192,40 @@ def test_a_second_lock_object_in_this_process_conflicts_too(db_path):
         with pytest.raises(SyncLockBusy):
             with sync_lock(db_path):
                 pass
+
+
+def test_is_held_reports_a_holder_without_taking_the_lock(db_path):
+    lock_file = db_path / LOCK_FILENAME
+    assert not is_held(db_path)
+    assert not lock_file.exists()  # asking creates nothing
+
+    with sync_lock(db_path):
+        holder_info = lock_file.read_bytes()
+        assert is_held(db_path)
+        assert is_held(db_path)
+        assert lock_file.read_bytes() == holder_info
+
+    assert not is_held(db_path)
+    with sync_lock(db_path):  # asking left no lock behind
+        pass
+
+
+def test_is_held_sees_a_holder_in_another_process(holder):
+    assert is_held(holder.db_path)
+    holder.stop()
+    assert not is_held(holder.db_path)
+
+
+def test_two_askers_do_not_see_each_other_as_a_holder(db_path):
+    """Writers ask at the same time; one asking must not read as a sync to the other."""
+    with sync_lock(db_path):
+        pass
+    fd = os.open(db_path / LOCK_FILENAME, os.O_RDONLY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)  # another is_held, mid-question
+        assert not is_held(db_path)
+    finally:
+        os.close(fd)
 
 
 @pytest.mark.parametrize(

@@ -274,6 +274,31 @@ class SyncLock:
             os.close(fd)
 
 
+def is_held(db_path: Path) -> bool:
+    """Whether anyone, this process included, holds the sync lock for `db_path`.
+
+    flock has no way to ask without trying, so this takes the lock for an instant and
+    drops it. It asks for a *shared* lock: that conflicts with a holder's exclusive one,
+    but not with another caller asking at the same moment, so two writers checking at
+    once never see each other as a sync. A sync starting in that instant is refused as
+    contended. A lock that cannot be asked about at all reads as not held, as `acquire`
+    proceeds unlocked in the same cases.
+    """
+    if fcntl is None:
+        return False
+    try:
+        fd = os.open(Path(db_path) / LOCK_FILENAME, os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except OSError as e:
+        return e.errno in _CONTENTION_ERRNOS
+    finally:
+        os.close(fd)
+    return False
+
+
 @contextmanager
 def sync_lock(db_path: Path) -> Iterator[SyncLock]:
     """Hold the sync lock for `db_path` for the duration of the block.

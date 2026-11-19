@@ -1,0 +1,432 @@
+"""What an index was built with, how a configuration differs from it, and the swap.
+
+Every v2 index folder holds INDEX_FILE: the embedding and chunking schemes its vectors and
+chunks were made with, its generation, and the probe vector its model gave for PROBE_TEXT.
+A folder with a LanceDB table and no INDEX_FILE is a minirag 1.x index, which v2 never
+writes to. A rebuild builds a complete index in `staging_dir(db)`; `swap_in` moves it into
+place and keeps the one it replaces as `previous_dir(db)`.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import os
+import shutil
+import uuid
+from collections.abc import Sequence
+from dataclasses import dataclass, replace
+from enum import StrEnum
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from minirag_mcp import __version__
+from minirag_mcp.chunker import SCHEME_VERSION
+from minirag_mcp.lock import is_held
+
+if TYPE_CHECKING:
+    from minirag_mcp.config import Config
+    from minirag_mcp.store import IndexOpenError
+
+# `config`, `store` and `embedder` are imported inside the functions that use them, so
+# that embedder.py can import the probe constants from here: store imports config, and
+# config imports embedder.
+
+INDEX_FILE = "index.json"
+FORMAT = 2
+PROBE_COSINE = 0.999
+# Never changed: every recorded probe is this text's vector, and an index is verified
+# by embedding it again.
+PROBE_TEXT = (
+    "minirag index probe. The quick brown fox jumps over the lazy dog. "
+    "Съешь же ещё этих мягких французских булок, да выпей чаю."
+)
+# The table every 1.x index holds; 1.x is frozen, so this name is too.
+_LEGACY_TABLE = "chunks.lance"
+
+
+@dataclass(frozen=True)
+class EmbeddingScheme:
+    model: str
+    dim: int
+    prefixes: str
+
+
+@dataclass(frozen=True)
+class ChunkingScheme:
+    scheme_version: int
+    token_budget: int
+
+
+@dataclass(frozen=True)
+class IndexIdentity:
+    format: int
+    minirag: str
+    generation: int
+    embedding: EmbeddingScheme
+    # Stored under "embedding" in the file. Empty until the first write records it.
+    probe: tuple[float, ...]
+    chunking: ChunkingScheme
+    fts_language: str
+    document_table: bool
+
+    @classmethod
+    def fresh(
+        cls, embedding: EmbeddingScheme, chunking: ChunkingScheme, fts_language: str
+    ) -> IndexIdentity:
+        """What a new index folder is stamped with at its first open."""
+        return cls(
+            format=FORMAT,
+            minirag=__version__,
+            generation=1,
+            embedding=embedding,
+            probe=(),
+            chunking=chunking,
+            fts_language=fts_language,
+            document_table=True,
+        )
+
+
+class IndexState(StrEnum):
+    READY = "ready"
+    REBUILD_PENDING = "rebuild pending"
+    SYNCING = "syncing"
+    UNAVAILABLE = "unavailable"
+
+
+class IdentityError(Exception):
+    """INDEX_FILE is unreadable, malformed, or in a format newer than FORMAT."""
+
+
+class LegacyIndexError(Exception):
+    """The folder holds a minirag 1.x index."""
+
+
+@dataclass(frozen=True)
+class RebuildInfo:
+    kind: str
+    reasons: tuple[str, ...]
+    generation: int
+    reembedded: int
+    restored: int
+
+    def to_dict(self) -> dict:
+        return {
+            "kind": self.kind,
+            "reasons": list(self.reasons),
+            "generation": self.generation,
+            "reembedded": self.reembedded,
+            "restored": self.restored,
+        }
+
+
+def _open_error(db_path: Path, error: OSError) -> IndexOpenError:
+    from minirag_mcp.store import IndexOpenError
+
+    return IndexOpenError.at(db_path, error)
+
+
+def _to_json(identity: IndexIdentity) -> dict:
+    return {
+        "format": identity.format,
+        "minirag": identity.minirag,
+        "generation": identity.generation,
+        "embedding": {
+            "model": identity.embedding.model,
+            "dim": identity.embedding.dim,
+            "prefixes": identity.embedding.prefixes,
+            "probe": list(identity.probe),
+        },
+        "chunking": {
+            "scheme_version": identity.chunking.scheme_version,
+            "token_budget": identity.chunking.token_budget,
+        },
+        "fts_language": identity.fts_language,
+        "document_table": identity.document_table,
+    }
+
+
+class _Malformed(Exception):
+    pass
+
+
+_KINDS = {str: "a string", int: "an integer", bool: "true or false", dict: "an object"}
+
+
+def _get(obj: dict, key: str, kind: type, prefix: str = ""):
+    value = obj.get(key)
+    if isinstance(value, kind) and not (kind is int and isinstance(value, bool)):
+        return value
+    if key not in obj:
+        raise _Malformed(f"{prefix}{key} is missing")
+    raise _Malformed(f"{prefix}{key} is not {_KINDS[kind]}")
+
+
+def _parse(path: Path, data: object) -> IndexIdentity:
+    if not isinstance(data, dict):
+        raise _Malformed("it is not a JSON object")
+    fmt = _get(data, "format", int)
+    if fmt > FORMAT:
+        writer = data.get("minirag")
+        writer = f"minirag {writer}" if isinstance(writer, str) else "a newer minirag"
+        raise IdentityError(
+            f"{path} was written in index format {fmt} by {writer}, newer than format "
+            f"{FORMAT}, the one this minirag ({__version__}) reads. Upgrade minirag-mcp to "
+            "open this index, or point DB_PATH at another folder."
+        )
+    if fmt != FORMAT:
+        raise _Malformed(f"format {fmt} is not one minirag writes")
+    minirag = _get(data, "minirag", str)
+    generation = _get(data, "generation", int)
+    embedding = _get(data, "embedding", dict)
+    chunking = _get(data, "chunking", dict)
+    probe = embedding.get("probe")
+    if not isinstance(probe, list) or not all(
+        isinstance(x, int | float) and not isinstance(x, bool) for x in probe
+    ):
+        raise _Malformed("embedding.probe is not a list of numbers")
+    return IndexIdentity(
+        format=fmt,
+        minirag=minirag,
+        generation=generation,
+        embedding=EmbeddingScheme(
+            model=_get(embedding, "model", str, "embedding."),
+            dim=_get(embedding, "dim", int, "embedding."),
+            prefixes=_get(embedding, "prefixes", str, "embedding."),
+        ),
+        probe=tuple(float(x) for x in probe),
+        chunking=ChunkingScheme(
+            scheme_version=_get(chunking, "scheme_version", int, "chunking."),
+            token_budget=_get(chunking, "token_budget", int, "chunking."),
+        ),
+        fts_language=_get(data, "fts_language", str),
+        document_table=_get(data, "document_table", bool),
+    )
+
+
+def _malformed(path: Path, detail: str) -> IdentityError:
+    return IdentityError(
+        f"{path} is not a valid minirag index description: {detail}. It records the scheme "
+        "this index was built with, so the index is not opened without it; restore the "
+        "file, or point DB_PATH at an empty folder to build a new index."
+    )
+
+
+def read_identity(db_path: Path) -> IndexIdentity | None:
+    """The identity recorded in `db_path`, or None when it has none."""
+    path = db_path / INDEX_FILE
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return None
+    except NotADirectoryError as e:
+        raise _open_error(db_path, e) from e
+    except OSError as e:
+        raise IdentityError(
+            f"{path} cannot be read: {e.strerror or e}. It records the scheme this index was "
+            "built with, so the index is not opened until it can be read."
+        ) from e
+    try:
+        data = json.loads(raw)
+    except ValueError as e:
+        raise _malformed(path, f"it is not valid JSON ({e})") from e
+    try:
+        return _parse(path, data)
+    except _Malformed as e:
+        raise _malformed(path, str(e)) from None
+
+
+def write_identity(db_path: Path, identity: IndexIdentity) -> None:
+    """Replace `db_path`'s identity in one step: a reader sees the old file or the new one."""
+    try:
+        db_path.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise _open_error(db_path, e) from e
+    # One name per writer: two processes stamping one folder must not share a file.
+    tmp = db_path / f"{INDEX_FILE}.{uuid.uuid4().hex}.tmp"
+    data = (json.dumps(_to_json(identity), ensure_ascii=False) + "\n").encode("utf-8")
+    try:
+        with open(tmp, "xb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, db_path / INDEX_FILE)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
+
+
+def is_legacy_index(db_path: Path) -> bool:
+    return (db_path / _LEGACY_TABLE).is_dir() and not os.path.lexists(db_path / INDEX_FILE)
+
+
+def legacy_error(db_path: Path, roots: Sequence[Path]) -> LegacyIndexError:
+    from minirag_mcp.config import default_db_path
+
+    return LegacyIndexError(
+        f"{db_path} holds a minirag 1.x index (a LanceDB table and no {INDEX_FILE}). "
+        "minirag 2 never writes to a 1.x index. Leave DB_PATH unset to use "
+        f"{default_db_path(roots)}, or point it at an empty folder."
+    )
+
+
+def differences(
+    recorded: IndexIdentity, embedding: EmbeddingScheme, chunking: ChunkingScheme
+) -> list[str]:
+    """What a rebuild with these schemes would change, one phrase per difference."""
+    was, old = recorded.embedding, recorded.chunking
+    found = []
+    if was.model != embedding.model:
+        found.append(f"model {was.model} -> {embedding.model}")
+    if was.prefixes != embedding.prefixes:
+        found.append(f"query/passage prefixes {was.prefixes} -> {embedding.prefixes}")
+    if was.model == embedding.model and was.dim != embedding.dim:
+        found.append(f"vector width {was.dim} -> {embedding.dim}")
+    if old.scheme_version != chunking.scheme_version:
+        found.append(f"chunking scheme {old.scheme_version} -> {chunking.scheme_version}")
+    if old.token_budget != chunking.token_budget:
+        found.append(f"chunk budget {old.token_budget} -> {chunking.token_budget} tokens")
+    return found
+
+
+def rebuild_kind(
+    recorded: IndexIdentity, embedding: EmbeddingScheme, chunking: ChunkingScheme
+) -> str:
+    """The rebuild needed: "reingest" when the chunks change, "reembed" when only the
+    vectors do, else "none"."""
+    if recorded.chunking != chunking:
+        return "reingest"
+    if recorded.embedding != embedding:
+        return "reembed"
+    return "none"
+
+
+def index_state(config: Config, embedder) -> tuple[IndexState, str]:
+    """The index's state against the configuration `embedder` was built for, and why.
+
+    Reads files and fastembed's registry only: it never loads a model or calls an endpoint.
+    """
+    from minirag_mcp.embedder import known_model
+    from minirag_mcp.store import IndexOpenError
+
+    db = config.db_path
+    try:
+        recover_swap(db)
+        recorded = read_identity(db)
+    except (IdentityError, IndexOpenError) as e:
+        return IndexState.UNAVAILABLE, str(e)
+    if recorded is None:
+        if is_legacy_index(db):
+            return IndexState.UNAVAILABLE, str(legacy_error(db, config.roots))
+        return IndexState.READY, ""
+    model = recorded.embedding.model
+    if (
+        model != embedder.model_name
+        and model not in config.embed_endpoints
+        and not known_model(model)
+    ):
+        return IndexState.UNAVAILABLE, (
+            f"this index was built with {model}, which cannot be loaded here: no embedding "
+            "endpoint is configured for it and fastembed does not know it"
+        )
+    found = differences(
+        recorded,
+        EmbeddingScheme(embedder.model_name, embedder.dim, embedder.prefixes),
+        ChunkingScheme(SCHEME_VERSION, config.token_budget),
+    )
+    if found:
+        return IndexState.REBUILD_PENDING, "; ".join(found)
+    return IndexState.READY, ""
+
+
+def staging_dir(db_path: Path) -> Path:
+    return db_path.with_name(db_path.name + ".next")
+
+
+def previous_dir(db_path: Path) -> Path:
+    return db_path.with_name(db_path.name + ".previous")
+
+
+def _remove(path: Path) -> None:
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    elif os.path.lexists(path):
+        path.unlink()
+
+
+def _holds_generation(db_path: Path, generation: int) -> bool:
+    if not db_path.is_dir():
+        return False
+    try:
+        found = read_identity(db_path)
+    except IdentityError:
+        return False
+    return found is not None and found.generation == generation
+
+
+def swap_in(db_path: Path) -> None:
+    """Put the index built in `staging_dir(db_path)` in place, one generation up.
+
+    The replaced index becomes `previous_dir(db_path)`, and the one kept there before is
+    dropped. Between the two renames `db_path` does not exist; `recover_swap` finishes a
+    swap whose process died there.
+    """
+    staging, previous = staging_dir(db_path), previous_dir(db_path)
+    staged = read_identity(staging)
+    if staged is None:
+        raise IdentityError(
+            f"{staging} holds no {INDEX_FILE}, so it is not a complete index and is not "
+            f"swapped in for {db_path}."
+        )
+    current = read_identity(db_path)
+    generation = max(staged.generation, current.generation if current else 0) + 1
+    write_identity(staging, replace(staged, generation=generation))
+    _remove(previous)
+    had_index = os.path.lexists(db_path)
+    if had_index:
+        os.rename(db_path, previous)
+    try:
+        os.rename(staging, db_path)
+    except OSError:
+        # Another process's recover_swap can move the staged index in between the renames.
+        if _holds_generation(db_path, generation):
+            return
+        if had_index:
+            os.rename(previous, db_path)
+        raise
+
+
+def recover_swap(db_path: Path) -> bool:
+    """Finish a swap whose process died between its two renames; True when one was.
+
+    Such a process left no index at `db_path`, the replaced one in `previous_dir`, and the
+    complete new one in `staging_dir`. Opening `db_path` as it is would start an empty index.
+    """
+    staging, previous = staging_dir(db_path), previous_dir(db_path)
+    if os.path.lexists(db_path) or not previous.is_dir():
+        return False
+    if read_identity(staging) is None:
+        return False
+    try:
+        os.rename(staging, db_path)
+    except OSError as e:
+        if os.path.lexists(db_path):  # the swapping process was alive and got there first
+            return False
+        from minirag_mcp.store import IndexOpenError
+
+        raise IndexOpenError(
+            f"{db_path} is missing: a rebuild stopped while swapping in {staging}, and "
+            f"finishing that swap failed: {e.strerror or e}. Rename {staging} to {db_path} to "
+            f"finish it; {previous} holds the index it replaced."
+        ) from e
+    return True
+
+
+def rebuild_running(db_path: Path) -> bool:
+    """Whether a rebuild of `db_path` is in progress: its staging folder and the sync lock.
+
+    The staging folder is checked first. Asking about the lock takes it for an instant,
+    which a sync starting at that instant would see as contention.
+    """
+    return staging_dir(db_path).is_dir() and is_held(db_path)

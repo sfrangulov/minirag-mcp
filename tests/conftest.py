@@ -23,6 +23,9 @@ from tokenizers.processors import TemplateProcessing
 
 import minirag_mcp.embedder as embedder_mod
 from minirag_mcp import security
+from minirag_mcp.chunker import SCHEME_VERSION
+from minirag_mcp.config import Config
+from minirag_mcp.identity import ChunkingScheme, EmbeddingScheme, IndexIdentity, write_identity
 from minirag_mcp.labels.model import ModelError
 from minirag_mcp.labels.taxonomy import ModelSpec
 
@@ -81,6 +84,17 @@ class FakeEmbedder:
 @pytest.fixture
 def fake_embedder() -> FakeEmbedder:
     return FakeEmbedder()
+
+
+def stamp_identity(config: Config, embedder) -> IndexIdentity:
+    """Write the identity a handle stamps a fresh folder with, for `embedder`."""
+    identity = IndexIdentity.fresh(
+        EmbeddingScheme(embedder.model_name, embedder.dim, embedder.prefixes),
+        ChunkingScheme(SCHEME_VERSION, config.token_budget),
+        config.fts_language,
+    )
+    write_identity(config.db_path, identity)
+    return identity
 
 
 def stub_tokenizer() -> Tokenizer:
