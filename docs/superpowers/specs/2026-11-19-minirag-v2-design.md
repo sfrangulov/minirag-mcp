@@ -129,8 +129,8 @@ pages block by block and loses small text in wide images without tiling.
 ### 1. The index server
 
 **Configuration** — `indexes.toml` in the user config directory
-(`platformdirs.user_config_path("minirag")`, i.e. `~/.config/minirag/` on macOS too, matching
-`~/.config/llama/`). `MINIRAG_CONFIG` overrides the path.
+(`$XDG_CONFIG_HOME` or `~/.config`, then `minirag/`, on macOS too, matching `~/.config/llama/`;
+`platformdirs.user_config_path("minirag")` on Windows). `MINIRAG_CONFIG` overrides the path.
 
 ```toml
 [server]

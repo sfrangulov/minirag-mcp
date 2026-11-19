@@ -38,7 +38,7 @@ from minirag_mcp.results import (
 from minirag_mcp.store import LABEL_COLUMNS, SearchResult, Store
 from store_helpers import _older_table, _raise_commit_conflict, _row
 
-ROOT = "/Users/x/Documents/solidcore_data"
+ROOT = "/Users/x/Documents/corpus"
 
 #: A real relative path from the indexed corpus: a numbered directory, a space in the
 #: directory name, an underscore-and-space filename, Cyrillic, and a `.docx` extension —
