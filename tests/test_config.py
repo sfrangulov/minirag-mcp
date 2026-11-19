@@ -176,6 +176,23 @@ def test_endpoints_come_from_the_environment(tmp_path):
     assert set(load_config({**env, "MODEL_NAME": MINILM}, cwd=tmp_path).embed_endpoints) == {MINILM}
 
 
+def test_an_embed_endpoint_needs_a_model_of_known_window(tmp_path):
+    """The endpoint gets text cut to the window where fastembed truncates in-process; for a
+    model without a known window the two backends would embed different text."""
+    env = {
+        "EMBED_URL": "http://127.0.0.1:8080/v1/embeddings",
+        "EMBED_ENDPOINT_MODEL": "m",
+        "MODEL_NAME": "BAAI/bge-small-en-v1.5",
+    }
+    with pytest.raises(ConfigError, match=r"(?s)BAAI/bge-small-en-v1\.5.*window.*unknown"):
+        load_config(env, cwd=tmp_path)
+    with pytest.raises(ConfigError, match="window"):
+        load_config(env, model_name_flag="x/unknown", cwd=tmp_path)
+    assert set(load_config({**env, "MODEL_NAME": MINILM}, cwd=tmp_path).embed_endpoints) == {MINILM}
+    in_process = {"MODEL_NAME": "BAAI/bge-small-en-v1.5"}
+    assert load_config(in_process, cwd=tmp_path).embed_endpoints == {}
+
+
 def test_retrieval_tuning_env(tmp_path):
     cfg = load_config({"RAG_DOCUMENT_WEIGHT": "0", "RAG_RERANK_TOP": "50"}, cwd=tmp_path)
     assert (cfg.document_weight, cfg.rerank_top) == (0.0, 50)

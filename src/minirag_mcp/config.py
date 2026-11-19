@@ -9,7 +9,7 @@ from pathlib import Path
 
 import platformdirs
 
-from minirag_mcp.embedder import E5_LARGE, default_budget, model_window
+from minirag_mcp.embedder import E5_LARGE, MODEL_WINDOWS, default_budget, model_window
 from minirag_mcp.endpoints import Endpoint, EndpointError, read_api_key
 
 DEFAULT_MODEL = E5_LARGE
@@ -220,6 +220,13 @@ def load_config(
     except EndpointError as e:
         raise ConfigError(f"ENDPOINT_API_KEY_FILE: {e}") from e
     embed_endpoint = _endpoint(env, "EMBED_URL", "EMBED_ENDPOINT_MODEL", api_key)
+    if embed_endpoint is not None and model_name not in MODEL_WINDOWS:
+        raise ConfigError(
+            f"EMBED_URL is set for {model_name!r}, whose window is unknown. Text for the "
+            "endpoint is cut where fastembed truncates it in-process, and for this model that "
+            f"length is not known. Use one of {', '.join(MODEL_WINDOWS)}, or unset EMBED_URL "
+            "to embed in-process."
+        )
 
     return Config(
         roots=roots,

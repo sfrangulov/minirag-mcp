@@ -1,6 +1,7 @@
 import math
 import pickle
 import re
+import threading
 
 import pytest
 from tokenizers import Tokenizer, pre_tokenizers
@@ -279,7 +280,7 @@ def test_the_endpoint_is_tried_again_after_the_interval(
     emb = e5(tmp_path, fake_llama)
     fake_llama.fail["/v1/embeddings"] = (503, "Loading model")
     with pytest.warns(RuntimeWarning, match="503"):
-        emb.embed_documents(["alpha"])
+        fallen = emb.embed_documents(["alpha"])
     del fake_llama.fail["/v1/embeddings"]
     emb.embed_documents(["beta"])
     assert len(fake_llama.requests) == 1, "tried again before the interval passed"
@@ -289,7 +290,37 @@ def test_the_endpoint_is_tried_again_after_the_interval(
     emb.embed_documents(["gamma"])
     assert inputs(fake_llama)[-1] == ["passage: gamma"]
     assert emb.backend == "endpoint" and emb.warning is None
+    assert emb.embed_documents(["alpha"]) == fallen  # the fallback embeds alike
     assert stub_text_embedding.batches == [["passage: alpha"], ["passage: beta"]]
+
+
+def test_an_endpoint_embed_does_not_wait_for_the_fallback_model_to_load(
+    tmp_path, fake_llama, tokenizer_file, monkeypatch
+):
+    real = embedder_mod.TextEmbedding
+    entered, release = threading.Event(), threading.Event()
+
+    class SlowToLoad:
+        list_supported_models = staticmethod(real.list_supported_models)
+
+        def __init__(self, *args, **kwargs):
+            entered.set()
+            release.wait(30)
+
+    monkeypatch.setattr(embedder_mod, "TextEmbedding", SlowToLoad)
+    emb = e5(tmp_path, fake_llama)
+    loader = threading.Thread(target=emb._load)
+    loader.start()
+    try:
+        assert entered.wait(5)
+        done: list = []
+        embedding = threading.Thread(target=lambda: done.append(emb.embed_documents(["alpha"])))
+        embedding.start()
+        embedding.join(5)
+        assert done, "the endpoint embed waited for the in-process model to load"
+    finally:
+        release.set()
+        loader.join(5)
 
 
 def test_without_a_fallback_an_unreachable_endpoint_is_an_error(

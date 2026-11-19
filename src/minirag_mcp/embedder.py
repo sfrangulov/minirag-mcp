@@ -138,6 +138,8 @@ class Embedder:
         self._file_tokenizers: tuple[Tokenizer, Tokenizer] | None = None
         self._prefix_tokens: int | None = None
         self._load_lock = threading.Lock()
+        # Apart from the model's lock: endpoint embeds must not wait out a fallback's load.
+        self._tokenizer_lock = threading.Lock()
         self._state_lock = threading.Lock()
         self._warning: str | None = None
         self._failed_at = 0.0
@@ -210,7 +212,9 @@ class Embedder:
     def _tokenizers(self) -> tuple[Tokenizer, Tokenizer]:
         """The model's tokenizer.json, read without the ONNX model: a counter that never
         truncates, and a cutter that truncates to the window as fastembed does."""
-        with self._load_lock:
+        if (loaded := self._file_tokenizers) is not None:
+            return loaded
+        with self._tokenizer_lock:
             if self._file_tokenizers is None:
                 repo = self._registry_entry()["sources"].get("hf")
                 try:
@@ -362,6 +366,8 @@ class Embedder:
             first = self._warning is None
             self._warning = message
             self._failed_at = time.monotonic()
+        # Python's default filter shows a given text once per process, so a long-running
+        # server may not repeat it; `warning`, status and every reply still carry it.
         if first:
             warnings.warn(message, RuntimeWarning, stacklevel=4)
 
