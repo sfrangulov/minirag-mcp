@@ -21,10 +21,10 @@ from minirag_mcp.handle import (
     OpenIndex,
     RebuildPendingError,
 )
-from minirag_mcp.ingest.ignore import IGNORE_FILE, IgnoredFileError, excluded_by
+from minirag_mcp.identity import REASON_SEPARATOR
+from minirag_mcp.ingest.ignore import IGNORE_FILE, excluded_by
 from minirag_mcp.ingest.pipeline import IngestResult, Pipeline
 from minirag_mcp.ingest.scanner import scan_roots
-from minirag_mcp.lock import SyncLockBusy
 from minirag_mcp.results import (
     DEFAULT_FIND_LIMIT,
     QueryError,
@@ -37,7 +37,6 @@ from minirag_mcp.results import (
 )
 from minirag_mcp.security import SecurityError, resolve_in_roots
 from minirag_mcp.store import DimensionMismatchError, IndexOpenError
-from minirag_mcp.sync import run_sync
 
 app = App(name="minirag-mcp", version=__version__)
 
@@ -312,9 +311,11 @@ def sync(
 ):
     """Reconcile the index with the document roots (synchronous).
 
-    Refuses to start if another process is already syncing this index.
+    Refuses to start if another process is already syncing this index. An index whose
+    configuration changed since it was built ("rebuild pending" in status) is rebuilt by a
+    sync without a path, and a sync with one is refused.
     """
-    cfg, _, opened = _load(base_dir, db_path, cache_dir, model_name)
+    cfg, handle, _ = _load(base_dir, db_path, cache_dir, model_name)
     scope = None
     if path is not None:
         try:
@@ -322,19 +323,21 @@ def sync(
         except SecurityError as e:
             _fail(str(e))
     try:
-        counts, errors = run_sync(
-            opened.pipeline,
-            opened.store,
-            cfg.roots,
-            cfg.max_file_size,
-            scope=scope,
-            on_event=lambda m: print(m, file=sys.stderr),
+        counts, errors, rebuilt = handle.run_sync(
+            scope, on_event=lambda m: print(m, file=sys.stderr)
         )
-    except (SyncLockBusy, IgnoredFileError) as e:
+    except Exception as e:  # a refusal, a busy lock, a rebuild that stopped before its swap
         _fail(str(e))
         raise AssertionError from e  # unreachable
     human = ", ".join(f"{k}: {v}" for k, v in counts.items())
-    _emit({"counts": counts, "errors": errors}, json, human)
+    if rebuilt is not None:
+        human += f"; rebuilt ({rebuilt.kind}): {REASON_SEPARATOR.join(rebuilt.reasons)}"
+    payload = {
+        "counts": counts,
+        "errors": errors,
+        "rebuild": rebuilt.to_dict() if rebuilt is not None else None,
+    }
+    _emit(payload, json, human)
     for err in errors:
         print(f"warn: {err['source']}: {err['error']}", file=sys.stderr)
     if counts["failed"] > 0:

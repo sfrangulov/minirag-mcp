@@ -282,19 +282,23 @@ class Pipeline:
         ocr_engine: str = "",
         file_time: float | None = None,
         page_starts: pages.PageStarts = (),
+        labels: dict[str, str] | None = None,
     ) -> IngestResult:
-        """Chunk, embed, label and store, replacing whatever `source` held before."""
+        """Chunk, embed, label and store, replacing whatever `source` held before. Given
+        `labels`, the label columns are those, and nothing is labelled."""
         chunks = self._chunk(markdown, source=source, title=title, seed_title=seed_title)
         texts = [c.text for c in chunks]
         chunk_pages = pages.chunk_pages(markdown, page_starts, chunks)
         vectors = self.embedder.embed_documents(texts)
-        labels, label_problem = self._label(
-            source=source,
-            source_type=source_type,
-            title=title,
-            chunk_texts=texts,
-            file_time=file_time,
-        )
+        label_problem = None
+        if labels is None:
+            labels, label_problem = self._label(
+                source=source,
+                source_type=source_type,
+                title=title,
+                chunk_texts=texts,
+                file_time=file_time,
+            )
         now = datetime.now(UTC).isoformat()
         records = [
             ChunkRecord(
@@ -410,6 +414,31 @@ class Pipeline:
                 title=real_title or doc.title,
                 seed_title=real_title is not None,
             )
+
+    def reingest_stored(self, info: SourceInfo, markdown: str) -> IngestResult:
+        """Store `markdown`, a source's stored text, cut again under this pipeline's budget.
+
+        For a source a rebuild cannot read again: the source keeps its type, title, hash,
+        mtime, OCR engine and labels, and nothing is parsed or labelled.
+        """
+        return self._chunk_and_store(
+            markdown,
+            source=info.source,
+            source_type=info.source_type,
+            title=info.title,
+            # A source stored without a title of its own carries its id as one.
+            seed_title=info.source_type == "file" or info.title != info.source,
+            file_hash=info.file_hash,
+            mtime=info.mtime,
+            ocr_engine=info.ocr_engine,
+            labels={
+                "labels_json": info.labels_json,
+                "label_keys": info.label_keys,
+                "label_hash": info.label_hash,
+                "doc_date": info.doc_date,
+                "doc_date_source": info.doc_date_source,
+            },
+        )
 
     def relabel_stale(
         self,

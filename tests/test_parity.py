@@ -7,6 +7,7 @@ checks that the caller is told the same thing.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -165,6 +166,76 @@ async def test_both_shells_refuse_an_ingest_into_a_pending_index_the_same_way(
     assert code_q == 0 and json.loads(out_q)["sources"][0]["source"] == b_md
     assert deleted["deletedChunks"] > 0
     assert code_d == 0 and json.loads(out_d)["deletedChunks"] > 0
+
+
+async def _finished_job(client, job_id: str) -> dict:
+    for _ in range(3000):
+        status = (await client.call_tool("sync_status", {"jobId": job_id})).data
+        if status["state"] in ("succeeded", "failed"):
+            return status
+        await asyncio.sleep(0.01)
+    raise AssertionError("the sync job did not finish")
+
+
+async def test_both_shells_report_the_rebuild(root, tmp_path, capsys, monkeypatch, fake_embedder):
+    """An unscoped sync of a pending index rebuilds it, and both shells say so alike."""
+    monkeypatch.setattr(cli, "_make_embedder", lambda cfg: fake_embedder)
+    envs = {
+        shell: {"BASE_DIR": str(root), "DB_PATH": str(tmp_path / shell)}
+        for shell in ("cli", "mcp", "human")
+    }
+    for env in envs.values():
+        assert run_cli(["sync", *_flags(env)], capsys)[0] == 0
+    budget = load_config(envs["cli"]).token_budget
+    bigger = budget + 90
+    monkeypatch.setenv("CHUNK_TOKEN_BUDGET", str(bigger))
+    for env in envs.values():
+        env["CHUNK_TOKEN_BUDGET"] = str(bigger)
+    reason = f"chunk budget {budget} -> {bigger} tokens"
+
+    code, out, _ = run_cli(["sync", *_flags(envs["cli"]), "--json"], capsys)
+    async with Client(create_app(load_config(envs["mcp"]), embedder=fake_embedder)) as c:
+        job = (await c.call_tool("sync_start", {})).data["jobId"]
+        status = await _finished_job(c, job)
+    code_h, out_h, _ = run_cli(["sync", *_flags(envs["human"])], capsys)
+
+    reported = json.loads(out)
+    assert code == 0 and status["state"] == "succeeded", status["error"]
+    assert reported["rebuild"] == status["rebuild"]
+    assert status["rebuild"] == {
+        "kind": "reingest",
+        "reasons": [reason],
+        "generation": 2,
+        "reembedded": 0,
+        "restored": 0,
+    }
+    assert reported["counts"] == status["counts"] and reported["errors"] == status["errors"]
+    assert code_h == 0 and out_h.strip().endswith(f"; rebuilt (reingest): {reason}")
+    code, out, _ = run_cli(["sync", *_flags(envs["cli"]), "--json"], capsys)
+    assert code == 0 and json.loads(out)["rebuild"] is None
+    _, st = await call_mcp(envs["mcp"], "status", {}, fake_embedder)
+    assert (st["indexState"], st["indexGeneration"], st["chunkBudget"]) == ("ready", 2, bigger)
+
+
+async def test_both_shells_refuse_a_scoped_sync_of_a_pending_index_the_same_way(
+    root, tmp_path, capsys, monkeypatch, fake_embedder
+):
+    monkeypatch.setattr(cli, "_make_embedder", lambda cfg: fake_embedder)
+    env = {"BASE_DIR": str(root), "DB_PATH": str(tmp_path / "db")}
+    assert run_cli(["sync", *_flags(env)], capsys)[0] == 0
+    bigger = load_config(env).token_budget + 90
+    monkeypatch.setenv("CHUNK_TOKEN_BUDGET", str(bigger))
+    env["CHUNK_TOKEN_BUDGET"] = str(bigger)
+    a_md = str(root / "sub" / "a.md")
+
+    code, out, err = run_cli(["sync", a_md, *_flags(env)], capsys)
+    is_error, text = await call_mcp(env, "sync_start", {"path": a_md}, fake_embedder)
+
+    refusal = _last_error(err)
+    assert code == 1 and out == "" and is_error and text.endswith(refusal)
+    assert "index needs a rebuild: run an unscoped sync" in refusal and a_md in refusal
+    _, st = await call_mcp(env, "status", {}, fake_embedder)
+    assert (st["indexState"], st["indexGeneration"]) == ("rebuild pending", 1)
 
 
 async def test_an_empty_query_is_refused_by_both(

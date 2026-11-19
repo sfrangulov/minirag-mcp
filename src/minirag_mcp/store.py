@@ -8,6 +8,7 @@ import warnings
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import asdict, dataclass, replace
 from datetime import timedelta
+from functools import wraps
 from pathlib import Path
 from typing import NamedTuple
 
@@ -19,6 +20,7 @@ from lancedb.index import FTS
 from minirag_mcp import literal
 from minirag_mcp.chunker import SCHEME_VERSION, join_document, join_parent
 from minirag_mcp.config import DEFAULT_FTS_LANGUAGE
+from minirag_mcp.identity import rebuild_running, staging_dir, writing
 from minirag_mcp.lookalike import NUM_PERM, LookAlike, Signature, SignatureIndex, signature
 from minirag_mcp.scope import is_under, sql_clause, sql_str
 
@@ -161,6 +163,7 @@ class SourceInfo:
     doc_date_source: str = ""
     # False when a chunk of this source was stored before page numbers were.
     pages_recorded: bool = True
+    label_keys: str = ""
 
 
 _META_COLS = [
@@ -173,6 +176,7 @@ _META_COLS = [
     "scheme_version",
     "ocr_engine",
     "labels_json",
+    "label_keys",
     "label_hash",
     "doc_date",
     "doc_date_source",
@@ -257,7 +261,7 @@ def _label_fields(row: dict) -> dict[str, str]:
     """SourceInfo's label fields; an index whose columns could not be added has none."""
     return {
         name: row.get(name) or ""
-        for name in ("labels_json", "label_hash", "doc_date", "doc_date_source")
+        for name in ("labels_json", "label_keys", "label_hash", "doc_date", "doc_date_source")
     }
 
 
@@ -333,6 +337,29 @@ class _Signatures:
 
 class DimensionMismatchError(Exception):
     """An existing index was built with a different embedding dimension than requested."""
+
+
+class IndexBusyError(Exception):
+    """A write refused because the index is being rebuilt, or was replaced meanwhile."""
+
+
+def _refused_while_rebuilt(write):
+    """`write` to the store, held off a swap and the start of a rebuild while it runs
+    (`writing`), and refused with IndexBusyError while a rebuild of the store runs: the
+    rebuilt index replaces this one, and the write would be lost with it."""
+
+    @wraps(write)
+    def guarded(self: Store, *args, **kwargs):
+        with writing(self.db_path):
+            if rebuild_running(self.db_path):
+                raise IndexBusyError(
+                    f"{self.db_path} is being rebuilt into {staging_dir(self.db_path)}; writes "
+                    "to it are refused until the rebuild finishes, since the rebuilt index "
+                    "replaces it. Retry once sync_status reports the sync finished."
+                )
+            return write(self, *args, **kwargs)
+
+    return guarded
 
 
 # Columns added after the first release. An index created before them is migrated in
@@ -708,6 +735,7 @@ class Store:
             f"directory, or delete the index and re-ingest."
         )
 
+    @_refused_while_rebuilt
     def replace_source(self, source: str, records: Sequence[ChunkRecord]) -> None:
         """Swap a source's chunks for `records` in one commit.
 
@@ -746,6 +774,7 @@ class Store:
         self._write_documents([self._document_row(source, records)])
         self._sign(source, records)
 
+    @_refused_while_rebuilt
     def move_source(self, old: str, new: str, *, mtime: float) -> int:
         """Re-path a source's chunks in one commit, keeping their text and vectors.
 
@@ -783,6 +812,7 @@ class Store:
         self._move_document(old, new)
         return len(moved)
 
+    @_refused_while_rebuilt
     def delete_source(self, source: str) -> int:
         clause = f"source = '{sql_str(source)}'"
         before = self._table.count_rows(filter=clause)
@@ -791,6 +821,70 @@ class Store:
         self._delete_signature(source)
         self._delete_documents([source])
         return before
+
+    def copy_reembedded(
+        self,
+        source: Store,
+        embed: Callable[[list[str]], list[list[float]]],
+        *,
+        batch_rows: int = 1024,
+        on_event: Callable[[str], None] | None = None,
+    ) -> int:
+        """Copy every chunk of `source` into this index with its stored text embedded again
+        by `embed`; the number of chunks copied.
+
+        Every other column is copied as it is, labels included, and so are the document
+        rows and the look-alike signatures, which stay current because the chunks keep
+        their stamps. Nothing is parsed. For an empty index, which may be of another width.
+        """
+        total = source.chunk_count()
+        schema = self._table.schema
+        columns = [name for name in schema.names if name != "vector"]
+        batches = source._table.search().select(columns).limit(_LIST_LIMIT).to_batches(batch_rows)
+        copied = 0
+        for batch in batches:
+            if not batch.num_rows:
+                continue
+            vectors = np.asarray(embed(batch.column("text").to_pylist()), dtype=np.float32)
+            if vectors.shape != (batch.num_rows, self.dim):
+                raise ValueError(
+                    f"re-embedding {batch.num_rows} chunks gave vectors of shape "
+                    f"{vectors.shape}, not ({batch.num_rows}, {self.dim})"
+                )
+            data = {name: batch.column(name) for name in columns}
+            data["vector"] = pa.FixedSizeListArray.from_arrays(pa.array(vectors.ravel()), self.dim)
+            self._table.add(pa.table({name: data[name] for name in schema.names}, schema=schema))
+            copied += batch.num_rows
+            if on_event:
+                on_event(f"re-embedded {copied} of {total} chunks")
+        self._copy_documents(source)
+        self._copy_signatures(source)
+        return copied
+
+    def _copy_documents(self, source: Store) -> None:
+        """`source`'s document rows, each written while its chunks here carry its stamp."""
+        try:
+            table = source._document_table(create=False)
+            if table is None:
+                return
+            names = _document_schema().names
+            batches = table.search().select(names).limit(_LIST_LIMIT).to_batches(_SIGN_BATCH)
+            for batch in batches:
+                if batch.num_rows:
+                    self._write_documents(batch.to_pylist())
+        except Exception as e:
+            self._warn_documents("copy the document rows", e)
+
+    def _copy_signatures(self, source: Store) -> None:
+        try:
+            table = source._signature_table(create=False)
+            if table is None:
+                return
+            data = table.search().select(_signature_schema().names).limit(_LIST_LIMIT).to_arrow()
+            if data.num_rows:
+                self._signature_table(create=True).add(data)
+        except Exception as e:
+            self._warn_signature("copy the look-alike signatures", e)
 
     # Look-alike signatures live in a table of their own, so no write spans both tables
     # in one commit. What keeps the two consistent is the chunk stamp a signature
@@ -1412,6 +1506,7 @@ class Store:
             for r in rows
         ]
 
+    @_refused_while_rebuilt
     def set_document_labels(
         self,
         source: str,

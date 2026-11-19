@@ -11,12 +11,16 @@ from pathlib import Path
 
 from minirag_mcp import ocr
 from minirag_mcp.config import Config
+from minirag_mcp.identity import RebuildInfo, acquire_sync_lock
 from minirag_mcp.ingest.ignore import IgnoredFileError, scope_excluded_by
 from minirag_mcp.ingest.pipeline import Pipeline
 from minirag_mcp.ingest.scanner import compute_diff, scan_roots
-from minirag_mcp.lock import SyncLock, sync_lock
 from minirag_mcp.scope import is_under
 from minirag_mcp.store import Store
+
+# One sync of the index, or of `scope` inside it: its counts, its per-file errors, and the
+# rebuild it made, if any. Run with the sync lock already held.
+SyncRun = Callable[[Path | None], tuple[dict[str, int], list[dict], RebuildInfo | None]]
 
 
 class SyncBusyError(Exception):
@@ -53,6 +57,7 @@ class SyncJob:
     )
     errors: list[dict] = field(default_factory=list)
     error: str | None = None
+    rebuild: RebuildInfo | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -63,6 +68,7 @@ class SyncJob:
             "counts": dict(self.counts),
             "errors": list(self.errors),
             "error": self.error,
+            "rebuild": self.rebuild.to_dict() if self.rebuild else None,
         }
 
 
@@ -79,7 +85,7 @@ def run_sync(
     Holds the cross-process sync lock (see `minirag_mcp.lock`) for the whole
     run and raises `SyncLockBusy` if another process is already syncing this
     index. `SyncManager` does not come through here — it takes the same lock
-    itself, earlier, and calls `_run_sync_unlocked`.
+    itself, earlier, and calls its `run`.
 
     `scope`, if given, is resolved to its canonical form (`Path.resolve()`)
     before use, matching `Config.roots` (which are always resolved). Without
@@ -88,8 +94,11 @@ def run_sync(
     comes back empty, the job "succeeds" with all-zero counts, and no error
     is ever raised.
     """
-    with sync_lock(store.db_path):
+    lock = acquire_sync_lock(store.db_path)
+    try:
         return _run_sync_unlocked(pipeline, store, roots, max_file_size, scope, on_event)
+    finally:
+        lock.release()
 
 
 def _run_sync_unlocked(
@@ -250,10 +259,20 @@ def _run_sync_unlocked(
 
 
 class SyncManager:
-    def __init__(self, pipeline: Pipeline, store: Store, config: Config):
-        self._pipeline = pipeline
-        self._store = store
-        self._config = config
+    def __init__(
+        self, pipeline: Pipeline, store: Store, config: Config, *, run: SyncRun | None = None
+    ):
+        """`run` syncs; without it, `pipeline` and `store` are synced as `run_sync` would."""
+        self._db_path = store.db_path
+        if run is None:
+
+            def run(scope: Path | None):
+                counts, errors = _run_sync_unlocked(
+                    pipeline, store, config.roots, config.max_file_size, scope, None
+                )
+                return counts, errors, None
+
+        self._run = run
         self._lock = threading.Lock()
         self._job: SyncJob | None = None
         self._thread: threading.Thread | None = None
@@ -270,7 +289,6 @@ class SyncManager:
         `SyncBusyError` if this process is already running one, `SyncLockBusy`
         if a different process is.
         """
-        lock = SyncLock(self._store.db_path)
         with self._lock:
             # Order matters twice over. The in-process guard runs first, so a second
             # job started while this one is still non-terminal is rejected as
@@ -290,7 +308,7 @@ class SyncManager:
             # already doomed, and since only the latest job's record is kept, that
             # failure is easy to miss entirely. Here, contention is an immediate
             # error on sync_start — a ToolError the client can act on.
-            lock.acquire()
+            lock = acquire_sync_lock(self._db_path)
             job = SyncJob(job_id=uuid.uuid4().hex)
             self._job = job  # newer job replaces any finished record
 
@@ -318,18 +336,11 @@ class SyncManager:
             # the in-process guard shut for the lifetime of the process.
             terminal = "failed"
             try:
-                counts, errors = _run_sync_unlocked(
-                    self._pipeline,
-                    self._store,
-                    self._config.roots,
-                    self._config.max_file_size,
-                    scope,
-                    None,
-                )
+                counts, errors, rebuilt = self._run(scope)
             except Exception as e:  # catastrophic failure (scan error, DB down, ...)
                 job.error = str(e)
             else:
-                job.counts, job.errors = counts, errors
+                job.counts, job.errors, job.rebuild = counts, errors, rebuilt
                 terminal = "succeeded"
             finally:
                 job.finished_at = _now()

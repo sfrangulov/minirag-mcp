@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import threading
+import warnings
 from dataclasses import replace
 from pathlib import Path
 
@@ -21,6 +22,7 @@ from minirag_mcp.endpoints import Endpoint
 from minirag_mcp.identity import (
     FORMAT,
     INDEX_FILE,
+    STAGING_MARKER,
     ChunkingScheme,
     EmbeddingScheme,
     IdentityError,
@@ -28,8 +30,11 @@ from minirag_mcp.identity import (
     IndexState,
     LegacyIndexError,
     RebuildInfo,
+    acquire_sync_lock,
+    begin_staging,
     create_identity,
     differences,
+    discard_staging,
     index_state,
     is_legacy_index,
     legacy_error,
@@ -38,12 +43,13 @@ from minirag_mcp.identity import (
     rebuild_kind,
     rebuild_running,
     recover_swap,
+    seal_staging,
     staging_dir,
     swap_in,
     update_identity,
     write_identity,
 )
-from minirag_mcp.lock import sync_lock
+from minirag_mcp.lock import SyncLockBusy, sync_lock
 from minirag_mcp.store import IndexOpenError, Store
 
 EMB = EmbeddingScheme(E5_LARGE, 1024, "e5")
@@ -425,7 +431,7 @@ def test_an_existing_identity_is_returned_without_taking_the_lock(tmp_path):
 
 def test_an_identity_lock_that_cannot_be_taken_warns_and_proceeds(tmp_path, monkeypatch):
     fresh = IndexIdentity.fresh(EMB, CHUNK, "English")
-    (tmp_path / ".db.identity.lock").mkdir()
+    (tmp_path / ".db.identity.lock").symlink_to(tmp_path / "gone" / "lock")
     with pytest.warns(RuntimeWarning, match=re.escape(str(tmp_path / ".db.identity.lock"))):
         assert create_identity(tmp_path / "db", fresh) == fresh
     monkeypatch.setattr(identity_mod, "fcntl", None)
@@ -819,3 +825,105 @@ def test_a_probe_of_the_wrong_width_is_malformed(tmp_path, probe):
     (tmp_path / INDEX_FILE).write_text(json.dumps(layout), encoding="utf-8")
     with pytest.raises(IdentityError, match="embedding.probe has"):
         read_identity(tmp_path)
+
+
+def test_an_identity_lock_file_this_user_cannot_write_still_locks(tmp_path):
+    if os.geteuid() == 0:  # pragma: no cover - the suite is not meant to run as root
+        pytest.skip("running as root: a read-only file denies nothing")
+    lock_file = tmp_path / ".db.identity.lock"
+    lock_file.touch()
+    lock_file.chmod(0o444)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        create_identity(tmp_path / "db", IndexIdentity.fresh(EMB, CHUNK, "English"))
+    assert read_identity(tmp_path / "db") is not None
+
+
+def test_swap_in_looks_at_previous_again_right_before_deleting_it(tmp_path, monkeypatch):
+    """What is at `<db>.previous` can change between the first look and the delete."""
+    db = tmp_path / "db"
+    make_index(db, 2, "serving")
+    make_index(previous_dir(db), 1, "kept")
+    make_index(staging_dir(db), 2, "rebuilt")
+    real = identity_mod.write_identity
+
+    def write(path, identity) -> None:
+        real(path, identity)
+        if path == staging_dir(db):
+            shutil.rmtree(previous_dir(db))
+            previous_dir(db).mkdir()
+            (previous_dir(db) / "notes.txt").write_text("the user's", encoding="utf-8")
+
+    monkeypatch.setattr(identity_mod, "write_identity", write)
+    with pytest.raises(IdentityError, match=re.escape(str(previous_dir(db)))):
+        swap_in(db)
+    assert (previous_dir(db) / "notes.txt").read_text(encoding="utf-8") == "the user's"
+    assert marker(db) == "serving"
+
+
+class _Killed(BaseException):
+    """The process dying where it is raised."""
+
+
+def _swap_killed_between_renames(db: Path, monkeypatch) -> None:
+    real = identity_mod.os.rename
+
+    def rename(src, dst) -> None:
+        if Path(src) == staging_dir(db):
+            raise _Killed
+        real(src, dst)
+
+    monkeypatch.setattr(identity_mod.os, "rename", rename)
+    with pytest.raises(_Killed):
+        swap_in(db)
+    monkeypatch.setattr(identity_mod.os, "rename", real)
+    assert not db.exists() and previous_dir(db).is_dir() and staging_dir(db).is_dir()
+
+
+def test_the_sync_lock_is_taken_after_an_interrupted_swap_is_finished(tmp_path, monkeypatch):
+    """The lock file lives inside the index folder: taken first, it would create an empty
+    folder where the swap has to put the rebuilt index."""
+    db = tmp_path / "db"
+    make_index(db, 1, "serving")
+    make_index(staging_dir(db), 1, "rebuilt")
+    _swap_killed_between_renames(db, monkeypatch)
+    lock = acquire_sync_lock(db)
+    try:
+        assert (generation(db), marker(db)) == (2, "rebuilt")
+        assert (db / ".sync.lock").is_file() and not staging_dir(db).exists()
+        with pytest.raises(SyncLockBusy):
+            acquire_sync_lock(db)
+    finally:
+        lock.release()
+
+
+def test_a_swap_between_its_renames_is_a_rebuild_running(tmp_path, monkeypatch):
+    """No write may go to a `db` path that a swap has emptied: it would land in neither."""
+    db = tmp_path / "db"
+    make_index(db, 1, "serving")
+    make_index(staging_dir(db), 1, "rebuilt")
+    _swap_killed_between_renames(db, monkeypatch)
+    assert rebuild_running(db)
+    recover_swap(db)
+    assert not rebuild_running(db)
+
+
+def test_staging_is_discarded_only_when_a_rebuild_made_it(tmp_path):
+    db = tmp_path / "db"
+    make_index(db, 1, "serving")
+    assert discard_staging(db) is False
+    for made in ("marker", "identity", "nothing"):
+        staging = begin_staging(db)
+        if made == "identity":
+            seal_staging(db, IDENT)
+            assert not (staging / STAGING_MARKER).exists()
+        elif made == "nothing":
+            (staging / STAGING_MARKER).unlink()
+        assert discard_staging(db) is True and not staging.exists(), made
+    staging_dir(db).mkdir()
+    (staging_dir(db) / "notes.txt").write_text("the user's", encoding="utf-8")
+    with pytest.raises(IdentityError, match=re.escape(str(staging_dir(db)))):
+        discard_staging(db)
+    assert (staging_dir(db) / "notes.txt").read_text(encoding="utf-8") == "the user's"
+    with pytest.raises(FileExistsError):
+        begin_staging(db)

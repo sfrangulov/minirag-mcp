@@ -97,8 +97,16 @@ def create_app(
         Only one sync runs against an index at a time. If one is already in
         progress — in this server or in another process, such as a
         `minirag-mcp sync` in a terminal — this call fails immediately with a
-        message identifying it, and no job is started. Single-file ingests and
-        queries are never blocked by a running sync.
+        message identifying it, and no job is started. Queries are never
+        blocked by a running sync; single-file ingests and deletes are refused
+        only while it rebuilds the index.
+
+        On an index whose configuration changed since it was built (status:
+        indexState "rebuild pending"), a sync without a path rebuilds it: the
+        stored text is embedded again when only the model or its prefixes
+        changed, the roots are ingested again when the chunking changed. The
+        index answers from its existing vectors until the rebuilt one replaces
+        it, and refuses writes meanwhile. A sync with a path is refused there.
         """
         h = live()
         c = h.get()
@@ -107,7 +115,7 @@ def create_app(
             scope = resolve_in_roots(path, c.config.roots)
             if (by := scope_excluded_by(scope, c.config.roots)) is not None:
                 raise ToolError(f"{scope} is excluded by {by}; nothing under it can be synced")
-        return {"jobId": h.sync.start(scope)}
+        return {"jobId": h.start_sync(scope)}
 
     @mcp.tool
     @guard
@@ -154,6 +162,15 @@ def create_app(
         errors, and nothing indexed under it is deleted. It counts as failed
         when it is a root, when indexed files are under it, or when the sync
         was started for it or for a path inside it.
+
+        rebuild is null unless the sync rebuilt the index (only a sync without
+        a path rebuilds, and only a "rebuild pending" index): then kind
+        ("reembed": the stored text embedded again; "reingest": the roots read
+        again), reasons (what changed, as status's rebuildReasons named it),
+        generation (the rebuilt index's), reembedded (chunks embedded again)
+        and restored (documents the roots could not give back — ingested data
+        and URLs, files this installation could not read again — stored again
+        from their indexed text, each file among them also in errors).
         """
         return live().sync.status(jobId).to_dict()
 

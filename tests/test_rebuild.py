@@ -1,0 +1,694 @@
+"""A rebuild into `<db>.next`, its swap, and every process picking up the new generation."""
+
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+import minirag_mcp.identity as identity_mod
+import minirag_mcp.ingest.pipeline as pipeline_mod
+import minirag_mcp.rebuild as rebuild_mod
+import minirag_mcp.store as store_mod
+from conftest import FakeEmbedder
+from minirag_mcp.chunker import join_document
+from minirag_mcp.config import load_config
+from minirag_mcp.embedder import E5_LARGE, MINILM
+from minirag_mcp.handle import IndexHandle, RebuildPendingError
+from minirag_mcp.identity import (
+    STAGING_MARKER,
+    IdentityError,
+    IndexState,
+    previous_dir,
+    read_identity,
+    staging_dir,
+)
+from minirag_mcp.ingest.parser import ParserError
+from minirag_mcp.lock import SyncLockBusy, sync_lock
+from minirag_mcp.rebuild import KEPT
+from minirag_mcp.results import run_query
+from minirag_mcp.store import DOCUMENT_TABLE, SIGNATURE_TABLE, IndexBusyError
+
+LONG = " ".join(
+    f"Sentence {i} " + " ".join(f"w{i}x{j}" for j in range(10)) + "." for i in range(40)
+)
+TAXONOMY = """
+[model]
+path = "/models/fake.gguf"
+temperature = 1.0
+
+[facets.type]
+values.minutes = { description = "Minutes. Decisions." }
+values.report = { description = "Report. Findings." }
+"""
+
+
+class Hooked(FakeEmbedder):
+    """Runs `during` at its first document embedding, then embeds as FakeEmbedder does."""
+
+    def __init__(self, *args, during=None, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.during = during
+        self.calls = 0
+
+    def embed_documents(self, texts):
+        self.calls += 1
+        if self.during is not None and self.calls == 1:
+            self.during()
+        return super().embed_documents(texts)
+
+
+class Killed(BaseException):
+    """The process dying where it is raised: nothing after it runs but `finally` blocks,
+    which a dying process skips too, and whose work (releasing flocks) the kernel does."""
+
+
+@pytest.fixture
+def corpus(tmp_path) -> Path:
+    root = tmp_path / "docs"
+    (root / "sub").mkdir(parents=True)
+    (root / "a.md").write_text("# Alpha\n\nAlpha body about budgets and reviews.")
+    (root / "b.md").write_text("# Beta\n\nBeta body about tokens and audits.")
+    (root / "sub" / "c.md").write_text("# Gamma\n\n" + LONG)
+    return root
+
+
+@pytest.fixture
+def models() -> dict[str, FakeEmbedder]:
+    return {
+        MINILM: FakeEmbedder(MINILM, salt="minilm"),
+        E5_LARGE: FakeEmbedder(E5_LARGE, salt="e5"),
+    }
+
+
+class Parses:
+    def __init__(self) -> None:
+        self.count = 0
+
+
+@pytest.fixture
+def parses(monkeypatch) -> Parses:
+    seen = Parses()
+    real = pipeline_mod.parse_file
+
+    def counting(path, config=None):
+        seen.count += 1
+        return real(path, config)
+
+    monkeypatch.setattr(pipeline_mod, "parse_file", counting)
+    return seen
+
+
+def handle(root: Path, models: dict, model_factory=None, **env: str) -> IndexHandle:
+    config = load_config({"BASE_DIR": str(root), **env}, cwd=root)
+    return IndexHandle(
+        config, embedder_factory=lambda scheme: models[scheme.model], model_factory=model_factory
+    )
+
+
+def built(root: Path, models: dict, model_factory=None, **env: str) -> IndexHandle:
+    """An index of `root` built with MiniLM, synced."""
+    h = handle(root, models, model_factory, MODEL_NAME=MINILM, **env)
+    h.run_sync(None)
+    return h
+
+
+def chunk_rows(h: IndexHandle) -> list[dict]:
+    rows = h.get().store._table.search().select(["id", "text", "vector"]).limit(10**6).to_list()
+    return sorted(rows, key=lambda r: r["id"])
+
+
+def table_rows(h: IndexHandle, name: str, columns: list[str]) -> list[dict]:
+    table = h.get().store._db.open_table(name)
+    return sorted(table.search().select(columns).limit(10**6).to_list(), key=lambda r: r["source"])
+
+
+def same_vectors(rows: list[dict], embedder) -> bool:
+    expected = embedder.embed_documents([r["text"] for r in rows])
+    return np.allclose([r["vector"] for r in rows], expected, atol=1e-6)
+
+
+def test_an_unscoped_sync_reembeds_on_a_model_change_without_reading_files(
+    corpus, models, parses, model_factory
+):
+    a = built(corpus, models, model_factory)
+    before = chunk_rows(a)
+    parses.count = 0
+    b = handle(corpus, models, model_factory)
+    assert b.state()[0] is IndexState.REBUILD_PENDING
+
+    counts, errors, info = b.run_sync(None)
+
+    assert (info.kind, info.generation, info.reembedded, info.restored) == (
+        "reembed",
+        2,
+        len(before),
+        0,
+    )
+    assert info.reasons == (f"model {MINILM} -> {E5_LARGE}",)
+    assert errors == [] and (counts["ingested"], counts["skipped"]) == (0, 3)
+    assert parses.count == 0 and model_factory.calls == []
+    after = chunk_rows(b)
+    assert [(r["id"], r["text"]) for r in after] == [(r["id"], r["text"]) for r in before]
+    assert same_vectors(after, models[E5_LARGE]) and not same_vectors(after, models[MINILM])
+    db = b.config.db_path
+    assert read_identity(db).embedding.model == E5_LARGE
+    assert read_identity(db).probe == pytest.approx(models[E5_LARGE].probe_vector())
+    assert read_identity(previous_dir(db)).embedding.model == MINILM
+    assert b.get().identity.generation == 2 and b.get().embedder is models[E5_LARGE]
+    assert b.state() == (IndexState.READY, "")
+    assert not staging_dir(db).exists()
+
+
+def test_reembedding_keeps_document_rows_signatures_and_labels(
+    corpus, models, parses, model_factory
+):
+    (corpus / ".minirag").mkdir()
+    (corpus / ".minirag" / "classify.toml").write_text(TAXONOMY)
+    model_factory.answers = {"Alpha": {"minutes": 1.0}}
+    model_factory.default = {"report": 1.0}
+    a = built(corpus, models, model_factory)
+    assert model_factory.calls
+    labels = {
+        s.source: (s.labels_json, s.label_keys, s.label_hash, s.doc_date)
+        for s in a.get().store.list_sources()
+    }
+    assert all(v[0] and v[1] and v[2] for v in labels.values())
+    documents = table_rows(a, DOCUMENT_TABLE, ["source", "title", "text", "ingested_at"])
+    signatures = table_rows(a, SIGNATURE_TABLE, ["source", "ingested_at", "signature"])
+    assert len(documents) == len(signatures) == 3
+    model_factory.calls.clear()
+    parses.count = 0
+
+    b = handle(corpus, models, model_factory)
+    events: list[str] = []
+    counts, errors, info = b.run_sync(None, on_event=events.append)
+
+    assert info.kind == "reembed" and errors == []
+    assert model_factory.calls == [] and parses.count == 0
+    # Carried over, not rebuilt by the sync's own backfills.
+    assert counts["signed"] == 0
+    assert [e for e in events if e.startswith(("documented ", "signed ", "relabelled "))] == []
+    store = b.get().store
+    assert {
+        s.source: (s.labels_json, s.label_keys, s.label_hash, s.doc_date)
+        for s in store.list_sources()
+    } == labels
+    assert table_rows(b, DOCUMENT_TABLE, ["source", "title", "text", "ingested_at"]) == documents
+    assert table_rows(b, SIGNATURE_TABLE, ["source", "ingested_at", "signature"]) == signatures
+    assert store.undocumented_sources() == [] and store.unsigned_sources() == []
+
+
+def test_a_new_vector_width_is_rebuilt_at_that_width(corpus, models):
+    models[E5_LARGE] = FakeEmbedder(E5_LARGE, dim=16, salt="e5")
+    built(corpus, models)
+    b = handle(corpus, models)
+    _, _, info = b.run_sync(None)
+    opened = b.get()
+    assert info.kind == "reembed"
+    assert opened.identity.embedding.dim == 16 and opened.store.dim == 16
+    assert opened.store._table.schema.field("vector").type.list_size == 16
+    assert same_vectors(chunk_rows(b), models[E5_LARGE])
+    found = run_query(opened.store, opened.embedder, b.config, "Beta body about tokens")
+    assert found["sources"][0]["source"] == str(corpus / "b.md")
+
+
+def test_a_budget_change_reingests_from_disk(corpus, models, parses):
+    small = 32
+    long_doc = str(corpus / "sub" / "c.md")
+    a = built(corpus, models, CHUNK_TOKEN_BUDGET=str(small))
+    cut_small = len(a.get().store.all_chunks(long_doc))
+    parses.count = 0
+    b = handle(corpus, models, MODEL_NAME=MINILM)
+    assert b.config.token_budget > small
+
+    counts, errors, info = b.run_sync(None)
+
+    assert (info.kind, info.generation, info.reembedded, info.restored) == ("reingest", 2, 0, 0)
+    assert info.reasons == (f"chunk budget {small} -> {b.config.token_budget} tokens",)
+    assert counts["ingested"] == 3 and parses.count == 3 and errors == []
+    assert read_identity(b.config.db_path).chunking.token_budget == b.config.token_budget
+    assert b.get().identity.chunking.token_budget == b.config.token_budget
+    assert len(b.get().store.all_chunks(long_doc)) < cut_small
+    assert b.state() == (IndexState.READY, "")
+
+
+def _words(text: str) -> list[str]:
+    return text.split()
+
+
+def test_a_reingest_keeps_what_the_disk_cannot_give_back(
+    corpus, models, monkeypatch, model_factory
+):
+    small = 32
+    (corpus / ".minirag").mkdir()
+    (corpus / ".minirag" / "classify.toml").write_text(TAXONOMY)
+    model_factory.default = {"report": 1.0}
+    a = built(corpus, models, model_factory)
+    a.ingest_pipeline().ingest_data("# Field notes\n\n" + LONG, source="notes")
+    notes_before = a.get().store.all_chunks("notes")
+    labels_before = {
+        s.source: (s.labels_json, s.label_keys, s.label_hash) for s in a.get().store.list_sources()
+    }
+    assert labels_before["notes"][0]
+    broken, gone = corpus / "b.md", corpus / "a.md"
+    broken_before = join_document(a.get().store.all_chunks(str(broken)))
+    gone.unlink()
+    real = pipeline_mod.parse_file
+
+    def parse(path, config=None):
+        if Path(path) == broken:
+            raise ParserError(f"{path}: this installation cannot read it any more")
+        return real(path, config)
+
+    monkeypatch.setattr(pipeline_mod, "parse_file", parse)
+    b = handle(corpus, models, model_factory, MODEL_NAME=MINILM, CHUNK_TOKEN_BUDGET=str(small))
+
+    counts, errors, info = b.run_sync(None)
+
+    assert (info.kind, info.restored) == ("reingest", 2)
+    store = b.get().store
+    for source in ("notes", str(broken)):
+        info_after = store.get_source(source)
+        assert (info_after.labels_json, info_after.label_keys, info_after.label_hash) == (
+            labels_before[source]
+        )
+    assert sorted(s.source for s in store.list_sources()) == sorted(
+        ["notes", str(broken), str(corpus / "sub" / "c.md")]
+    )
+    assert {"source": str(broken), "error": KEPT} in errors
+    assert [e for e in errors if e["source"] == "notes"] == []
+    assert counts["failed"] == 1 and counts["deleted"] == 0
+    notes = store.get_source("notes")
+    assert (notes.source_type, notes.title) == ("data", "Field notes")
+    notes_after = store.all_chunks("notes")
+    assert len(notes_after) > len(notes_before)
+    assert max(models[MINILM].count_tokens(c.text) for c in notes_after) <= small
+    assert _words(join_document(notes_after)) == _words(join_document(notes_before))
+    assert _words(join_document(store.all_chunks(str(broken)))) == _words(broken_before)
+    assert store.get_source(str(broken)).file_hash == pipeline_mod.file_sha256(broken)
+
+
+def test_a_reingest_keeps_the_files_of_a_root_it_cannot_see(tmp_path, models):
+    docs, drive = tmp_path / "docs", tmp_path / "drive"
+    docs.mkdir()
+    drive.mkdir()
+    (docs / "a.md").write_text("# Alpha\n\nAlpha body.")
+    (drive / "x.md").write_text("# Remote\n\nRemote body about cranes.")
+    roots = f'["{docs}", "{drive}"]'
+    built(docs, models, BASE_DIRS=roots, CHUNK_TOKEN_BUDGET="32")
+    hidden = drive.rename(tmp_path / "unmounted")
+
+    b = handle(docs, models, MODEL_NAME=MINILM, BASE_DIRS=roots)
+    _, errors, info = b.run_sync(None)
+
+    assert info.restored == 1
+    assert {"source": str(drive / "x.md"), "error": KEPT} in errors
+    assert b.get().store.get_source(str(drive / "x.md")) is not None
+    assert hidden.is_dir()
+
+
+def test_a_scoped_sync_on_a_pending_index_is_refused_and_writes_nothing(corpus, models):
+    a = built(corpus, models, CHUNK_TOKEN_BUDGET="32")
+    (corpus / "a.md").write_text("# Alpha\n\nAlpha body, changed on disk.")
+    before = chunk_rows(a)
+    b = handle(corpus, models, MODEL_NAME=MINILM)
+    db = b.config.db_path
+
+    with pytest.raises(RebuildPendingError) as refused:
+        b.run_sync(corpus / "a.md")
+    with pytest.raises(RebuildPendingError) as at_start:
+        b.start_sync(corpus / "a.md")
+    job = b.sync.start(corpus / "a.md")  # past the check at start, the run refuses it too
+    b.sync.wait()
+
+    message = str(refused.value)
+    assert "index needs a rebuild: run an unscoped sync" in message
+    assert f"chunk budget 32 -> {b.config.token_budget} tokens" in message
+    assert str(corpus / "a.md") in message and "nothing was synced" in message
+    assert str(at_start.value) == message
+    assert (b.sync.status(job).state, b.sync.status(job).error) == ("failed", message)
+    assert chunk_rows(b) == before
+    assert read_identity(db).generation == 1 and b.get().identity.generation == 1
+    assert b.state()[0] is IndexState.REBUILD_PENDING
+
+
+def test_the_old_index_answers_until_the_swap(corpus, models):
+    built(corpus, models)
+    serving = handle(corpus, models, MODEL_NAME=MINILM)
+    seen: dict = {}
+
+    def during() -> None:
+        opened = serving.get()
+        found = run_query(opened.store, opened.embedder, serving.config, "Alpha body")
+        seen["serving"] = (opened.identity.generation, [s["source"] for s in found["sources"]])
+        seen["rebuilding"] = b.get().identity.generation
+
+    models[E5_LARGE] = Hooked(E5_LARGE, salt="e5", during=during)
+    b = handle(corpus, models)
+    b.run_sync(None)
+
+    generation, sources = seen["serving"]
+    assert generation == 1 and str(corpus / "a.md") in sources
+    assert seen["rebuilding"] == 1
+    assert serving.get().identity.generation == 2
+
+
+def test_a_failed_rebuild_leaves_the_old_index_serving(corpus, models):
+    a = built(corpus, models)
+
+    def fail() -> None:
+        raise RuntimeError("the embedding endpoint went away")
+
+    models[E5_LARGE] = Hooked(E5_LARGE, salt="e5", during=fail)
+    b = handle(corpus, models)
+    with pytest.raises(RuntimeError, match="went away"):
+        b.run_sync(None)
+
+    db = b.config.db_path
+    assert read_identity(db).generation == 1 and b.get().identity.generation == 1
+    assert b.state()[0] is IndexState.REBUILD_PENDING
+    assert not staging_dir(db).exists() and not previous_dir(db).exists()
+    opened = b.get()
+    found = run_query(opened.store, opened.embedder, b.config, "Beta body")
+    assert str(corpus / "b.md") in [s["source"] for s in found["sources"]]
+    a.ingest_pipeline().ingest_data("Written after the failure.", source="after")
+    _, _, info = b.run_sync(None)
+    assert info.generation == 2 and b.get().store.get_source("after") is not None
+
+
+def test_writes_are_refused_while_a_staging_dir_and_the_sync_lock_are_both_there(corpus, models):
+    h = built(corpus, models)
+    db = h.config.db_path
+    store = h.get().store
+    a_md = str(corpus / "a.md")
+    expected = (
+        f"{db} is being rebuilt into {staging_dir(db)}; writes to it are refused until the "
+        "rebuild finishes, since the rebuilt index replaces it. Retry once sync_status "
+        "reports the sync finished."
+    )
+    staging_dir(db).mkdir()
+    writes = {
+        "ingest": lambda: h.ingest_pipeline().ingest_data("x", source="s"),
+        "delete": lambda: store.delete_source(a_md),
+        "move": lambda: store.move_source(a_md, str(corpus / "moved.md"), mtime=1.0),
+        "labels": lambda: store.set_document_labels(
+            a_md, labels_json="", label_keys="", label_hash="h", doc_date="", doc_date_source=""
+        ),
+    }
+    with sync_lock(db):
+        for name, write in writes.items():
+            with pytest.raises(IndexBusyError) as refused:
+                write()
+            assert str(refused.value) == expected, name
+    assert store.get_source(a_md).label_hash != "h"
+    h.ingest_pipeline().ingest_data("x", source="s")
+    assert store.get_source("s") is not None
+
+
+def test_writes_are_refused_while_a_rebuild_runs(corpus, models):
+    built(corpus, models)
+    serving = handle(corpus, models, MODEL_NAME=MINILM)
+    a_md = str(corpus / "a.md")
+    refused: dict[str, str] = {}
+
+    def during() -> None:
+        for name, write in (
+            ("ingest", lambda: serving.ingest_pipeline().ingest_data("x", source="late")),
+            ("delete", lambda: serving.get().store.delete_source(a_md)),
+        ):
+            with pytest.raises(IndexBusyError) as e:
+                write()
+            refused[name] = str(e.value)
+
+    models[E5_LARGE] = Hooked(E5_LARGE, salt="e5", during=during)
+    b = handle(corpus, models)
+    b.run_sync(None)
+
+    assert set(refused) == {"ingest", "delete"}
+    assert all("is being rebuilt into" in why for why in refused.values())
+    store = b.get().store
+    assert store.get_source("late") is None and store.get_source(a_md) is not None
+    b.ingest_pipeline().ingest_data("x", source="late")
+    assert store.get_source("late") is not None
+
+
+def test_a_write_under_way_when_a_rebuild_starts_is_in_the_rebuilt_index(
+    corpus, models, monkeypatch
+):
+    """It passed the check before the staging folder existed and commits after: the
+    rebuild waits for it before it reads the index, or the swap loses it."""
+    built(corpus, models)
+    serving = handle(corpus, models, MODEL_NAME=MINILM)
+    checked, go = threading.Event(), threading.Event()
+    real = store_mod.rebuild_running
+
+    def held_after_the_check(db):
+        running = real(db)
+        if threading.current_thread().name == "writer":
+            checked.set()
+            assert go.wait(30)
+        return running
+
+    monkeypatch.setattr(store_mod, "rebuild_running", held_after_the_check)
+    writer = threading.Thread(
+        target=lambda: serving.ingest_pipeline().ingest_data("Late text.", source="late"),
+        name="writer",
+    )
+    writer.start()
+    assert checked.wait(30)
+    b = handle(corpus, models)
+    rebuilding = threading.Thread(target=lambda: b.run_sync(None), name="rebuild")
+    rebuilding.start()
+    time.sleep(0.5)
+    go.set()
+    writer.join(30)
+    rebuilding.join(60)
+
+    assert not rebuilding.is_alive() and b.get().identity.generation == 2
+    late = [r for r in chunk_rows(b) if r["id"].startswith("late#")]
+    assert late and same_vectors(late, models[E5_LARGE])
+
+
+def _crash(root: Path, crash_in: str) -> subprocess.CompletedProcess:
+    """Run in another process a rebuild of `root` to e5 that dies (os._exit) in its first
+    `crash_in` call to the new embedder."""
+    script = (
+        "import os, sys\n"
+        "from pathlib import Path\n"
+        f"sys.path.insert(0, {str(Path(__file__).parent)!r})\n"
+        "from conftest import FakeEmbedder\n"
+        "from minirag_mcp.config import load_config\n"
+        "from minirag_mcp.handle import IndexHandle\n"
+        "class Dying(FakeEmbedder):\n"
+        f"    def {crash_in}(self, *args):\n"
+        "        os._exit(9)\n"
+        f"models = {{{MINILM!r}: FakeEmbedder({MINILM!r}, salt='minilm'),\n"
+        f"          {E5_LARGE!r}: Dying({E5_LARGE!r}, salt='e5')}}\n"
+        f"config = load_config({{'BASE_DIR': {str(root)!r}}}, cwd=Path({str(root)!r}))\n"
+        "IndexHandle(config, embedder_factory=lambda s: models[s.model]).run_sync(None)\n"
+    )
+    unset = ("BASE_DIR", "BASE_DIRS", "DB_PATH", "MODEL_NAME", "CHUNK_TOKEN_BUDGET")
+    env = {k: v for k, v in os.environ.items() if k not in unset}
+    return subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, timeout=180, env=env
+    )
+
+
+def test_a_leftover_staging_dir_never_blocks_a_sync(corpus, models):
+    a = built(corpus, models)
+    proc = _crash(corpus, "embed_documents")
+    assert proc.returncode == 9, proc.stderr
+    db = a.config.db_path
+    staging = staging_dir(db)
+    assert (staging / STAGING_MARKER).is_file() and read_identity(staging) is None
+    assert read_identity(db).generation == 1 and not previous_dir(db).exists()
+
+    (corpus / "d.md").write_text("# Delta\n\nDelta body about cranes.")
+    h = handle(corpus, models, MODEL_NAME=MINILM)
+    h.ingest_pipeline().ingest_data("Written beside the debris.", source="beside")
+    counts, errors, info = h.run_sync(None)
+
+    assert (counts["ingested"], info, errors) == (1, None, [])
+    assert not staging.exists()
+    assert h.get().store.get_source(str(corpus / "d.md")) is not None
+
+
+def test_a_staging_folder_no_rebuild_made_is_never_deleted(corpus, models):
+    h = built(corpus, models)
+    staging = staging_dir(h.config.db_path)
+    staging.mkdir()
+    (staging / "notes.txt").write_text("the user's", encoding="utf-8")
+    with pytest.raises(IdentityError, match=re.escape(str(staging))):
+        h.run_sync(None)
+    assert (staging / "notes.txt").read_text(encoding="utf-8") == "the user's"
+
+
+def test_a_rebuild_whose_swap_would_be_refused_stops_before_any_work(corpus, models):
+    built(corpus, models)
+    models[E5_LARGE] = Hooked(E5_LARGE, salt="e5")
+    b = handle(corpus, models)
+    db = b.config.db_path
+    previous_dir(db).mkdir()
+    (previous_dir(db) / "notes.txt").write_text("the user's", encoding="utf-8")
+    with pytest.raises(IdentityError, match=re.escape(str(previous_dir(db)))):
+        b.run_sync(None)
+    assert models[E5_LARGE].calls == 0
+    assert not staging_dir(db).exists() and read_identity(db).generation == 1
+    assert (previous_dir(db) / "notes.txt").read_text(encoding="utf-8") == "the user's"
+
+
+def test_no_sync_of_the_new_index_starts_before_the_rebuild_returns(corpus, models, monkeypatch):
+    """The sync lock lives in the index folder, and the swap moves the one the rebuild
+    holds into `<db>.previous`; the rebuild holds the new folder's from before the swap."""
+    built(corpus, models)
+    other = handle(corpus, models)
+    outcomes: list[str] = []
+    real = rebuild_mod.swap_in
+
+    def swap(db) -> None:
+        real(db)
+        for start in (lambda: other.run_sync(None), lambda: other.start_sync(None)):
+            try:
+                start()
+            except SyncLockBusy:
+                outcomes.append("refused")
+            else:
+                outcomes.append("started")
+
+    monkeypatch.setattr(rebuild_mod, "swap_in", swap)
+    b = handle(corpus, models)
+    _, _, info = b.run_sync(None)
+
+    assert info.generation == 2
+    assert outcomes == ["refused", "refused"]
+    assert other.run_sync(None)[2] is None
+
+
+def test_a_swap_by_another_process_is_picked_up_before_the_next_request(
+    corpus, models, model_factory
+):
+    built(corpus, models)
+    serving = handle(corpus, models, model_factory)
+    first = serving.get()
+    manager = serving.sync
+    assert first.identity.generation == 1 and first.embedder is models[MINILM]
+
+    handle(corpus, models).run_sync(None)
+
+    opened = serving.get()
+    assert opened is not first and opened.identity.generation == 2
+    assert opened.embedder is models[E5_LARGE] and opened.pipeline.embedder is models[E5_LARGE]
+    assert serving.sync is manager and opened.labels is first.labels
+    assert serving.state() == (IndexState.READY, "")
+    assert serving.get() is opened
+
+
+def test_a_write_prepared_before_a_swap_is_refused(corpus, models):
+    """Its chunks were made the way the replaced index was, and would land in the new one."""
+    built(corpus, models)
+    serving = handle(corpus, models, MODEL_NAME=MINILM)
+    pipeline = serving.ingest_pipeline()
+    handle(corpus, models).run_sync(None)
+
+    with pytest.raises(IndexBusyError, match="replaced by a rebuilt index"):
+        pipeline.ingest_data("Late text.", source="late")
+    assert handle(corpus, models).get().store.get_source("late") is None
+
+
+def test_sync_start_after_a_swap_embeds_with_the_new_scheme(corpus, models):
+    """F5: the job resolves the index when it runs, never with a pipeline taken before."""
+    built(corpus, models)
+    serving = handle(corpus, models)
+    manager = serving.sync
+    handle(corpus, models).run_sync(None)
+    (corpus / "d.md").write_text("# Delta\n\nDelta body about cranes.")
+
+    job = manager.start(None)
+    manager.wait()
+
+    status = manager.status(job)
+    assert (status.state, status.counts["ingested"], status.rebuild) == ("succeeded", 1, None)
+    assert status.to_dict()["rebuild"] is None
+    assert serving.sync is manager
+    delta = [r for r in chunk_rows(serving) if r["id"].startswith(str(corpus / "d.md"))]
+    assert delta and same_vectors(delta, models[E5_LARGE])
+
+
+def test_an_unscoped_sync_start_rebuilds_and_reports_it(corpus, models):
+    built(corpus, models)
+    serving = handle(corpus, models)
+    job = serving.start_sync(None)
+    serving.sync.wait()
+    status = serving.sync.status(job)
+    assert status.state == "succeeded", status.error
+    assert status.to_dict()["rebuild"] == {
+        "kind": "reembed",
+        "reasons": [f"model {MINILM} -> {E5_LARGE}"],
+        "generation": 2,
+        "reembedded": status.rebuild.reembedded,
+        "restored": 0,
+    }
+    assert status.rebuild.reembedded > 0
+    assert serving.get().identity.generation == 2
+
+
+def test_an_interrupted_swap_is_finished_on_open(corpus, models, monkeypatch):
+    """Review Focus 3: a rebuild killed between the swap's renames leaves no `db`. Opened
+    as it is, that would be a fresh empty index answering "nothing indexed"."""
+    a = built(corpus, models)
+    chunks = a.get().store.chunk_count()
+    db = a.config.db_path
+    real = identity_mod.os.rename
+
+    def rename(src, dst) -> None:
+        if Path(src) == staging_dir(db):
+            raise Killed
+        real(src, dst)
+
+    monkeypatch.setattr(identity_mod.os, "rename", rename)
+    with pytest.raises(Killed):
+        handle(corpus, models).run_sync(None)
+    monkeypatch.setattr(identity_mod.os, "rename", real)
+    assert not db.exists() and previous_dir(db).is_dir()
+    assert read_identity(staging_dir(db)) is not None
+
+    opened = a.get()  # open across the crash
+    assert opened.identity.generation == 2 and opened.identity.embedding.model == E5_LARGE
+    assert opened.store.chunk_count() == chunks
+    assert not staging_dir(db).exists()
+    fresh = handle(corpus, models).get()
+    assert fresh.identity.generation == 2 and fresh.store.chunk_count() == chunks
+
+
+def test_an_interrupted_swap_is_finished_by_the_next_sync(corpus, models, monkeypatch):
+    a = built(corpus, models)
+    chunks = a.get().store.chunk_count()
+    db = a.config.db_path
+    manager = handle(corpus, models).sync  # a server's, taken before the crash
+    real = identity_mod.os.rename
+
+    def rename(src, dst) -> None:
+        if Path(src) == staging_dir(db):
+            raise Killed
+        real(src, dst)
+
+    monkeypatch.setattr(identity_mod.os, "rename", rename)
+    with pytest.raises(Killed):
+        handle(corpus, models).run_sync(None)
+    monkeypatch.setattr(identity_mod.os, "rename", real)
+
+    job = manager.start(None)
+    manager.wait()
+    status = manager.status(job)
+    assert (status.state, status.rebuild) == ("succeeded", None), status.error
+    assert read_identity(db).generation == 2
+    assert handle(corpus, models).get().store.chunk_count() == chunks
+    assert not staging_dir(db).exists()

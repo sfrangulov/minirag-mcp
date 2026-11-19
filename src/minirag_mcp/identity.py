@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING
 
 from minirag_mcp import __version__
 from minirag_mcp.chunker import SCHEME_VERSION
-from minirag_mcp.lock import is_held
+from minirag_mcp.lock import SyncLock, is_held
 
 try:
     import fcntl
@@ -311,12 +311,14 @@ def _warn_unlocked(db_path: Path, why: str) -> None:
 
 
 @contextmanager
-def _identity_lock(db_path: Path) -> Iterator[None]:
+def _identity_lock(db_path: Path, *, shared: bool = False) -> Iterator[None]:
     """Hold the lock that orders stamps, swaps and swap recovery of `db_path`, waiting for it.
 
-    Held only for a few renames and small writes. A lock that cannot be taken degrades as
-    the sync lock does: it warns and the block runs unlocked, because refusing would leave
-    an index on a platform or a folder without flock unopenable.
+    Held exclusively only for a few renames and small writes. A write to the index holds
+    it shared (`writing`), so a swap, or the start of a rebuild, waits for writes under
+    way. A lock that cannot be taken degrades as the sync lock does: it warns and the
+    block runs unlocked, because refusing would leave an index on a platform or a folder
+    without flock unopenable.
     """
     path = _lock_path(db_path)
     if fcntl is None:
@@ -324,19 +326,29 @@ def _identity_lock(db_path: Path) -> Iterator[None]:
         yield
         return
     try:
-        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+        fd = os.open(path, os.O_RDONLY | os.O_CREAT, 0o644)
     except OSError as e:
         _warn_unlocked(db_path, f"Could not take the lock at {path} ({e.strerror or e})")
         yield
         return
     try:
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            fcntl.flock(fd, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
         except OSError as e:
             _warn_unlocked(db_path, f"Could not take the lock at {path} ({e.strerror or e})")
         yield
     finally:
         os.close(fd)
+
+
+@contextmanager
+def writing(db_path: Path) -> Iterator[None]:
+    """Hold off a swap of `db_path`, and the start of its rebuild, while one write runs.
+
+    Writers share the lock, so they never wait for each other.
+    """
+    with _identity_lock(db_path, shared=True):
+        yield
 
 
 def _link_new(db_path: Path, identity: IndexIdentity) -> IndexIdentity:
@@ -566,6 +578,8 @@ def swap_in(db_path: Path) -> None:
     generation = max(staged.generation, current.generation if current else 0) + 1
     write_identity(staging, replace(staged, generation=generation))
     if os.path.lexists(previous):
+        # Again: what is there may have changed since the first look.
+        _check_previous(previous)
         shutil.rmtree(previous)
     with _identity_lock(db_path):
         had_index = os.path.lexists(db_path)
@@ -619,9 +633,82 @@ def recover_swap(db_path: Path) -> bool:
 
 
 def rebuild_running(db_path: Path) -> bool:
-    """Whether a rebuild of `db_path` is in progress: its staging folder and the sync lock.
+    """Whether a rebuild of `db_path` is in progress: its staging folder and the sync lock,
+    or its staging folder and no `db_path`, which a swap leaves between its renames.
 
     The staging folder is checked first. Asking about the lock takes it for an instant,
     which a sync starting at that instant would see as contention.
     """
-    return staging_dir(db_path).is_dir() and is_held(db_path)
+    return staging_dir(db_path).is_dir() and (not os.path.lexists(db_path) or is_held(db_path))
+
+
+def acquire_sync_lock(db_path: Path) -> SyncLock:
+    """Take the sync lock of `db_path`, which lives inside it; SyncLockBusy when held.
+
+    Taken under the identity lock, after finishing a swap that died between its renames:
+    taking it creates `db_path`, and a folder created there by a sync would stop that
+    swap from ever being finished.
+    """
+    lock = SyncLock(db_path)
+    with _identity_lock(db_path):
+        _finish_swap(db_path)
+        lock.acquire()
+    return lock
+
+
+# Written into the staging folder when a rebuild creates it: INDEX_FILE, written last,
+# says the staged index is complete; this says the folder is a rebuild's before that.
+STAGING_MARKER = ".minirag-rebuild"
+
+
+def begin_staging(db_path: Path) -> Path:
+    """Create the staging folder a rebuild of `db_path` builds in, and return it.
+
+    Created under the identity lock, which every write holds shared, so a write under way
+    finishes first, and every later one sees the folder and is refused (`rebuild_running`):
+    none lands in the index after the rebuild has begun reading it. Refused up front when
+    `swap_in` would refuse the swap at the end.
+    """
+    _check_previous(previous_dir(db_path))
+    staging = staging_dir(db_path)
+    with _identity_lock(db_path):
+        staging.mkdir()
+        (staging / STAGING_MARKER).touch()
+    return staging
+
+
+def seal_staging(db_path: Path, identity: IndexIdentity) -> None:
+    """Record `identity` in the staging folder of `db_path`, which makes it a complete index."""
+    staging = staging_dir(db_path)
+    write_identity(staging, identity)
+    with contextlib.suppress(FileNotFoundError):
+        (staging / STAGING_MARKER).unlink()
+
+
+def discard_staging(db_path: Path) -> bool:
+    """Delete the staging folder a stopped rebuild of `db_path` left; True when there was one.
+
+    Only a folder a rebuild made is deleted: one holding INDEX_FILE or STAGING_MARKER, or
+    nothing. The caller holds the sync lock, so no rebuild is writing there, and has
+    finished an interrupted swap first, so the folder is not one that swap still needs.
+    """
+    staging = staging_dir(db_path)
+    if not os.path.lexists(staging):
+        return False
+    ours = (
+        not staging.is_symlink()
+        and staging.is_dir()
+        and (
+            (staging / STAGING_MARKER).is_file()
+            or read_identity(staging) is not None
+            or not any(staging.iterdir())
+        )
+    )
+    if not ours:
+        raise IdentityError(
+            f"{staging} is where a rebuild of {db_path} builds the new index, but it holds "
+            f"no minirag index ({INDEX_FILE} and {STAGING_MARKER} are both missing), so it is "
+            "not deleted and nothing is synced. Move it elsewhere and sync again."
+        )
+    shutil.rmtree(staging)
+    return True

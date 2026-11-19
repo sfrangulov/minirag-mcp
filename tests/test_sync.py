@@ -7,6 +7,7 @@ from dataclasses import asdict, replace
 
 import pytest
 
+import minirag_mcp.identity as identity_mod
 import minirag_mcp.sync as sync_mod
 from minirag_mcp.chunker import SCHEME_VERSION
 from minirag_mcp.config import load_config
@@ -520,7 +521,7 @@ def test_restarting_the_moment_a_job_reports_terminal_is_never_refused(env, monk
                 time.sleep(0.05)
             super().release()
 
-    monkeypatch.setattr(sync_mod, "SyncLock", LingeringLock)
+    monkeypatch.setattr(identity_mod, "SyncLock", LingeringLock)
     mgr = SyncManager(pipeline, store, cfg)
 
     first = mgr.start()

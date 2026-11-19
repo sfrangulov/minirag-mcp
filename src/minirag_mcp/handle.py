@@ -6,15 +6,20 @@ constructor of an embedder for a scheme.
 
 An index is opened by the schemes its INDEX_FILE records, never by the configured ones:
 its vectors are comparable only with queries embedded the same way. A configuration that
-differs makes it `rebuild pending`, and it keeps answering from what it holds.
+differs makes it `rebuild pending`, and it keeps answering from what it holds until an
+unscoped sync rebuilds it. A rebuild swapped in by any process is followed: the handle
+opens the new generation before the next call is answered.
 """
 
 from __future__ import annotations
 
+import contextlib
+import os
 import threading
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
+from pathlib import Path
 
 from minirag_mcp.chunker import SCHEME_VERSION
 from minirag_mcp.config import Config
@@ -33,7 +38,10 @@ from minirag_mcp.identity import (
     IdentityError,
     IndexIdentity,
     IndexState,
+    RebuildInfo,
+    acquire_sync_lock,
     create_identity,
+    discard_staging,
     index_state,
     is_legacy_index,
     legacy_error,
@@ -47,8 +55,8 @@ from minirag_mcp.labels.endpoint_model import endpoint_model_factory
 from minirag_mcp.labels.labeler import ModelFactory
 from minirag_mcp.labels.model import default_model_factory
 from minirag_mcp.results import embedder_notes
-from minirag_mcp.store import Store
-from minirag_mcp.sync import SyncManager
+from minirag_mcp.store import IndexBusyError, IndexOpenError, Store
+from minirag_mcp.sync import SyncManager, _run_sync_unlocked
 
 EmbedderFactory = Callable[[EmbeddingScheme], object]
 
@@ -98,17 +106,127 @@ class OpenIndex:
     reranker: RerankEndpoint | None = None
 
 
+def _stat_key(db: Path) -> tuple[int, int] | None:
+    """What tells one INDEX_FILE of `db` from another without reading it; None while there
+    is none to read."""
+    try:
+        st = os.stat(db / INDEX_FILE)
+    except OSError:
+        return None
+    return st.st_ino, st.st_mtime_ns
+
+
+class _Watch:
+    """Tells whether another generation has replaced the one opened at `db`."""
+
+    def __init__(self, db: Path, generation: int, key: tuple[int, int] | None) -> None:
+        self.db = db
+        self.generation = generation
+        self._key = key
+
+    def replaced(self) -> bool:
+        """Reads INDEX_FILE only when it changed since the last look. While there is none to
+        read (a swap between its renames), the open generation stays."""
+        key = _stat_key(self.db)
+        if key is None:
+            # A swap whose process died between its renames is finished here; a live one
+            # holds the identity lock, which this waits for.
+            with contextlib.suppress(IdentityError, IndexOpenError, OSError):
+                recover_swap(self.db)
+            key = _stat_key(self.db)
+        if key is None or key == self._key:
+            return False
+        try:
+            found = read_identity(self.db)
+        except (IdentityError, IndexOpenError):
+            return False
+        if found is None:
+            return False
+        if found.generation == self.generation:
+            self._key = key
+            return False
+        return True
+
+
+class _BeforeStore:
+    """Called before every write of one generation's pipeline.
+
+    Refuses a write prepared for a generation another has replaced since, which would put
+    chunks made the old way into the new index. Records the probe at the first write into
+    a fresh index, so that write fixes which model it was built with, and arms the
+    embedder with it. Refuses the write while the served model is not the recorded one.
+    """
+
+    def __init__(self, embedder, watch: _Watch) -> None:
+        self._embedder = embedder
+        self._watch = watch
+        self._lock = threading.Lock()
+        self._recorded = False
+
+    def __call__(self) -> None:
+        db = self._watch.db
+        if self._watch.replaced():
+            raise IndexBusyError(
+                f"{db} was replaced by a rebuilt index while this write was being prepared, so "
+                "it was not written: it was made the way the replaced index was. Retry it."
+            )
+        IndexHandle._refuse_mismatch(self._embedder)
+        if self._recorded:
+            return
+        embedder = self._embedder
+        with self._lock:
+            if self._recorded:
+                return
+            current = read_identity(db)
+            if current is None or current.generation != self._watch.generation:
+                return
+            if current.probe:
+                embedder.expect_probe(current.probe)
+            else:
+                vector = tuple(embedder.probe_vector())
+                if why := embedder.reference_error(vector):
+                    raise IndexUnavailableError(why)
+                warn_unverifiable(embedder, "this index")
+                if update_identity(db, current.generation, probe=vector) is None:
+                    return
+                embedder.expect_probe(vector)
+            self._recorded = True
+
+
+def warn_unverifiable(embedder, what: str) -> None:
+    """Warn when an endpoint serves a model no reference probe ships for."""
+    if getattr(embedder, "endpoint", None) is not None and not embedder.has_reference():
+        warnings.warn(
+            f"No reference probe ships for {embedder.model_name}, so the model the endpoint "
+            f"serves cannot be verified; {what} records whatever it serves as that model.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+
+
 @dataclass(frozen=True)
 class _Opened:
     index: OpenIndex
-    sync: SyncManager
     # Built for the configuration: `index.embedder` itself unless the index was built
     # with another scheme.
     configured: object
+    # Every embedder this generation uses, by the scheme it was asked for with.
+    made: Mapping[EmbeddingScheme, object]
+    watch: _Watch
+    before_store: _BeforeStore
+
+
+def _distinct(embedders: Iterable[object]) -> list[object]:
+    out: list[object] = []
+    for e in embedders:
+        if all(e is not o for o in out):
+            out.append(e)
+    return out
 
 
 class IndexHandle:
-    """Opens one index on first use and hands every caller the same open index.
+    """Opens one index on first use and hands every caller the same open index, until
+    another generation replaces it.
 
     A failed open raises and leaves nothing open, so the next call tries again. The
     endpoint clients of embedders the handle built itself are closed when what they
@@ -137,36 +255,61 @@ class IndexHandle:
             config.roots, config.cache_dir, model_factory, needs_extra=not served
         )
         self._lock = threading.Lock()
-        self._probe_lock = threading.Lock()
-        self._probe_recorded = False
         self._current: _Opened | None = None
+        # Kept across generations, so a job started before a swap is still the one polled.
+        self._sync: SyncManager | None = None
 
     def get(self) -> OpenIndex:
         return self._opened().index
 
     @property
     def sync(self) -> SyncManager:
-        return self._opened().sync
+        self._opened()
+        return self._sync
 
     def state(self) -> tuple[IndexState, str]:
         """The index's state and why; never raises. An index that cannot be opened is
         unavailable, with the open's error as the reason."""
         try:
             opened = self._opened()
-            if opened.sync.running:
+            if self._sync is not None and self._sync.running:
                 return IndexState.SYNCING, ""
             return index_state(self.config, opened.configured)
         except Exception as e:
             return IndexState.UNAVAILABLE, str(e)
 
     def _opened(self) -> _Opened:
-        if (current := self._current) is None:
+        current = self._current
+        if current is None or current.watch.replaced():
             with self._lock:
-                if self._current is None:
-                    self._current = self._build()
+                if self._current is current:
+                    self._current = self._reopen(current, {})
                 current = self._current
         self._refuse_mismatch(current.index.embedder)
         return current
+
+    def _reopen(self, current: _Opened | None, keep: Mapping[EmbeddingScheme, object]) -> _Opened:
+        """Open the generation in place now, with the embedders of `current` and `keep`
+        where they fit; those it does not use are let go. The caller holds `self._lock`."""
+        held = current.made if current else {}
+        # From both, not from the merged pool: an embedder of `current` that `keep` replaces
+        # under its scheme is not in the pool, and is let go too.
+        candidates = _distinct([*held.values(), *keep.values()])
+        reranker = current.index.reranker if current else None
+        try:
+            opened = self._build({**held, **keep}, reranker)
+        except BaseException:
+            self._current = None
+            for e in candidates:
+                self._release(e)
+            if reranker is not None:
+                reranker.close()
+            raise
+        used = list(opened.made.values())
+        for e in candidates:
+            if all(e is not u for u in used):
+                self._release(e)
+        return opened
 
     @staticmethod
     def _refuse_mismatch(embedder) -> None:
@@ -181,36 +324,53 @@ class IndexHandle:
         if embedder.probe_error is not None:
             raise IndexUnavailableError(embedder.probe_error)
 
-    def _build(self) -> _Opened:
+    def _build(
+        self, pool: Mapping[EmbeddingScheme, object], reranker: RerankEndpoint | None
+    ) -> _Opened:
         config = self.config
-        configured = self._make(configured_scheme(config))
-        built = [configured]
+        made: dict[EmbeddingScheme, object] = {}
+        built: list[object] = []
+
+        def make(scheme: EmbeddingScheme) -> object:
+            if scheme not in made:
+                embedder = pool.get(scheme)
+                if embedder is None:
+                    embedder = self._make(scheme)
+                    built.append(embedder)
+                made[scheme] = embedder
+            return made[scheme]
+
+        db = config.db_path
         try:
+            configured = make(configured_scheme(config))
+            # Before the identity is read: a swap landing in between changes the file again.
+            key = _stat_key(db)
             identity = self._identity(
                 _scheme_of(configured), ChunkingScheme(SCHEME_VERSION, config.token_budget)
             )
-            embedder = self._embedder_for(identity, configured)
-            if embedder is not configured:
-                built.append(embedder)
-            store = Store(
-                config.db_path, dim=identity.embedding.dim, fts_language=config.fts_language
-            )
+            embedder = self._embedder_for(identity, configured, make)
+            store = Store(db, dim=identity.embedding.dim, fts_language=config.fts_language)
             identity = self._record_fts_language(identity, store)
             chunking = replace(config, token_budget=identity.chunking.token_budget)
             if identity.probe:
                 embedder.expect_probe(identity.probe)
             if identity.probe and getattr(embedder, "endpoint", None) is not None:
                 self._verify_at_open(embedder)
+            watch = _Watch(db, identity.generation, key)
+            before_store = _BeforeStore(embedder, watch)
             pipeline = Pipeline(
-                store, embedder, chunking, labels=self._labels, before_store=self.ensure_probe
+                store, embedder, chunking, labels=self._labels, before_store=before_store
             )
-            reranker = RerankEndpoint(config.rerank_endpoint) if config.rerank_endpoint else None
+            if reranker is None and config.rerank_endpoint:
+                reranker = RerankEndpoint(config.rerank_endpoint)
         except BaseException:
-            for made in built:
-                self._release(made)
+            for e in built:
+                self._release(e)
             raise
         index = OpenIndex(config, store, embedder, pipeline, self._labels, identity, reranker)
-        return _Opened(index, SyncManager(pipeline, store, config), configured)
+        if self._sync is None:
+            self._sync = SyncManager(pipeline, store, config, run=self._run_held)
+        return _Opened(index, configured, made, watch, before_store)
 
     @staticmethod
     def _verify_at_open(embedder) -> None:
@@ -221,37 +381,8 @@ class IndexHandle:
             raise IndexUnavailableError(str(e)) from e
 
     def ensure_probe(self) -> None:
-        """Called before every write: records the probe when the index has none, so the
-        first write into a fresh index fixes which model it was built with, and arms the
-        embedder with it. Refuses the write while the served model is not the recorded one."""
-        opened = self._opened()
-        if self._probe_recorded:
-            return
-        embedder, db = opened.index.embedder, self.config.db_path
-        with self._probe_lock:
-            if self._probe_recorded:
-                return
-            current = read_identity(db)
-            if current is None or current.generation != opened.index.identity.generation:
-                return
-            if current.probe:
-                embedder.expect_probe(current.probe)
-            else:
-                vector = tuple(embedder.probe_vector())
-                if why := embedder.reference_error(vector):
-                    raise IndexUnavailableError(why)
-                if getattr(embedder, "endpoint", None) is not None and not embedder.has_reference():
-                    warnings.warn(
-                        f"No reference probe ships for {embedder.model_name}, so the model "
-                        f"the endpoint serves cannot be verified; this index records "
-                        "whatever it serves as that model.",
-                        RuntimeWarning,
-                        stacklevel=2,
-                    )
-                if update_identity(db, current.generation, probe=vector) is None:
-                    return
-                embedder.expect_probe(vector)
-            self._probe_recorded = True
+        """What the open generation's pipeline calls before every write (`_BeforeStore`)."""
+        self._opened().before_store()
 
     def _identity(self, embedding: EmbeddingScheme, chunking: ChunkingScheme) -> IndexIdentity:
         """The recorded identity; a folder without one is stamped with these schemes before
@@ -269,7 +400,9 @@ class IndexHandle:
         except IdentityError as e:
             raise IndexUnavailableError(str(e)) from e
 
-    def _embedder_for(self, identity: IndexIdentity, configured) -> object:
+    def _embedder_for(
+        self, identity: IndexIdentity, configured, make: Callable[[EmbeddingScheme], object]
+    ) -> object:
         """The embedder every query and ingest of this index goes through: one for the
         scheme `identity` says its vectors were made with."""
         recorded = identity.embedding
@@ -283,20 +416,15 @@ class IndexHandle:
                 "available here, or point DB_PATH at another folder to build a new index."
             )
 
-        embedder = None
         try:
-            embedder = self._make(recorded)
+            embedder = make(recorded)
             width = embedder.dim
-            if width != recorded.dim:
-                raise unavailable(
-                    f"at {recorded.dim} dimensions, but it makes {width}-dimensional vectors here"
-                )
-        except BaseException as e:
-            if embedder is not None:
-                self._release(embedder)
-            if isinstance(e, UnknownModelError):
-                raise unavailable(f"which cannot be loaded here: {str(e).rstrip('.')}") from e
-            raise
+        except UnknownModelError as e:
+            raise unavailable(f"which cannot be loaded here: {str(e).rstrip('.')}") from e
+        if width != recorded.dim:
+            raise unavailable(
+                f"at {recorded.dim} dimensions, but it makes {width}-dimensional vectors here"
+            )
         return embedder
 
     def _record_fts_language(self, identity: IndexIdentity, store: Store) -> IndexIdentity:
@@ -313,7 +441,7 @@ class IndexHandle:
                 f"recording that in {db / INDEX_FILE} failed: {e}. Search is unaffected; the "
                 f"file names {identity.fts_language} until an open records it.",
                 RuntimeWarning,
-                stacklevel=5,
+                stacklevel=6,
             )
             return identity
         # None: a swap put another generation in place since it was read.
@@ -323,6 +451,13 @@ class IndexHandle:
         if self._owns_embedders and (endpoint := getattr(embedder, "endpoint", None)):
             endpoint.close()
 
+    def _pending(self, why: str, then: str) -> RebuildPendingError:
+        return RebuildPendingError(
+            f"The index at {self.config.db_path} differs from its configuration ({why}), "
+            "so this index needs a rebuild: run an unscoped sync (sync_start without a "
+            f"path, or `minirag-mcp sync`). {then}"
+        )
+
     def ingest_pipeline(self) -> Pipeline:
         """The pipeline the ingest tools and commands write through; RebuildPendingError
         while the index needs a rebuild, which leaves it to searches and deletes until an
@@ -330,15 +465,109 @@ class IndexHandle:
         opened = self._opened()
         state, why = index_state(self.config, opened.configured)
         if state is IndexState.REBUILD_PENDING:
-            raise RebuildPendingError(
-                f"The index at {self.config.db_path} differs from its configuration ({why}), "
-                "so this index needs a rebuild: run an unscoped sync (sync_start without a "
-                "path, or `minirag-mcp sync`). Ingests wait for it; searches are answered "
-                "from the existing index meanwhile."
+            raise self._pending(
+                why, "Ingests wait for it; searches are answered from the existing index meanwhile."
             )
         if state is IndexState.UNAVAILABLE:
             raise IndexUnavailableError(why)
         return opened.index.pipeline
+
+    def run_sync(
+        self, scope: Path | None, on_event: Callable[[str], None] | None = None
+    ) -> tuple[dict[str, int], list[dict], RebuildInfo | None]:
+        """Sync the index with the roots, or only `scope` inside them, holding the sync lock.
+
+        On a `rebuild pending` index an unscoped sync rebuilds it, and the handle opens the
+        rebuilt generation; a scoped one is refused with RebuildPendingError, nothing
+        written. SyncLockBusy while another sync of the index runs.
+        """
+        # Opened first: a 1.x index is refused before the lock file is made inside it.
+        self._opened()
+        lock = acquire_sync_lock(self.config.db_path)
+        try:
+            return self._sync_held(scope, on_event)
+        finally:
+            lock.release()
+
+    def start_sync(self, scope: Path | None = None) -> str:
+        """`run_sync` as a background job of `sync`; its job id. The refusal of a scoped
+        sync on a `rebuild pending` index is raised here, before any job starts."""
+        opened = self._opened()
+        if scope is not None:
+            state, why = index_state(self.config, opened.configured)
+            if state is IndexState.REBUILD_PENDING:
+                raise self._scoped_refusal(why, scope)
+        return self.sync.start(scope)
+
+    def _scoped_refusal(self, why: str, scope: Path) -> RebuildPendingError:
+        return self._pending(
+            why,
+            f"A sync of {scope} alone would add chunks made the old way, so nothing was synced; "
+            "searches are answered from the existing index meanwhile.",
+        )
+
+    def _run_held(
+        self, scope: Path | None
+    ) -> tuple[dict[str, int], list[dict], RebuildInfo | None]:
+        return self._sync_held(scope, None)
+
+    def _sync_held(
+        self, scope: Path | None, on_event: Callable[[str], None] | None
+    ) -> tuple[dict[str, int], list[dict], RebuildInfo | None]:
+        """`run_sync` for a caller holding the sync lock."""
+        db = self.config.db_path
+        if not recover_swap(db):
+            # Only a rebuild holding this lock writes there, so one found now stopped. Left
+            # in place it would make `rebuild_running` true, and this sync's writes refused.
+            discard_staging(db)
+        opened = self._opened()
+        state, why = index_state(self.config, opened.configured)
+        if state is IndexState.UNAVAILABLE:
+            raise IndexUnavailableError(why)
+        if state is IndexState.REBUILD_PENDING:
+            if scope is not None:
+                raise self._scoped_refusal(why, scope)
+            return self._rebuild(opened, on_event)
+        index = opened.index
+        counts, errors = _run_sync_unlocked(
+            index.pipeline,
+            index.store,
+            self.config.roots,
+            self.config.max_file_size,
+            scope,
+            on_event,
+        )
+        return counts, errors, None
+
+    def _rebuild(
+        self, opened: _Opened, on_event: Callable[[str], None] | None
+    ) -> tuple[dict[str, int], list[dict], RebuildInfo]:
+        from minirag_mcp.rebuild import rebuild  # rebuild.py imports this module
+
+        made: dict[EmbeddingScheme, object] = {}
+
+        def make(scheme: EmbeddingScheme) -> object:
+            if scheme not in made:
+                made[scheme] = self._make(scheme)
+            return made[scheme]
+
+        try:
+            counts, errors, info = rebuild(opened.index, make, on_event)
+        except BaseException:
+            for e in _distinct(made.values()):
+                self._release(e)
+            raise
+        with self._lock:
+            current = self._current
+            if current is opened:
+                self._current = self._reopen(current, made)
+            else:
+                # Another call opened the rebuilt generation first, or the handle was closed.
+                used = list(current.made.values()) if current is not None else []
+                for e in _distinct(made.values()):
+                    if all(e is not u for u in used):
+                        self._release(e)
+        return counts, errors, info
 
     def notes(self) -> list[str]:
         """What a result's `warnings` carries about the open index; empty while all is well."""
@@ -349,14 +578,13 @@ class IndexHandle:
         """Let the open index go and close the endpoint clients the handle built for it.
 
         The next `get()` opens the index again, with a new sync manager. A sync job already
-        running finishes with what it was given.
+        running resolves the index through the handle, and so opens it again.
         """
         with self._lock:
             current, self._current = self._current, None
-            self._probe_recorded = False
+            self._sync = None
         if current is not None:
-            self._release(current.index.embedder)
-            if current.configured is not current.index.embedder:
-                self._release(current.configured)
+            for e in _distinct(current.made.values()):
+                self._release(e)
             if current.index.reranker is not None:
                 current.index.reranker.close()

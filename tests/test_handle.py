@@ -36,7 +36,7 @@ from minirag_mcp.identity import (
     write_identity,
 )
 from minirag_mcp.results import run_query
-from minirag_mcp.store import ChunkRecord, IndexOpenError, Store
+from minirag_mcp.store import ChunkRecord, IndexBusyError, IndexOpenError, Store
 from minirag_mcp.sync import SyncManager
 
 UNUSED_URL = "http://127.0.0.1:9/v1/embeddings"
@@ -645,9 +645,21 @@ def test_an_open_index_turns_unavailable_when_the_endpoint_changes_model(
     assert h.state() == (IndexState.READY, "")
 
 
-def test_the_store_hook_is_the_handles_probe_recorder(tmp_path, fake_embedder):
+def test_the_store_hook_is_bound_to_the_generation_it_was_opened_with(tmp_path, fake_embedder):
+    """Re-resolved through the handle, a pipeline taken before a swap would pass its check
+    against the new generation and write chunks made the old way into it."""
     h = handle(tmp_path, fake_embedder)
-    assert h.get().pipeline.before_store == h.ensure_probe
+    opened = h.get()
+    hook = opened.pipeline.before_store
+    db = h.config.db_path
+    write_identity(db, replace(read_identity(db), generation=2))
+    reopened = h.get()
+    assert reopened is not opened and reopened.pipeline.before_store is not hook
+    with pytest.raises(IndexBusyError, match="replaced by a rebuilt index"):
+        hook()
+    reopened.pipeline.before_store()
+    h.ensure_probe()
+    assert read_identity(db).probe == pytest.approx(fake_embedder._vec(PROBE_TEXT))
 
 
 def test_a_same_width_wrong_model_is_refused_on_a_fresh_folder(
@@ -686,3 +698,23 @@ def test_a_model_without_a_reference_warns_once_and_is_recorded(
     with pytest.warns(RuntimeWarning, match="cannot be verified"):
         h.get().pipeline.ingest_data("x", source="s")
     assert read_identity(h.config.db_path).probe
+
+
+def test_the_rebuilt_generation_embeds_with_the_rebuilds_embedder(
+    tmp_path, fake_llama, tokenizer_file, built, closed
+):
+    """Not a second copy of the model it loaded; the one it replaces has its client closed."""
+    fake_llama.dim = 1024
+    (tmp_path / "a.md").write_text("# Alpha\n\nAlpha body about budgets.")
+    ep = {E5_LARGE: Endpoint(fake_llama.url("/v1/embeddings"), "e5")}
+    IndexHandle(replace(cfg(tmp_path, CHUNK_TOKEN_BUDGET="32"), embed_endpoints=ep)).run_sync(None)
+    built.clear()
+    closed.clear()
+    h = IndexHandle(replace(cfg(tmp_path), embed_endpoints=ep))
+    replaced = h.get().embedder
+
+    _, _, info = h.run_sync(None)
+
+    assert info.kind == "reingest" and len(built) == 2 and built[0] is replaced
+    assert h.get().embedder is built[1] and h.get().identity.generation == 2
+    assert closed == [replaced.endpoint]
