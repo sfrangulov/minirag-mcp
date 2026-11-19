@@ -346,7 +346,9 @@ class IndexBusyError(Exception):
 def _refused_while_rebuilt(write):
     """`write` to the store, held off a swap and the start of a rebuild while it runs
     (`writing`), and refused with IndexBusyError while a rebuild of the store runs: the
-    rebuilt index replaces this one, and the write would be lost with it."""
+    rebuilt index replaces this one, and the write would be lost with it. Then the
+    store's `write_check` runs, under the same lock, so no swap can land between it and
+    the write."""
 
     @wraps(write)
     def guarded(self: Store, *args, **kwargs):
@@ -357,6 +359,8 @@ def _refused_while_rebuilt(write):
                     "to it are refused until the rebuild finishes, since the rebuilt index "
                     "replaces it. Retry once sync_status reports the sync finished."
                 )
+            if self.write_check is not None:
+                self.write_check()
             return write(self, *args, **kwargs)
 
     return guarded
@@ -477,6 +481,10 @@ class Store:
         self.fts_index_language = fts_language
         # Columns this instance could not add to an older index (see _ensure_scheme_columns)
         self.missing_columns: tuple[str, ...] = ()
+        # Run before every write, under the lock a swap of the index needs exclusively; it
+        # raises to refuse the write. The path stays when a swap puts another index there,
+        # and LanceDB follows it, so a store opened before a swap writes into the new one.
+        self.write_check: Callable[[], None] | None = None
         # False only when an older index is missing the chunking-scheme columns and they
         # could not be added (see _ensure_scheme_columns)
         self.schema_migrated = True
@@ -857,6 +865,11 @@ class Store:
             copied += batch.num_rows
             if on_event:
                 on_event(f"re-embedded {copied} of {total} chunks")
+        if copied != total:
+            raise RuntimeError(
+                f"Re-embedding read {copied} of the {total} chunks of {source.db_path}, so "
+                f"the index rebuilt in {self.db_path} would lack some; it is not used."
+            )
         self._copy_documents(source)
         self._copy_signatures(source)
         return copied

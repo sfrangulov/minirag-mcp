@@ -11,6 +11,7 @@ import minirag_mcp.identity as identity_mod
 import minirag_mcp.sync as sync_mod
 from minirag_mcp.chunker import SCHEME_VERSION
 from minirag_mcp.config import load_config
+from minirag_mcp.identity import begin_staging
 from minirag_mcp.ingest.pipeline import Pipeline
 from minirag_mcp.lock import SyncLock, SyncLockBusy, sync_lock
 from minirag_mcp.store import DOCUMENT_TABLE, ChunkRecord, Store
@@ -1174,3 +1175,14 @@ def test_a_document_backfill_failure_is_reported_not_raised(env, monkeypatch):
     [error] = errors
     assert error["error"].startswith("documents: ") and "commit conflict" in error["error"]
     assert len(store.undocumented_sources()) == 3
+
+
+def test_run_sync_deletes_the_staging_folder_a_stopped_rebuild_left(env):
+    """Left in place, with this sync's own lock held, it reads as a rebuild running and
+    every write of the sync is refused."""
+    cfg, store, pipeline, root = env
+    seed(root)
+    staging = begin_staging(store.db_path)
+    counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    assert (counts["ingested"], counts["failed"], errors) == (2, 0, [])
+    assert not staging.exists()

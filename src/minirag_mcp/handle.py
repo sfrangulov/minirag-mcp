@@ -41,7 +41,6 @@ from minirag_mcp.identity import (
     RebuildInfo,
     acquire_sync_lock,
     create_identity,
-    discard_staging,
     index_state,
     is_legacy_index,
     legacy_error,
@@ -148,6 +147,26 @@ class _Watch:
         return True
 
 
+def _replaced(db: Path) -> IndexBusyError:
+    return IndexBusyError(
+        f"{db} was replaced by a rebuilt index while this write was being prepared, so it "
+        "was not written: it was made the way the replaced index was. Retry it."
+    )
+
+
+def _same_generation(db: Path, generation: int) -> Callable[[], None]:
+    """A store's `write_check`: refuses a write once another generation is in place."""
+
+    def check() -> None:
+        # Never recover_swap here: it takes the identity lock exclusively, which this
+        # thread already holds shared through another descriptor (`writing`).
+        found = read_identity(db)
+        if found is None or found.generation != generation:
+            raise _replaced(db)
+
+    return check
+
+
 class _BeforeStore:
     """Called before every write of one generation's pipeline.
 
@@ -166,10 +185,7 @@ class _BeforeStore:
     def __call__(self) -> None:
         db = self._watch.db
         if self._watch.replaced():
-            raise IndexBusyError(
-                f"{db} was replaced by a rebuilt index while this write was being prepared, so "
-                "it was not written: it was made the way the replaced index was. Retry it."
-            )
+            raise _replaced(db)
         IndexHandle._refuse_mismatch(self._embedder)
         if self._recorded:
             return
@@ -179,7 +195,7 @@ class _BeforeStore:
                 return
             current = read_identity(db)
             if current is None or current.generation != self._watch.generation:
-                return
+                raise _replaced(db)
             if current.probe:
                 embedder.expect_probe(current.probe)
             else:
@@ -188,7 +204,7 @@ class _BeforeStore:
                     raise IndexUnavailableError(why)
                 warn_unverifiable(embedder, "this index")
                 if update_identity(db, current.generation, probe=vector) is None:
-                    return
+                    raise _replaced(db)
                 embedder.expect_probe(vector)
             self._recorded = True
 
@@ -351,6 +367,7 @@ class IndexHandle:
             embedder = self._embedder_for(identity, configured, make)
             store = Store(db, dim=identity.embedding.dim, fts_language=config.fts_language)
             identity = self._record_fts_language(identity, store)
+            store.write_check = _same_generation(db, identity.generation)
             chunking = replace(config, token_budget=identity.chunking.token_budget)
             if identity.probe:
                 embedder.expect_probe(identity.probe)
@@ -514,12 +531,7 @@ class IndexHandle:
     def _sync_held(
         self, scope: Path | None, on_event: Callable[[str], None] | None
     ) -> tuple[dict[str, int], list[dict], RebuildInfo | None]:
-        """`run_sync` for a caller holding the sync lock."""
-        db = self.config.db_path
-        if not recover_swap(db):
-            # Only a rebuild holding this lock writes there, so one found now stopped. Left
-            # in place it would make `rebuild_running` true, and this sync's writes refused.
-            discard_staging(db)
+        """`run_sync` for a caller holding the sync lock (`acquire_sync_lock`)."""
         opened = self._opened()
         state, why = index_state(self.config, opened.configured)
         if state is IndexState.UNAVAILABLE:
@@ -560,7 +572,17 @@ class IndexHandle:
         with self._lock:
             current = self._current
             if current is opened:
-                self._current = self._reopen(current, made)
+                try:
+                    self._current = self._reopen(current, made)
+                except Exception as e:
+                    # The rebuilt generation is in place either way; the next call opens it.
+                    errors.append(
+                        {
+                            "source": str(self.config.db_path),
+                            "error": f"rebuilt as generation {info.generation}, but opening "
+                            f"it failed: {e}",
+                        }
+                    )
             else:
                 # Another call opened the rebuilt generation first, or the handle was closed.
                 used = list(current.made.values()) if current is not None else []

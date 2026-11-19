@@ -12,7 +12,7 @@ import shutil
 from collections.abc import Callable
 from pathlib import Path
 
-from minirag_mcp import __version__
+from minirag_mcp import __version__, ocr
 from minirag_mcp.chunker import SCHEME_VERSION, join_document
 from minirag_mcp.handle import (
     EmbedderFactory,
@@ -130,6 +130,10 @@ def _restore(
     Kept: what was ingested from data or a URL, and a file this installation could not
     read again, or whose folder it could not see into. Not kept: a file gone from disk, or
     excluded by a rule, or moved, which `compute_diff` decides as for any sync.
+
+    Also stored again: a file read with OCR before, which an installation without OCR read
+    again from its text layer alone. A PDF with any text layer reads without error then,
+    and the text OCR gave its scanned pages would be gone.
     """
     config = current.config
     blind: list[tuple[Path, str | None]] = []
@@ -145,10 +149,14 @@ def _restore(
         ignored=ignored,
     )
     gone = set(diff.to_delete) | {m.source for m in diff.moved}
-    have = {info.source for info in pipeline.store.list_sources()}
+    rebuilt = {info.source: info for info in pipeline.store.list_sources()}
+    ocr_lost = not ocr.available()
     restored = 0
     for info in indexed:
-        if info.source in have or info.source in gone:
+        if info.source in gone:
+            continue
+        again = rebuilt.get(info.source)
+        if again is not None and not (ocr_lost and info.ocr_engine and not again.ocr_engine):
             continue
         try:
             pipeline.reingest_stored(info, join_document(current.store.all_chunks(info.source)))

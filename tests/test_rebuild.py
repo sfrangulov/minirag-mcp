@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 import numpy as np
@@ -15,6 +17,7 @@ import pytest
 
 import minirag_mcp.identity as identity_mod
 import minirag_mcp.ingest.pipeline as pipeline_mod
+import minirag_mcp.ocr as ocr_mod
 import minirag_mcp.rebuild as rebuild_mod
 import minirag_mcp.store as store_mod
 from conftest import FakeEmbedder
@@ -23,6 +26,7 @@ from minirag_mcp.config import load_config
 from minirag_mcp.embedder import E5_LARGE, MINILM
 from minirag_mcp.handle import IndexHandle, RebuildPendingError
 from minirag_mcp.identity import (
+    INDEX_FILE,
     STAGING_MARKER,
     IdentityError,
     IndexState,
@@ -30,11 +34,11 @@ from minirag_mcp.identity import (
     read_identity,
     staging_dir,
 )
-from minirag_mcp.ingest.parser import ParserError
+from minirag_mcp.ingest.parser import ParsedDoc, ParserError
 from minirag_mcp.lock import SyncLockBusy, sync_lock
 from minirag_mcp.rebuild import KEPT
 from minirag_mcp.results import run_query
-from minirag_mcp.store import DOCUMENT_TABLE, SIGNATURE_TABLE, IndexBusyError
+from minirag_mcp.store import DOCUMENT_TABLE, SIGNATURE_TABLE, ChunkRecord, IndexBusyError
 
 LONG = " ".join(
     f"Sentence {i} " + " ".join(f"w{i}x{j}" for j in range(10)) + "." for i in range(40)
@@ -692,3 +696,185 @@ def test_an_interrupted_swap_is_finished_by_the_next_sync(corpus, models, monkey
     assert read_identity(db).generation == 2
     assert handle(corpus, models).get().store.chunk_count() == chunks
     assert not staging_dir(db).exists()
+
+
+def _late_record(models) -> ChunkRecord:
+    return ChunkRecord(
+        id="late#0",
+        source="late",
+        source_type="data",
+        title="late",
+        chunk_index=0,
+        text="Late text.",
+        vector=models[MINILM].embed_documents(["Late text."])[0],
+        file_hash="",
+        mtime=0.0,
+        ingested_at=datetime.now(UTC).isoformat(),
+    )
+
+
+def test_a_swap_between_the_hook_and_the_write_refuses_the_write(corpus, models):
+    """The hook passed against generation 1; the store checks again under the lock a swap
+    needs, since a store opened before a swap writes into the new index at its path."""
+    built(corpus, models)
+    pipeline = handle(corpus, models, MODEL_NAME=MINILM).ingest_pipeline()
+    hook = pipeline.before_store
+
+    def then_swap() -> None:
+        hook()
+        handle(corpus, models).run_sync(None)
+
+    pipeline.before_store = then_swap
+    with pytest.raises(IndexBusyError, match="replaced by a rebuilt index"):
+        pipeline.ingest_data("Late text.", source="late")
+    assert handle(corpus, models).get().store.get_source("late") is None
+
+
+def test_a_write_waiting_out_a_swap_is_refused_after_it(corpus, models, monkeypatch):
+    built(corpus, models)
+    serving = handle(corpus, models, MODEL_NAME=MINILM)
+    store = serving.get().store
+    db = serving.config.db_path
+    outcome: dict[str, str] = {}
+
+    def write() -> None:
+        try:
+            store.replace_source("late", [_late_record(models)])
+            outcome["late"] = "written"
+        except IndexBusyError as e:
+            outcome["late"] = str(e)
+
+    writer = threading.Thread(target=write)
+    real = identity_mod.os.rename
+
+    def rename(src, dst) -> None:
+        if Path(src) == db and writer.ident is None:
+            writer.start()  # under the swap's exclusive lock: the write waits for it
+            time.sleep(0.3)
+        real(src, dst)
+
+    monkeypatch.setattr(identity_mod.os, "rename", rename)
+    handle(corpus, models).run_sync(None)
+    writer.join(30)
+
+    assert "replaced by a rebuilt index" in outcome["late"]
+    assert handle(corpus, models).get().store.get_source("late") is None
+
+
+def test_a_reingest_without_ocr_keeps_the_text_ocr_read(corpus, models, monkeypatch):
+    """A PDF with a text layer reads without error on an install without OCR, and the
+    text OCR gave its scanned pages would silently be gone."""
+    scan = corpus / "scan.pdf"
+    scan.write_bytes(b"%PDF-1.4 stand-in")
+    with_ocr = ParsedDoc(
+        "# Scan\n\nText layer page.\n\nScanned page read by OCR: invoice 4711.",
+        "Scan",
+        ocr_engine="rapidocr",
+    )
+    without = ParsedDoc("# Scan\n\nText layer page.", "Scan")
+    reads = {"ocr": True}
+    real = pipeline_mod.parse_file
+
+    def parse(path, config=None):
+        if Path(path) == scan:
+            return with_ocr if reads["ocr"] else without
+        return real(path, config)
+
+    monkeypatch.setattr(pipeline_mod, "parse_file", parse)
+    built(corpus, models, CHUNK_TOKEN_BUDGET="32")
+    reads["ocr"] = False
+    monkeypatch.setattr(ocr_mod, "available", lambda: False)
+
+    _, errors, info = handle(corpus, models, MODEL_NAME=MINILM).run_sync(None)
+
+    store = handle(corpus, models, MODEL_NAME=MINILM).get().store
+    assert "invoice 4711" in join_document(store.all_chunks(str(scan)))
+    assert store.get_source(str(scan)).ocr_engine == "rapidocr"
+    assert {"source": str(scan), "error": KEPT} in errors
+    assert info.restored == 1
+
+
+def test_the_index_kept_from_the_last_swap_is_deleted_before_a_rebuild_starts(corpus, models):
+    """At most two copies of the index take disk space: the serving one and the staged one."""
+    built(corpus, models)
+    handle(corpus, models).run_sync(None)
+    db = handle(corpus, models).config.db_path
+    assert read_identity(previous_dir(db)).generation == 1
+    seen: dict[str, bool] = {}
+
+    def during() -> None:
+        seen["previous"] = previous_dir(db).exists()
+
+    models[MINILM] = Hooked(MINILM, salt="minilm", during=during)
+    _, _, info = handle(corpus, models, MODEL_NAME=MINILM).run_sync(None)
+
+    assert seen == {"previous": False}
+    assert info.generation == 3 and read_identity(previous_dir(db)).generation == 2
+
+
+def test_a_delete_of_previous_stopped_midway_never_blocks_a_rebuild(corpus, models, monkeypatch):
+    built(corpus, models)
+    handle(corpus, models).run_sync(None)
+    db = handle(corpus, models).config.db_path
+    real = shutil.rmtree
+
+    def dies_midway(path, *args, **kwargs) -> None:
+        if Path(path).name.startswith(previous_dir(db).name):
+            (Path(path) / INDEX_FILE).unlink()
+            raise Killed
+        real(path, *args, **kwargs)
+
+    monkeypatch.setattr(shutil, "rmtree", dies_midway)
+    with pytest.raises(Killed):
+        handle(corpus, models, MODEL_NAME=MINILM).run_sync(None)
+    monkeypatch.setattr(shutil, "rmtree", real)
+
+    _, _, info = handle(corpus, models, MODEL_NAME=MINILM).run_sync(None)
+    assert info.generation == 3 and read_identity(previous_dir(db)).generation == 2
+    assert sorted(p.name for p in db.parent.iterdir() if p.name.startswith(db.name)) == [
+        db.name,
+        previous_dir(db).name,
+    ]
+
+
+def test_a_short_copy_is_never_swapped_in(corpus, models):
+    built(corpus, models)
+    b = handle(corpus, models)
+    store = b.get().store
+    n = store.chunk_count()
+    store.chunk_count = lambda: n + 1
+    with pytest.raises(RuntimeError, match=f"read {n} of the {n + 1} chunks"):
+        b.run_sync(None)
+    db = b.config.db_path
+    assert read_identity(db).generation == 1 and not staging_dir(db).exists()
+    assert b.state()[0] is IndexState.REBUILD_PENDING
+
+
+def test_a_rebuild_whose_new_generation_cannot_be_opened_still_reports_it(
+    corpus, models, monkeypatch
+):
+    """Generation 2 is in place: the sync succeeded, and the next call opens it."""
+    built(corpus, models)
+    b = handle(corpus, models)
+    real = rebuild_mod.swap_in
+
+    def boom(pool, reranker):
+        raise RuntimeError("cannot open it now")
+
+    def swap(db) -> None:
+        real(db)
+        b._build = boom
+
+    monkeypatch.setattr(rebuild_mod, "swap_in", swap)
+    counts, errors, info = b.run_sync(None)
+    del b._build
+
+    db = b.config.db_path
+    assert info.generation == 2 and read_identity(db).generation == 2
+    assert errors == [
+        {
+            "source": str(db),
+            "error": "rebuilt as generation 2, but opening it failed: cannot open it now",
+        }
+    ]
+    assert b.get().identity.generation == 2 and b.state() == (IndexState.READY, "")

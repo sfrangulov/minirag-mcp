@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import glob
 import json
 import os
 import shutil
@@ -526,6 +527,25 @@ def _check_previous(previous: Path) -> None:
         )
 
 
+def _drop_previous(db_path: Path) -> None:
+    """Delete `previous_dir(db_path)`, and what earlier deletes of it left behind.
+
+    It is renamed first, so a delete that stops midway leaves a trash folder, never a
+    `previous` without INDEX_FILE, which `_check_previous` would refuse at every later
+    swap.
+    """
+    previous = previous_dir(db_path)
+    for trash in previous.parent.glob(f"{glob.escape(previous.name)}.*.trash"):
+        shutil.rmtree(trash, ignore_errors=True)
+    if not os.path.lexists(previous):
+        return
+    # Again: what is there may have changed since the first look.
+    _check_previous(previous)
+    trash = previous.with_name(f"{previous.name}.{uuid.uuid4().hex}.trash")
+    os.rename(previous, trash)
+    shutil.rmtree(trash)
+
+
 def _holds_generation(db_path: Path, generation: int) -> bool:
     if not db_path.is_dir():
         return False
@@ -577,10 +597,7 @@ def swap_in(db_path: Path) -> None:
     current = read_identity(db_path)
     generation = max(staged.generation, current.generation if current else 0) + 1
     write_identity(staging, replace(staged, generation=generation))
-    if os.path.lexists(previous):
-        # Again: what is there may have changed since the first look.
-        _check_previous(previous)
-        shutil.rmtree(previous)
+    _drop_previous(db_path)
     with _identity_lock(db_path):
         had_index = os.path.lexists(db_path)
         if had_index:
@@ -647,12 +664,19 @@ def acquire_sync_lock(db_path: Path) -> SyncLock:
 
     Taken under the identity lock, after finishing a swap that died between its renames:
     taking it creates `db_path`, and a folder created there by a sync would stop that
-    swap from ever being finished.
+    swap from ever being finished. Then the staging folder of a rebuild that stopped is
+    deleted (`discard_staging`): only a rebuild holding this lock writes there, and left
+    in place it would make `rebuild_running` true and refuse this sync's own writes.
     """
     lock = SyncLock(db_path)
     with _identity_lock(db_path):
         _finish_swap(db_path)
         lock.acquire()
+    try:
+        discard_staging(db_path)
+    except BaseException:
+        lock.release()
+        raise
     return lock
 
 
@@ -667,9 +691,10 @@ def begin_staging(db_path: Path) -> Path:
     Created under the identity lock, which every write holds shared, so a write under way
     finishes first, and every later one sees the folder and is refused (`rebuild_running`):
     none lands in the index after the rebuild has begun reading it. Refused up front when
-    `swap_in` would refuse the swap at the end.
+    `swap_in` would refuse the swap at the end. The index kept from the last swap is
+    deleted first, so that at most two copies of the index take disk space.
     """
-    _check_previous(previous_dir(db_path))
+    _drop_previous(db_path)
     staging = staging_dir(db_path)
     with _identity_lock(db_path):
         staging.mkdir()

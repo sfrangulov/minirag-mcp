@@ -718,3 +718,19 @@ def test_the_rebuilt_generation_embeds_with_the_rebuilds_embedder(
     assert info.kind == "reingest" and len(built) == 2 and built[0] is replaced
     assert h.get().embedder is built[1] and h.get().identity.generation == 2
     assert closed == [replaced.endpoint]
+
+
+def test_the_hook_refuses_a_write_when_the_identity_it_reads_is_another_generation(
+    tmp_path, fake_embedder, monkeypatch
+):
+    """Even when its quick look misses a swap: it never lets the write go on unchecked."""
+    h = handle(tmp_path, fake_embedder)
+    opened = h.get()
+    db = h.config.db_path
+    monkeypatch.setattr(handle_mod._Watch, "replaced", lambda self: False)
+    write_identity(db, replace(read_identity(db), generation=2))
+    with pytest.raises(IndexBusyError, match="replaced by a rebuilt index"):
+        opened.pipeline.before_store()
+    with pytest.raises(IndexBusyError, match="replaced by a rebuilt index"):
+        opened.store.delete_source("s")
+    assert read_identity(db).probe == ()
