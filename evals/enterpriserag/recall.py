@@ -145,7 +145,7 @@ def fingerprint(cfg) -> dict:
     }
 
 
-def _open(db: Path, corpus: Path, hybrid_weight: float | None = None):
+def _open(db: Path, corpus: Path, hybrid_weight: float | None = None, model: str | None = None):
     from minirag_mcp.config import load_config
     from minirag_mcp.embedder import Embedder
     from minirag_mcp.store import Store
@@ -153,6 +153,8 @@ def _open(db: Path, corpus: Path, hybrid_weight: float | None = None):
     env = {"BASE_DIR": str(corpus), "DB_PATH": str(db)}
     if hybrid_weight is not None:
         env["RAG_HYBRID_WEIGHT"] = str(hybrid_weight)
+    if model:
+        env["MODEL_NAME"] = model
     cfg = load_config(env)
     emb = Embedder(cfg.model_name, cfg.cache_dir)
     store = Store(cfg.db_path, dim=emb.dim, fts_language=cfg.fts_language)
@@ -189,8 +191,14 @@ def run_full(db: Path, corpus: Path, hybrid_weight: float | None = None) -> int:
     return 0
 
 
-def run_subset(corpus: Path, update: bool) -> int:
+def run_subset(corpus: Path, update: bool, model: str | None = None, prefixes: bool = False) -> int:
     from bulk_index import build
+
+    experiment = bool(model or prefixes)
+    if prefixes:
+        from common import apply_e5_prefixes
+
+        apply_e5_prefixes()
 
     questions = load_questions()
     rel = subset(corpus_files(corpus), questions, total=TOTAL, seed=SEED)
@@ -200,15 +208,34 @@ def run_subset(corpus: Path, update: bool) -> int:
     root = root.resolve()
     # The parallel build, whose rows `bulk_index.py --verify` holds equal to stock sync's:
     # stock sync takes about 1.7 hours over these 20,000 files, this about 20 minutes.
-    result = build(root, db, workers=9, threads=2, batch_files=1000, log=sys.stderr)
+    result = build(
+        root,
+        db,
+        workers=9,
+        threads=2,
+        batch_files=1000,
+        log=sys.stderr,
+        model=model,
+        prefixes=prefixes,
+    )
     if result["errors"] or result["counts"]["ingested"] != len(rel):
         print(
             f"subset index incomplete: {result['counts']}, {result['errors'][:3]}", file=sys.stderr
         )
         return 1
-    cfg, emb, store = _open(db, root)
+    cfg, emb, store = _open(db, root, model=model)
     summary = summarize(measure(store, emb, cfg, questions))
     current = {"summary": summary, "fingerprint": fingerprint(cfg), "subset": subset_hash(rel)}
+    if experiment:
+        current["experiment"] = {"model": cfg.model_name, "e5_prefixes": prefixes}
+        tag = cfg.model_name.split("/")[-1] + ("-prefixed" if prefixes else "")
+        RUNS.mkdir(parents=True, exist_ok=True)
+        out = RUNS / f"subset_{tag}.json"
+        out.write_text(json.dumps(current, indent=2) + "\n", encoding="utf-8")
+        base = json.loads(BASELINE.read_text(encoding="utf-8")) if BASELINE.exists() else None
+        _print(summary, base and base["summary"])
+        print(f"\nexperiment written to {out}; deltas against the baseline ({BASELINE.name})")
+        return 0
     if update or not BASELINE.exists():
         BASELINE.write_text(json.dumps(current, indent=2) + "\n", encoding="utf-8")
         _print(summary)
@@ -234,6 +261,12 @@ def main() -> int:
     ap.add_argument("--db", type=Path, default=INDEX)
     ap.add_argument("--corpus", type=Path, default=CORPUS)
     ap.add_argument("--update-baseline", action="store_true")
+    ap.add_argument("--model", help="--subset only: another MODEL_NAME, kept out of the baseline")
+    ap.add_argument(
+        "--e5-prefixes",
+        action="store_true",
+        help='--subset only: embed with "query: " / "passage: " (multilingual-e5)',
+    )
     ap.add_argument(
         "--hybrid-weight",
         type=float,
@@ -242,7 +275,7 @@ def main() -> int:
     args = ap.parse_args()
     if args.full:
         return run_full(args.db, args.corpus, args.hybrid_weight)
-    return run_subset(args.corpus, args.update_baseline)
+    return run_subset(args.corpus, args.update_baseline, args.model, args.e5_prefixes)
 
 
 if __name__ == "__main__":

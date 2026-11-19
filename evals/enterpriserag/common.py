@@ -107,3 +107,19 @@ def sample_ids(questions: list[Question], fraction: float = 0.2) -> list[str]:
         k = max(1, round(n * fraction))
         ids += [group[int((i + 0.5) * n / k)].question_id for i in range(k)]
     return sorted(ids)
+
+
+def apply_e5_prefixes() -> None:
+    """Prefix texts the way multilingual-e5 was trained: "query: " and "passage: ".
+
+    An experiment, applied per process: neither fastembed nor minirag adds them, and the
+    model card warns that without them quality drops.
+    """
+    from minirag_mcp.embedder import Embedder
+
+    if getattr(Embedder, "_e5_prefixed", False):
+        return
+    docs, query = Embedder.embed_documents, Embedder.embed_query
+    Embedder.embed_documents = lambda self, texts: docs(self, [f"passage: {t}" for t in texts])
+    Embedder.embed_query = lambda self, text: query(self, f"query: {text}")
+    Embedder._e5_prefixed = True

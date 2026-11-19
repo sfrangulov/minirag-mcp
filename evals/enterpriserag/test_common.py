@@ -141,3 +141,19 @@ def test_sample_ids_keep_the_type_mix():
     }
     assert counts == {"basic": 35, "semantic": 25, "high_level": 2, "misc": 1}
     assert ids == sample_ids(qs) and len(set(ids)) == len(ids)
+
+
+def test_e5_prefixes_wrap_documents_and_queries(monkeypatch):
+    from common import apply_e5_prefixes
+
+    from minirag_mcp.embedder import Embedder
+
+    seen = []
+    monkeypatch.setattr(Embedder, "embed_documents", lambda self, texts: seen.append(texts) or [])
+    monkeypatch.setattr(Embedder, "embed_query", lambda self, text: seen.append(text) or [])
+    monkeypatch.setattr(Embedder, "_e5_prefixed", False, raising=False)
+    apply_e5_prefixes()
+    apply_e5_prefixes()
+    Embedder.embed_documents(None, ["a", "b"])
+    Embedder.embed_query(None, "q")
+    assert seen == [["passage: a", "passage: b"], "query: q"]

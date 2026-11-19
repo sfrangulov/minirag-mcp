@@ -42,7 +42,14 @@ class _Collect:
         self.records = list(records)
 
 
-def _init(corpus: str, db: str, threads: int) -> None:
+def _env(corpus: str, db: str, model: str | None) -> dict:
+    env = {"BASE_DIR": corpus, "DB_PATH": db}
+    if model:
+        env["MODEL_NAME"] = model
+    return env
+
+
+def _init(corpus: str, db: str, threads: int, model: str | None, prefixes: bool) -> None:
     global _pipeline
     import fastembed
 
@@ -53,7 +60,11 @@ def _init(corpus: str, db: str, threads: int) -> None:
 
     # Several processes share the cores; each onnxruntime session gets a slice of them.
     embedder_mod.TextEmbedding = functools.partial(fastembed.TextEmbedding, threads=threads)
-    cfg = load_config({"BASE_DIR": corpus, "DB_PATH": db})
+    if prefixes:
+        from common import apply_e5_prefixes
+
+        apply_e5_prefixes()
+    cfg = load_config(_env(corpus, db, model))
     _pipeline = Pipeline(_Collect(), Embedder(cfg.model_name, cfg.cache_dir), cfg)
 
 
@@ -65,12 +76,12 @@ def _ingest(path: str):
     return path, _pipeline.store.records, None
 
 
-def _open_store(corpus: Path, db: Path):
+def _open_store(corpus: Path, db: Path, model: str | None = None):
     from minirag_mcp.config import load_config
     from minirag_mcp.embedder import Embedder
     from minirag_mcp.store import Store
 
-    cfg = load_config({"BASE_DIR": str(corpus), "DB_PATH": str(db)})
+    cfg = load_config(_env(str(corpus), str(db), model))
     emb = Embedder(cfg.model_name, cfg.cache_dir)
     return cfg, emb, Store(cfg.db_path, dim=emb.dim, fts_language=cfg.fts_language)
 
@@ -94,11 +105,20 @@ def _flush(store, batch: list) -> None:
     store._put_signatures(entries)
 
 
-def build(corpus: Path, db: Path, workers: int, threads: int, batch_files: int, log) -> dict:
+def build(
+    corpus: Path,
+    db: Path,
+    workers: int,
+    threads: int,
+    batch_files: int,
+    log,
+    model: str | None = None,
+    prefixes: bool = False,
+) -> dict:
     from minirag_mcp.ingest.scanner import scan_roots
 
     corpus = corpus.resolve()
-    cfg, _, store = _open_store(corpus, db)
+    cfg, _, store = _open_store(corpus, db, model)
     done = {s.source for s in store.list_sources()} if store.chunk_count() else set()
     # The scanner's own walk, so the file set and the row order are the ones sync writes:
     # BM25 ties between near-duplicates break by row order.
@@ -117,7 +137,9 @@ def build(corpus: Path, db: Path, workers: int, threads: int, batch_files: int, 
     started = time.monotonic()
     batch: list = []
     ctx = mp.get_context("spawn")
-    with ctx.Pool(workers, initializer=_init, initargs=(str(corpus), str(db), threads)) as pool:
+    with ctx.Pool(
+        workers, initializer=_init, initargs=(str(corpus), str(db), threads, model, prefixes)
+    ) as pool:
         for path, records, err in pool.imap(_ingest, todo, chunksize=8):
             if err:
                 counts["failed"] += 1
