@@ -1,7 +1,9 @@
 import errno
+import fcntl
 import json
 import os
 import re
+import shutil
 import threading
 from dataclasses import replace
 from pathlib import Path
@@ -247,20 +249,162 @@ def test_a_stamp_racing_a_swap_never_replaces_the_index(tmp_path, monkeypatch):
     make_index(db, 1, "serving")
     make_index(staging_dir(db), 1, "rebuilt")
     fresh = IndexIdentity.fresh(EMB, CHUNK, "English")
-    stamped: list[IndexIdentity] = []
-    real_rename = os.rename
+    b_found_nothing = threading.Event()
+    stamped: list[IndexIdentity | BaseException] = []
+    real_read, real_rename = identity_mod.read_identity, os.rename
 
-    def stamp_between_the_renames(src, dst):
-        if Path(src) == staging_dir(db) and not stamped:
-            stamped.append(fresh)
-            stamped[0] = create_identity(db, fresh)
+    def read(path: Path) -> IndexIdentity | None:
+        found = real_read(path)
+        if threading.current_thread().name == "B" and path == db and found is None:
+            b_found_nothing.set()
+        return found
+
+    def stamp() -> None:
+        try:
+            stamped.append(create_identity(db, fresh))
+        except BaseException as e:
+            stamped.append(e)
+        finally:
+            b_found_nothing.set()
+
+    b = threading.Thread(target=stamp, name="B")
+
+    def start_b_between_the_renames(src, dst):
+        if Path(src) == staging_dir(db) and b.ident is None:
+            b.start()
+            b_found_nothing.wait(10)
         real_rename(src, dst)
 
-    monkeypatch.setattr(identity_mod.os, "rename", stamp_between_the_renames)
+    monkeypatch.setattr(identity_mod, "read_identity", read)
+    monkeypatch.setattr(identity_mod.os, "rename", start_b_between_the_renames)
     swap_in(db)
+    b.join(10)
     assert (generation(db), marker(db)) == (2, "rebuilt")
     assert stamped == [read_identity(db)]
     assert (generation(previous_dir(db)), marker(previous_dir(db))) == (1, "serving")
+
+
+def test_a_stamp_that_passed_its_checks_before_a_swap_cannot_land_inside_it(tmp_path, monkeypatch):
+    """B is about to create its file when A moves the index away, then B links it."""
+    db = tmp_path / "db"
+    make_index(db, 1, "serving")
+    make_index(staging_dir(db), 1, "rebuilt")
+    fresh = IndexIdentity.fresh(EMB, CHUNK, "English")
+    b_writing, b_linked, a_moved_db = threading.Event(), threading.Event(), threading.Event()
+    outcome: dict[str, object] = {}
+    real_temp, real_link, real_rename = identity_mod._temp_file, os.link, os.rename
+
+    def temp(path, identity):
+        if threading.current_thread().name == "B":
+            b_writing.set()
+            a_moved_db.wait(2)
+        return real_temp(path, identity)
+
+    def link(src, dst):
+        try:
+            return real_link(src, dst)
+        finally:
+            if threading.current_thread().name == "B":
+                b_linked.set()
+
+    def rename(src, dst):
+        if threading.current_thread().name == "A" and Path(src) == db:
+            b_writing.wait(10)
+            real_rename(src, dst)
+            a_moved_db.set()
+            return
+        if threading.current_thread().name == "A" and Path(src) == staging_dir(db):
+            b_linked.wait(10)
+        real_rename(src, dst)
+
+    def run(name: str, call) -> None:
+        try:
+            outcome[name] = call()
+        except BaseException as e:
+            outcome[name] = e
+        finally:
+            if name == "B":
+                b_writing.set()
+                b_linked.set()
+
+    monkeypatch.setattr(identity_mod, "_temp_file", temp)
+    monkeypatch.setattr(identity_mod.os, "link", link)
+    monkeypatch.setattr(identity_mod.os, "rename", rename)
+    threads = [
+        threading.Thread(target=run, args=("B", lambda: create_identity(db, fresh)), name="B"),
+        threading.Thread(target=run, args=("A", lambda: swap_in(db)), name="A"),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(30)
+    assert outcome["A"] is None
+    assert outcome["B"] in (replace(IDENT, generation=1), replace(IDENT, generation=2))
+    assert (generation(db), marker(db)) == (2, "rebuilt")
+    assert (generation(previous_dir(db)), marker(previous_dir(db))) == (1, "serving")
+    assert not staging_dir(db).exists()
+
+
+def _lock_taken(path: Path) -> bool:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(fd)
+    return False
+
+
+def test_the_identity_lock_sits_beside_the_index_and_covers_every_change(tmp_path, monkeypatch):
+    db = tmp_path / "db"
+    lock_file = tmp_path / ".db.identity.lock"
+    seen: list[tuple[str, bool]] = []
+    real_link, real_rename = os.link, os.rename
+
+    def link(src, dst):
+        seen.append(("link", _lock_taken(lock_file)))
+        real_link(src, dst)
+
+    def rename(src, dst):
+        seen.append((f"{Path(src).name} -> {Path(dst).name}", _lock_taken(lock_file)))
+        real_rename(src, dst)
+
+    monkeypatch.setattr(identity_mod.os, "link", link)
+    monkeypatch.setattr(identity_mod.os, "rename", rename)
+    create_identity(db, replace(IDENT, generation=1))
+    make_index(staging_dir(db), 1, "rebuilt")
+    swap_in(db)
+    assert lock_file.is_file() and not list(db.glob("*.lock"))
+    # A swap that died between its renames, finished by recover_swap.
+    make_index(staging_dir(db), 2, "rebuilt again")
+    shutil.rmtree(previous_dir(db))
+    real_rename(db, previous_dir(db))
+    assert recover_swap(db) is True
+    assert seen == [
+        ("link", True),
+        ("db -> db.previous", True),
+        ("db.next -> db", True),
+        ("db.next -> db", True),
+    ]
+    assert lock_file.is_file()
+
+
+def test_an_existing_identity_is_returned_without_taking_the_lock(tmp_path):
+    db = tmp_path / "db"
+    write_identity(db, IDENT)
+    assert create_identity(db, IndexIdentity.fresh(EMB, CHUNK, "English")) == IDENT
+    assert not (tmp_path / ".db.identity.lock").exists()
+
+
+def test_an_identity_lock_that_cannot_be_taken_warns_and_proceeds(tmp_path, monkeypatch):
+    fresh = IndexIdentity.fresh(EMB, CHUNK, "English")
+    (tmp_path / ".db.identity.lock").mkdir()
+    with pytest.warns(RuntimeWarning, match=re.escape(str(tmp_path / ".db.identity.lock"))):
+        assert create_identity(tmp_path / "db", fresh) == fresh
+    monkeypatch.setattr(identity_mod, "fcntl", None)
+    with pytest.warns(RuntimeWarning, match="fcntl is unavailable"):
+        assert create_identity(tmp_path / "other", fresh) == fresh
 
 
 def test_no_fresh_stamp_while_a_swap_may_be_under_way(tmp_path):
@@ -421,7 +565,7 @@ def test_swap_in_bumps_generation_and_keeps_one_previous(tmp_path):
     swap_in(db)
     assert (generation(db), marker(db)) == (3, "third")
     assert (generation(previous_dir(db)), marker(previous_dir(db))) == (2, "second")
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["db", "db.previous"]
+    assert sorted(p.name for p in tmp_path.iterdir()) == [".db.identity.lock", "db", "db.previous"]
 
     make_index(staging_dir(db), 7, "fourth")
     swap_in(db)
@@ -475,10 +619,36 @@ def test_a_failed_rollback_names_every_folder_and_the_swap_is_finished_later(tmp
         swap_in(db)
     for folder in (db, previous_dir(db), staging_dir(db)):
         assert str(folder) in str(excinfo.value)
+    assert f"{db} is missing" in str(excinfo.value)
+    assert "The next open finishes the swap" in str(excinfo.value)
     monkeypatch.setattr(identity_mod.os, "rename", real_rename)
     assert recover_swap(db) is True
     assert (generation(db), marker(db)) == (2, "rebuilt")
     assert marker(previous_dir(db)) == "serving"
+
+
+def test_a_failed_rollback_onto_a_recreated_index_folder_says_so(tmp_path, monkeypatch):
+    """Something made db between the renames: neither rename can land, and recovery cannot."""
+    db = tmp_path / "db"
+    make_index(db, 1, "serving")
+    make_index(staging_dir(db), 1, "rebuilt")
+    real_rename = os.rename
+
+    def db_reappears(src, dst):
+        if Path(src) == staging_dir(db):
+            db.mkdir()
+            (db / "intruder").write_text("x", encoding="utf-8")
+        real_rename(src, dst)
+
+    monkeypatch.setattr(identity_mod.os, "rename", db_reappears)
+    with pytest.raises(IndexOpenError) as excinfo:
+        swap_in(db)
+    message = str(excinfo.value)
+    for folder in (db, previous_dir(db), staging_dir(db)):
+        assert str(folder) in message
+    assert "is missing" not in message and "next open" not in message
+    assert f"{db} was created again" in message
+    assert recover_swap(db) is False
 
 
 def test_swap_in_never_deletes_a_previous_that_is_not_an_index(tmp_path):
@@ -491,7 +661,7 @@ def test_swap_in_never_deletes_a_previous_that_is_not_an_index(tmp_path):
         swap_in(db)
     assert (previous_dir(db) / "notes.txt").read_text(encoding="utf-8") == "the user's"
     assert (generation(db), marker(db)) == (1, "serving")
-    assert marker(staging_dir(db)) == "rebuilt"
+    assert (generation(staging_dir(db)), marker(staging_dir(db))) == (1, "rebuilt")
 
 
 def test_swap_in_refuses_a_1x_index(tmp_path):

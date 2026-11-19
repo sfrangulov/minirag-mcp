@@ -15,7 +15,9 @@ import json
 import os
 import shutil
 import uuid
-from collections.abc import Sequence
+import warnings
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
@@ -24,6 +26,11 @@ from typing import TYPE_CHECKING
 from minirag_mcp import __version__
 from minirag_mcp.chunker import SCHEME_VERSION
 from minirag_mcp.lock import is_held
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - POSIX-only; the tests all run on POSIX
+    fcntl = None
 
 if TYPE_CHECKING:
     from minirag_mcp.config import Config
@@ -284,26 +291,50 @@ def write_identity(db_path: Path, identity: IndexIdentity) -> None:
 _NO_HARD_LINKS = frozenset({errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENOSYS})
 
 
-def create_identity(db_path: Path, identity: IndexIdentity) -> IndexIdentity:
-    """Stamp `db_path` with `identity` unless it has one; the identity it holds after.
+def _lock_path(db_path: Path) -> Path:
+    # Beside the index, not in it: the lock has to outlast the renames it orders.
+    return db_path.with_name(f".{db_path.name}.identity.lock")
 
-    Never replaces a recorded identity, so a stamp racing another process's stamp or swap
-    cannot put a new, empty index in place of an existing one.
+
+def _warn_unlocked(db_path: Path, why: str) -> None:
+    warnings.warn(
+        f"{why}, so this change to {db_path} runs unlocked: a stamp or swap of it by another "
+        "process at the same moment is not kept apart from this one.",
+        RuntimeWarning,
+        stacklevel=4,  # past this helper, the context manager and contextlib
+    )
+
+
+@contextmanager
+def _identity_lock(db_path: Path) -> Iterator[None]:
+    """Hold the lock that orders stamps, swaps and swap recovery of `db_path`, waiting for it.
+
+    Held only for a few renames and small writes. A lock that cannot be taken degrades as
+    the sync lock does: it warns and the block runs unlocked, because refusing would leave
+    an index on a platform or a folder without flock unopenable.
     """
-    staging, previous = staging_dir(db_path), previous_dir(db_path)
-    if staging.is_dir() and previous.is_dir():
-        # A swap can be between its two renames, when db_path is missing for an instant;
-        # creating it then would leave an empty index where both of them belong.
-        recover_swap(db_path)
-        found = read_identity(db_path)
-        if found is None:
-            raise IdentityError(
-                f"{db_path} holds no {INDEX_FILE} while {staging} and {previous} both exist, "
-                "so a rebuild may be swapping one of them in; it is not stamped as a new "
-                f"index. If no sync is running, move {db_path} aside so that the next open "
-                f"finishes the swap of {staging}, or remove {staging} to start {db_path} anew."
-            )
-        return found
+    path = _lock_path(db_path)
+    if fcntl is None:
+        _warn_unlocked(db_path, f"fcntl is unavailable on this platform, so {path} is not taken")
+        yield
+        return
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError as e:
+        _warn_unlocked(db_path, f"Could not take the lock at {path} ({e.strerror or e})")
+        yield
+        return
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except OSError as e:
+            _warn_unlocked(db_path, f"Could not take the lock at {path} ({e.strerror or e})")
+        yield
+    finally:
+        os.close(fd)
+
+
+def _link_new(db_path: Path, identity: IndexIdentity) -> IndexIdentity:
     path = db_path / INDEX_FILE
     tmp, data = _temp_file(db_path, identity)
     try:
@@ -325,6 +356,41 @@ def create_identity(db_path: Path, identity: IndexIdentity) -> IndexIdentity:
         with contextlib.suppress(OSError):
             tmp.unlink()
     return identity
+
+
+def create_identity(db_path: Path, identity: IndexIdentity) -> IndexIdentity:
+    """Stamp `db_path` with `identity` unless it has one; the identity it holds after.
+
+    Never replaces a recorded identity, and never lands inside a swap, so a stamp cannot
+    put a new, empty index in place of an existing one.
+    """
+    found = read_identity(db_path)
+    if found is not None:
+        return found
+    try:
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise _open_error(db_path, e) from e
+    with _identity_lock(db_path):
+        found = read_identity(db_path)
+        if found is not None:
+            return found
+        staging, previous = staging_dir(db_path), previous_dir(db_path)
+        if staging.is_dir() and previous.is_dir():
+            # A swap that died between its renames left db_path missing; stamping it would
+            # leave an empty index where both of these belong.
+            _finish_swap(db_path)
+            found = read_identity(db_path)
+            if found is None:
+                raise IdentityError(
+                    f"{db_path} holds no {INDEX_FILE} while {staging} and {previous} both "
+                    "exist, so a rebuild may be swapping one of them in; it is not stamped as "
+                    f"a new index. If no sync is running, move {db_path} aside so that the "
+                    f"next open finishes the swap of {staging}, or remove {staging} to start "
+                    f"{db_path} anew."
+                )
+            return found
+        return _link_new(db_path, identity)
 
 
 def is_legacy_index(db_path: Path) -> bool:
@@ -419,8 +485,8 @@ def previous_dir(db_path: Path) -> Path:
     return db_path.with_name(db_path.name + ".previous")
 
 
-def _drop_previous(previous: Path) -> None:
-    """Delete the index kept from the swap before; anything else there is left alone."""
+def _check_previous(previous: Path) -> None:
+    """Refuse to swap when `previous` holds anything but the index kept from the last swap."""
     if not os.path.lexists(previous):
         return
     if previous.is_symlink() or not previous.is_dir() or read_identity(previous) is None:
@@ -429,7 +495,6 @@ def _drop_previous(previous: Path) -> None:
             f"minirag index ({INDEX_FILE} is missing), so it is not deleted and nothing is "
             "swapped. Move it elsewhere and sync again."
         )
-    shutil.rmtree(previous)
 
 
 def _holds_generation(db_path: Path, generation: int) -> bool:
@@ -440,6 +505,24 @@ def _holds_generation(db_path: Path, generation: int) -> bool:
     except IdentityError:
         return False
     return found is not None and found.generation == generation
+
+
+def _rollback_failed(db_path: Path, error: OSError, undo: OSError) -> str:
+    staging, previous = staging_dir(db_path), previous_dir(db_path)
+    if os.path.lexists(db_path):
+        return (
+            f"{db_path} was created again while {staging} was being swapped in for it, so the "
+            f"swap failed ({error.strerror or error}) and {previous}, the index it was to "
+            f"replace, could not be put back ({undo.strerror or undo}). What is at {db_path} "
+            f"now is neither of them: move it aside, then rename {staging} or {previous} to "
+            f"{db_path}."
+        )
+    return (
+        f"{db_path} is missing: swapping in {staging} failed ({error.strerror or error}), and "
+        f"putting back {previous}, the index it was to replace, failed too "
+        f"({undo.strerror or undo}). The next open finishes the swap; or rename {staging} or "
+        f"{previous} to {db_path}."
+    )
 
 
 def swap_in(db_path: Path) -> None:
@@ -461,38 +544,33 @@ def swap_in(db_path: Path) -> None:
             f"{db_path} holds a minirag 1.x index (a LanceDB table and no {INDEX_FILE}). "
             f"minirag 2 never writes to a 1.x index, so {staging} is not swapped in for it."
         )
+    _check_previous(previous)
     current = read_identity(db_path)
     generation = max(staged.generation, current.generation if current else 0) + 1
     write_identity(staging, replace(staged, generation=generation))
-    _drop_previous(previous)
-    had_index = os.path.lexists(db_path)
-    if had_index:
-        os.rename(db_path, previous)
-    try:
-        os.rename(staging, db_path)
-    except OSError as e:
-        # Another process's recover_swap can move the staged index in between the renames.
-        if _holds_generation(db_path, generation):
-            return
+    if os.path.lexists(previous):
+        shutil.rmtree(previous)
+    with _identity_lock(db_path):
+        had_index = os.path.lexists(db_path)
         if had_index:
-            try:
-                os.rename(previous, db_path)
-            except OSError as undo:
-                raise _open_failure(
-                    f"{db_path} is missing: swapping in {staging} failed "
-                    f"({e.strerror or e}), and putting back {previous}, the index it was "
-                    f"to replace, failed too ({undo.strerror or undo}). The next open "
-                    f"finishes the swap; or rename {staging} or {previous} to {db_path}."
-                ) from e
-        raise
+            os.rename(db_path, previous)
+        try:
+            os.rename(staging, db_path)
+        except OSError as e:
+            # Unlocked (see _identity_lock), another process's recover_swap can move the
+            # staged index in between the renames.
+            if _holds_generation(db_path, generation):
+                return
+            if had_index:
+                try:
+                    os.rename(previous, db_path)
+                except OSError as undo:
+                    raise _open_failure(_rollback_failed(db_path, e, undo)) from e
+            raise
 
 
-def recover_swap(db_path: Path) -> bool:
-    """Finish a swap whose process died between its two renames; True when one was.
-
-    Such a process left no index at `db_path`, the replaced one in `previous_dir`, and the
-    complete new one in `staging_dir`. Opening `db_path` as it is would start an empty index.
-    """
+def _finish_swap(db_path: Path) -> bool:
+    """`recover_swap` for a caller already holding the identity lock."""
     staging, previous = staging_dir(db_path), previous_dir(db_path)
     if os.path.lexists(db_path) or not previous.is_dir():
         return False
@@ -501,7 +579,7 @@ def recover_swap(db_path: Path) -> bool:
     try:
         os.rename(staging, db_path)
     except OSError as e:
-        if os.path.lexists(db_path):  # the swapping process was alive and got there first
+        if os.path.lexists(db_path):  # unlocked, the swapping process can get there first
             return False
         raise _open_failure(
             f"{db_path} is missing: a rebuild stopped while swapping in {staging}, and "
@@ -509,6 +587,18 @@ def recover_swap(db_path: Path) -> bool:
             f"finish it; {previous} holds the index it replaced."
         ) from e
     return True
+
+
+def recover_swap(db_path: Path) -> bool:
+    """Finish a swap whose process died between its two renames; True when one was.
+
+    Such a process left no index at `db_path`, the replaced one in `previous_dir`, and the
+    complete new one in `staging_dir`. Opening `db_path` as it is would start an empty index.
+    """
+    if os.path.lexists(db_path) or not previous_dir(db_path).is_dir():
+        return False
+    with _identity_lock(db_path):
+        return _finish_swap(db_path)
 
 
 def rebuild_running(db_path: Path) -> bool:
