@@ -27,6 +27,8 @@ No benchmark data enters this repository. Everything lives under `ERB_DATA_DIR`
 | `bulk_index.py` | Builds the full index in parallel; `--verify N` proves it equals stock `sync`. |
 | `index.py` | Builds or reports an index through the stock `minirag-mcp sync`. |
 | `recall.py` | Retrieval-only recall (`--full`), or the regression check (`--subset`). |
+| `doc_bm25.py` | Whole-document BM25 table, fused with a saved `--full` run's document ranking. |
+| `rerank_full.py` | A `/v1/rerank` cross-encoder over the top 50 chunks of a full run, alone and with `doc_bm25`. |
 | `run.py` | The two `claude -p` arms. Resumable; stops on usage limits. |
 | `answers.py` | Transcripts → the benchmark's answer file, with counts of what went wrong. |
 | `judge_codex.py`, `judged_eval.py` | The benchmark's evaluators with a Codex-served judge. |
