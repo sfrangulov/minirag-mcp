@@ -10,8 +10,8 @@ so answers.py and run.py read both the same way.
 
 minirag arm: the server's read tools over MCP, with the server's own instructions added
 to the system prompt, as an MCP client passes them. files arm: grep/read/list/find over
-the corpus inside a Linux container — on the owner's Mac, Defender and Jamf Protect scan
-every file open and a full-corpus search takes three to five minutes.
+the corpus inside a Linux container — on a Mac where endpoint security scans every file
+open, a full-corpus search takes three to five minutes.
 """
 
 from __future__ import annotations
