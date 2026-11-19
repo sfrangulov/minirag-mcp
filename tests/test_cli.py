@@ -9,6 +9,7 @@ import pytest
 import minirag_mcp.cli as cli
 from minirag_mcp import ocr
 from minirag_mcp.chunker import SCHEME_VERSION
+from minirag_mcp.config import DEFAULT_MODEL
 from minirag_mcp.labels.model import INSTALL_HINT, ModelError
 from minirag_mcp.lock import sync_lock
 from minirag_mcp.store import MAX_TOP_K, Store
@@ -248,7 +249,8 @@ def test_sync_completes_and_exits_zero_when_the_lock_file_cannot_be_opened(corpu
     sniffing, so both are faked: the fake magika reports a non-"ok" status,
     which sends markitdown down its normal extension-based fallback path for
     a plain .md file — the ingest is still real, just not routed through a
-    model.
+    model. The fake fastembed keeps one thing of the real one: its registry
+    lists the configured model, whose width the index handle reads from it.
     """
     if os.geteuid() == 0:  # pragma: no cover - the suite is not meant to run as root
         pytest.skip("running as root: chmod 000 denies nothing")
@@ -260,7 +262,11 @@ def test_sync_completes_and_exits_zero_when_the_lock_file_cannot_be_opened(corpu
     script = (
         "import sys, types\n"
         "fake_fastembed = types.ModuleType('fastembed')\n"
-        "fake_fastembed.TextEmbedding = object\n"
+        "fake_fastembed.TextEmbedding = type('TextEmbedding', (), {\n"
+        "    'list_supported_models': staticmethod(\n"
+        f"        lambda: [{{'model': {DEFAULT_MODEL!r}, 'dim': 1024}}]\n"
+        "    ),\n"
+        "})\n"
         "sys.modules['fastembed'] = fake_fastembed\n"
         "fake_magika = types.ModuleType('magika')\n"
         "fake_magika.Magika = type('Magika', (), {\n"
@@ -274,7 +280,8 @@ def test_sync_completes_and_exits_zero_when_the_lock_file_cannot_be_opened(corpu
         "cli._make_embedder = lambda cfg: FakeEmbedder()\n"
         f"cli.app(['sync', '--base-dir', {str(corpus)!r}, '--json'])\n"
     )
-    env = {k: v for k, v in os.environ.items() if k not in ("BASE_DIR", "BASE_DIRS", "DB_PATH")}
+    unset = ("BASE_DIR", "BASE_DIRS", "DB_PATH", "MODEL_NAME")
+    env = {k: v for k, v in os.environ.items() if k not in unset}
     try:
         proc = subprocess.run(
             [sys.executable, "-c", script], capture_output=True, text=True, timeout=180, env=env

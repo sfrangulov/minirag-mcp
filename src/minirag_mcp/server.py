@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
 from typing import Literal
@@ -13,45 +12,21 @@ from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 
 from minirag_mcp import __version__
-from minirag_mcp.chunker import SCHEME_VERSION, join_document
+from minirag_mcp.chunker import join_document
 from minirag_mcp.config import Config, ConfigError, load_config
-from minirag_mcp.embedder import Embedder
-from minirag_mcp.endpoints import EmbeddingEndpoint
+from minirag_mcp.handle import IndexHandle, OpenIndex
 from minirag_mcp.ingest.ignore import scope_excluded_by
-from minirag_mcp.ingest.pipeline import Pipeline
 from minirag_mcp.instructions import build_instructions
-from minirag_mcp.labels import LabelerSource
-from minirag_mcp.labels.model import default_model_factory
 from minirag_mcp.results import (
     DEFAULT_FIND_LIMIT,
-    embedder_notes,
-    embedding_status,
-    fts_status,
-    ignore_status,
     ingest_reply,
-    labels_status,
     list_payload,
-    ocr_status,
-    pages_status,
     result_dict,
     run_find,
     run_query,
-    scheme_status,
-    signature_status,
+    status_payload,
 )
 from minirag_mcp.security import resolve_in_roots
-from minirag_mcp.store import Store
-from minirag_mcp.sync import SyncManager
-
-
-@dataclass
-class _Ctx:
-    config: Config
-    store: Store
-    embedder: object
-    pipeline: Pipeline
-    sync: SyncManager
-    labels: LabelerSource
 
 
 def _scopes(scope: str | list[str] | None) -> tuple[str, ...]:
@@ -74,30 +49,23 @@ def create_app(
     # server whose configuration failed to load still tells the client how to use it —
     # same reason `status` keeps answering.
     mcp = FastMCP("minirag-mcp", instructions=build_instructions(env))
-    holder: dict[str, _Ctx | None] = {"ctx": None}
+    handle = (
+        None
+        if config is None or config_error is not None
+        else IndexHandle(
+            config,
+            embedder_factory=None if embedder is None else (lambda scheme: embedder),
+            model_factory=model_factory,
+        )
+    )
 
-    def ctx() -> _Ctx:
-        if config is None or config_error is not None:
+    def live() -> IndexHandle:
+        if handle is None:
             raise ToolError(f"Configuration error: {config_error or 'no configuration'}")
-        if holder["ctx"] is None:
-            if embedder is not None:
-                emb = embedder
-            else:
-                ep = config.embed_endpoints.get(config.model_name)
-                emb = Embedder(
-                    config.model_name,
-                    config.cache_dir,
-                    endpoint=EmbeddingEndpoint(ep) if ep else None,
-                )
-            store = Store(config.db_path, dim=emb.dim, fts_language=config.fts_language)
-            labels = LabelerSource(
-                config.roots, config.cache_dir, model_factory or default_model_factory
-            )
-            pipeline = Pipeline(store, emb, config, labels=labels)
-            holder["ctx"] = _Ctx(
-                config, store, emb, pipeline, SyncManager(pipeline, store, config), labels
-            )
-        return holder["ctx"]
+        return handle
+
+    def opened() -> OpenIndex:
+        return live().get()
 
     def guard(fn):
         @wraps(fn)
@@ -132,13 +100,14 @@ def create_app(
         message identifying it, and no job is started. Single-file ingests and
         queries are never blocked by a running sync.
         """
-        c = ctx()
+        h = live()
+        c = h.get()
         scope = None
         if path is not None:
             scope = resolve_in_roots(path, c.config.roots)
             if (by := scope_excluded_by(scope, c.config.roots)) is not None:
                 raise ToolError(f"{scope} is excluded by {by}; nothing under it can be synced")
-        return {"jobId": c.sync.start(scope)}
+        return {"jobId": h.sync.start(scope)}
 
     @mcp.tool
     @guard
@@ -181,7 +150,7 @@ def create_app(
         when it is a root, when indexed files are under it, or when the sync
         was started for it or for a path inside it.
         """
-        return ctx().sync.status(jobId).to_dict()
+        return live().sync.status(jobId).to_dict()
 
     @mcp.tool
     @guard
@@ -196,9 +165,10 @@ def create_app(
         is something to say, notes that the embedding endpoint is unreachable
         and the in-process model embedded instead: same vectors, slower.
         """
-        c = ctx()
-        path = resolve_in_roots(filePath, c.config.roots)
-        return ingest_reply(c.pipeline.ingest_file(path), embedder_notes(c.embedder))
+        h = live()
+        pipeline = h.ingest_pipeline()
+        path = resolve_in_roots(filePath, h.config.roots)
+        return ingest_reply(pipeline.ingest_file(path), h.notes())
 
     @mcp.tool
     @guard
@@ -211,10 +181,10 @@ def create_app(
         so reuse the same source to update an item. `labelProblem` and
         `warnings` are as in ingest_file.
         """
-        c = ctx()
+        h = live()
         return ingest_reply(
-            c.pipeline.ingest_data(data, source=source, fmt=format, title=title),
-            embedder_notes(c.embedder),
+            h.ingest_pipeline().ingest_data(data, source=source, fmt=format, title=title),
+            h.notes(),
         )
 
     @mcp.tool
@@ -230,9 +200,9 @@ def create_app(
         one to control the index key or to update a previously ingested URL.
         `labelProblem` and `warnings` are as in ingest_file.
         """
-        c = ctx()
+        h = live()
         return ingest_reply(
-            c.pipeline.ingest_url(url, source=source, title=title), embedder_notes(c.embedder)
+            h.ingest_pipeline().ingest_url(url, source=source, title=title), h.notes()
         )
 
     @mcp.tool
@@ -306,7 +276,7 @@ def create_app(
         only for having no label or no date; each `sources` row carries its
         `labels` and `date`.
         """
-        c = ctx()
+        c = opened()
         return run_query(
             c.store,
             c.embedder,
@@ -368,7 +338,7 @@ def create_app(
         and dateTo filter as in query_documents, and citations follow its
         rule: each document's `displayPath`, verbatim.
         """
-        c = ctx()
+        c = opened()
         return run_find(
             c.store,
             c.config.roots,
@@ -400,7 +370,7 @@ def create_app(
         default to 1). A chunk of a PDF carries `pages` as in
         query_documents.
         """
-        c = ctx()
+        c = opened()
         if filePath is not None:
             key = str(resolve_in_roots(filePath, c.config.roots))
         elif source is not None:
@@ -426,7 +396,7 @@ def create_app(
         responses — prefer read_chunk_neighbors when only the context
         around one chunk is needed.
         """
-        c = ctx()
+        c = opened()
         not_indexed_hint = ""
         if filePath is not None:
             key = str(resolve_in_roots(filePath, c.config.roots))
@@ -490,7 +460,7 @@ def create_app(
         sort="date" lists newest first, documents without a date last. Rows
         carry `labels` and `date` when present.
         """
-        c = ctx()
+        c = opened()
         return list_payload(
             c.store,
             c.config.roots,
@@ -512,7 +482,7 @@ def create_app(
         index entry — a file left in place under a document root is
         re-ingested by a later sync_start.
         """
-        c = ctx()
+        c = opened()
         if filePath is not None:
             key = str(resolve_in_roots(filePath, c.config.roots))
         elif source is not None:
@@ -569,31 +539,9 @@ def create_app(
         counts, and the model state, with modelHint saying why when it is
         "unavailable" — or the file's error.
         """
-        if config is None or config_error is not None:
+        if handle is None:
             return {"version": __version__, "configError": config_error or "no configuration"}
-        out: dict = {
-            "version": __version__,
-            "roots": [str(r) for r in config.roots],
-            "dbPath": str(config.db_path),
-            "model": config.model_name,
-            "hybridWeight": config.hybrid_weight,
-            "chunkScheme": SCHEME_VERSION,
-            **ocr_status(),
-            **ignore_status(config.roots),
-        }
-        try:
-            c = ctx()
-            out["chunkCount"] = c.store.chunk_count()
-            out["sourceCount"] = c.store.source_count()
-            out.update(embedding_status(c.embedder))
-            out.update(scheme_status(c.store))
-            out.update(fts_status(c.store))
-            out.update(signature_status(c.store))
-            out.update(pages_status(c.store))
-            out.update(labels_status(c.labels, c.store))
-        except Exception as e:
-            out["indexError"] = str(e)
-        return out
+        return status_payload(config, handle)
 
     return mcp
 

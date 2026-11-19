@@ -12,9 +12,10 @@ import unicodedata
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from minirag_mcp import literal, ocr
-from minirag_mcp.chunker import shared_lines
+from minirag_mcp import __version__, literal, ocr
+from minirag_mcp.chunker import SCHEME_VERSION, shared_lines
 from minirag_mcp.config import Config
 from minirag_mcp.ingest import ignore
 from minirag_mcp.ingest.pipeline import IngestResult
@@ -41,6 +42,9 @@ from minirag_mcp.store import (
     SourceInfo,
     Store,
 )
+
+if TYPE_CHECKING:
+    from minirag_mcp.handle import IndexHandle
 
 EMPTY_INDEX_NOTICE = (
     "Nothing is indexed yet, so no query can match. Index the document roots first: "
@@ -261,6 +265,37 @@ def ocr_status() -> dict:
         "ocr": "unavailable",
         "ocrHint": f"scanned PDFs and images cannot be indexed; {ocr.INSTALL_HINT}",
     }
+
+
+def status_payload(config: Config, handle: IndexHandle) -> dict:
+    """`status` for a valid configuration, the same in both shells.
+
+    An index that cannot be opened is reported as `indexError`, not raised: `status` is
+    what a broken setup is diagnosed with.
+    """
+    out: dict = {
+        "version": __version__,
+        "roots": [str(r) for r in config.roots],
+        "dbPath": str(config.db_path),
+        "model": config.model_name,
+        "hybridWeight": config.hybrid_weight,
+        "chunkScheme": SCHEME_VERSION,
+        **ocr_status(),
+        **ignore_status(config.roots),
+    }
+    try:
+        opened = handle.get()
+        out["chunkCount"] = opened.store.chunk_count()
+        out["sourceCount"] = opened.store.source_count()
+        out.update(embedding_status(opened.embedder))
+        out.update(scheme_status(opened.store))
+        out.update(fts_status(opened.store))
+        out.update(signature_status(opened.store))
+        out.update(pages_status(opened.store))
+        out.update(labels_status(opened.labels, opened.store))
+    except Exception as e:
+        out["indexError"] = str(e)
+    return out
 
 
 def display_path(source: str, roots: Sequence[Path] = ()) -> str:

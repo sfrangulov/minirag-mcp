@@ -58,6 +58,20 @@ def _flags(env: dict) -> list[str]:
     return out
 
 
+async def test_status_is_identical_in_both_shells(
+    root, tmp_path, capsys, monkeypatch, fake_embedder
+):
+    monkeypatch.setattr(cli, "_make_embedder", lambda cfg: fake_embedder)
+    env = {"BASE_DIR": str(root), "DB_PATH": str(tmp_path / "db")}
+    code, _, _ = run_cli(["sync", *_flags(env)], capsys)
+    assert code == 0
+    is_error, st = await call_mcp(env, "status", {}, fake_embedder)
+    code, out, _ = run_cli(["status", *_flags(env), "--json"], capsys)
+    assert not is_error and code == 0
+    assert (st["sourceCount"], "indexError" in st) == (1, False)
+    assert json.loads(out) == st
+
+
 async def test_an_empty_query_is_refused_by_both(
     root, tmp_path, capsys, monkeypatch, fake_embedder
 ):

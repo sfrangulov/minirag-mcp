@@ -12,36 +12,26 @@ from typing import Annotated
 from cyclopts import App, Parameter
 
 from minirag_mcp import __version__
-from minirag_mcp.chunker import SCHEME_VERSION, join_document
+from minirag_mcp.chunker import join_document
 from minirag_mcp.config import Config, ConfigError, load_config
-from minirag_mcp.embedder import Embedder, EmbedderUnavailableError, UnknownModelError
-from minirag_mcp.endpoints import EmbeddingEndpoint
+from minirag_mcp.embedder import EmbedderUnavailableError, UnknownModelError
+from minirag_mcp.handle import IndexHandle, OpenIndex
 from minirag_mcp.ingest.ignore import IGNORE_FILE, IgnoredFileError, excluded_by
 from minirag_mcp.ingest.pipeline import IngestResult, Pipeline
 from minirag_mcp.ingest.scanner import scan_roots
-from minirag_mcp.labels import LabelerSource
-from minirag_mcp.labels.model import default_model_factory
 from minirag_mcp.lock import SyncLockBusy
 from minirag_mcp.results import (
     DEFAULT_FIND_LIMIT,
     QueryError,
-    embedder_notes,
-    embedding_status,
-    fts_status,
-    ignore_status,
     ingest_reply,
-    labels_status,
     list_payload,
-    ocr_status,
-    pages_status,
     result_dict,
     run_find,
     run_query,
-    scheme_status,
-    signature_status,
+    status_payload,
 )
 from minirag_mcp.security import SecurityError, resolve_in_roots
-from minirag_mcp.store import DimensionMismatchError, IndexOpenError, Store
+from minirag_mcp.store import DimensionMismatchError, IndexOpenError
 from minirag_mcp.sync import run_sync
 
 app = App(name="minirag-mcp", version=__version__)
@@ -64,9 +54,8 @@ ModelNameOpt = Annotated[
 ]
 
 
-def _make_embedder(cfg: Config) -> Embedder:  # patched in tests
-    ep = cfg.embed_endpoints.get(cfg.model_name)
-    return Embedder(cfg.model_name, cfg.cache_dir, endpoint=EmbeddingEndpoint(ep) if ep else None)
+def _make_embedder(cfg: Config) -> object | None:
+    return None  # patched in tests; None builds through make_embedder
 
 
 def _make_model_factory() -> Callable | None:
@@ -100,10 +89,6 @@ def _parse_labels(flags: list[str] | None) -> dict[str, str | list[str]] | None:
     return {k: v[0] if len(v) == 1 else v for k, v in out.items()}
 
 
-def _label_source(cfg: Config) -> LabelerSource:
-    return LabelerSource(cfg.roots, cfg.cache_dir, _make_model_factory() or default_model_factory)
-
-
 def _fail(msg: str) -> None:
     print(f"error: {msg}", file=sys.stderr)
     raise SystemExit(1)
@@ -124,17 +109,25 @@ def _load_cfg(
     )
 
 
+def _handle(cfg: Config) -> IndexHandle:
+    emb = _make_embedder(cfg)
+    return IndexHandle(
+        cfg,
+        embedder_factory=None if emb is None else (lambda scheme: emb),
+        model_factory=_make_model_factory(),
+    )
+
+
 def _load(
     base_dir: list[str] | None,
     db_path: str | None,
     cache_dir: str | None,
     model_name: str | None,
-) -> tuple[Config, Store, Pipeline]:
+) -> tuple[Config, IndexHandle, OpenIndex]:
     try:
         cfg = _load_cfg(base_dir, db_path, cache_dir, model_name)
-        emb = _make_embedder(cfg)
-        store = Store(cfg.db_path, dim=emb.dim, fts_language=cfg.fts_language)
-        return cfg, store, Pipeline(store, emb, cfg, labels=_label_source(cfg))
+        handle = _handle(cfg)
+        return cfg, handle, handle.get()
     except ConfigError as e:
         _fail(str(e))
         raise AssertionError from e  # unreachable
@@ -216,7 +209,8 @@ def ingest(
     json: JsonFlag = False,
 ):
     """Ingest files or directories (recursive)."""
-    cfg, store, pipeline = _load(base_dir, db_path, cache_dir, model_name)
+    cfg, handle, _ = _load(base_dir, db_path, cache_dir, model_name)
+    pipeline = handle.ingest_pipeline()
     files: list[Path] = []
     # Already held to the rules by their scan; only files named directly are checked again.
     scanned: set[Path] = set()
@@ -257,7 +251,7 @@ def ingest(
                 done.append(pipeline.ingest_file(f, rules_checked=f in scanned))
             except Exception as e:  # per-file failures never abort the batch
                 failures.append({"source": str(f), "error": str(e)})
-    notes = embedder_notes(pipeline.embedder)
+    notes = handle.notes()
     payload = {"ingested": [ingest_reply(r, notes) for r in done], "failed": failures}
     human = "\n".join([f"ingested {len(done)} file(s):"] + [f"  {r.source}" for r in done])
     _emit(payload, json, human)
@@ -281,13 +275,14 @@ def ingest_url(
     json: JsonFlag = False,
 ):
     """Fetch an http(s) URL and index it."""
-    _, _, pipeline = _load(base_dir, db_path, cache_dir, model_name)
+    _, handle, _ = _load(base_dir, db_path, cache_dir, model_name)
+    pipeline = handle.ingest_pipeline()
     try:
         with pipeline.job() as report:
             r = pipeline.ingest_url(url, source=source, title=title)
     except Exception as e:
         _fail(str(e))
-    reply = ingest_reply(r, embedder_notes(pipeline.embedder))
+    reply = ingest_reply(r, handle.notes())
     _emit(reply, json, f"ingested {r.source} ({r.chunk_count} chunks)")
     _warn_labelling(pipeline, report.problems)
 
@@ -306,7 +301,7 @@ def sync(
 
     Refuses to start if another process is already syncing this index.
     """
-    cfg, store, pipeline = _load(base_dir, db_path, cache_dir, model_name)
+    cfg, _, opened = _load(base_dir, db_path, cache_dir, model_name)
     scope = None
     if path is not None:
         try:
@@ -315,8 +310,8 @@ def sync(
             _fail(str(e))
     try:
         counts, errors = run_sync(
-            pipeline,
-            store,
+            opened.pipeline,
+            opened.store,
             cfg.roots,
             cfg.max_file_size,
             scope=scope,
@@ -355,11 +350,11 @@ def query(
     if top_k < 1:
         _fail(f"--top-k must be at least 1, got {top_k}")
     labels = _parse_labels(label)
-    cfg, store, pipeline = _load(base_dir, db_path, cache_dir, model_name)
+    cfg, _, opened = _load(base_dir, db_path, cache_dir, model_name)
     try:
         payload = run_query(
-            store,
-            pipeline.embedder,
+            opened.store,
+            opened.embedder,
             cfg,
             text,
             top_k=top_k,
@@ -367,7 +362,7 @@ def query(
             labels=labels,
             date_from=date_from,
             date_to=date_to,
-            label_source=pipeline.labels,
+            label_source=opened.labels,
         )
     except (QueryError, EmbedderUnavailableError) as e:
         _fail(str(e))
@@ -442,10 +437,10 @@ def find(
     starts with a dash goes after `--`, and every option before it.
     """
     labels = _parse_labels(label)
-    cfg, store, pipeline = _load(base_dir, db_path, cache_dir, model_name)
+    cfg, _, opened = _load(base_dir, db_path, cache_dir, model_name)
     try:
         payload = run_find(
-            store,
+            opened.store,
             cfg.roots,
             terms,
             match="any" if any_ else "all",
@@ -455,7 +450,7 @@ def find(
             date_to=date_to,
             limit=limit,
             offset=offset,
-            label_source=pipeline.labels,
+            label_source=opened.labels,
         )
     except QueryError as e:
         _fail(str(e))
@@ -479,7 +474,7 @@ def read_neighbors(
     json: JsonFlag = False,
 ):
     """Read chunks around a given chunk index."""
-    cfg, store, _ = _load(base_dir, db_path, cache_dir, model_name)
+    cfg, _, opened = _load(base_dir, db_path, cache_dir, model_name)
     if file_path is not None:
         try:
             key = str(resolve_in_roots(file_path, cfg.roots, require_absolute=False))
@@ -489,7 +484,7 @@ def read_neighbors(
         key = source
     else:
         _fail("provide --file-path or --source")
-    chunks = store.neighbors(key, chunk_index, before=before, after=after)
+    chunks = opened.store.neighbors(key, chunk_index, before=before, after=after)
     payload = {"chunks": [result_dict(r) for r in chunks]}
     human = (
         "\n\n".join(
@@ -518,7 +513,7 @@ def read(
     chunk repeats to carry it into its own vector is emitted once, where the document
     had it.
     """
-    cfg, store, _ = _load(base_dir, db_path, cache_dir, model_name)
+    cfg, _, opened = _load(base_dir, db_path, cache_dir, model_name)
     if path is not None:
         try:
             key = str(resolve_in_roots(path, cfg.roots, require_absolute=False))
@@ -528,10 +523,10 @@ def read(
         key = source
     else:
         _fail("provide a path or --source")
-    chunks = store.all_chunks(key)
+    chunks = opened.store.all_chunks(key)
     if not chunks:
         _fail(f"source not found in index: {key}")
-    info = store.get_source(key)
+    info = opened.store.get_source(key)
     text = join_document(chunks)
     payload = {
         "source": key,
@@ -571,17 +566,17 @@ def list_cmd(
     named in a warning on stderr and in unlistedFolders with --json.
     """
     labels = _parse_labels(label)
-    cfg, store, pipeline = _load(base_dir, db_path, cache_dir, model_name)
+    cfg, _, opened = _load(base_dir, db_path, cache_dir, model_name)
     try:
         payload = list_payload(
-            store,
+            opened.store,
             cfg.roots,
             tuple(scope or ()),
             labels=labels,
             date_from=date_from,
             date_to=date_to,
             sort=sort,
-            label_source=pipeline.labels,
+            label_source=opened.labels,
         )
     except QueryError as e:
         _fail(str(e))
@@ -614,37 +609,12 @@ def status(
     # exactly what you run `status` to diagnose, so it reports the error and exits 0.
     # Every other command still fails loudly on the same ConfigError.
     try:
-        _load_cfg(base_dir, db_path, cache_dir, model_name)
+        cfg = _load_cfg(base_dir, db_path, cache_dir, model_name)
     except ConfigError as e:
         payload = {"version": __version__, "configError": str(e)}
         _emit(payload, json, "\n".join(f"{k}: {v}" for k, v in payload.items()))
         return
-    cfg = _load_cfg(base_dir, db_path, cache_dir, model_name)
-    payload = {
-        "version": __version__,
-        "roots": [str(r) for r in cfg.roots],
-        "dbPath": str(cfg.db_path),
-        "model": cfg.model_name,
-        "hybridWeight": cfg.hybrid_weight,
-        "chunkScheme": SCHEME_VERSION,
-        **ocr_status(),
-        **ignore_status(cfg.roots),
-    }
-    # An index that cannot be opened is reported, not raised: the server's `status` does
-    # the same, and both are what a broken setup is diagnosed with.
-    try:
-        emb = _make_embedder(cfg)
-        store = Store(cfg.db_path, dim=emb.dim, fts_language=cfg.fts_language)
-        payload["chunkCount"] = store.chunk_count()
-        payload["sourceCount"] = store.source_count()
-        payload.update(embedding_status(emb))
-        payload.update(scheme_status(store))
-        payload.update(fts_status(store))
-        payload.update(signature_status(store))
-        payload.update(pages_status(store))
-        payload.update(labels_status(_label_source(cfg), store))
-    except Exception as e:
-        payload["indexError"] = str(e)
+    payload = status_payload(cfg, _handle(cfg))
     human = "\n".join(f"{k}: {v}" for k, v in payload.items())
     _emit(payload, json, human)
 
@@ -661,7 +631,7 @@ def delete(
     json: JsonFlag = False,
 ):
     """Delete an indexed file (by path) or data/url item (by --source)."""
-    cfg, store, _ = _load(base_dir, db_path, cache_dir, model_name)
+    cfg, _, opened = _load(base_dir, db_path, cache_dir, model_name)
     if path is not None:
         try:
             key = str(resolve_in_roots(path, cfg.roots, require_absolute=False))
@@ -671,7 +641,7 @@ def delete(
         key = source
     else:
         _fail("provide a path or --source")
-    deleted = store.delete_source(key)
+    deleted = opened.store.delete_source(key)
     if deleted == 0:
         _fail(f"source not found in index: {key}")
     _emit({"source": key, "deletedChunks": deleted}, json, f"deleted {deleted} chunk(s) of {key}")
@@ -695,7 +665,8 @@ def classify_try(
 
     Nothing is embedded or stored.
     """
-    cfg, _, pipeline = _load(base_dir, db_path, cache_dir, model_name)
+    cfg, _, opened = _load(base_dir, db_path, cache_dir, model_name)
+    pipeline = opened.pipeline
     try:
         target = resolve_in_roots(path, cfg.roots, require_absolute=False)
         preview = pipeline.preview_labels(target)
