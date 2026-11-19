@@ -12,7 +12,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
-from markitdown import MarkItDown
+from markitdown import MarkItDown, StreamInfo
 from requests.adapters import HTTPAdapter
 
 from minirag_mcp import ocr
@@ -418,6 +418,21 @@ def _parse_vtt(path: Path) -> ParsedDoc:
     return ParsedDoc(markdown=markdown, title=_file_title(markdown, None, path.stem))
 
 
+# markitdown guesses a text file's charset from its first 4 KB, so a UTF-8 file that is
+# pure ASCII that far is decoded as ASCII and refused at its first later accent or dash.
+_PLAIN_TEXT_EXTENSIONS = frozenset({".txt", ".md", ".markdown"})
+
+
+def _utf8_hint(path: Path) -> StreamInfo | None:
+    if path.suffix.lower() not in _PLAIN_TEXT_EXTENSIONS:
+        return None
+    try:
+        path.read_bytes().decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    return StreamInfo(charset="utf-8")
+
+
 def parse_file(path: Path, config: Config | None = None) -> ParsedDoc:
     if path.suffix.lower() == ".vtt":
         return _parse_vtt(path)
@@ -435,7 +450,7 @@ def parse_file(path: Path, config: Config | None = None) -> ParsedDoc:
         title = _stem_title(_strip_extension_suffix(path.stem))
         return ParsedDoc(markdown=text, title=title, ocr_engine=ocr.ENGINE_RAPIDOCR)
     try:
-        result = _md().convert(str(path))
+        result = _md().convert(str(path), stream_info=_utf8_hint(path))
     except Exception as e:  # markitdown may raise lib-specific errors too
         raise ParserError(f"Failed to convert {path}: {e}") from e
     markdown = _converted_markdown(result)

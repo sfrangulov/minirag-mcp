@@ -490,3 +490,22 @@ def test_a_moved_source_keeps_its_pages(store):
     store.replace_source("/a.pdf", [replace(rec("/a.pdf", 0, "x"), pages="3-4")])
     store.move_source("/a.pdf", "/sub/a.pdf", mtime=2.0)
     assert [c.pages for c in store.all_chunks("/sub/a.pdf")] == ["3-4"]
+
+
+# LanceDB's indexed BM25 search returns rows with equal scores in no fixed order (two
+# orders in thirty identical queries, measured); a fused ranking that took that order as
+# given answered one query differently from one process to the next.
+def test_ties_are_ranked_the_same_whatever_order_lancedb_returns_them(store, monkeypatch):
+    from lancedb.query import LanceQueryBuilder
+
+    for name in ("a.md", "b.md", "c.md", "d.md"):
+        store.replace_source(name, [rec(name, 0, "the procurement request form", vec=[0.5] * 8)])
+    store.update_indices()
+
+    def ranked():
+        return [r.source for r in store.search("procurement request", [0.5] * 8, top_k=4)]
+
+    first = ranked()
+    to_list = LanceQueryBuilder.to_list
+    monkeypatch.setattr(LanceQueryBuilder, "to_list", lambda self: to_list(self)[::-1])
+    assert ranked() == first

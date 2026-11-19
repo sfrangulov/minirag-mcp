@@ -227,6 +227,11 @@ def _run_sync_unlocked(
     counts["signed"] += signed
     errors.extend(sign_errors)
 
+    # Also on a run that changed nothing: an index written before this existed is
+    # brought up to date by its next sync.
+    if problem := store.update_indices():
+        errors.append({"source": str(store.db_path), "error": problem})
+
     # Read once the job has ended, since releasing the model can add a problem of its
     # own. Not failures: the documents are indexed, and only their labels are missing.
     if report.problems:

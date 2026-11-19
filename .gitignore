@@ -18,3 +18,7 @@ models/
 
 # agent working files (reports, sdd scratch) — never committed
 .superpowers/
+
+# local secrets (API keys) — never committed
+.env
+.env.*
