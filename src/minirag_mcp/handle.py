@@ -13,7 +13,7 @@ from dataclasses import dataclass
 
 from minirag_mcp.config import Config
 from minirag_mcp.embedder import Embedder, prefix_rule
-from minirag_mcp.endpoints import EmbeddingEndpoint
+from minirag_mcp.endpoints import EmbeddingEndpoint, RerankEndpoint
 from minirag_mcp.identity import EmbeddingScheme
 from minirag_mcp.ingest.pipeline import Pipeline
 from minirag_mcp.labels import LabelerSource
@@ -55,6 +55,7 @@ class OpenIndex:
     embedder: object
     pipeline: Pipeline
     labels: LabelerSource
+    reranker: RerankEndpoint | None = None
 
 
 class IndexHandle:
@@ -114,7 +115,8 @@ class IndexHandle:
             self._release(embedder)
             raise
         pipeline = Pipeline(store, embedder, config, labels=self._labels)
-        return OpenIndex(config, store, embedder, pipeline, self._labels)
+        reranker = RerankEndpoint(config.rerank_endpoint) if config.rerank_endpoint else None
+        return OpenIndex(config, store, embedder, pipeline, self._labels, reranker)
 
     def _release(self, embedder: object) -> None:
         if self._owns_embedders and (endpoint := getattr(embedder, "endpoint", None)):
@@ -140,3 +142,5 @@ class IndexHandle:
             current, self._current = self._current, None
         if current is not None:
             self._release(current[0].embedder)
+            if current[0].reranker is not None:
+                current[0].reranker.close()

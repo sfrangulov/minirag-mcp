@@ -285,3 +285,105 @@ def test_fts_failure_degrades_to_vector_ranking(store, monkeypatch):
     got = store.search("ERR_CONNECTION_REFUSED", V(1.0), top_k=3, hybrid_weight=0.6)
     assert calls["fts"] == 1, "the FTS path must actually have been taken"
     assert got and got[0].source == "/cook.md"  # degraded to pure vector order
+
+
+def last_highest(query, texts):
+    return [float(i) for i in range(len(texts))]
+
+
+@pytest.fixture
+def store12(tmp_path):
+    s = Store(tmp_path / "db12", dim=8)
+    s.replace_source(
+        "/many.md", [rec("/many.md", i, f"chunk number {i}", V(i * 0.05)) for i in range(12)]
+    )
+    return s
+
+
+def test_the_reranker_reorders_only_the_top_n(store12):
+    first = store12.search("q", V(0.0), top_k=12, hybrid_weight=0.6)
+    got = store12.search(
+        "q", V(0.0), top_k=12, hybrid_weight=0.6, reranker=last_highest, rerank_top=5
+    )
+    assert [g.text for g in got[:5]] == [f.text for f in first[:5]][::-1]
+    assert [g.text for g in got[5:]] == [f.text for f in first[5:]]
+    assert [g.score for g in got[:5]] == [f.score for f in first[:5]][::-1]
+    assert all(g.rerank_score is not None for g in got[:5])
+    assert all(g.rerank_score is None for g in got[5:])
+
+
+def test_the_reranker_sees_the_query_and_the_chunk_texts(store12):
+    seen = []
+
+    def spy(query, texts):
+        seen.append((query, list(texts)))
+        return [0.0] * len(texts)
+
+    first = store12.search("the query", V(0.0), top_k=4, hybrid_weight=0.6)
+    store12.search("the query", V(0.0), top_k=4, hybrid_weight=0.6, reranker=spy, rerank_top=4)
+    assert seen == [("the query", [f.text for f in first])]
+
+
+def test_equal_scores_keep_the_fused_order(store12):
+    first = store12.search("q", V(0.0), top_k=6, hybrid_weight=0.6)
+    got = store12.search(
+        "q", V(0.0), top_k=6, hybrid_weight=0.6, reranker=lambda q, t: [1.0] * len(t)
+    )
+    assert [g.text for g in got] == [f.text for f in first]
+
+
+def test_a_failing_reranker_keeps_the_first_stage_order(store12):
+    def boom(query, texts):
+        raise RuntimeError("down")
+
+    first = store12.search("q", V(0.0), top_k=6, hybrid_weight=0.6)
+    got = store12.search("q", V(0.0), top_k=6, hybrid_weight=0.6, reranker=boom)
+    assert got == first
+
+
+def test_a_wrong_number_of_scores_keeps_the_first_stage_order(store12):
+    first = store12.search("q", V(0.0), top_k=6, hybrid_weight=0.6)
+    got = store12.search("q", V(0.0), top_k=6, hybrid_weight=0.6, reranker=lambda q, t: [1.0])
+    assert got == first
+
+
+def test_distance_filters_apply_before_reranking(hybrid_store):
+    seen = []
+
+    def spy(query, texts):
+        seen.append(list(texts))
+        return [0.0] * len(texts)
+
+    got = hybrid_store.search(
+        "widget", V(0.0), top_k=5, hybrid_weight=0.6, max_distance=0.5, reranker=spy
+    )
+    assert got and seen
+    assert not any("keyed" in t for t in seen[0])
+    assert all(r.distance is not None for r in got)
+
+
+def test_the_fetch_window_covers_rerank_top(tmp_path):
+    s = Store(tmp_path / "db80", dim=8)
+    s.replace_source(
+        "/big.md", [rec("/big.md", i, f"chunk number {i}", V(i * 0.01)) for i in range(80)]
+    )
+    seen = []
+
+    def spy(query, texts):
+        seen.append(len(texts))
+        return [0.0] * len(texts)
+
+    s.search("q", V(0.0), top_k=5, hybrid_weight=0.0, reranker=spy, rerank_top=60)
+    assert seen == [60]
+
+
+def test_max_files_applies_after_reranking(store):
+    # The reranker promotes the cook.md chunk to first place; max_files=1 must then keep
+    # its source, where a cut before reranking would have kept auth.md.
+    def prefer_cook(query, texts):
+        return [1.0 if "Borscht" in t else 0.0 for t in texts]
+
+    plain = store.search("x", V(0.0), top_k=5, hybrid_weight=0.0, max_files=1)
+    got = store.search("x", V(0.0), top_k=5, hybrid_weight=0.0, max_files=1, reranker=prefer_cook)
+    assert plain[0].source == "/auth.md"
+    assert {g.source for g in got} == {"/cook.md"}

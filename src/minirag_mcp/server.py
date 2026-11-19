@@ -268,6 +268,11 @@ def create_app(
         present only when there is something to say, explains the last:
         the results are the same, only slower to come.
 
+        Results are in reranked order when a reranker is configured:
+        `rerankScore` is the cross-encoder's score, `score` the first-stage
+        score, and `reranked` says which happened. If the reranker could not
+        be reached, `warnings` says so and the order is the first stage's.
+
         Cite what you take, so the user can verify it, in whatever
         language you answer: end with a Sources list, one line per
         document you actually used, each line just that document's
@@ -294,6 +299,7 @@ def create_app(
             date_from=dateFrom,
             date_to=dateTo,
             label_source=c.labels,
+            reranker=c.reranker,
         )
 
     @mcp.tool

@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 from minirag_mcp import __version__, literal, ocr
 from minirag_mcp.chunker import SCHEME_VERSION, shared_lines
 from minirag_mcp.config import Config
+from minirag_mcp.endpoints import RerankEndpoint
 from minirag_mcp.ingest import ignore
 from minirag_mcp.ingest.pipeline import IngestResult
 from minirag_mcp.ingest.scanner import FileState, compute_states, scan_roots
@@ -83,6 +84,31 @@ def embedder_notes(embedder) -> list[str]:
     return [warning] if warning else []
 
 
+def rerank_status(reranker: RerankEndpoint | None) -> dict:
+    """Whether results are reranked, and while the endpoint is unreachable, why not."""
+    if reranker is None:
+        return {"reranker": "off"}
+    if reranker.last_error:
+        return {"reranker": "unreachable", "rerankWarning": reranker.last_error}
+    return {"reranker": "endpoint"}
+
+
+class _Recorder:
+    """One query's view of a shared reranker: what it failed with, kept per call so
+    concurrent queries share no state."""
+
+    def __init__(self, reranker: RerankEndpoint) -> None:
+        self._reranker = reranker
+        self.error: str | None = None
+
+    def __call__(self, query: str, passages: list[str]) -> list[float]:
+        try:
+            return self._reranker.scores(query, passages)
+        except Exception as e:
+            self.error = str(e)
+            raise
+
+
 def ingest_reply(r: IngestResult, notes: Sequence[str] = ()) -> dict:
     """One ingested document as the ingest tools and commands report it.
 
@@ -117,6 +143,8 @@ def result_dict(r: SearchResult) -> dict:
         "distance": r.distance,
         "parentId": r.parent_id or None,
     }
+    if r.rerank_score is not None:
+        out["rerankScore"] = r.rerank_score
     if r.pages:
         out["pages"] = r.pages
     return out
@@ -313,6 +341,7 @@ def status_payload(config: Config, handle: IndexHandle) -> dict:
         out["chunkCount"] = opened.store.chunk_count()
         out["sourceCount"] = opened.store.source_count()
         out.update(embedding_status(opened.embedder))
+        out.update(rerank_status(opened.reranker))
         out.update(scheme_status(opened.store))
         out.update(fts_status(opened.store))
         out.update(signature_status(opened.store))
@@ -425,6 +454,7 @@ def run_query(
     date_from: str | None = None,
     date_to: str | None = None,
     label_source: LabelerSource | None = None,
+    reranker: RerankEndpoint | None = None,
 ) -> dict:
     """`query_documents` and `minirag-mcp query`, as one implementation.
 
@@ -438,6 +468,7 @@ def run_query(
         raise QueryError(f"topK must be at least 1, got {top_k}")
     scopes = tuple(scopes)
     label_filter, labeler = _parse_filter(store, labels, date_from, date_to, label_source)
+    recorder = _Recorder(reranker) if reranker is not None else None
     results = store.search(
         query,
         embedder.embed_query(query),
@@ -449,6 +480,8 @@ def run_query(
         grouping=config.grouping,
         max_files=config.max_files,
         filter_sql=to_sql(label_filter) if label_filter else None,
+        reranker=recorder,
+        rerank_top=config.rerank_top,
     )
     payload = {
         "results": [result_dict(r) for r in results],
@@ -456,8 +489,12 @@ def run_query(
         "parents": parent_map(results),
         # Read after the query was embedded: that embedding is what may have fallen back.
         "embeddingBackend": getattr(embedder, "backend", "in-process"),
+        "reranked": any(r.rerank_score is not None for r in results),
     }
-    if notes := embedder_notes(embedder):
+    notes = embedder_notes(embedder)
+    if recorder is not None and recorder.error:
+        notes.append(f"Reranking was skipped ({recorder.error}); results are in first-stage order.")
+    if notes:
         payload["warnings"] = notes
     add_look_alikes(payload["sources"], store, config.roots)
     if label_filter is not None and labeler is not None:

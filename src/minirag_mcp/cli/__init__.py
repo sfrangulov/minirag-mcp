@@ -363,6 +363,7 @@ def query(
             date_from=date_from,
             date_to=date_to,
             label_source=opened.labels,
+            reranker=opened.reranker,
         )
     except (QueryError, EmbedderUnavailableError) as e:
         _fail(str(e))

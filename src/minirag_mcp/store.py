@@ -98,6 +98,27 @@ class SearchResult:
     doc_date: str = ""
     doc_date_source: str = ""
     pages: str = ""
+    # The cross-encoder's raw score; None for a hit that was not reranked. `score` stays
+    # the first-stage fused score.
+    rerank_score: float | None = None
+
+
+def _rerank(
+    results: list[SearchResult],
+    query_text: str,
+    reranker: Callable[[str, list[str]], list[float]],
+    rerank_top: int,
+) -> list[SearchResult]:
+    head, tail = results[:rerank_top], results[rerank_top:]
+    try:
+        scores = [float(x) for x in reranker(query_text, [r.text for r in head])]
+    except Exception:
+        return results
+    if len(scores) != len(head):
+        return results
+    scored = [replace(r, rerank_score=x) for r, x in zip(head, scores, strict=True)]
+    scored.sort(key=lambda r: -r.rerank_score)  # stable: ties keep fused order
+    return scored + tail
 
 
 @dataclass(frozen=True)
@@ -1603,6 +1624,8 @@ class Store:
         include_parents: bool = True,
         filter_sql: str | None = None,
         document_weight: float = 0.0,
+        reranker: Callable[[str, list[str]], list[float]] | None = None,
+        rerank_top: int = 30,
     ) -> list[SearchResult]:
         """Hybrid search: vector + BM25 fused by weighted RRF, then filtered.
 
@@ -1625,6 +1648,11 @@ class Store:
           a distance are kept unconditionally, since a distance-gap rule has nothing to
           judge them by. Surviving results keep their fused-rank order.
 
+        With a `reranker`, the first `rerank_top` results left after those two filters are
+        rescored against the query text and re-sorted by descending score (ties keep
+        fused order); the rest follow in fused order. A reranker that raises, or returns
+        the wrong number of scores, leaves the fused order untouched.
+
         `max_files` then keeps only the first N distinct sources in rank order, and the
         list is truncated to `top_k` last.
 
@@ -1632,7 +1660,7 @@ class Store:
         enclosing section, rebuilt from the chunk's siblings. Ranking is unaffected —
         the retrieval unit is what was scored, and the section is only what is read.
         """
-        fetch = max(top_k * 4, 50)
+        fetch = max(top_k * 4, 50, rerank_top if reranker else 0)
         clause = _and_clauses(sql_clause(scopes), filter_sql)
 
         vq = self._table.search(query_vector).limit(fetch)
@@ -1713,6 +1741,9 @@ class Store:
             if distances:
                 kept = set(distances[: relevance_cutoff(distances, grouping)])
                 results = [r for r in results if r.distance is None or r.distance in kept]
+
+        if reranker is not None and results:
+            results = _rerank(results, query_text, reranker, rerank_top)
 
         if max_files is not None:
             keep: list[SearchResult] = []

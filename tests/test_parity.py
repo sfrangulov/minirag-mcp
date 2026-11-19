@@ -239,6 +239,30 @@ async def test_both_shells_pass_on_an_embedding_fallback(
         assert status["embeddingWarning"] == "W"
 
 
+async def test_reranked_queries_are_identical_in_both_shells(
+    root, tmp_path, capsys, monkeypatch, fake_embedder, fake_llama
+):
+    monkeypatch.setattr(cli, "_make_embedder", lambda cfg: fake_embedder)
+    (root / "sub" / "b.md").write_text("# Beta\n\nAlpha tokens and auth in a second note.")
+    monkeypatch.setenv("RERANK_URL", fake_llama.url("/v1/rerank"))
+    monkeypatch.setenv("RERANK_MODEL", "rr")
+    env = {
+        "BASE_DIR": str(root),
+        "DB_PATH": str(tmp_path / "db"),
+        **{k: os.environ[k] for k in ("RERANK_URL", "RERANK_MODEL")},
+    }
+    assert run_cli(["sync", *_flags(env)], capsys)[0] == 0
+    args = {"query": "alpha tokens"}
+    is_error, found = await call_mcp(env, "query_documents", args, fake_embedder)
+    code, out, _ = run_cli(["query", "alpha tokens", *_flags(env), "--json"], capsys)
+    assert not is_error and code == 0
+    assert found["reranked"] is True and "rerankScore" in found["results"][0]
+    assert json.loads(out) == found
+    is_error, st = await call_mcp(env, "status", {}, fake_embedder)
+    _, out, _ = run_cli(["status", *_flags(env), "--json"], capsys)
+    assert st["reranker"] == "endpoint" and json.loads(out) == st
+
+
 @pytest.mark.skipif(os.geteuid() == 0, reason="root reads a chmod 000 folder anyway")
 async def test_a_folder_the_listing_cannot_see_into_is_reported_by_both(
     root, tmp_path, capsys, monkeypatch, fake_embedder

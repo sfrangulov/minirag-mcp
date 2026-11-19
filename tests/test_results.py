@@ -27,6 +27,7 @@ import pytest
 from conftest import FakeEmbedder, FakeModelFactory
 from label_helpers import L, record
 from minirag_mcp.config import Config
+from minirag_mcp.endpoints import Endpoint, RerankEndpoint
 from minirag_mcp.labels import LabelerSource
 from minirag_mcp.results import (
     QueryError,
@@ -35,6 +36,7 @@ from minirag_mcp.results import (
     documents_status,
     labels_status,
     list_payload,
+    rerank_status,
     run_query,
 )
 from minirag_mcp.store import LABEL_COLUMNS, SearchResult, Store
@@ -294,7 +296,7 @@ def test_an_unfiltered_query_has_exactly_the_old_keys(
             "budget review",
             label_source=source,
         )
-        assert set(payload) == {"results", "sources", "parents", "embeddingBackend"}
+        assert set(payload) == {"results", "sources", "parents", "embeddingBackend", "reranked"}
     # Labels were stored, so the source row shows them; the shell keys stay unchanged.
     assert "labels" in payload["sources"][0]
 
@@ -574,3 +576,61 @@ def test_a_query_ranks_with_the_configured_document_weight(tmp_path, root, store
 
     assert first(0.0) == "b.md"
     assert first(0.5) == "a.md"
+
+
+def _two_chunks(store, embedder, root):
+    path = root / "r.md"
+    path.write_text("x")
+    texts = ["budget alpha", "budget review plan"]
+    store.replace_source(
+        str(path),
+        [
+            replace(
+                record(
+                    str(path),
+                    {},
+                    text=t,
+                    vector=embedder.embed_documents([t])[0],
+                    mtime=path.stat().st_mtime,
+                ),
+                id=f"{path}#{i}",
+                chunk_index=i,
+            )
+            for i, t in enumerate(texts)
+        ],
+    )
+
+
+def test_a_served_reranker_reorders_and_says_so(tmp_path, root, store, fake_embedder, fake_llama):
+    _two_chunks(store, fake_embedder, root)
+    rr = RerankEndpoint(Endpoint(fake_llama.url("/v1/rerank"), "rr"))
+    cfg = make_config(root, tmp_path)
+    plain = run_query(store, fake_embedder, cfg, "review plan")
+    payload = run_query(store, fake_embedder, cfg, "review plan", reranker=rr)
+    assert payload["reranked"] is True and "warnings" not in payload
+    assert payload["results"][0]["text"] == "budget review plan"
+    assert payload["results"][0]["rerankScore"] == 0.0  # fake: 2 shared words - 2.0
+    assert payload["results"][0]["score"] == next(
+        r["score"] for r in plain["results"] if r["text"] == "budget review plan"
+    )
+    assert all("rerankScore" not in r for r in plain["results"])
+
+
+def test_an_unreachable_reranker_is_flagged_in_the_result_and_in_status(
+    tmp_path, root, store, fake_embedder, dead_url
+):
+    _two_chunks(store, fake_embedder, root)
+    rr = RerankEndpoint(Endpoint(dead_url + "/v1/rerank", "rr"))
+    payload = run_query(
+        store, fake_embedder, make_config(root, tmp_path), "review plan", reranker=rr
+    )
+    assert payload["reranked"] is False and payload["results"]
+    assert payload["warnings"][0].startswith("Reranking was skipped")
+    assert rerank_status(rr) == {"reranker": "unreachable", "rerankWarning": rr.last_error}
+
+
+def test_without_a_reranker_reranked_is_false(tmp_path, root, store, fake_embedder):
+    _two_chunks(store, fake_embedder, root)
+    payload = run_query(store, fake_embedder, make_config(root, tmp_path), "review plan")
+    assert payload["reranked"] is False and "warnings" not in payload
+    assert rerank_status(None) == {"reranker": "off"}
