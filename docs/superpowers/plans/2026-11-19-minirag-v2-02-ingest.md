@@ -811,3 +811,15 @@ Then follow CLAUDE.md's session-completion protocol (quality gates, `git pull --
 > measure hit@10/MRR on both fields with the sign test, and implement only the items that gain
 > significantly (TDD, one commit each). Record every number, kept or dropped, in the
 > g7q.12 notes; nothing private goes into the repo.
+
+### Task 11: Measure Apple Vision as a macOS second reader for low-confidence Tesseract pages
+
+> Added 2026-11-19 (owner asked why it was deferred). The spike's evidence rests on one poor
+> scan. Collect every OCR'd page of the owner's corpus with Tesseract mean word confidence
+> below 0.85 (plus the fax-quality specification folder named in the private OCR report),
+> transcribe 10-15 regions by hand, and compare Tesseract alone vs Tesseract + Vision (2
+> overlapping ROI bands, accurate, ru-RU+en-US, language correction on) on CER, word recall
+> and the private ruler's questions that hit those documents. Pick the confidence threshold
+> from the data. Implement the second reader (macOS-only, `sys_platform == 'darwin'` marker,
+> pyobjc in the `[ocr]` extra) only if it gains; it re-OCRs only the low-confidence pages.
+> Numbers go to bd minirag-mcp-g7q.9; private material stays outside the repo.

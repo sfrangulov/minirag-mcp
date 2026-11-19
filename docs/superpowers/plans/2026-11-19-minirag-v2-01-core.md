@@ -1066,6 +1066,18 @@ def test_core_env_passes_through_only_core_variables(monkeypatch):
 
 ### Task 13: Measure and set the e5 default chunk budget
 
+> **Widened (owner, 2026-11-19):** also measure `BAAI/bge-m3` as a candidate default model
+> before the re-index (a model change after migration would mean re-indexing twice). Serve it
+> through llama.cpp (GGUF converted from the official weights at the router's commit, as e5
+> and the reranker were; verify against the reference implementation), embed the private
+> ruler's chunks at the winning budget, and compare with e5 on both fields and on the English
+> 20k subset, with document BM25 and the reranker on. Also try bge-m3 whole-document vectors
+> (one vector per document up to 8192 tokens) as an extra fusion signal. Decision rule: switch
+> the default only on a significant gain on the Russian ruler (sign test p < 0.05 on hit@10 or
+> bootstrap CI of MRR excluding 0) without a loss on English; then add it to MODEL_WINDOWS /
+> DEFAULT_BUDGETS, check fastembed supports it for the in-process fallback (if not, record that
+> bge-m3 requires an endpoint), and record all numbers in bd g7q.1.
+
 **Files:**
 - Modify: `src/minirag_mcp/embedder.py` (`DEFAULT_BUDGETS[E5_LARGE]`), `tests/test_config.py`
 - Outside the repository (private): `<ruler>/scripts/v2_measure.py`, its indexes and runs under `<ruler>`, the private Russian ruler (its location is in the bd memory about the ruler: `bd memories ruler`)
