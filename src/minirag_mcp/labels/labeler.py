@@ -72,8 +72,12 @@ class Labeler:
         roots: Sequence[Path],
         cache_dir: Path,
         model_factory: ModelFactory = default_model_factory,
+        *,
+        needs_extra: bool = True,
     ):
         self.taxonomy = taxonomy
+        # False when a server holds the model: the [classify] extra is then irrelevant.
+        self._needs_extra = needs_extra
         self._roots = tuple(roots)
         self._cache_dir = cache_dir
         self._model_factory = model_factory
@@ -232,10 +236,10 @@ class Labeler:
         it fails."""
         if not any(f.needs_model for f in self.taxonomy.facets):
             return None
-        if not _model.available():
+        if self._needs_extra and not _model.available():
             return INSTALL_HINT
         spec = self.taxonomy.model
-        if spec is not None and spec.path is not None:
+        if self._needs_extra and spec is not None and spec.path is not None:
             # stat(), not exists()/is_file(): from Python 3.14 those return False on a
             # PermissionError, so an unreadable folder would be reported as a missing file.
             try:
@@ -263,14 +267,21 @@ class LabelerSource:
         roots: Sequence[Path],
         cache_dir: Path,
         model_factory: ModelFactory = default_model_factory,
+        *,
+        needs_extra: bool = True,
     ):
         self.path = taxonomy_path(roots)
+        self._needs_extra = needs_extra
         self._roots = tuple(roots)
         self._cache_dir = cache_dir
         self._model_factory = model_factory
         self._lock = threading.Lock()
         self._stamp: tuple[int, int] | None = None
         self._current: tuple[Labeler | None, str | None] = (None, None)
+
+    @property
+    def backend(self) -> str:
+        return "in-process" if self._needs_extra else "endpoint"
 
     def get(self) -> tuple[Labeler | None, str | None]:
         try:
@@ -289,7 +300,13 @@ class LabelerSource:
                 except TaxonomyError as e:
                     self._current = (None, str(e))
                 else:
-                    labeler = Labeler(taxonomy, self._roots, self._cache_dir, self._model_factory)
+                    labeler = Labeler(
+                        taxonomy,
+                        self._roots,
+                        self._cache_dir,
+                        self._model_factory,
+                        needs_extra=self._needs_extra,
+                    )
                     self._current = (labeler, None)
                 self._stamp = stamp
             return self._current

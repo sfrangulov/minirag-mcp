@@ -681,7 +681,7 @@ def _labels_status(source: LabelerSource, store: Store | None) -> dict:
     taxonomy = labeler.taxonomy
     infos = store.list_sources() if store is not None else []
     state, problem = labeler.model_status()
-    out: dict = {"file": str(source.path), "model": state}
+    out: dict = {"file": str(source.path), "model": state, "backend": source.backend}
     if state == "unavailable":
         out["modelHint"] = problem or INSTALL_HINT
     facets: dict = {}

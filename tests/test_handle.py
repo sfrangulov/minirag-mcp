@@ -202,3 +202,20 @@ def test_embedders_from_an_injected_factory_are_left_open(tmp_path, closed):
     h.get()
     h.close()
     assert closed == []
+
+
+def test_classify_url_selects_the_served_model(tmp_path, fake_embedder):
+    from minirag_mcp.results import labels_status
+
+    config = replace(cfg(tmp_path), classify_endpoint=Endpoint("http://127.0.0.1:9", "plumb"))
+    opened = IndexHandle(config, embedder_factory=lambda scheme: fake_embedder).get()
+    assert opened.labels.backend == "endpoint"
+    opened.labels.path.parent.mkdir(parents=True, exist_ok=True)
+    opened.labels.path.write_text(
+        '[facets.project]\ndefault = "core"\nvalues.core = { description = "Core." }\n',
+        encoding="utf-8",
+    )
+    assert labels_status(opened.labels, opened.store)["labels"]["backend"] == "endpoint"
+
+    plain = IndexHandle(cfg(tmp_path), embedder_factory=lambda scheme: fake_embedder)
+    assert plain.get().labels.backend == "in-process"

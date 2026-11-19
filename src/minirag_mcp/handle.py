@@ -17,6 +17,7 @@ from minirag_mcp.endpoints import EmbeddingEndpoint
 from minirag_mcp.identity import EmbeddingScheme
 from minirag_mcp.ingest.pipeline import Pipeline
 from minirag_mcp.labels import LabelerSource
+from minirag_mcp.labels.endpoint_model import endpoint_model_factory
 from minirag_mcp.labels.labeler import ModelFactory
 from minirag_mcp.labels.model import default_model_factory
 from minirag_mcp.results import embedder_notes
@@ -75,8 +76,15 @@ class IndexHandle:
         self.config = config
         self._owns_embedders = embedder_factory is None
         self._make = embedder_factory or (lambda scheme: make_embedder(config, scheme))
+        served = model_factory is None and config.classify_endpoint is not None
+        if model_factory is None:
+            model_factory = (
+                endpoint_model_factory(config.classify_endpoint)
+                if served
+                else default_model_factory
+            )
         self._labels = LabelerSource(
-            config.roots, config.cache_dir, model_factory or default_model_factory
+            config.roots, config.cache_dir, model_factory, needs_extra=not served
         )
         self._lock = threading.Lock()
         self._current: tuple[OpenIndex, SyncManager] | None = None
