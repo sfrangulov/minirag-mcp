@@ -158,8 +158,10 @@ def test_a_failed_load_does_not_leave_the_token_counter_degraded(tmp_path, monke
 def test_prefix_rule_marks_the_e5_family():
     assert prefix_rule(E5_LARGE) == prefix_rule("intfloat/multilingual-e5-small") == "e5"
     assert prefix_rule(MINILM) == prefix_rule("BAAI/bge-base-en") == "none"
+    assert prefix_rule("other/multilingual-e5-large") == "none"
+    assert prefix_rule("intfloat/bge-x") == "none"
 
 
 def test_model_window_and_default_budget():
     assert (model_window(E5_LARGE), model_window(MINILM), model_window("x/y")) == (512, 128, 128)
-    assert default_budget("x/y") == 110
+    assert default_budget("x/y") == default_budget(MINILM) == 110

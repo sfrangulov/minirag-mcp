@@ -77,7 +77,7 @@ class Holder:
 
 @pytest.fixture
 def db_path(tmp_path) -> Path:
-    p = tmp_path / ".minirag" / "lancedb"
+    p = tmp_path / ".minirag" / "v2"
     p.mkdir(parents=True)
     return p
 
@@ -342,7 +342,7 @@ def test_a_lock_that_cannot_be_established_warns_instead_of_raising(
     tmp_path, not_root, shape, expected_errno
 ):
     """Regression: these escaped acquire() as raw OSErrors and killed the sync."""
-    db_path = tmp_path / ".minirag" / "lancedb"
+    db_path = tmp_path / ".minirag" / "v2"
     shape(db_path)
     try:
         lock = SyncLock(db_path)

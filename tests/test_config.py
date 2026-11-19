@@ -58,34 +58,34 @@ def test_flags_beat_env(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "env",
+    "env,var",
     [
-        {"MAX_FILE_SIZE": "abc"},
-        {"MAX_FILE_SIZE": "0"},
-        {"CHUNK_TOKEN_BUDGET": "0"},
-        {"CHUNK_TOKEN_BUDGET": "513"},
-        {"RAG_DOCUMENT_WEIGHT": "1.5"},
-        {"RAG_DOCUMENT_WEIGHT": "-0.1"},
-        {"RAG_DOCUMENT_WEIGHT": "x"},
-        {"RAG_RERANK_TOP": "0"},
-        {"RAG_RERANK_TOP": "201"},
-        {"EMBED_URL": "http://127.0.0.1:8080/v1/embeddings"},
-        {"EMBED_ENDPOINT_MODEL": "e5"},
-        {"RERANK_URL": "http://127.0.0.1:8080/v1/rerank"},
-        {"CLASSIFY_MODEL": "plumb-4b"},
-        {"EMBED_URL": "ftp://h/v1/embeddings", "EMBED_ENDPOINT_MODEL": "e5"},
-        {"ENDPOINT_API_KEY_FILE": "/nonexistent/key"},
-        {"RAG_HYBRID_WEIGHT": "1.5"},
-        {"RAG_HYBRID_WEIGHT": "-0.1"},
-        {"RAG_GROUPING": "bogus"},
-        {"RAG_MAX_DISTANCE": "-1"},
-        {"RAG_MAX_FILES": "0"},
-        {"ALLOW_PRIVATE_URLS": "maybe"},
-        {"ALLOW_PRIVATE_URLS": "2"},
+        ({"MAX_FILE_SIZE": "abc"}, "MAX_FILE_SIZE"),
+        ({"MAX_FILE_SIZE": "0"}, "MAX_FILE_SIZE"),
+        ({"CHUNK_TOKEN_BUDGET": "0"}, "CHUNK_TOKEN_BUDGET"),
+        ({"CHUNK_TOKEN_BUDGET": "513"}, "CHUNK_TOKEN_BUDGET"),
+        ({"RAG_DOCUMENT_WEIGHT": "1.5"}, "RAG_DOCUMENT_WEIGHT"),
+        ({"RAG_DOCUMENT_WEIGHT": "-0.1"}, "RAG_DOCUMENT_WEIGHT"),
+        ({"RAG_DOCUMENT_WEIGHT": "x"}, "RAG_DOCUMENT_WEIGHT"),
+        ({"RAG_RERANK_TOP": "0"}, "RAG_RERANK_TOP"),
+        ({"RAG_RERANK_TOP": "201"}, "RAG_RERANK_TOP"),
+        ({"EMBED_URL": "http://127.0.0.1:8080/v1/embeddings"}, "EMBED_URL"),
+        ({"EMBED_ENDPOINT_MODEL": "e5"}, "EMBED_ENDPOINT_MODEL"),
+        ({"RERANK_URL": "http://127.0.0.1:8080/v1/rerank"}, "RERANK_URL"),
+        ({"CLASSIFY_MODEL": "plumb-4b"}, "CLASSIFY_MODEL"),
+        ({"EMBED_URL": "ftp://h/v1/embeddings", "EMBED_ENDPOINT_MODEL": "e5"}, "EMBED_URL"),
+        ({"ENDPOINT_API_KEY_FILE": "/nonexistent/key"}, "ENDPOINT_API_KEY_FILE"),
+        ({"RAG_HYBRID_WEIGHT": "1.5"}, "RAG_HYBRID_WEIGHT"),
+        ({"RAG_HYBRID_WEIGHT": "-0.1"}, "RAG_HYBRID_WEIGHT"),
+        ({"RAG_GROUPING": "bogus"}, "RAG_GROUPING"),
+        ({"RAG_MAX_DISTANCE": "-1"}, "RAG_MAX_DISTANCE"),
+        ({"RAG_MAX_FILES": "0"}, "RAG_MAX_FILES"),
+        ({"ALLOW_PRIVATE_URLS": "maybe"}, "ALLOW_PRIVATE_URLS"),
+        ({"ALLOW_PRIVATE_URLS": "2"}, "ALLOW_PRIVATE_URLS"),
     ],
 )
-def test_invalid_numeric_env(env, tmp_path):
-    with pytest.raises(ConfigError):
+def test_invalid_numeric_env(env, var, tmp_path):
+    with pytest.raises(ConfigError, match=var):
         load_config(env, cwd=tmp_path)
 
 
@@ -179,3 +179,22 @@ def test_endpoints_come_from_the_environment(tmp_path):
 def test_retrieval_tuning_env(tmp_path):
     cfg = load_config({"RAG_DOCUMENT_WEIGHT": "0", "RAG_RERANK_TOP": "50"}, cwd=tmp_path)
     assert (cfg.document_weight, cfg.rerank_top) == (0.0, 50)
+
+
+def test_the_model_flag_keys_the_embed_endpoint(tmp_path):
+    env = {"EMBED_URL": "http://127.0.0.1:8080/v1/embeddings", "EMBED_ENDPOINT_MODEL": "m"}
+    cfg = load_config(env, model_name_flag=MINILM, cwd=tmp_path)
+    assert set(cfg.embed_endpoints) == {MINILM}
+
+
+def test_the_api_key_never_appears_in_a_repr(tmp_path):
+    (tmp_path / "key").write_text("secret\n")
+    env = {
+        "EMBED_URL": "http://127.0.0.1:8080/v1/embeddings",
+        "EMBED_ENDPOINT_MODEL": "m",
+        "ENDPOINT_API_KEY_FILE": str(tmp_path / "key"),
+    }
+    cfg = load_config(env, cwd=tmp_path)
+    assert next(iter(cfg.embed_endpoints.values())).api_key == "secret"
+    assert "secret" not in repr(cfg)
+    assert "secret" not in repr(Endpoint("http://h", "n", api_key="secret"))

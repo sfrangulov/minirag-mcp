@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import threading
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import requests
@@ -19,7 +19,7 @@ class EndpointError(Exception):
 class Endpoint:
     url: str
     name: str
-    api_key: str | None = None
+    api_key: str | None = field(default=None, repr=False)
     timeout: float = 120.0
 
 

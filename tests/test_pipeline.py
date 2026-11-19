@@ -17,7 +17,7 @@ from minirag_mcp.store import Store
 @pytest.fixture
 def pipe(tmp_path, fake_embedder):
     cfg = load_config({"BASE_DIR": str(tmp_path)}, cwd=tmp_path)
-    store = Store(tmp_path / ".minirag" / "lancedb", dim=fake_embedder.dim)
+    store = Store(tmp_path / ".minirag" / "v2", dim=fake_embedder.dim)
     return Pipeline(store, fake_embedder, cfg), store, tmp_path
 
 

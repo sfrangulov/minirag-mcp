@@ -231,7 +231,7 @@ def load_config(
         # see the text at all, so a larger budget would only build chunks whose tails
         # are silently discarded. The bound is inclusive, and that is only sound
         # because `Embedder.count_tokens` counts with truncation disabled — a counter
-        # that saturated at the ceiling would make `count <= 128` true of every text
+        # that saturated at the ceiling would make `count <= window` true of every text
         # and turn the documented maximum into "no budget at all".
         token_budget=_int(
             env, "CHUNK_TOKEN_BUDGET", default_budget(model_name), 16, model_window(model_name)

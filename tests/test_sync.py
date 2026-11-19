@@ -19,7 +19,7 @@ from minirag_mcp.sync import SyncBusyError, SyncManager, run_sync
 @pytest.fixture
 def env(tmp_path, fake_embedder):
     cfg = load_config({"BASE_DIR": str(tmp_path)}, cwd=tmp_path)
-    store = Store(tmp_path / ".minirag" / "lancedb", dim=fake_embedder.dim)
+    store = Store(tmp_path / ".minirag" / "v2", dim=fake_embedder.dim)
     pipeline = Pipeline(store, fake_embedder, cfg)
     return cfg, store, pipeline, tmp_path
 
