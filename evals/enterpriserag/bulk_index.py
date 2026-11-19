@@ -60,6 +60,9 @@ def _init(corpus: str, db: str, threads: int, model: str | None, prefixes: bool)
 
     # Several processes share the cores; each onnxruntime session gets a slice of them.
     embedder_mod.TextEmbedding = functools.partial(fastembed.TextEmbedding, threads=threads)
+    from common import apply_embedding_endpoint
+
+    apply_embedding_endpoint()
     if prefixes:
         from common import apply_e5_prefixes
 

@@ -123,3 +123,72 @@ def apply_e5_prefixes() -> None:
     Embedder.embed_documents = lambda self, texts: docs(self, [f"passage: {t}" for t in texts])
     Embedder.embed_query = lambda self, text: query(self, f"query: {text}")
     Embedder._e5_prefixed = True
+
+
+def apply_embedding_endpoint() -> bool:
+    """Embed through an OpenAI-compatible endpoint named by ERB_EMBED_URL, when set.
+
+    An experiment, applied per process before any prefixing: vectors come from the
+    endpoint (llama.cpp's /v1/embeddings measured within cosine 0.99999 of fastembed's
+    for multilingual-e5-large), while chunk sizes are still counted locally with the
+    model's own tokenizer.json, untruncated and unpadded as minirag counts them.
+    """
+    url = os.environ.get("ERB_EMBED_URL")
+    if not url:
+        return False
+    import glob
+
+    import requests
+    from tokenizers import Tokenizer
+
+    from minirag_mcp.embedder import Embedder, _unit
+
+    if getattr(Embedder, "_endpoint", None) == url:
+        return True
+    # A llama.cpp router routes by model name and may require a key.
+    model_name = os.environ.get("ERB_EMBED_MODEL")
+    key = os.environ.get("ERB_EMBED_KEY")
+    headers = {"Authorization": f"Bearer {key}"} if key else {}
+    counters: dict[str, object] = {}
+
+    def count_tokens(self, text: str) -> int:
+        counter = counters.get(self.model_name)
+        if counter is None:
+            repo = "models--qdrant--" + self.model_name.split("/")[-1] + "-onnx"
+            found = glob.glob(
+                str(self.cache_dir / f"{repo}*" / "snapshots" / "*" / "tokenizer.json")
+            )
+            found += glob.glob(
+                str(
+                    self.cache_dir
+                    / f"{repo.replace('qdrant', 'Qdrant')}*"
+                    / "snapshots"
+                    / "*"
+                    / "tokenizer.json"
+                )
+            )
+            if not found:
+                raise SystemExit(f"no tokenizer.json for {self.model_name} under {self.cache_dir}")
+            counter = Tokenizer.from_file(found[0])
+            counter.no_truncation()
+            counter.no_padding()
+            counters[self.model_name] = counter
+        return len(counter.encode(text).ids)
+
+    def embed(texts: list[str]) -> list[list[float]]:
+        out: list[list[float]] = []
+        for i in range(0, len(texts), 32):
+            body: dict = {"input": texts[i : i + 32]}
+            if model_name:
+                body["model"] = model_name
+            r = requests.post(url, json=body, headers=headers, timeout=600)
+            r.raise_for_status()
+            data = sorted(r.json()["data"], key=lambda d: d["index"])
+            out += [_unit([float(x) for x in d["embedding"]]) for d in data]
+        return out
+
+    Embedder.count_tokens = count_tokens
+    Embedder.embed_documents = lambda self, texts: embed(list(texts)) if texts else []
+    Embedder.embed_query = lambda self, text: embed([text])[0]
+    Embedder._endpoint = url
+    return True

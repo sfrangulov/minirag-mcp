@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import platform
 import sys
 import tempfile
@@ -193,8 +194,10 @@ def run_full(db: Path, corpus: Path, hybrid_weight: float | None = None) -> int:
 
 def run_subset(corpus: Path, update: bool, model: str | None = None, prefixes: bool = False) -> int:
     from bulk_index import build
+    from common import apply_embedding_endpoint
 
-    experiment = bool(model or prefixes)
+    endpoint = apply_embedding_endpoint()
+    experiment = bool(model or prefixes or endpoint)
     if prefixes:
         from common import apply_e5_prefixes
 
@@ -227,8 +230,13 @@ def run_subset(corpus: Path, update: bool, model: str | None = None, prefixes: b
     summary = summarize(measure(store, emb, cfg, questions))
     current = {"summary": summary, "fingerprint": fingerprint(cfg), "subset": subset_hash(rel)}
     if experiment:
-        current["experiment"] = {"model": cfg.model_name, "e5_prefixes": prefixes}
+        current["experiment"] = {
+            "model": cfg.model_name,
+            "e5_prefixes": prefixes,
+            "embedding_endpoint": os.environ.get("ERB_EMBED_URL"),
+        }
         tag = cfg.model_name.split("/")[-1] + ("-prefixed" if prefixes else "")
+        tag += "-endpoint" if endpoint else ""
         RUNS.mkdir(parents=True, exist_ok=True)
         out = RUNS / f"subset_{tag}.json"
         out.write_text(json.dumps(current, indent=2) + "\n", encoding="utf-8")
