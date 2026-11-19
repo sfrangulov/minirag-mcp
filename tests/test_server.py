@@ -145,7 +145,7 @@ async def test_sync_start_is_a_tool_error_while_another_process_syncs(app):
     """
     mcp, root = app
     async with Client(mcp) as c:
-        with sync_lock(root / ".minirag" / "lancedb"):
+        with sync_lock(root / ".minirag" / "v2"):
             with pytest.raises(ToolError, match="syncing this index") as excinfo:
                 await c.call_tool("sync_start", {})
             assert "DB_PATH" in str(excinfo.value)
@@ -159,7 +159,7 @@ async def test_ingest_file_and_query_are_not_blocked_by_a_held_sync_lock(app):
     """The lock is scoped to sync: single-file ingest and search stay unblocked."""
     mcp, root = app
     async with Client(mcp) as c:
-        with sync_lock(root / ".minirag" / "lancedb"):
+        with sync_lock(root / ".minirag" / "v2"):
             r = (await c.call_tool("ingest_file", {"filePath": str(root / "auth.md")})).data
             assert r["chunkCount"] >= 1
             res = (await c.call_tool("query_documents", {"query": "OAuth2 token"})).data

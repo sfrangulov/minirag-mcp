@@ -4,16 +4,20 @@ from pathlib import Path
 import pytest
 
 from minirag_mcp.config import DEFAULT_MODEL, ConfigError, load_config
+from minirag_mcp.embedder import E5_LARGE, MINILM, default_budget
+from minirag_mcp.endpoints import Endpoint
 
 
 def test_defaults_from_cwd(tmp_path):
     cfg = load_config({}, cwd=tmp_path)
     assert cfg.roots == (tmp_path.resolve(),)
-    assert cfg.db_path == tmp_path.resolve() / ".minirag" / "lancedb"
-    assert cfg.model_name == DEFAULT_MODEL
+    assert cfg.db_path == tmp_path.resolve() / ".minirag" / "v2"
+    assert cfg.model_name == DEFAULT_MODEL == "intfloat/multilingual-e5-large"
     assert cfg.max_file_size == 104857600
-    assert cfg.token_budget == 110
-    assert cfg.hybrid_weight == 0.6
+    assert cfg.token_budget == default_budget(E5_LARGE)
+    assert (cfg.hybrid_weight, cfg.document_weight, cfg.rerank_top) == (0.6, 0.5, 30)
+    assert cfg.embed_endpoints == {}
+    assert cfg.rerank_endpoint is cfg.classify_endpoint is cfg.index_name is None
     assert cfg.grouping is None and cfg.max_distance is None and cfg.max_files is None
     assert cfg.allow_private_urls is False  # the SSRF guard is on unless turned off
     assert "minirag-mcp" in str(cfg.cache_dir)  # platformdirs cache, not cwd-relative
@@ -22,7 +26,7 @@ def test_defaults_from_cwd(tmp_path):
 def test_base_dir_env(tmp_path):
     cfg = load_config({"BASE_DIR": str(tmp_path)}, cwd=Path("/"))
     assert cfg.roots == (tmp_path.resolve(),)
-    assert cfg.db_path == tmp_path.resolve() / ".minirag" / "lancedb"
+    assert cfg.db_path == tmp_path.resolve() / ".minirag" / "v2"
 
 
 def test_base_dirs_json_overrides_base_dir(tmp_path):
@@ -30,7 +34,7 @@ def test_base_dirs_json_overrides_base_dir(tmp_path):
     env = {"BASE_DIR": "/ignored", "BASE_DIRS": f'["{a}", "{b}"]'}
     cfg = load_config(env, cwd=tmp_path)
     assert cfg.roots == (a.resolve(), b.resolve())
-    assert cfg.db_path == a.resolve() / ".minirag" / "lancedb"  # first root hosts the index
+    assert cfg.db_path == a.resolve() / ".minirag" / "v2"  # first root hosts the index
 
 
 @pytest.mark.parametrize("bad", ["/a:/b", "[]", '["ok", ""]', "not json", '"str"'])
@@ -59,7 +63,18 @@ def test_flags_beat_env(tmp_path):
         {"MAX_FILE_SIZE": "abc"},
         {"MAX_FILE_SIZE": "0"},
         {"CHUNK_TOKEN_BUDGET": "0"},
-        {"CHUNK_TOKEN_BUDGET": "129"},
+        {"CHUNK_TOKEN_BUDGET": "513"},
+        {"RAG_DOCUMENT_WEIGHT": "1.5"},
+        {"RAG_DOCUMENT_WEIGHT": "-0.1"},
+        {"RAG_DOCUMENT_WEIGHT": "x"},
+        {"RAG_RERANK_TOP": "0"},
+        {"RAG_RERANK_TOP": "201"},
+        {"EMBED_URL": "http://127.0.0.1:8080/v1/embeddings"},
+        {"EMBED_ENDPOINT_MODEL": "e5"},
+        {"RERANK_URL": "http://127.0.0.1:8080/v1/rerank"},
+        {"CLASSIFY_MODEL": "plumb-4b"},
+        {"EMBED_URL": "ftp://h/v1/embeddings", "EMBED_ENDPOINT_MODEL": "e5"},
+        {"ENDPOINT_API_KEY_FILE": "/nonexistent/key"},
         {"RAG_HYBRID_WEIGHT": "1.5"},
         {"RAG_HYBRID_WEIGHT": "-0.1"},
         {"RAG_GROUPING": "bogus"},
@@ -126,3 +141,41 @@ def test_ocr_min_chars_zero_allowed_and_negative_rejected(tmp_path):
 def test_ocr_lang_blank_rejected(tmp_path):
     with pytest.raises(ConfigError):
         load_config({"RAG_OCR_LANG": "  "}, cwd=tmp_path)
+
+
+def test_the_budget_ceiling_is_the_models_window(tmp_path):
+    assert load_config({"CHUNK_TOKEN_BUDGET": "512"}, cwd=tmp_path).token_budget == 512
+    with pytest.raises(ConfigError, match="512"):
+        load_config({"CHUNK_TOKEN_BUDGET": "513"}, cwd=tmp_path)
+    with pytest.raises(ConfigError, match="128"):
+        load_config({"MODEL_NAME": MINILM, "CHUNK_TOKEN_BUDGET": "129"}, cwd=tmp_path)
+    assert load_config({"MODEL_NAME": "some/unknown"}, cwd=tmp_path).token_budget == 110
+    with pytest.raises(ConfigError):
+        load_config({"MODEL_NAME": "some/unknown", "CHUNK_TOKEN_BUDGET": "129"}, cwd=tmp_path)
+
+
+def test_endpoints_come_from_the_environment(tmp_path):
+    (tmp_path / "key").write_text("\n  secret  \n")
+    env = {
+        "EMBED_URL": "http://127.0.0.1:8080/v1/embeddings",
+        "EMBED_ENDPOINT_MODEL": "multilingual-e5-large",
+        "RERANK_URL": "http://127.0.0.1:8080/v1/rerank",
+        "RERANK_MODEL": "bge-reranker-v2-m3",
+        "CLASSIFY_URL": "http://127.0.0.1:8080",
+        "CLASSIFY_MODEL": "plumb-4b",
+        "ENDPOINT_API_KEY_FILE": str(tmp_path / "key"),
+    }
+    cfg = load_config(env, cwd=tmp_path)
+    assert cfg.embed_endpoints == {
+        E5_LARGE: Endpoint("http://127.0.0.1:8080/v1/embeddings", "multilingual-e5-large", "secret")
+    }
+    assert cfg.rerank_endpoint == Endpoint(
+        "http://127.0.0.1:8080/v1/rerank", "bge-reranker-v2-m3", "secret"
+    )
+    assert cfg.classify_endpoint == Endpoint("http://127.0.0.1:8080", "plumb-4b", "secret")
+    assert set(load_config({**env, "MODEL_NAME": MINILM}, cwd=tmp_path).embed_endpoints) == {MINILM}
+
+
+def test_retrieval_tuning_env(tmp_path):
+    cfg = load_config({"RAG_DOCUMENT_WEIGHT": "0", "RAG_RERANK_TOP": "50"}, cwd=tmp_path)
+    assert (cfg.document_weight, cfg.rerank_top) == (0.0, 50)

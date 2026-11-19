@@ -13,7 +13,28 @@ from fastembed import TextEmbedding
 # but we construct one directly, so it is declared as a dependency of ours too.
 from tokenizers import Tokenizer
 
+from minirag_mcp.chunker import DEFAULT_TOKEN_BUDGET, MODEL_MAX_TOKENS
 from minirag_mcp.chunker.tokens import estimate_tokens
+
+MINILM = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+E5_LARGE = "intfloat/multilingual-e5-large"
+MODEL_WINDOWS: dict[str, int] = {E5_LARGE: 512, MINILM: 128}
+DEFAULT_BUDGETS: dict[str, int] = {E5_LARGE: 110, MINILM: 110}
+
+
+def model_window(model_name: str) -> int:
+    return MODEL_WINDOWS.get(model_name, MODEL_MAX_TOKENS)
+
+
+def default_budget(model_name: str) -> int:
+    return DEFAULT_BUDGETS.get(model_name, DEFAULT_TOKEN_BUDGET)
+
+
+def prefix_rule(model_name: str) -> str:
+    lowered = model_name.lower()
+    if lowered.startswith("intfloat/") and "e5" in lowered.split("/", 1)[1]:
+        return "e5"
+    return "none"
 
 
 class UnknownModelError(Exception):

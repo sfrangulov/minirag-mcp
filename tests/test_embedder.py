@@ -7,11 +7,21 @@ from tokenizers.pre_tokenizers import Whitespace
 
 from minirag_mcp.chunker import MODEL_MAX_TOKENS, chunk_markdown
 from minirag_mcp.config import DEFAULT_MODEL, load_config
-from minirag_mcp.embedder import Embedder, EmbedderUnavailableError, UnknownModelError, _unit
+from minirag_mcp.embedder import (
+    E5_LARGE,
+    MINILM,
+    Embedder,
+    EmbedderUnavailableError,
+    UnknownModelError,
+    _unit,
+    default_budget,
+    model_window,
+    prefix_rule,
+)
 
 
 def test_dim_from_registry_without_download(tmp_path):
-    emb = Embedder(DEFAULT_MODEL, cache_dir=tmp_path)
+    emb = Embedder(MINILM, cache_dir=tmp_path)
     assert emb.dim == 384
     assert not any(tmp_path.iterdir())  # nothing downloaded
 
@@ -71,7 +81,7 @@ def _truncating_embedder(tmp_path, monkeypatch) -> tuple[Embedder, Tokenizer]:
     tokenizer = Tokenizer(WordLevel(vocab={"[UNK]": 0}, unk_token="[UNK]"))
     tokenizer.pre_tokenizer = Whitespace()
     tokenizer.enable_truncation(max_length=MODEL_MAX_TOKENS)
-    emb = Embedder(DEFAULT_MODEL, cache_dir=tmp_path)
+    emb = Embedder(MINILM, cache_dir=tmp_path)
     monkeypatch.setattr(emb, "_load", lambda: _FakeTextEmbedding(tokenizer))
     honest = Tokenizer.from_str(tokenizer.to_str())
     honest.no_truncation()
@@ -95,7 +105,9 @@ def test_chunks_fit_the_encoder_at_the_documented_maximum_budget(tmp_path, monke
     `count <= budget` is trivially true there, the packer stops cutting, and the
     document comes out as one chunk many times the ceiling."""
     emb, honest = _truncating_embedder(tmp_path, monkeypatch)
-    cfg = load_config({"CHUNK_TOKEN_BUDGET": str(MODEL_MAX_TOKENS)}, cwd=tmp_path)
+    cfg = load_config(
+        {"MODEL_NAME": MINILM, "CHUNK_TOKEN_BUDGET": str(MODEL_MAX_TOKENS)}, cwd=tmp_path
+    )
     budget = cfg.token_budget
     assert budget == MODEL_MAX_TOKENS, "the documented maximum has to be accepted"
 
@@ -141,3 +153,13 @@ def test_a_failed_load_does_not_leave_the_token_counter_degraded(tmp_path, monke
         emb.count_tokens("one two three")
     monkeypatch.setattr(mod, "TextEmbedding", lambda **kw: _FakeTextEmbedding(tokenizer))
     assert emb.count_tokens("one two three") == 3
+
+
+def test_prefix_rule_marks_the_e5_family():
+    assert prefix_rule(E5_LARGE) == prefix_rule("intfloat/multilingual-e5-small") == "e5"
+    assert prefix_rule(MINILM) == prefix_rule("BAAI/bge-base-en") == "none"
+
+
+def test_model_window_and_default_budget():
+    assert (model_window(E5_LARGE), model_window(MINILM), model_window("x/y")) == (512, 128, 128)
+    assert default_budget("x/y") == 110

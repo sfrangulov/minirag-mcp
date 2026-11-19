@@ -205,7 +205,7 @@ def test_sync_refuses_while_another_process_holds_the_lock(corpus, capsys):
     one (flock keys on the open file description). See tests/test_lock.py for the
     genuinely cross-process coverage.
     """
-    with sync_lock(corpus / ".minirag" / "lancedb"):
+    with sync_lock(corpus / ".minirag" / "v2"):
         with pytest.raises(SystemExit) as exc:
             run(["sync", "--base-dir", str(corpus)])
     assert exc.value.code == 1
@@ -252,7 +252,7 @@ def test_sync_completes_and_exits_zero_when_the_lock_file_cannot_be_opened(corpu
     """
     if os.geteuid() == 0:  # pragma: no cover - the suite is not meant to run as root
         pytest.skip("running as root: chmod 000 denies nothing")
-    lock_file = corpus / ".minirag" / "lancedb" / ".sync.lock"
+    lock_file = corpus / ".minirag" / "v2" / ".sync.lock"
     lock_file.parent.mkdir(parents=True)
     lock_file.write_text("")
     lock_file.chmod(0o000)
@@ -294,7 +294,7 @@ def test_sync_completes_and_exits_zero_when_the_lock_file_cannot_be_opened(corpu
 
 def test_ingest_is_not_blocked_by_a_held_sync_lock(corpus, capsys):
     """The lock is scoped to sync: single-file ingests stay unblocked."""
-    with sync_lock(corpus / ".minirag" / "lancedb"):
+    with sync_lock(corpus / ".minirag" / "v2"):
         run(["ingest", str(corpus / "a.md"), "--base-dir", str(corpus), "--json"])
     assert json.loads(capsys.readouterr().out)["ingested"]
 
@@ -552,7 +552,7 @@ def test_classify_try_prints_the_distribution_and_writes_nothing(
 
     assert out["labels"]["type"]["value"] == "minutes"
     assert out["distribution"]["type"] == {"minutes": 0.8, "report": 0.2}
-    assert Store(corpus / ".minirag" / "lancedb", dim=fake_embedder.dim).chunk_count() == 0
+    assert Store(corpus / ".minirag" / "v2", dim=fake_embedder.dim).chunk_count() == 0
     run(["classify", "try", str(corpus / "m.md"), "--base-dir", str(corpus)])
     human = capsys.readouterr().out
     assert "type: minutes" in human and "report" in human
