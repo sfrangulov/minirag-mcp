@@ -794,21 +794,28 @@ def test_a_reingest_without_ocr_keeps_the_text_ocr_read(corpus, models, monkeypa
     assert info.restored == 1
 
 
-def test_the_index_kept_from_the_last_swap_is_deleted_before_a_rebuild_starts(corpus, models):
-    """At most two copies of the index take disk space: the serving one and the staged one."""
+def test_a_rebuild_that_fails_mid_build_leaves_the_previous_index_as_it_was(corpus, models):
+    """`<db>.previous` is the user's rollback, kept until the next rebuild is swapped in."""
     built(corpus, models)
     handle(corpus, models).run_sync(None)
     db = handle(corpus, models).config.db_path
-    assert read_identity(previous_dir(db)).generation == 1
+    kept = read_identity(previous_dir(db))
+    files = sorted(p.relative_to(previous_dir(db)) for p in previous_dir(db).rglob("*"))
     seen: dict[str, bool] = {}
 
-    def during() -> None:
+    def fail() -> None:
         seen["previous"] = previous_dir(db).exists()
+        raise RuntimeError("the embedding endpoint went away")
 
-    models[MINILM] = Hooked(MINILM, salt="minilm", during=during)
+    models[MINILM] = Hooked(MINILM, salt="minilm", during=fail)
+    with pytest.raises(RuntimeError, match="went away"):
+        handle(corpus, models, MODEL_NAME=MINILM).run_sync(None)
+
+    assert seen == {"previous": True}
+    assert read_identity(previous_dir(db)) == kept and kept.generation == 1
+    assert sorted(p.relative_to(previous_dir(db)) for p in previous_dir(db).rglob("*")) == files
+    assert read_identity(db).generation == 2
     _, _, info = handle(corpus, models, MODEL_NAME=MINILM).run_sync(None)
-
-    assert seen == {"previous": False}
     assert info.generation == 3 and read_identity(previous_dir(db)).generation == 2
 
 

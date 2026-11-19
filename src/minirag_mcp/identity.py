@@ -691,10 +691,10 @@ def begin_staging(db_path: Path) -> Path:
     Created under the identity lock, which every write holds shared, so a write under way
     finishes first, and every later one sees the folder and is refused (`rebuild_running`):
     none lands in the index after the rebuild has begun reading it. Refused up front when
-    `swap_in` would refuse the swap at the end. The index kept from the last swap is
-    deleted first, so that at most two copies of the index take disk space.
+    `swap_in` would refuse the swap at the end. The index kept from the last swap stays
+    until this one is swapped in: it is what a user rolls back to.
     """
-    _drop_previous(db_path)
+    _check_previous(previous_dir(db_path))
     staging = staging_dir(db_path)
     with _identity_lock(db_path):
         staging.mkdir()
