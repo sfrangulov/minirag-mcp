@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import json
 import math
 import re
 import socket
@@ -12,6 +13,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -40,15 +42,21 @@ class FakeEmbedder:
     all the packer's budget arithmetic depends on.
     """
 
-    dim = 8
-    model_name = "fake"
+    def __init__(self, model_name: str = "fake", dim: int = 8, salt: str = "") -> None:
+        self.model_name = model_name
+        self.dim = dim
+        self.salt = salt
 
     def count_tokens(self, text: str) -> int:
         return len(_WORDS.findall(text)) + 2
 
     def _vec(self, text: str) -> list[float]:
-        h = hashlib.sha256(text.encode("utf-8")).digest()
-        raw = [int.from_bytes(h[i : i + 4], "big") / 2**32 - 0.5 for i in range(0, 32, 4)]
+        raw: list[float] = []
+        for block in range(-(-self.dim // 8)):
+            key = f"{self.salt}{text}" if block == 0 else f"{self.salt}{text}#{block}"
+            h = hashlib.sha256(key.encode("utf-8")).digest()
+            raw += [int.from_bytes(h[i : i + 4], "big") / 2**32 - 0.5 for i in range(0, 32, 4)]
+        raw = raw[: self.dim]
         norm = math.sqrt(sum(x * x for x in raw)) or 1.0
         return [x / norm for x in raw]
 
@@ -236,3 +244,138 @@ def redirect_server(monkeypatch):
     finally:
         server.shutdown()
         server.server_close()
+
+
+@dataclass(frozen=True)
+class Seen:
+    method: str
+    path: str
+    query: str
+    headers: dict[str, str]
+    body: dict | None
+
+
+class _LlamaHandler(BaseHTTPRequestHandler):
+    """The routes of a llama.cpp router that minirag talks to, answering like the real
+    ones in the ways that matter: embeddings and rerank results come back in reverse
+    index order, so a client that trusts arrival order fails."""
+
+    def do_GET(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler's naming
+        self._serve(None)
+
+    def do_POST(self) -> None:  # noqa: N802
+        raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        self._serve(json.loads(raw) if raw else {})
+
+    def _serve(self, body: dict | None) -> None:
+        llama = self.server.llama
+        parts = urlsplit(self.path)
+        llama.requests.append(
+            Seen(self.command, parts.path, parts.query, dict(self.headers.items()), body)
+        )
+        route = parts.path
+        if route in llama.fail:
+            status, text = llama.fail[route]
+            self._send(status, text.encode("utf-8"), "text/plain")
+        elif route in llama.html:
+            self._send(200, b"<html><body>not an API</body></html>", "text/html")
+        elif self.command == "GET" and route == "/props":
+            self._json(llama.props)
+        elif self.command == "POST" and route == "/v1/embeddings":
+            self._json(self._embeddings(llama, body or {}))
+        elif self.command == "POST" and route == "/v1/rerank":
+            self._json(self._rerank(body or {}))
+        elif self.command == "POST" and route == "/tokenize":
+            self._json({"tokens": self._tokens(llama, (body or {}).get("content", ""))})
+        elif self.command == "POST" and route == "/completion":
+            self._json({"completion_probabilities": [{"top_logprobs": llama.top_logprobs}]})
+        else:
+            self._send(404, b"not found", "text/plain")
+
+    @staticmethod
+    def _embeddings(llama, body: dict) -> dict:
+        fake = FakeEmbedder(dim=llama.dim, salt=llama.vector_salt)
+        data = [
+            {"index": i, "embedding": [3 * x for x in fake._vec(t)]}
+            for i, t in enumerate(body.get("input", []))
+        ]
+        data.reverse()
+        if llama.drop_last and data:
+            data.pop()
+        return {"data": data}
+
+    @staticmethod
+    def _rerank(body: dict) -> dict:
+        query = set(str(body.get("query", "")).split())
+        results = [
+            {"index": i, "relevance_score": len(query & set(str(d).split())) - 2.0}
+            for i, d in enumerate(body.get("documents", []))
+        ]
+        results.reverse()
+        return {"results": results}
+
+    @staticmethod
+    def _tokens(llama, text: str) -> list[int]:
+        text = text.strip()
+        if len(text) == 1 and "A" <= text <= "P":
+            first = 32 + ord(text) - ord("A")
+            return [first, 1] if llama.split_letters else [first]
+        if llama.token_count is not None:
+            return list(range(llama.token_count))
+        return [1000 + i for i, _ in enumerate(text.split())]
+
+    def _json(self, payload) -> None:
+        self._send(200, json.dumps(payload).encode("utf-8"), "application/json")
+
+    def _send(self, status: int, raw: bytes, content_type: str) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def log_message(self, *args) -> None:
+        pass
+
+
+class FakeLlama:
+    """A llama.cpp router on 127.0.0.1. Fields are read per request, so a test may
+    change them between calls."""
+
+    def __init__(self, port: int) -> None:
+        self.port = port
+        self.requests: list[Seen] = []
+        self.fail: dict[str, tuple[int, str]] = {}
+        self.html: set[str] = set()
+        self.dim = 8
+        self.vector_salt = ""
+        self.drop_last = False
+        self.top_logprobs: list[dict] = []
+        self.props: dict = {}
+        self.token_count: int | None = None
+        self.split_letters = False
+
+    def url(self, path: str = "") -> str:
+        return f"http://127.0.0.1:{self.port}{path}"
+
+
+@pytest.fixture
+def fake_llama():
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _LlamaHandler)
+    llama = FakeLlama(server.server_address[1])
+    server.llama = llama
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        yield llama
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.fixture
+def dead_url() -> str:
+    """A loopback URL that refuses connections: the port was free a moment ago."""
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    return f"http://127.0.0.1:{port}"

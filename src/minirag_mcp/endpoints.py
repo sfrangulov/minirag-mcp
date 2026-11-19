@@ -1,0 +1,139 @@
+"""HTTP clients for the routes of an OpenAI-style llama.cpp router."""
+
+from __future__ import annotations
+
+import math
+from collections.abc import Sequence
+from dataclasses import dataclass
+from pathlib import Path
+
+import requests
+
+
+class EndpointError(Exception):
+    """A call to an endpoint failed; the message names the URL and the cause."""
+
+
+@dataclass(frozen=True)
+class Endpoint:
+    url: str
+    name: str
+    api_key: str | None = None
+    timeout: float = 120.0
+
+
+EMBED_BATCH = 32
+_BODY_CHARS = 300
+
+
+def _session() -> requests.Session:
+    session = requests.Session()
+    # Keeps HTTP(S)_PROXY from routing a router's traffic through a corporate proxy.
+    session.trust_env = False
+    return session
+
+
+def read_api_key(path: Path | None) -> str | None:
+    if path is None:
+        return None
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise EndpointError(f"cannot read the API key file {path}: {exc}") from exc
+    for line in text.splitlines():
+        if line.strip():
+            return line.strip()
+    raise EndpointError(f"the API key file {path} is empty")
+
+
+def request_json(
+    endpoint: Endpoint,
+    url: str,
+    body: dict | None = None,
+    *,
+    session: requests.Session | None = None,
+) -> dict:
+    headers = {"Authorization": f"Bearer {endpoint.api_key}"} if endpoint.api_key else {}
+    sess = session or _session()
+    try:
+        if body is None:
+            response = sess.get(url, headers=headers, timeout=endpoint.timeout)
+        else:
+            payload = {**body, "model": endpoint.name}
+            response = sess.post(url, json=payload, headers=headers, timeout=endpoint.timeout)
+    except requests.RequestException as exc:
+        raise EndpointError(f"cannot reach {url}: {exc}") from exc
+    if not response.ok:
+        raise EndpointError(f"{url} answered {response.status_code}: {response.text[:_BODY_CHARS]}")
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise EndpointError(f"{url} answered 200 but the reply was not JSON") from exc
+    if not isinstance(data, dict):
+        raise EndpointError(f"{url} answered 200 but the JSON reply was not an object")
+    return data
+
+
+class _Client:
+    def __init__(self, endpoint: Endpoint) -> None:
+        self.endpoint = endpoint
+        self._session: requests.Session | None = None
+
+    def _post(self, body: dict) -> dict:
+        if self._session is None:
+            self._session = _session()
+        return request_json(self.endpoint, self.endpoint.url, body, session=self._session)
+
+
+class EmbeddingEndpoint(_Client):
+    def embed(self, texts: Sequence[str]) -> list[list[float]]:
+        vectors: list[list[float]] = []
+        for start in range(0, len(texts), EMBED_BATCH):
+            batch = list(texts[start : start + EMBED_BATCH])
+            vectors += self._embed_batch(batch)
+        return vectors
+
+    def _embed_batch(self, batch: list[str]) -> list[list[float]]:
+        url = self.endpoint.url
+        reply = self._post({"input": batch})
+        try:
+            rows = sorted(reply["data"], key=lambda row: row["index"])
+            if [row["index"] for row in rows] != list(range(len(batch))):
+                raise EndpointError(f"{url} returned {len(rows)} embeddings for {len(batch)} texts")
+            return [_unit([float(x) for x in row["embedding"]]) for row in rows]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise EndpointError(f"{url} returned an unexpected embeddings reply: {exc!r}") from exc
+
+
+def _unit(vector: list[float]) -> list[float]:
+    norm = math.sqrt(sum(x * x for x in vector))
+    return vector if norm == 0 else [x / norm for x in vector]
+
+
+class RerankEndpoint(_Client):
+    def __init__(self, endpoint: Endpoint) -> None:
+        super().__init__(endpoint)
+        self.last_error: str | None = None
+
+    def scores(self, query: str, passages: Sequence[str]) -> list[float]:
+        if not passages:
+            return []
+        try:
+            result = self._scores(query, list(passages))
+        except EndpointError as exc:
+            self.last_error = str(exc)
+            raise
+        self.last_error = None
+        return result
+
+    def _scores(self, query: str, passages: list[str]) -> list[float]:
+        url = self.endpoint.url
+        reply = self._post({"query": query, "documents": passages, "top_n": len(passages)})
+        try:
+            by_index = {int(r["index"]): float(r["relevance_score"]) for r in reply["results"]}
+        except (KeyError, TypeError, ValueError) as exc:
+            raise EndpointError(f"{url} returned an unexpected rerank reply: {exc!r}") from exc
+        missing = [i for i in range(len(passages)) if i not in by_index]
+        if missing:
+            raise EndpointError(f"{url} returned no score for passage {missing[0]}")
+        return [by_index[i] for i in range(len(passages))]
