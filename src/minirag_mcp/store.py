@@ -1228,7 +1228,9 @@ class Store:
         vq = self._table.search(query_vector).limit(fetch)
         if clause:
             vq = vq.where(clause, prefilter=True)
-        vrows = vq.to_list()
+        # LanceDB returns rows with equal scores in no fixed order, and the fusion below
+        # takes rank as given: ties are broken by id, so one query ranks the same every time.
+        vrows = sorted(vq.to_list(), key=lambda r: (r["_distance"], r["id"]))
         dist_by_id = {r["id"]: r["_distance"] for r in vrows}
 
         fts_rows: list[dict] = []
@@ -1243,7 +1245,7 @@ class Store:
                 ).limit(fetch)
                 if clause:
                     fq = fq.where(clause)
-                fts_rows = fq.to_list()
+                fts_rows = sorted(fq.to_list(), key=lambda r: (-r["_score"], r["id"]))
             except Exception:
                 fts_rows = []  # malformed FTS query degrades to vector-only ranking
 
@@ -1256,8 +1258,7 @@ class Store:
                 hybrid_weight,
             )
             ordered = [
-                by_id[rid]
-                for rid, _ in sorted(rrf_scores.items(), key=lambda kv: kv[1], reverse=True)
+                by_id[rid] for rid, _ in sorted(rrf_scores.items(), key=lambda kv: (-kv[1], kv[0]))
             ]
 
         results: list[SearchResult] = []
