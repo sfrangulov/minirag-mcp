@@ -279,6 +279,8 @@ class _LlamaHandler(BaseHTTPRequestHandler):
             self._send(status, text.encode("utf-8"), "text/plain")
         elif route in llama.html:
             self._send(200, b"<html><body>not an API</body></html>", "text/html")
+        elif route in llama.replies:
+            self._json(llama.replies[route])
         elif self.command == "GET" and route == "/props":
             self._json(llama.props)
         elif self.command == "POST" and route == "/v1/embeddings":
@@ -347,6 +349,7 @@ class FakeLlama:
         self.requests: list[Seen] = []
         self.fail: dict[str, tuple[int, str]] = {}
         self.html: set[str] = set()
+        self.replies: dict[str, object] = {}
         self.dim = 8
         self.vector_salt = ""
         self.drop_last = False

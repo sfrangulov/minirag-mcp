@@ -1,4 +1,5 @@
 import re
+import socket
 
 import pytest
 
@@ -9,6 +10,7 @@ from minirag_mcp.endpoints import (
     EndpointError,
     RerankEndpoint,
     read_api_key,
+    request_json,
 )
 
 
@@ -59,7 +61,7 @@ def test_a_reply_that_is_not_json_is_an_endpoint_error(fake_llama):
 
 def test_a_short_reply_is_an_endpoint_error(fake_llama):
     fake_llama.drop_last = True
-    with pytest.raises(EndpointError):
+    with pytest.raises(EndpointError, match="returned 1 embeddings for 2 texts"):
         EmbeddingEndpoint(ep(fake_llama)).embed(["a", "b"])
 
 
@@ -97,3 +99,43 @@ def test_read_api_key(tmp_path):
     for path in (tmp_path / "missing", tmp_path / "blank"):
         with pytest.raises(EndpointError, match=re.escape(str(path))):
             read_api_key(path)
+
+
+def test_request_json_gets_when_there_is_no_body(fake_llama):
+    fake_llama.props = {"n_ctx": 512}
+    got = request_json(ep(fake_llama), fake_llama.url("/props"))
+    assert got == {"n_ctx": 512}
+    assert [(r.method, r.path) for r in fake_llama.requests] == [("GET", "/props")]
+
+
+def test_a_silent_endpoint_times_out_naming_the_url():
+    with socket.socket() as silent:
+        silent.bind(("127.0.0.1", 0))
+        silent.listen(1)
+        url = f"http://127.0.0.1:{silent.getsockname()[1]}/v1/embeddings"
+        with pytest.raises(EndpointError, match=re.escape(url)):
+            EmbeddingEndpoint(Endpoint(url, "e5", timeout=0.3)).embed(["a"])
+
+
+def test_an_embeddings_reply_without_data_is_an_endpoint_error(fake_llama):
+    fake_llama.replies["/v1/embeddings"] = {"object": "list"}
+    with pytest.raises(EndpointError, match="unexpected embeddings reply"):
+        EmbeddingEndpoint(ep(fake_llama)).embed(["a"])
+
+
+def test_a_rerank_index_out_of_range_is_an_endpoint_error(fake_llama):
+    fake_llama.replies["/v1/rerank"] = {"results": [{"index": 5, "relevance_score": 1.0}]}
+    rr = RerankEndpoint(ep(fake_llama, "/v1/rerank"))
+    with pytest.raises(EndpointError, match="no score for passage 0"):
+        rr.scores("q", ["a"])
+    assert "no score" in rr.last_error
+
+
+def test_a_closed_client_opens_a_new_session_on_next_use(fake_llama):
+    client = EmbeddingEndpoint(ep(fake_llama))
+    client.embed(["a"])
+    first = client._session
+    client.close()
+    assert client._session is None
+    assert len(client.embed(["a"])) == 1
+    assert client._session is not first

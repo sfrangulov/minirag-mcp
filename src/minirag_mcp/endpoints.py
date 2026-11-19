@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -53,24 +54,27 @@ def request_json(
     *,
     session: requests.Session | None = None,
 ) -> dict:
+    if session is None:
+        with _session() as own:
+            return request_json(endpoint, url, body, session=own)
     headers = {"Authorization": f"Bearer {endpoint.api_key}"} if endpoint.api_key else {}
-    sess = session or _session()
     try:
         if body is None:
-            response = sess.get(url, headers=headers, timeout=endpoint.timeout)
+            response = session.get(url, headers=headers, timeout=endpoint.timeout)
         else:
             payload = {**body, "model": endpoint.name}
-            response = sess.post(url, json=payload, headers=headers, timeout=endpoint.timeout)
+            response = session.post(url, json=payload, headers=headers, timeout=endpoint.timeout)
     except requests.RequestException as exc:
         raise EndpointError(f"cannot reach {url}: {exc}") from exc
+    status = response.status_code
     if not response.ok:
-        raise EndpointError(f"{url} answered {response.status_code}: {response.text[:_BODY_CHARS]}")
+        raise EndpointError(f"{url} answered {status}: {response.text[:_BODY_CHARS]}")
     try:
         data = response.json()
     except ValueError as exc:
-        raise EndpointError(f"{url} answered 200 but the reply was not JSON") from exc
+        raise EndpointError(f"{url} answered {status} but the reply was not JSON") from exc
     if not isinstance(data, dict):
-        raise EndpointError(f"{url} answered 200 but the JSON reply was not an object")
+        raise EndpointError(f"{url} answered {status} but the JSON reply was not an object")
     return data
 
 
@@ -78,11 +82,21 @@ class _Client:
     def __init__(self, endpoint: Endpoint) -> None:
         self.endpoint = endpoint
         self._session: requests.Session | None = None
+        # A sync thread and query threads may share one client.
+        self._lock = threading.Lock()
 
     def _post(self, body: dict) -> dict:
-        if self._session is None:
-            self._session = _session()
-        return request_json(self.endpoint, self.endpoint.url, body, session=self._session)
+        with self._lock:
+            if self._session is None:
+                self._session = _session()
+            session = self._session
+        return request_json(self.endpoint, self.endpoint.url, body, session=session)
+
+    def close(self) -> None:
+        with self._lock:
+            session, self._session = self._session, None
+        if session is not None:
+            session.close()
 
 
 class EmbeddingEndpoint(_Client):
