@@ -10,6 +10,7 @@ place and keeps the one it replaces as `previous_dir(db)`.
 from __future__ import annotations
 
 import contextlib
+import errno
 import json
 import os
 import shutil
@@ -126,6 +127,12 @@ def _open_error(db_path: Path, error: OSError) -> IndexOpenError:
     return IndexOpenError.at(db_path, error)
 
 
+def _open_failure(message: str) -> IndexOpenError:
+    from minirag_mcp.store import IndexOpenError
+
+    return IndexOpenError(message)
+
+
 def _to_json(identity: IndexIdentity) -> dict:
     return {
         "format": identity.format,
@@ -236,8 +243,21 @@ def read_identity(db_path: Path) -> IndexIdentity | None:
         raise _malformed(path, str(e)) from None
 
 
-def write_identity(db_path: Path, identity: IndexIdentity) -> None:
-    """Replace `db_path`'s identity in one step: a reader sees the old file or the new one."""
+def _write_new(path: Path, data: bytes) -> None:
+    """Create `path` holding `data`, durably; FileExistsError when it already exists."""
+    f = open(path, "xb")
+    try:
+        with f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+    except BaseException:
+        with contextlib.suppress(OSError):
+            path.unlink()
+        raise
+
+
+def _temp_file(db_path: Path, identity: IndexIdentity) -> tuple[Path, bytes]:
     try:
         db_path.mkdir(parents=True, exist_ok=True)
     except OSError as e:
@@ -245,16 +265,66 @@ def write_identity(db_path: Path, identity: IndexIdentity) -> None:
     # One name per writer: two processes stamping one folder must not share a file.
     tmp = db_path / f"{INDEX_FILE}.{uuid.uuid4().hex}.tmp"
     data = (json.dumps(_to_json(identity), ensure_ascii=False) + "\n").encode("utf-8")
+    _write_new(tmp, data)
+    return tmp, data
+
+
+def write_identity(db_path: Path, identity: IndexIdentity) -> None:
+    """Replace `db_path`'s identity in one step: a reader sees the old file or the new one."""
+    tmp, _ = _temp_file(db_path, identity)
     try:
-        with open(tmp, "xb") as f:
-            f.write(data)
-            f.flush()
-            os.fsync(f.fileno())
         os.replace(tmp, db_path / INDEX_FILE)
     except BaseException:
         with contextlib.suppress(OSError):
             tmp.unlink()
         raise
+
+
+# What link(2) answers on a filesystem without hard links (FAT, exFAT, some shares).
+_NO_HARD_LINKS = frozenset({errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENOSYS})
+
+
+def create_identity(db_path: Path, identity: IndexIdentity) -> IndexIdentity:
+    """Stamp `db_path` with `identity` unless it has one; the identity it holds after.
+
+    Never replaces a recorded identity, so a stamp racing another process's stamp or swap
+    cannot put a new, empty index in place of an existing one.
+    """
+    staging, previous = staging_dir(db_path), previous_dir(db_path)
+    if staging.is_dir() and previous.is_dir():
+        # A swap can be between its two renames, when db_path is missing for an instant;
+        # creating it then would leave an empty index where both of them belong.
+        recover_swap(db_path)
+        found = read_identity(db_path)
+        if found is None:
+            raise IdentityError(
+                f"{db_path} holds no {INDEX_FILE} while {staging} and {previous} both exist, "
+                "so a rebuild may be swapping one of them in; it is not stamped as a new "
+                f"index. If no sync is running, move {db_path} aside so that the next open "
+                f"finishes the swap of {staging}, or remove {staging} to start {db_path} anew."
+            )
+        return found
+    path = db_path / INDEX_FILE
+    tmp, data = _temp_file(db_path, identity)
+    try:
+        try:
+            os.link(tmp, path)
+        except OSError as e:
+            if e.errno not in _NO_HARD_LINKS:
+                raise
+            # Still never over another file, but a reader can see this one half-written.
+            _write_new(path, data)
+    except FileExistsError:
+        found = read_identity(db_path)
+        if found is None:
+            raise IdentityError(
+                f"{path} exists but holds nothing readable, so {db_path} is not stamped; remove it."
+            ) from None
+        return found
+    finally:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+    return identity
 
 
 def is_legacy_index(db_path: Path) -> bool:
@@ -305,7 +375,8 @@ def rebuild_kind(
 def index_state(config: Config, embedder) -> tuple[IndexState, str]:
     """The index's state against the configuration `embedder` was built for, and why.
 
-    Reads files and fastembed's registry only: it never loads a model or calls an endpoint.
+    Reads files and fastembed's registry, and never loads a model or calls an endpoint. It
+    may write, though: an interrupted swap is finished first (`recover_swap`).
     """
     from minirag_mcp.embedder import known_model
     from minirag_mcp.store import IndexOpenError
@@ -348,11 +419,17 @@ def previous_dir(db_path: Path) -> Path:
     return db_path.with_name(db_path.name + ".previous")
 
 
-def _remove(path: Path) -> None:
-    if path.is_dir() and not path.is_symlink():
-        shutil.rmtree(path)
-    elif os.path.lexists(path):
-        path.unlink()
+def _drop_previous(previous: Path) -> None:
+    """Delete the index kept from the swap before; anything else there is left alone."""
+    if not os.path.lexists(previous):
+        return
+    if previous.is_symlink() or not previous.is_dir() or read_identity(previous) is None:
+        raise IdentityError(
+            f"{previous} is where a rebuild keeps the index it replaces, but it holds no "
+            f"minirag index ({INDEX_FILE} is missing), so it is not deleted and nothing is "
+            "swapped. Move it elsewhere and sync again."
+        )
+    shutil.rmtree(previous)
 
 
 def _holds_generation(db_path: Path, generation: int) -> bool:
@@ -379,21 +456,34 @@ def swap_in(db_path: Path) -> None:
             f"{staging} holds no {INDEX_FILE}, so it is not a complete index and is not "
             f"swapped in for {db_path}."
         )
+    if is_legacy_index(db_path):
+        raise LegacyIndexError(
+            f"{db_path} holds a minirag 1.x index (a LanceDB table and no {INDEX_FILE}). "
+            f"minirag 2 never writes to a 1.x index, so {staging} is not swapped in for it."
+        )
     current = read_identity(db_path)
     generation = max(staged.generation, current.generation if current else 0) + 1
     write_identity(staging, replace(staged, generation=generation))
-    _remove(previous)
+    _drop_previous(previous)
     had_index = os.path.lexists(db_path)
     if had_index:
         os.rename(db_path, previous)
     try:
         os.rename(staging, db_path)
-    except OSError:
+    except OSError as e:
         # Another process's recover_swap can move the staged index in between the renames.
         if _holds_generation(db_path, generation):
             return
         if had_index:
-            os.rename(previous, db_path)
+            try:
+                os.rename(previous, db_path)
+            except OSError as undo:
+                raise _open_failure(
+                    f"{db_path} is missing: swapping in {staging} failed "
+                    f"({e.strerror or e}), and putting back {previous}, the index it was "
+                    f"to replace, failed too ({undo.strerror or undo}). The next open "
+                    f"finishes the swap; or rename {staging} or {previous} to {db_path}."
+                ) from e
         raise
 
 
@@ -413,9 +503,7 @@ def recover_swap(db_path: Path) -> bool:
     except OSError as e:
         if os.path.lexists(db_path):  # the swapping process was alive and got there first
             return False
-        from minirag_mcp.store import IndexOpenError
-
-        raise IndexOpenError(
+        raise _open_failure(
             f"{db_path} is missing: a rebuild stopped while swapping in {staging}, and "
             f"finishing that swap failed: {e.strerror or e}. Rename {staging} to {db_path} to "
             f"finish it; {previous} holds the index it replaced."

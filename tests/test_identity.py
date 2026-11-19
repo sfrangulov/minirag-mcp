@@ -2,6 +2,7 @@ import errno
 import json
 import os
 import re
+import threading
 from dataclasses import replace
 from pathlib import Path
 
@@ -23,7 +24,9 @@ from minirag_mcp.identity import (
     IdentityError,
     IndexIdentity,
     IndexState,
+    LegacyIndexError,
     RebuildInfo,
+    create_identity,
     differences,
     index_state,
     is_legacy_index,
@@ -170,6 +173,104 @@ def test_a_failed_write_leaves_the_old_file(tmp_path, monkeypatch):
         write_identity(db, replace(IDENT, generation=2))
     assert (db / INDEX_FILE).read_bytes() == before
     assert [p.name for p in db.iterdir()] == [INDEX_FILE]
+
+
+def test_concurrent_writers_never_share_a_temp_file(tmp_path, monkeypatch):
+    db = tmp_path / "db"
+    write_identity(db, IDENT)
+    both_writing = threading.Barrier(2, timeout=10)
+    real_fsync = os.fsync
+
+    def fsync_once_both_are_writing(fd):
+        both_writing.wait()
+        real_fsync(fd)
+
+    monkeypatch.setattr(identity_mod.os, "fsync", fsync_once_both_are_writing)
+    candidates = [replace(IDENT, generation=2), replace(IDENT, generation=3)]
+    errors: list[BaseException] = []
+
+    def write(identity: IndexIdentity) -> None:
+        try:
+            write_identity(db, identity)
+        except BaseException as e:
+            errors.append(e)
+
+    writers = [threading.Thread(target=write, args=(c,)) for c in candidates]
+    for w in writers:
+        w.start()
+    for w in writers:
+        w.join()
+    assert errors == []
+    assert read_identity(db) in candidates
+    assert [p.name for p in db.iterdir()] == [INDEX_FILE]
+
+
+def test_create_identity_stamps_a_new_folder_and_never_overwrites(tmp_path):
+    db = tmp_path / "db"
+    fresh = IndexIdentity.fresh(EMB, CHUNK, "English")
+    assert create_identity(db, fresh) == fresh
+    assert read_identity(db) == fresh
+    write_identity(db, IDENT)
+    recorded = (db / INDEX_FILE).read_bytes()
+    assert create_identity(db, fresh) == IDENT
+    assert (db / INDEX_FILE).read_bytes() == recorded
+    assert [p.name for p in db.iterdir()] == [INDEX_FILE]
+
+
+def test_create_identity_without_hard_links_still_never_overwrites(tmp_path, monkeypatch):
+    def no_hard_links(src, dst):
+        raise OSError(errno.ENOTSUP, "Operation not supported")
+
+    monkeypatch.setattr(identity_mod.os, "link", no_hard_links)
+    db = tmp_path / "db"
+    fresh = IndexIdentity.fresh(EMB, CHUNK, "English")
+    assert create_identity(db, fresh) == fresh
+    assert read_identity(db) == fresh
+    assert create_identity(db, IDENT) == fresh
+    assert read_identity(db) == fresh
+    assert [p.name for p in db.iterdir()] == [INDEX_FILE]
+
+
+def test_create_identity_refuses_an_unreadable_entry_in_the_way(tmp_path):
+    db = tmp_path / "db"
+    db.mkdir()
+    (db / INDEX_FILE).symlink_to(tmp_path / "nowhere")
+    with pytest.raises(IdentityError, match="holds nothing readable"):
+        create_identity(db, IndexIdentity.fresh(EMB, CHUNK, "English"))
+    assert (db / INDEX_FILE).is_symlink()
+    assert sorted(p.name for p in db.iterdir()) == [INDEX_FILE]
+
+
+def test_a_stamp_racing_a_swap_never_replaces_the_index(tmp_path, monkeypatch):
+    """Another process found no identity at db, because a swap had just moved it away."""
+    db = tmp_path / "db"
+    make_index(db, 1, "serving")
+    make_index(staging_dir(db), 1, "rebuilt")
+    fresh = IndexIdentity.fresh(EMB, CHUNK, "English")
+    stamped: list[IndexIdentity] = []
+    real_rename = os.rename
+
+    def stamp_between_the_renames(src, dst):
+        if Path(src) == staging_dir(db) and not stamped:
+            stamped.append(fresh)
+            stamped[0] = create_identity(db, fresh)
+        real_rename(src, dst)
+
+    monkeypatch.setattr(identity_mod.os, "rename", stamp_between_the_renames)
+    swap_in(db)
+    assert (generation(db), marker(db)) == (2, "rebuilt")
+    assert stamped == [read_identity(db)]
+    assert (generation(previous_dir(db)), marker(previous_dir(db))) == (1, "serving")
+
+
+def test_no_fresh_stamp_while_a_swap_may_be_under_way(tmp_path):
+    db = tmp_path / "db"
+    db.mkdir()
+    make_index(previous_dir(db), 1, "serving")
+    make_index(staging_dir(db), 2, "rebuilt")
+    with pytest.raises(IdentityError, match=re.escape(str(staging_dir(db)))):
+        create_identity(db, IndexIdentity.fresh(EMB, CHUNK, "English"))
+    assert list(db.iterdir()) == []
 
 
 def test_a_lancedb_table_without_identity_is_legacy(tmp_path):
@@ -356,6 +457,52 @@ def test_a_failed_second_rename_puts_the_index_back(tmp_path, monkeypatch):
     assert (generation(db), marker(db)) == (1, "serving")
     assert marker(staging_dir(db)) == "rebuilt"
     assert not previous_dir(db).exists()
+
+
+def test_a_failed_rollback_names_every_folder_and_the_swap_is_finished_later(tmp_path, monkeypatch):
+    db = tmp_path / "db"
+    make_index(db, 1, "serving")
+    make_index(staging_dir(db), 1, "rebuilt")
+    real_rename = os.rename
+
+    def only_the_first_rename(src, dst):
+        if Path(dst) == db:
+            raise OSError(errno.EACCES, "Permission denied")
+        real_rename(src, dst)
+
+    monkeypatch.setattr(identity_mod.os, "rename", only_the_first_rename)
+    with pytest.raises(IndexOpenError) as excinfo:
+        swap_in(db)
+    for folder in (db, previous_dir(db), staging_dir(db)):
+        assert str(folder) in str(excinfo.value)
+    monkeypatch.setattr(identity_mod.os, "rename", real_rename)
+    assert recover_swap(db) is True
+    assert (generation(db), marker(db)) == (2, "rebuilt")
+    assert marker(previous_dir(db)) == "serving"
+
+
+def test_swap_in_never_deletes_a_previous_that_is_not_an_index(tmp_path):
+    db = tmp_path / "db"
+    make_index(db, 1, "serving")
+    make_index(staging_dir(db), 1, "rebuilt")
+    previous_dir(db).mkdir()
+    (previous_dir(db) / "notes.txt").write_text("the user's", encoding="utf-8")
+    with pytest.raises(IdentityError, match=re.escape(str(previous_dir(db)))):
+        swap_in(db)
+    assert (previous_dir(db) / "notes.txt").read_text(encoding="utf-8") == "the user's"
+    assert (generation(db), marker(db)) == (1, "serving")
+    assert marker(staging_dir(db)) == "rebuilt"
+
+
+def test_swap_in_refuses_a_1x_index(tmp_path):
+    db = tmp_path / "db"
+    Store(db, dim=8)
+    make_index(staging_dir(db), 1, "rebuilt")
+    with pytest.raises(LegacyIndexError, match=re.escape(str(db))):
+        swap_in(db)
+    assert is_legacy_index(db)
+    assert not previous_dir(db).exists()
+    assert marker(staging_dir(db)) == "rebuilt"
 
 
 def test_a_swap_finished_by_another_process_is_not_a_failure(tmp_path, monkeypatch):
