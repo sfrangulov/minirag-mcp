@@ -187,19 +187,23 @@ def run_full(db: Path, corpus: Path) -> int:
 
 
 def run_subset(corpus: Path, update: bool) -> int:
-    from minirag_mcp.ingest.pipeline import Pipeline
-    from minirag_mcp.sync import run_sync
+    from bulk_index import build
 
     questions = load_questions()
     rel = subset(corpus_files(corpus), questions, total=TOTAL, seed=SEED)
     work = Path(tempfile.mkdtemp(prefix="minirag-erb-subset-"))
     root, db = work / "corpus", work / "lancedb"
     materialize(corpus, rel, root)
-    cfg, emb, store = _open(db, root)
-    counts, errors = run_sync(Pipeline(store, emb, cfg), store, cfg.roots, cfg.max_file_size)
-    if errors or counts["failed"] or counts["ingested"] != len(rel):
-        print(f"subset index incomplete: {counts}, {errors[:3]}", file=sys.stderr)
+    root = root.resolve()
+    # The parallel build, whose rows `bulk_index.py --verify` holds equal to stock sync's:
+    # stock sync takes about 1.7 hours over these 20,000 files, this about 20 minutes.
+    result = build(root, db, workers=9, threads=2, batch_files=1000, log=sys.stderr)
+    if result["errors"] or result["counts"]["ingested"] != len(rel):
+        print(
+            f"subset index incomplete: {result['counts']}, {result['errors'][:3]}", file=sys.stderr
+        )
         return 1
+    cfg, emb, store = _open(db, root)
     summary = summarize(measure(store, emb, cfg, questions))
     current = {"summary": summary, "fingerprint": fingerprint(cfg), "subset": subset_hash(rel)}
     if update or not BASELINE.exists():

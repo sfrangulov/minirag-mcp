@@ -1,0 +1,143 @@
+{
+  "summary": {
+    "overall": {
+      "n": 470,
+      "recall@5": 71.59,
+      "recall@10": 81.12,
+      "recall@20": 87.08,
+      "mrr": 0.6395,
+      "recall_default_call": 76.46,
+      "pool_docs": 76.4,
+      "recall_pool": 92.77,
+      "deep_recall@10": 82.0,
+      "deep_recall@20": 86.84,
+      "deep_recall@50": 91.53,
+      "deep_recall@100": 93.5
+    },
+    "by_type": {
+      "basic": {
+        "n": 175,
+        "recall@5": 84.57,
+        "recall@10": 90.86,
+        "recall@20": 94.29,
+        "mrr": 0.6821,
+        "recall_default_call": 88.0,
+        "pool_docs": 78.3,
+        "recall_pool": 98.86,
+        "deep_recall@10": 91.43,
+        "deep_recall@20": 93.71,
+        "deep_recall@50": 98.86,
+        "deep_recall@100": 99.43
+      },
+      "completeness": {
+        "n": 20,
+        "recall@5": 44.01,
+        "recall@10": 61.47,
+        "recall@20": 69.28,
+        "mrr": 0.751,
+        "recall_default_call": 53.64,
+        "pool_docs": 73.6,
+        "recall_pool": 79.66,
+        "deep_recall@10": 62.1,
+        "deep_recall@20": 68.57,
+        "deep_recall@50": 76.31,
+        "deep_recall@100": 80.38
+      },
+      "conflicting_info": {
+        "n": 20,
+        "recall@5": 80.0,
+        "recall@10": 90.0,
+        "recall@20": 92.5,
+        "mrr": 0.8139,
+        "recall_default_call": 87.5,
+        "pool_docs": 62.5,
+        "recall_pool": 100.0,
+        "deep_recall@10": 90.0,
+        "deep_recall@20": 92.5,
+        "deep_recall@50": 97.5,
+        "deep_recall@100": 100.0
+      },
+      "constrained": {
+        "n": 30,
+        "recall@5": 95.0,
+        "recall@10": 98.33,
+        "recall@20": 100.0,
+        "mrr": 0.9,
+        "recall_default_call": 93.33,
+        "pool_docs": 68.7,
+        "recall_pool": 100.0,
+        "deep_recall@10": 98.33,
+        "deep_recall@20": 100.0,
+        "deep_recall@50": 100.0,
+        "deep_recall@100": 100.0
+      },
+      "intra_document_reasoning": {
+        "n": 40,
+        "recall@5": 85.0,
+        "recall@10": 97.5,
+        "recall@20": 100.0,
+        "mrr": 0.7156,
+        "recall_default_call": 95.0,
+        "pool_docs": 76.0,
+        "recall_pool": 100.0,
+        "deep_recall@10": 97.5,
+        "deep_recall@20": 100.0,
+        "deep_recall@50": 100.0,
+        "deep_recall@100": 100.0
+      },
+      "miscellaneous": {
+        "n": 20,
+        "recall@5": 100.0,
+        "recall@10": 100.0,
+        "recall@20": 100.0,
+        "mrr": 0.9017,
+        "recall_default_call": 100.0,
+        "pool_docs": 75.4,
+        "recall_pool": 100.0,
+        "deep_recall@10": 100.0,
+        "deep_recall@20": 100.0,
+        "deep_recall@50": 100.0,
+        "deep_recall@100": 100.0
+      },
+      "project_related": {
+        "n": 40,
+        "recall@5": 70.41,
+        "recall@10": 83.69,
+        "recall@20": 92.33,
+        "mrr": 0.9313,
+        "recall_default_call": 67.85,
+        "pool_docs": 50.4,
+        "recall_pool": 95.17,
+        "deep_recall@10": 83.69,
+        "deep_recall@20": 92.33,
+        "deep_recall@50": 96.08,
+        "deep_recall@100": 98.47
+      },
+      "semantic": {
+        "n": 125,
+        "recall@5": 42.4,
+        "recall@10": 56.0,
+        "recall@20": 68.0,
+        "mrr": 0.3119,
+        "recall_default_call": 51.2,
+        "pool_docs": 86.9,
+        "recall_pool": 79.2,
+        "deep_recall@10": 58.4,
+        "deep_recall@20": 68.0,
+        "deep_recall@50": 75.2,
+        "deep_recall@100": 80.0
+      }
+    }
+  },
+  "fingerprint": {
+    "machine": "arm64",
+    "system": "Darwin 27.2.0",
+    "python": "3.13.15",
+    "onnxruntime": "1.28.0",
+    "fastembed": "0.8.0",
+    "lancedb": "0.36.0",
+    "model": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+    "minirag": "1.1.1"
+  },
+  "subset": "e241a34c34d0618911fedac37a0d1acca59519efadb34653d8cb2474c0625a26"
+}
