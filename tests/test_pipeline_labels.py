@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from conftest import FakeChoiceModel, stamp_identity
+from minirag_mcp.chunker import join_document
 from minirag_mcp.config import Config, load_config
 from minirag_mcp.handle import IndexHandle
 from minirag_mcp.ingest.pipeline import Pipeline, file_sha256
@@ -279,6 +280,25 @@ def test_documents_ingested_inside_one_job_share_one_model_and_one_taxonomy(corp
     assert corpus.store.get_source(str(b)).label_hash == first_hash
     corpus.pipeline.ingest_file(b)
     assert corpus.store.get_source(str(b)).label_hash == corpus.hash() != first_hash
+
+
+def test_a_reingest_keeps_its_stored_labels_and_makes_no_model(corpus, model_factory):
+    """A rebuild re-stores what it cannot read again from its stored text; it must not
+    label it again, which would load the classify model a second time."""
+    corpus.taxonomy()
+    model_factory.answers = {"Minutes of": {"minutes": 0.9, "report": 0.1}}
+    doc = corpus.doc("alpha/weekly.md", "Minutes of the weekly sync.", 3)
+    corpus.pipeline.ingest_file(doc)
+    before = corpus.store.get_source(str(doc))
+    model_factory.answers = {"Minutes of": {"report": 0.9, "minutes": 0.1}}
+    made = len(model_factory.created)
+
+    corpus.pipeline.reingest_stored(before, join_document(corpus.store.all_chunks(str(doc))))
+
+    after = corpus.store.get_source(str(doc))
+    assert [getattr(after, f) for f in FIELDS] == [getattr(before, f) for f in FIELDS]
+    assert corpus.labels(doc)["type"].value == "minutes"
+    assert len(model_factory.created) == made
 
 
 # --- sync --------------------------------------------------------------------------

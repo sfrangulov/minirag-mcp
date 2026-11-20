@@ -1,3 +1,4 @@
+import pickle
 from dataclasses import replace
 
 import pytest
@@ -35,6 +36,48 @@ def test_ingest_file_roundtrip(pipe):
     assert info.source_type == "file"
     assert info.file_hash == file_sha256(f)
     assert info.mtime == f.stat().st_mtime
+
+
+class _Untouchable:
+    def __getattr__(self, name):
+        raise AssertionError(f"preparing a document read .{name} of the label source")
+
+
+def test_prepare_file_needs_neither_a_store_nor_labels(tmp_path, fake_embedder):
+    cfg = load_config({"BASE_DIR": str(tmp_path)}, cwd=tmp_path)
+    f = tmp_path / "doc.md"
+    f.write_text("# T\n\n" + "Sentence about topic. " * 80, encoding="utf-8")
+    doc = Pipeline(None, fake_embedder, cfg, labels=_Untouchable()).prepare_file(f)
+    assert len(doc.chunks) == len(doc.vectors) == len(doc.pages) > 1
+    assert (doc.source, doc.source_type, doc.file_hash, doc.mtime) == (
+        str(f),
+        "file",
+        file_sha256(f),
+        f.stat().st_mtime,
+    )
+
+
+def test_a_prepared_document_survives_pickling(tmp_path, fake_embedder):
+    cfg = load_config({"BASE_DIR": str(tmp_path)}, cwd=tmp_path)
+    f = tmp_path / "doc.md"
+    f.write_text("# T\n\n" + "Sentence about topic. " * 80, encoding="utf-8")
+    doc = Pipeline(None, fake_embedder, cfg).prepare_file(f)
+    assert pickle.loads(pickle.dumps(doc)) == doc
+
+
+def test_ingest_file_stores_exactly_what_was_prepared(pipe):
+    p, store, root = pipe
+    f = root / "doc.md"
+    f.write_text("# T\n\n" + "Sentence about topic. " * 80, encoding="utf-8")
+    doc = p.prepare_file(f)
+    assert p.ingest_file(f).chunk_count == len(doc.chunks) > 1
+    rows = store._table.search().where(f"source = '{f}'").limit(10_000).to_list()
+    rows.sort(key=lambda r: r["chunk_index"])
+    assert [r["text"] for r in rows] == [c.text for c in doc.chunks]
+    assert [r["pages"] for r in rows] == list(doc.pages)
+    assert len(rows) == len(doc.vectors)
+    for row, vector in zip(rows, doc.vectors, strict=True):
+        assert list(row["vector"]) == pytest.approx(vector)
 
 
 def test_chunks_leave_room_for_the_passage_prefix(tmp_path):

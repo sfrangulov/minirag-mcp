@@ -12,7 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from minirag_mcp import ocr
-from minirag_mcp.chunker import SCHEME_VERSION, chunk_markdown, estimate_tokens
+from minirag_mcp.chunker import SCHEME_VERSION, Chunk, chunk_markdown, estimate_tokens
 from minirag_mcp.config import Config
 from minirag_mcp.ingest import ignore, pages
 from minirag_mcp.ingest import parser as _parser
@@ -53,6 +53,27 @@ class IngestResult:
     # Why the document was stored without some or all of its labels; None when nothing
     # is missing or the corpus has no classify.toml.
     label_problem: str | None = None
+
+
+@dataclass(frozen=True)
+class PreparedDocument:
+    """A document parsed, chunked, page-mapped and embedded; not yet labelled or stored.
+
+    Made without the store or the labeler, so that one process can prepare it and
+    another store it: it must stay picklable.
+    """
+
+    source: str
+    source_type: str
+    title: str
+    chunks: tuple[Chunk, ...]
+    vectors: tuple[Sequence[float], ...]
+    # Per chunk: "12", "12-13", or "" where the page is not known.
+    pages: tuple[str, ...]
+    file_hash: str = ""
+    mtime: float = 0.0
+    ocr_engine: str = ""
+    file_time: float | None = None
 
 
 def file_sha256(path: Path) -> str:
@@ -269,7 +290,7 @@ class Pipeline:
             return {}, f"stored without labels: {_reason(e)}"
         return _label_columns(doc), _label_problem(doc)
 
-    def _chunk_and_store(
+    def prepare(
         self,
         markdown: str,
         *,
@@ -282,51 +303,80 @@ class Pipeline:
         ocr_engine: str = "",
         file_time: float | None = None,
         page_starts: pages.PageStarts = (),
-        labels: dict[str, str] | None = None,
-    ) -> IngestResult:
-        """Chunk, embed, label and store, replacing whatever `source` held before. Given
-        `labels`, the label columns are those, and nothing is labelled."""
+    ) -> PreparedDocument:
+        """Chunk, page-map and embed `markdown`. Reads neither the store nor the labels."""
         chunks = self._chunk(markdown, source=source, title=title, seed_title=seed_title)
-        texts = [c.text for c in chunks]
         chunk_pages = pages.chunk_pages(markdown, page_starts, chunks)
-        vectors = self.embedder.embed_documents(texts)
+        vectors = self.embedder.embed_documents([c.text for c in chunks])
+        return PreparedDocument(
+            source=source,
+            source_type=source_type,
+            title=title,
+            chunks=tuple(chunks),
+            vectors=tuple(vectors),
+            pages=tuple(chunk_pages),
+            file_hash=file_hash,
+            mtime=mtime,
+            ocr_engine=ocr_engine,
+            file_time=file_time,
+        )
+
+    def records(
+        self, doc: PreparedDocument, *, labels: dict[str, str] | None = None
+    ) -> tuple[list[ChunkRecord], str | None]:
+        """The rows that store `doc`, and why any of its labels are missing.
+
+        Labelled in the active job, unless `labels` gives the label columns; then
+        nothing is labelled.
+        """
         label_problem = None
         if labels is None:
             labels, label_problem = self._label(
-                source=source,
-                source_type=source_type,
-                title=title,
-                chunk_texts=texts,
-                file_time=file_time,
+                source=doc.source,
+                source_type=doc.source_type,
+                title=doc.title,
+                chunk_texts=[c.text for c in doc.chunks],
+                file_time=doc.file_time,
             )
         now = datetime.now(UTC).isoformat()
         records = [
             ChunkRecord(
-                id=f"{source}#{i}",
-                source=source,
-                source_type=source_type,
-                title=title,
+                id=f"{doc.source}#{i}",
+                source=doc.source,
+                source_type=doc.source_type,
+                title=doc.title,
                 chunk_index=i,
                 text=chunk.text,
                 vector=vec,
-                file_hash=file_hash,
-                mtime=mtime,
+                file_hash=doc.file_hash,
+                mtime=doc.mtime,
                 ingested_at=now,
                 # Scoped to the source so a parent is addressable on its own, and so
                 # two documents can never share one.
-                parent_id=f"{source}#p{chunk.parent_index}",
-                ocr_engine=ocr_engine,
+                parent_id=f"{doc.source}#p{chunk.parent_index}",
+                ocr_engine=doc.ocr_engine,
                 scheme_version=SCHEME_VERSION,
-                pages=chunk_pages[i],
+                pages=doc.pages[i],
                 **labels,
             )
-            for i, (chunk, vec) in enumerate(zip(chunks, vectors, strict=True))
+            for i, (chunk, vec) in enumerate(zip(doc.chunks, doc.vectors, strict=True))
         ]
+        return records, label_problem
+
+    def store_prepared(
+        self, doc: PreparedDocument, *, labels: dict[str, str] | None = None
+    ) -> IngestResult:
+        """Label and store `doc`, replacing whatever its source held before. Given
+        `labels`, the label columns are those, and nothing is labelled."""
+        records, label_problem = self.records(doc, labels=labels)
         if self.before_store is not None:
             self.before_store()
-        self.store.replace_source(source, records)
+        self.store.replace_source(doc.source, records)
         return IngestResult(
-            source=source, chunk_count=len(records), title=title, label_problem=label_problem
+            source=doc.source,
+            chunk_count=len(records),
+            title=doc.title,
+            label_problem=label_problem,
         )
 
     def _checked_stat(self, path: Path) -> os.stat_result:
@@ -351,28 +401,36 @@ class Pipeline:
             )
         return info
 
-    def ingest_file(self, path: Path, *, rules_checked: bool = False) -> IngestResult:
-        """`rules_checked` is a sync's: its scan already held the file to the rules, and
-        a rule file edited mid-sync must not turn files it scanned into failures."""
+    def prepare_file(self, path: Path, *, rules_checked: bool = False) -> PreparedDocument:
+        """Read, parse and prepare one file. Reads neither the store nor the labels.
+
+        `rules_checked` is a sync's: its scan already held the file to the rules, and
+        a rule file edited mid-sync must not turn files it scanned into failures.
+        """
         # Refused rather than indexed: the next sync would take it out again, silently.
         if not rules_checked and (by := ignore.excluded_by(path, self.config.roots)) is not None:
             raise IgnoredFileError(f"{path} is excluded by {by}; remove its rule to index it")
         info = self._checked_stat(path)
         doc = parse_file(path, self.config)
+        return self.prepare(
+            doc.markdown,
+            source=str(path),
+            source_type="file",
+            title=doc.title,
+            # a file's title is always a real one: metadata, a heading, or its name
+            seed_title=True,
+            file_hash=file_sha256(path),
+            mtime=info.st_mtime,
+            ocr_engine=doc.ocr_engine,
+            file_time=_file_time(info),
+            page_starts=doc.page_starts,
+        )
+
+    def ingest_file(self, path: Path, *, rules_checked: bool = False) -> IngestResult:
+        """Prepare and store one file; `rules_checked` is as `prepare_file` takes it."""
+        doc = self.prepare_file(path, rules_checked=rules_checked)
         with self.job():
-            return self._chunk_and_store(
-                doc.markdown,
-                source=str(path),
-                source_type="file",
-                title=doc.title,
-                # a file's title is always a real one: metadata, a heading, or its name
-                seed_title=True,
-                file_hash=file_sha256(path),
-                mtime=info.st_mtime,
-                ocr_engine=doc.ocr_engine,
-                file_time=_file_time(info),
-                page_starts=doc.page_starts,
-            )
+            return self.store_prepared(doc)
 
     def ingest_data(
         self, data: str, source: str, fmt: str = "text", title: str | None = None
@@ -387,12 +445,14 @@ class Pipeline:
             real_title = find_title(markdown, title)
         with self.job():
             # Without a title of its own the source id stands in, and an id is not a title.
-            return self._chunk_and_store(
-                markdown,
-                source=source,
-                source_type="data",
-                title=real_title or source,
-                seed_title=real_title is not None,
+            return self.store_prepared(
+                self.prepare(
+                    markdown,
+                    source=source,
+                    source_type="data",
+                    title=real_title or source,
+                    seed_title=real_title is not None,
+                )
             )
 
     def ingest_url(
@@ -407,12 +467,14 @@ class Pipeline:
         # A titleless page is titled after its URL, which is an address, not a title.
         real_title = explicit or (doc.title if doc.has_title else None)
         with self.job():
-            return self._chunk_and_store(
-                doc.markdown,
-                source=source or url,
-                source_type="url",
-                title=real_title or doc.title,
-                seed_title=real_title is not None,
+            return self.store_prepared(
+                self.prepare(
+                    doc.markdown,
+                    source=source or url,
+                    source_type="url",
+                    title=real_title or doc.title,
+                    seed_title=real_title is not None,
+                )
             )
 
     def reingest_stored(self, info: SourceInfo, markdown: str) -> IngestResult:
@@ -421,7 +483,7 @@ class Pipeline:
         For a source a rebuild cannot read again: the source keeps its type, title, hash,
         mtime, OCR engine and labels, and nothing is parsed or labelled.
         """
-        return self._chunk_and_store(
+        doc = self.prepare(
             markdown,
             source=info.source,
             source_type=info.source_type,
@@ -431,6 +493,9 @@ class Pipeline:
             file_hash=info.file_hash,
             mtime=info.mtime,
             ocr_engine=info.ocr_engine,
+        )
+        return self.store_prepared(
+            doc,
             labels={
                 "labels_json": info.labels_json,
                 "label_keys": info.label_keys,
