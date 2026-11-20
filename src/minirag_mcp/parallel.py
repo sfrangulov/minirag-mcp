@@ -1,14 +1,27 @@
-"""How many sync workers, and how many threads each may use."""
+"""Sync workers: how many, how many threads each may use, and the processes they run in."""
 
 from __future__ import annotations
 
+import multiprocessing
 import os
+import pickle
 import re
 import subprocess
 import sys
+from collections import deque
+from collections.abc import Callable, Generator, Iterator, Sequence
+from concurrent.futures import Future, ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
+from typing import TYPE_CHECKING, NamedTuple, Protocol
 
-from fastembed import TextEmbedding
+from minirag_mcp.endpoints import EndpointError
+
+# Nothing heavier at the top: every worker process imports this module first, so fastembed
+# and the pipeline are imported where they are used.
+if TYPE_CHECKING:
+    from minirag_mcp.config import Config
+    from minirag_mcp.ingest.pipeline import Pipeline, PreparedDocument
 
 FILES_PER_WORKER = 4
 # Interpreter and libraries per worker process, measured.
@@ -60,6 +73,8 @@ def total_memory() -> int | None:
 
 
 def worker_footprint(embedder) -> int:
+    from fastembed import TextEmbedding
+
     if getattr(embedder, "backend", "") == "endpoint":
         return WORKER_BASE_BYTES
     for entry in TextEmbedding.list_supported_models():
@@ -81,3 +96,119 @@ def worker_count(configured: int | None, files: int, *, default: int) -> int:
 
 def worker_threads(workers: int) -> int:
     return max(1, physical_cores() // workers)
+
+
+WORKER_DIED = (
+    "the worker process reading this file stopped abruptly (a crash in a native "
+    "library, or killed for memory); it was not indexed"
+)
+
+
+class Preparer(Protocol):
+    def prepare_file(self, path: Path, *, rules_checked: bool) -> PreparedDocument: ...
+
+
+class Prepared(NamedTuple):
+    path: Path
+    document: PreparedDocument | None
+    error: str | None
+    # Failed by the embedding endpoint (unreachable, timed out, or a bad reply): a failure
+    # every file after it is likely to meet too.
+    endpoint_failed: bool = False
+
+
+def worker_pipeline(config: Config, embedder, threads: int | None) -> Pipeline:
+    """The worker half of a sync's pipeline: no store, no labels, no store hook.
+
+    `embedder` is the parent pipeline's, unpickled in the worker as its own copy.
+    """
+    from minirag_mcp.ingest.pipeline import Pipeline
+
+    embedder.threads = threads
+    # Every worker would load its own copy of the model in-process, and the worker count
+    # is sized for an endpoint: with e5, N workers falling back need N x 3.3 GB.
+    embedder.allow_fallback = False
+    return Pipeline(None, embedder, config)
+
+
+def prepare_one(preparer: Preparer, path: Path) -> Prepared:
+    """`path` prepared as a sync's worker prepares it; a failure is its error."""
+    try:
+        return Prepared(path, preparer.prepare_file(path, rules_checked=True), None)
+    except EndpointError as e:
+        return Prepared(path, None, str(e), endpoint_failed=True)
+    except Exception as e:
+        return Prepared(path, None, str(e))
+
+
+# One worker's own: what it prepares with, or why it has nothing to prepare with.
+_preparer: Preparer | None = None
+_unbuilt: str | None = None
+
+
+def _init_worker(make_preparer: bytes) -> None:
+    global _preparer, _unbuilt
+    # A stdio MCP server's stdout is its protocol channel, and this process inherited it.
+    os.dup2(2, 1)
+    # Tesseract's OpenMP threads would otherwise multiply with the workers.
+    os.environ.setdefault("OMP_THREAD_LIMIT", "1")
+    # Kept, never raised: an initializer that raises breaks the pool, and every file would
+    # read as a crash. Unpickled here, inside the try, for the same reason.
+    try:
+        _preparer = pickle.loads(make_preparer)()
+    except Exception as e:
+        _unbuilt = str(e)
+
+
+def _prepare(path: Path) -> Prepared:
+    if _unbuilt is not None:
+        return Prepared(path, None, _unbuilt)
+    return prepare_one(_preparer, path)
+
+
+def _run(
+    make_preparer: bytes, waiting: deque[Path], workers: int, in_flight: int
+) -> Generator[Prepared, None, list[Path]]:
+    """Prepare paths from the left of `waiting` in one pool, in order. Returns the paths
+    the pool had in flight when it broke, else []."""
+    pool = ProcessPoolExecutor(
+        workers,
+        # Spawn, never fork: the parent may be the MCP server with LanceDB and sync threads
+        # running, and a forked child inherits their locks in whatever state they are in.
+        mp_context=multiprocessing.get_context("spawn"),
+        initializer=_init_worker,
+        initargs=(make_preparer,),
+    )
+    running: deque[tuple[Path, Future[Prepared]]] = deque()
+    try:
+        while waiting or running:
+            while waiting and len(running) < in_flight:
+                running.append((waiting[0], pool.submit(_prepare, waiting[0])))
+                waiting.popleft()
+            result = running[0][1].result()
+            running.popleft()
+            yield result
+    except BrokenProcessPool:
+        return [path for path, _ in running]
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
+    return []
+
+
+def prepare_files(
+    make_preparer: Callable[[], Preparer], paths: Sequence[Path], *, workers: int
+) -> Iterator[Prepared]:
+    """Each of `paths` prepared in one of `workers` processes, in input order.
+
+    A worker that dies takes its pool down with the files the pool had in flight. Those are
+    prepared again one at a time in a one-worker pool, replaced whenever a file breaks it,
+    so only a file that kills its worker fails, with WORKER_DIED; a fresh pool then takes
+    the rest.
+    """
+    factory = pickle.dumps(make_preparer)
+    waiting = deque(paths)
+    while waiting:
+        suspects = deque((yield from _run(factory, waiting, workers, 2 * workers)))
+        while suspects:
+            for path in (yield from _run(factory, suspects, 1, 1)):
+                yield Prepared(path, None, WORKER_DIED)
