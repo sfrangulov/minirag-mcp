@@ -1,7 +1,9 @@
+import ctypes
 import multiprocessing
 import os
 import pickle
 import re
+import sys
 from functools import partial
 from types import SimpleNamespace
 
@@ -29,7 +31,9 @@ SAMPLE = "".join(
         (18, 64 * GiB, int(1.5 * GiB), 17),  # endpoint: the cores decide
         (18, 64 * GiB, int(3.6 * GiB), 8),  # in-process e5: memory decides
         (8, 16 * GiB, int(3.6 * GiB), 2),
-        (8, None, int(3.6 * GiB), 7),  # memory unknown
+        (8, None, int(3.6 * GiB), 2),  # memory unknown, the model in every worker
+        (2, None, int(3.6 * GiB), 1),
+        (8, None, parallel.WORKER_BASE_BYTES, 7),  # memory unknown, an endpoint
         (1, 64 * GiB, GiB, 1),
         (4, GiB, 4 * GiB, 1),
     ],
@@ -81,6 +85,41 @@ def test_worker_threads_share_the_cores(monkeypatch):
 def test_total_memory_is_positive_or_unknown():
     memory = parallel.total_memory()
     assert memory is None or memory > 0
+
+
+class Kernel32:
+    """`GlobalMemoryStatusEx`, filling in `total` bytes of physical memory, or failing."""
+
+    def __init__(self, total: int, *, fails: bool = False) -> None:
+        self.total = total
+        self.fails = fails
+        self.lengths: list[int] = []
+
+    def GlobalMemoryStatusEx(self, status) -> int:  # noqa: N802 - the Windows API's name
+        self.lengths.append(status._obj.dwLength)
+        if self.fails:
+            return 0
+        status._obj.ullTotalPhys = self.total
+        return 1
+
+
+def on_windows(monkeypatch, kernel32: Kernel32) -> None:
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.delattr(os, "sysconf")
+    monkeypatch.setattr(ctypes, "windll", SimpleNamespace(kernel32=kernel32), raising=False)
+
+
+def test_total_memory_on_windows_is_its_physical_memory(monkeypatch):
+    kernel32 = Kernel32(16 * GiB)
+    on_windows(monkeypatch, kernel32)
+    assert parallel.total_memory() == 16 * GiB
+    # sizeof(MEMORYSTATUSEX): Windows refuses the call for any other length.
+    assert kernel32.lengths == [64]
+
+
+def test_total_memory_on_windows_is_unknown_when_the_call_fails(monkeypatch):
+    on_windows(monkeypatch, Kernel32(16 * GiB, fails=True))
+    assert parallel.total_memory() is None
 
 
 @pytest.fixture

@@ -29,6 +29,8 @@ FILES_PER_WORKER = 4
 WORKER_BASE_BYTES = 3 * 2**29
 # ~65 MB of 1024-dim vectors held as Python floats; ~200 commits per 400k rows.
 BATCH_ROWS = 2000
+# Workers that each load the model, on a machine whose memory cannot be read.
+UNKNOWN_MEMORY_WORKERS = 2
 
 # (source, error); error is None when the source was stored.
 Written = tuple[str, str | None]
@@ -71,7 +73,35 @@ def physical_cores() -> int:
     return max(1, min(found or logical, logical))
 
 
+def _windows_memory() -> int | None:
+    import ctypes
+
+    class MemoryStatusEx(ctypes.Structure):
+        _fields_ = [
+            ("dwLength", ctypes.c_uint32),
+            ("dwMemoryLoad", ctypes.c_uint32),
+            ("ullTotalPhys", ctypes.c_uint64),
+            ("ullAvailPhys", ctypes.c_uint64),
+            ("ullTotalPageFile", ctypes.c_uint64),
+            ("ullAvailPageFile", ctypes.c_uint64),
+            ("ullTotalVirtual", ctypes.c_uint64),
+            ("ullAvailVirtual", ctypes.c_uint64),
+            ("ullAvailExtendedVirtual", ctypes.c_uint64),
+        ]
+
+    status = MemoryStatusEx()
+    status.dwLength = ctypes.sizeof(status)
+    try:
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return None
+    except (OSError, AttributeError):
+        return None
+    return status.ullTotalPhys or None
+
+
 def total_memory() -> int | None:
+    if sys.platform == "win32":
+        return _windows_memory()
     try:
         return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
     except (ValueError, OSError, AttributeError):
@@ -93,6 +123,9 @@ def default_workers(cores: int, memory: int | None, footprint: int) -> int:
     workers = max(1, cores - 1)
     if memory is not None:
         workers = min(workers, max(1, memory // 2 // footprint))
+    elif footprint > WORKER_BASE_BYTES:
+        # Above the base, the footprint holds a model every worker loads its own copy of.
+        workers = min(workers, UNKNOWN_MEMORY_WORKERS)
     return workers
 
 
