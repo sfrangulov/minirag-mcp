@@ -296,9 +296,9 @@ version. Next to 1.1.1 it brings:
   processes; OCR by Tesseract, with Apple Vision as a second reader on macOS;
   struck-through text kept and marked; `RAG_EXCLUDE` and `RAG_MAX_TABLE_ROWS` (see
   [Configuration](#configuration)).
-- **13 tools**, `list_indexes` the new one, each taking an optional `index` (see [MCP
-  Tools](#mcp-tools)), and **13 CLI commands**, `serve` and `indexes` the new ones (see
-  [CLI](#cli)).
+- **13 tools**, `list_indexes` the new one; every other tool takes an optional `index`
+  (see [MCP Tools](#mcp-tools)). **13 CLI commands**, `serve` and `indexes` the new ones
+  (see [CLI](#cli)).
 
 ### Installing v2
 
@@ -345,7 +345,7 @@ overrides both, and `--config` overrides that for one command.
 [server]                            # every key optional
 host = "127.0.0.1"
 port = 8765
-api_key_file = "~/llama/api-key"    # bearer key for the model endpoints
+# api_key_file = "~/llama/api-key"  # only with model endpoints: a missing file stops the server
 
 [index.client-a]
 description = "Client A engagement documents"
@@ -371,9 +371,9 @@ same default:
 `exclude` is a list (`exclude = ["drafts/", "*.tmp.docx"]`) where `RAG_EXCLUDE` joins the
 patterns with `;`. Paths are absolute or start with `~`, an unknown key is an error that
 names it, and two indexes cannot share one `db`. No environment variable reaches an
-index of this file; `HOME` only expands `~`. `[server]` also takes `token_file` (default: `token` next to
-`indexes.toml`) and `cache_dir` (`CACHE_DIR` for every index); the endpoint tables are
-under [Model endpoints](#model-endpoints).
+index of this file; `HOME` only expands `~`. `[server]` also takes `token_file`
+(default: `token` next to `indexes.toml`) and `cache_dir` (`CACHE_DIR` for every
+index); the endpoint tables are under [Model endpoints](#model-endpoints).
 
 ```bash
 minirag-mcp serve
@@ -456,8 +456,8 @@ instructions to the model (see [Search by Default](#search-by-default)).
 `list_indexes` (in a terminal, `minirag-mcp indexes`) lists every index with its
 description, model, language and state, and whether this connection may use it. A call
 that names an index it may not use, or one that does not exist, is refused with the
-names of those it may use — never answered with an empty result. Every result carries
-`index`, the index that answered it.
+names of those it may use — never answered with an empty result. Every other tool's
+result carries `index`, the index that answered it.
 
 In a terminal, `--index NAME` makes a command use that index of `indexes.toml` instead
 of the one the environment variables configure, `--config PATH` names another
@@ -831,7 +831,9 @@ url = "http://127.0.0.1:8080"
 name = "plumb-4b"
 ```
 
-For one index configured by environment variables, the same as variables:
+For one index configured by environment variables, the same as variables.
+`minirag-mcp` here is the v2 command (see [Installing v2](#installing-v2)): 1.1.1
+ignores these variables and embeds in-process.
 
 ```bash
 export EMBED_URL=http://127.0.0.1:8080/v1/embeddings EMBED_ENDPOINT_MODEL=multilingual-e5-large
@@ -968,15 +970,14 @@ answered with zeros.
 A shared or read-only folder can be indexed in place by keeping the patterns in
 minirag's own configuration instead: `RAG_EXCLUDE` holds `.gitignore` patterns
 separated by `;`, e.g. `RAG_EXCLUDE="drafts/;*.tmp.docx;/personal/"`, and in
-`indexes.toml` an index's `exclude` holds them as a list. They apply to
-every root exactly as if written at the top of its `.miniragignore`, ahead of it:
-anchored patterns (`/x/y`, `x/y`) are relative to each root, and a root's own file
-comes last, so it can re-include with `!` what a pattern took out. Everywhere a
-`.miniragignore` takes effect, they do too, and `ingest_file` names `RAG_EXCLUDE` (or
-the index's `exclude`) and the matching pattern when it refuses a file. A pattern the
-parser rejects stops
-the server at load, naming it. `status` reports the number of patterns as
-`excludePatterns`.
+`indexes.toml` an index's `exclude` holds them as a list. They apply to every root
+exactly as if written at the top of its `.miniragignore`, ahead of it: anchored
+patterns (`/x/y`, `x/y`) are relative to each root, and a root's own file comes
+last, so it can re-include with `!` what a pattern took out. Everywhere a
+`.miniragignore` takes effect, they do too, and `ingest_file` names `RAG_EXCLUDE`
+(or the index's `exclude`) and the matching pattern when it refuses a file. A
+pattern the parser rejects stops the server at load, naming it. `status` reports
+the number of patterns as `excludePatterns`.
 
 Hidden files and folders, Office lock files (`~$…`), `node_modules`,
 `__pycache__` and virtualenvs are skipped with or without one.
@@ -1039,12 +1040,12 @@ What the extra changes:
   read kept. A line only Vision found goes beside the Tesseract line it overlaps
   most, and to the end of the page only when it overlaps none. On hand-checked
   regions of such pages this halved the character error rate. The same corpus can
-  therefore index slightly different
-  text on macOS than on Linux or Windows: a document with a page read this way
-  has the `ocrEngine` `tesseract+vision` (a page Vision finds nothing on, such as
-  the blank back of a duplex scan, does not count), and
-  `RAG_OCR_SECOND_READER_BELOW=0` turns the second reader off. A page Vision fails
-  on keeps Tesseract's text and logs a warning naming the file and page.
+  therefore index slightly different text on macOS than on Linux or Windows: a
+  document with a page read this way has the `ocrEngine` `tesseract+vision` (a
+  page Vision finds nothing on, such as the blank back of a duplex scan, does not
+  count), and `RAG_OCR_SECOND_READER_BELOW=0` turns the second reader off. A page
+  Vision fails on keeps Tesseract's text and logs a warning naming the file and
+  page.
 - **Image files become documents.** `.png` `.jpg` `.jpeg` `.tiff` `.tif` `.bmp`
   `.webp` join the scan whitelist, titled from the filename by the same rules as
   everything else. A multi-page TIFF — what a scanner or a fax gateway writes —
@@ -1459,12 +1460,13 @@ roots again into a new index that replaces it.
 
 ## MCP Tools
 
-13 tools. Each takes an optional `index` argument: without it a call uses the
-connection's default index (the one its URL names, or the only one a stdio server
-has), and with it the index named, when the connection may use that one (see [One
-server, several indexes](#one-server-several-indexes)). One call always touches one
-index, and every result carries `index`, the one that answered, so a follow-up call
-can pass it back.
+13 tools. Every tool but `list_indexes` takes an optional `index` argument: without
+it a call uses the connection's default index (the one its URL names, or the only one
+a stdio server has), and with it the index named, when the connection may use that
+one (see [One server, several indexes](#one-server-several-indexes)). Such a call
+always touches one index, and its result carries `index`, the one that answered, so
+a follow-up call can pass it back. `list_indexes` takes no argument and reports every
+index, with `default` naming the connection's.
 
 | Tool | Purpose |
 |---|---|

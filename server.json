@@ -67,15 +67,14 @@
         },
         {
           "name": "CHUNK_TOKEN_BUDGET",
-          "description": "Retrieval-unit size in the embedding model's own tokens. Defaults to 250 for intfloat/multilingual-e5-large and 110 for any other model. Range 16 to the model's window: 512 for e5, 128 for MiniLM and for a model minirag does not know.",
+          "description": "Retrieval-unit size in the embedding model's own tokens. The default depends on the model: 250 for intfloat/multilingual-e5-large, 110 for MiniLM and any other model. Range 16 to the model's window: 512 for e5, 128 for MiniLM and for a model minirag does not know.",
           "isRequired": false,
           "isSecret": false,
-          "format": "number",
-          "default": "250"
+          "format": "number"
         },
         {
           "name": "RAG_HYBRID_WEIGHT",
-          "description": "Keyword weight in the weighted RRF fusion, range 0.0-1.0. 0 is vector-only; higher values raise the BM25 contribution.",
+          "description": "Keyword weight of the chunks in the weighted RRF fusion, range 0.0-1.0; higher values raise the BM25 contribution. 0 drops the chunk keyword search; the whole-document ranking still adds its bonus unless RAG_DOCUMENT_WEIGHT is 0 too, which leaves pure vector search.",
           "isRequired": false,
           "isSecret": false,
           "format": "number",
