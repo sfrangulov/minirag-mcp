@@ -10,9 +10,9 @@ import pytest
 from conftest import FakeEmbedder
 from index_helpers import file_registry
 from minirag_mcp.config import ConfigError, load_config
-from minirag_mcp.embedder import E5_LARGE, MINILM
+from minirag_mcp.embedder import E5_LARGE, MINILM, EmbedderUnavailableError
 from minirag_mcp.handle import IndexHandle
-from minirag_mcp.identity import IndexState
+from minirag_mcp.identity import PROBE_TEXT, IndexState, record_probe
 from minirag_mcp.registry import (
     SINGLE_INDEX_NAME,
     UNRESTRICTED,
@@ -258,6 +258,76 @@ def test_only_an_ingest_is_admitted_by_the_handle(indexes_file, fake_embedder, m
     assert admitted == []
     _, rt = reg.open(UNRESTRICTED, "alpha", Use.INGEST)
     assert len(admitted) == 1 and rt.pipeline is admitted[0]
+
+
+def _reopened(where: str, every: bool = False):
+    """`IndexHandle.ingest_pipeline` with the handle let go of its open index `where` the
+    admission is: before it or after it. The next `get()` then opens the index again, which
+    hands out another OpenIndex, as a swapped generation does. Only the first admission,
+    unless `every`."""
+    real = IndexHandle.ingest_pipeline
+    calls = []
+
+    def admit(self):
+        calls.append(where)
+        if where == "before" and (every or len(calls) == 1):
+            self.close()
+        pipeline = real(self)
+        if where == "after" and (every or len(calls) == 1):
+            self.close()
+        return pipeline
+
+    return admit
+
+
+@pytest.mark.parametrize("where", ["before", "after"])
+def test_an_ingest_gets_the_open_index_its_admitted_pipeline_belongs_to(
+    indexes_file, fake_embedder, monkeypatch, where
+):
+    reg = file_registry(indexes_file, lambda c, s: fake_embedder)
+    reg.open(UNRESTRICTED, "alpha", Use.READ)
+    monkeypatch.setattr(IndexHandle, "ingest_pipeline", _reopened(where))
+    entry, rt = reg.open(UNRESTRICTED, "alpha", Use.INGEST)
+    assert rt is entry.handle.get()
+    assert rt.pipeline.store is rt.store and rt.pipeline.embedder is rt.embedder
+
+
+def test_an_ingest_into_an_index_swapped_at_every_admission_is_refused(
+    indexes_file, fake_embedder, monkeypatch
+):
+    reg = file_registry(indexes_file, lambda c, s: fake_embedder)
+    monkeypatch.setattr(IndexHandle, "ingest_pipeline", _reopened("after", every=True))
+    with pytest.raises(IndexRefused) as e:
+        reg.open(Connection("alpha", frozenset()), None, Use.INGEST)
+    assert str(e.value) == (
+        "Index 'alpha' changed twice while this ingest was being admitted (another process "
+        "rebuilt it, or recorded its probe), so nothing was written. Retry it."
+    )
+
+
+def test_one_index_failing_its_probe_on_a_shared_model_leaves_the_other_answering(
+    indexes_file, stub_text_embedding, reference_probes
+):
+    indexes_file.write('[server]\ncache_dir = "~/models"\n\n' + indexes_file.text)
+    reg = IndexRegistry.from_file(indexes_file.path, indexes_file.env)
+    alpha, beta = (reg.resolve(UNRESTRICTED, n) for n in ("alpha", "beta"))
+    wrong = tuple(FakeEmbedder(dim=1024, salt="another model")._vec(PROBE_TEXT))
+    for entry, probe in ((alpha, wrong), (beta, reference_probes[E5_LARGE])):
+        recorded = record_probe(entry.config.db_path, entry.runtime().identity.generation, probe)
+        assert recorded is not None and recorded.probe == probe
+    mismatch = "differs from the one recorded when this index was built"
+
+    beta.runtime().embedder.embed_query("bananas")
+    with pytest.raises(EmbedderUnavailableError, match=mismatch):
+        alpha.runtime().embedder.embed_query("apricots")
+    with pytest.raises(IndexUnavailable, match=mismatch):
+        reg.open(UNRESTRICTED, "alpha", Use.READ)
+    _, rt = reg.open(UNRESTRICTED, "beta", Use.READ)
+    rt.embedder.embed_query("budgets")
+    assert beta.state() == (IndexState.READY, "") and rt.embedder.probe_error is None
+    state, why = alpha.state()
+    assert state is IndexState.UNAVAILABLE and mismatch in why
+    assert stub_text_embedding.model_names == [E5_LARGE]
 
 
 class HeldEmbedder(FakeEmbedder):

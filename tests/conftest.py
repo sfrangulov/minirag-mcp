@@ -25,7 +25,6 @@ from tokenizers.pre_tokenizers import Whitespace
 from tokenizers.processors import TemplateProcessing
 
 import minirag_mcp.embedder as embedder_mod
-import minirag_mcp.handle as handle_mod
 from index_helpers import IndexesFile, make_indexes_file
 from minirag_mcp import ocr, ocr_vision, parallel, security
 from minirag_mcp.chunker import SCHEME_VERSION
@@ -127,6 +126,8 @@ def indexes_file(tmp_path) -> IndexesFile:
 def index_states(monkeypatch) -> dict[str, tuple[IndexState, str]]:
     """The state `IndexHandle` reads for each index, by `config.index_name` ("default" in the
     environment mode); an index not named here is ready."""
+    import minirag_mcp.handle as handle_mod  # heavy; spawned sync workers import conftest
+
     states: dict[str, tuple[IndexState, str]] = {}
 
     def index_state(config: Config, embedder) -> tuple[IndexState, str]:
@@ -424,7 +425,7 @@ def inline_workers(monkeypatch) -> list[int]:
         for path in paths:
             yield parallel.prepare_one(preparer, path)
 
-    def prepare_files(make_preparer, paths, *, workers):
+    def prepare_files(make_preparer, paths, *, workers, on_event=None):
         calls.append(workers)
         return prepared(pickle.dumps(make_preparer), list(paths))
 

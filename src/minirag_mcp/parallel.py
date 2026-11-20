@@ -243,10 +243,18 @@ def _run(
 # Every pool sizes itself against the whole machine, so in one process, which may serve
 # several indexes, only one runs at a time; the sync of another index waits for it.
 _POOL_GATE = threading.Lock()
+POOL_WAIT = (
+    "waiting for another index's sync in this process to finish its workers; this sync's "
+    "workers start then"
+)
 
 
 def prepare_files(
-    make_preparer: Callable[[], Preparer], paths: Sequence[Path], *, workers: int
+    make_preparer: Callable[[], Preparer],
+    paths: Sequence[Path],
+    *,
+    workers: int,
+    on_event: Callable[[str], None] | None = None,
 ) -> Iterator[Prepared]:
     """Each of `paths` prepared in one of `workers` processes, yielded as it finishes.
 
@@ -256,16 +264,22 @@ def prepare_files(
     worker fails, with WORKER_DIED; a fresh pool then takes the rest.
 
     While one call's pools run in this process, another call starts none until that call
-    has ended; closing its iterator ends it.
+    has ended, and tells `on_event` it waits; closing an iterator ends its call.
     """
     factory = pickle.dumps(make_preparer)
     waiting = deque(paths)
-    with _POOL_GATE:
+    if not _POOL_GATE.acquire(blocking=False):
+        if on_event is not None:
+            on_event(POOL_WAIT)
+        _POOL_GATE.acquire()
+    try:
         while waiting:
             suspects = deque((yield from _run(factory, waiting, workers, 2 * workers)))
             while suspects:
                 for path in (yield from _run(factory, suspects, 1, 1)):
                     yield Prepared(path, None, WORKER_DIED)
+    finally:
+        _POOL_GATE.release()
 
 
 class BatchWriter:

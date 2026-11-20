@@ -123,9 +123,10 @@ def _cli_embedder(cfg: Config, scheme: EmbeddingScheme) -> object:
 
 
 def _single(cfg: Config) -> IndexRegistry:
-    return IndexRegistry.single(
-        cfg, embedder_factory=_cli_embedder, model_factory=_make_model_factory()
-    )
+    # Without a stand-in the handle builds its own embedders, as the server's does, so both
+    # shells refuse an index alike and the handle closes what it built.
+    factory = _cli_embedder if _make_embedder(cfg) is not None else None
+    return IndexRegistry.single(cfg, embedder_factory=factory, model_factory=_make_model_factory())
 
 
 _CONNECTION = Connection(SINGLE_INDEX_NAME, None)

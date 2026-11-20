@@ -130,9 +130,9 @@ def test_parallel_and_serial_sync_write_identical_indexes(tmp_path, model_factor
     spy_workers: list[int] = []
     real = parallel.prepare_files
 
-    def spy(make_preparer, paths, *, workers):
+    def spy(make_preparer, paths, *, workers, **kwargs):
         spy_workers.append(workers)
-        return real(make_preparer, paths, workers=workers)
+        return real(make_preparer, paths, workers=workers, **kwargs)
 
     monkeypatch.setattr(parallel, "prepare_files", spy)
     counts_b, errors_b = run_sync(handle_b)
@@ -235,7 +235,7 @@ def test_a_small_sync_stays_in_this_process(tmp_path, fake_embedder, monkeypatch
 
 def test_two_indexes_syncing_at_once_run_one_worker_pool_at_a_time(tmp_path, monkeypatch):
     """Each pool sizes itself against the whole machine, so two at once would over-commit
-    its memory: the second index's pool waits for the first's to end."""
+    its memory: the second index's pool waits for the first's to end, and says so."""
     pools: list[str] = []
     syncs: list[int] = []
     second_sync, second_pool = threading.Event(), threading.Event()
@@ -257,11 +257,11 @@ def test_two_indexes_syncing_at_once_run_one_worker_pool_at_a_time(tmp_path, mon
 
     real = parallel.prepare_files
 
-    def entering(make_preparer, paths, *, workers):
+    def entering(make_preparer, paths, *, workers, **kwargs):
         syncs.append(workers)
         if len(syncs) == 2:
             second_sync.set()
-        return real(make_preparer, paths, workers=workers)
+        return real(make_preparer, paths, workers=workers, **kwargs)
 
     monkeypatch.setattr(parallel, "ProcessPoolExecutor", Recorded)
     monkeypatch.setattr(parallel, "prepare_files", entering)
@@ -269,12 +269,21 @@ def test_two_indexes_syncing_at_once_run_one_worker_pool_at_a_time(tmp_path, mon
     for name in ("one", "two"):
         (tmp_path / name).mkdir()
         handles.append(corpus(tmp_path / name, FakeEmbedder(), 8)[1])
-    jobs = [h.start_sync(None) for h in handles]
-    for h in handles:
-        h.sync.wait(120)
-    done = [h.sync.status(job) for h, job in zip(handles, jobs, strict=True)]
-    assert [(j.state, j.counts["ingested"]) for j in done] == [("succeeded", 8)] * 2
+    events: list[list[str]] = [[], []]
+    counts: dict[int, dict[str, int]] = {}
+
+    def run(i: int) -> None:
+        counts[i], _, _ = handles[i].run_sync(None, events[i].append)
+
+    threads = [threading.Thread(target=run, args=(i,)) for i in (0, 1)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(120)
+    assert [counts[i]["ingested"] for i in (0, 1)] == [8, 8]
     assert syncs == [2, 2] and pools == ["start", "end", "start", "end"]
+    said = [[e for e in events[i] if "another index's sync" in e] for i in (0, 1)]
+    assert sorted(len(lines) for lines in said) == [0, 1]
 
 
 def test_failures_in_a_parallel_sync_are_counted_like_serial_ones(
@@ -353,8 +362,8 @@ def test_a_source_written_by_an_earlier_batch_is_replaced_not_appended(
     real = parallel.prepare_files
 
     # A sync's diff names a path once, so only the stand-in can hand one back twice.
-    def twice(make_preparer, files, *, workers):
-        return real(make_preparer, [*files, files[0]], workers=workers)
+    def twice(make_preparer, files, *, workers, **kwargs):
+        return real(make_preparer, [*files, files[0]], workers=workers, **kwargs)
 
     monkeypatch.setattr(parallel, "prepare_files", twice)
     sync(h)

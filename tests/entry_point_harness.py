@@ -24,9 +24,9 @@ def sync_instead_of_serving() -> None:
     pools: list[int] = []
     prepare_files = parallel.prepare_files
 
-    def spy(make_preparer, paths, *, workers):
+    def spy(make_preparer, paths, *, workers, **kwargs):
         pools.append(workers)
-        return prepare_files(make_preparer, paths, workers=workers)
+        return prepare_files(make_preparer, paths, workers=workers, **kwargs)
 
     parallel.prepare_files = spy
     # Not the subject, and fetching Tesseract's data would go online.

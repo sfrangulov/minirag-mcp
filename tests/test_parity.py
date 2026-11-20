@@ -18,11 +18,11 @@ from fastmcp import Client
 
 import minirag_mcp.cli as cli
 import minirag_mcp.embedder as embedder_mod
-from conftest import FakeEmbedder
+from conftest import FakeEmbedder, stamp_identity
 from lookalike_texts import MINUTES, REGULATION_V1, REGULATION_V2
 from minirag_mcp import ocr, ocr_vision
 from minirag_mcp.config import default_db_path, load_config
-from minirag_mcp.embedder import Embedder
+from minirag_mcp.embedder import E5_LARGE, Embedder
 from minirag_mcp.labels import Labeler
 from minirag_mcp.labels.model import ModelError
 from minirag_mcp.server import create_app
@@ -420,6 +420,22 @@ async def test_an_unknown_model_is_refused_the_same_way_by_both(root, tmp_path, 
     assert is_error and code == 1 and text.endswith(refusal)
     assert refusal.startswith("Index 'default' is unavailable: Model 'x/unknown' is not in")
     assert refusal.endswith(" — see fastembed's supported models.")
+
+
+async def test_an_index_recorded_at_another_width_is_refused_the_same_way_by_both(
+    root, tmp_path, capsys
+):
+    env = {
+        "BASE_DIR": str(root),
+        "DB_PATH": str(tmp_path / "db"),
+        "CACHE_DIR": str(tmp_path / "models"),
+    }
+    stamp_identity(load_config(env), FakeEmbedder(E5_LARGE, dim=16))
+    is_error, text = await call_mcp(env, "query_documents", {"query": "alpha"}, None)
+    code, _, err = run_cli(["query", "alpha", *_flags(env)], capsys)
+    refusal = _last_error(err)
+    assert is_error and code == 1 and text.endswith(refusal)
+    assert f"built with {E5_LARGE}, at 16 dimensions, but it makes 1024-dimensional" in refusal
 
 
 async def test_both_shells_report_the_embedding_backend(

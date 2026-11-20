@@ -1,3 +1,4 @@
+import contextlib
 import ctypes
 import multiprocessing
 import os
@@ -202,9 +203,9 @@ def test_workers_never_write_to_stdout(paths, capfd):
 
 
 def test_closing_early_stops_every_worker(paths):
-    got = parallel.prepare_files(Preparer, paths, workers=2)
-    assert next(got).error is None
-    got.close()
+    # Closed even when the assert fails, or the pool gate stays held for every later test.
+    with contextlib.closing(parallel.prepare_files(Preparer, paths, workers=2)) as got:
+        assert next(got).error is None
     assert multiprocessing.active_children() == []
 
 

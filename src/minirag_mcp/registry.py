@@ -8,7 +8,6 @@ is a registry of one index named `default`.
 
 from __future__ import annotations
 
-import dataclasses
 import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -99,6 +98,17 @@ class IndexEntry:
 
     def state(self) -> tuple[IndexState, str]:
         return self.handle.state()
+
+
+def _admitted(entry: IndexEntry) -> OpenIndex | None:
+    """The open index whose pipeline the handle admitted an ingest into; None when another
+    generation was opened between the admission and the look at the open index, twice."""
+    for _ in range(2):
+        pipeline = entry.handle.ingest_pipeline()
+        opened = entry.handle.get()
+        if opened.pipeline is pipeline:
+            return opened
+    return None
 
 
 def _entry_factory(
@@ -236,13 +246,15 @@ class IndexRegistry:
         entry = self._resolve(entries, connection, requested)
         others = tuple(n for n in entries if n != entry.name and connection.reachable(n))
         try:
-            opened = entry.runtime()
-            if use is Use.INGEST:
-                pipeline = entry.handle.ingest_pipeline()
-                if pipeline is not opened.pipeline:
-                    opened = dataclasses.replace(opened, pipeline=pipeline)
+            opened = _admitted(entry) if use is Use.INGEST else entry.handle.get()
         except RebuildPendingError as e:
             raise IndexRefused(f"Index {entry.name!r}: {e}{_also(others)}") from e
         except Exception as e:
             raise IndexUnavailable(entry.name, _reason(e), others) from e
+        if opened is None:
+            raise IndexRefused(
+                f"Index {entry.name!r} changed twice while this ingest was being admitted "
+                "(another process rebuilt it, or recorded its probe), so nothing was written. "
+                f"Retry it.{_also(others)}"
+            )
         return entry, opened

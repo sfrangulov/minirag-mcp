@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from minirag_mcp.registry import IndexRegistry
+if TYPE_CHECKING:
+    from minirag_mcp.registry import IndexRegistry
 
 CORPORA = {
     "alpha": ("alpha.md", "# Alpha\n\nAlpha body about apricots and audits."),
@@ -56,6 +58,10 @@ def make_indexes_file(tmp_path: Path) -> IndexesFile:
 
 
 def file_registry(indexes_file: IndexesFile, embedder_factory, **kw) -> IndexRegistry:
+    # Imported here: conftest imports this module, and so does every sync worker the tests
+    # spawn that unpickles a conftest stand-in.
+    from minirag_mcp.registry import IndexRegistry
+
     return IndexRegistry.from_file(
         indexes_file.path, indexes_file.env, embedder_factory=embedder_factory, **kw
     )

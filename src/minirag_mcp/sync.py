@@ -89,6 +89,7 @@ def _ingest_in_workers(
     indexed: set[str],
     ingested: Callable[[str], None],
     failed: Callable[[str, str], None],
+    emit: Callable[[str], None],
 ) -> int:
     """Prepare `paths` in `workers` processes and store them from this one, in batches,
     labelled in the caller's labelling job. How many were never prepared because the
@@ -133,7 +134,9 @@ def _ingest_in_workers(
                 failed(source, error)
 
     read = in_a_row = not_read = 0
-    with contextlib.closing(parallel.prepare_files(make, paths, workers=workers)) as prepared:
+    with contextlib.closing(
+        parallel.prepare_files(make, paths, workers=workers, on_event=emit)
+    ) as prepared:
         for result in prepared:
             read += 1
             in_a_row = in_a_row + 1 if result.endpoint_failed else 0
@@ -320,7 +323,7 @@ def _run_sync_unlocked(
         else:
             indexed = {info.source for info in listing}
             not_read = _ingest_in_workers(
-                pipeline, store, diff.to_ingest, workers, indexed, ingested, failed
+                pipeline, store, diff.to_ingest, workers, indexed, ingested, failed, emit
             )
             if not_read:
                 # Not one error per file: they were never read, and the next sync reads
