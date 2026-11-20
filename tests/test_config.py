@@ -221,3 +221,17 @@ def test_the_api_key_never_appears_in_a_repr(tmp_path):
     assert next(iter(cfg.embed_endpoints.values())).api_key == "secret"
     assert "secret" not in repr(cfg)
     assert "secret" not in repr(Endpoint("http://h", "n", api_key="secret"))
+
+
+def test_sync_workers_defaults_to_unset(tmp_path):
+    assert load_config({}, cwd=tmp_path).sync_workers is None
+
+
+def test_sync_workers_reads_the_environment(tmp_path):
+    assert load_config({"RAG_SYNC_WORKERS": "4"}, cwd=tmp_path).sync_workers == 4
+
+
+@pytest.mark.parametrize("value", ["0", "257", "x"])
+def test_sync_workers_outside_one_to_256_is_rejected(tmp_path, value):
+    with pytest.raises(ConfigError, match="RAG_SYNC_WORKERS"):
+        load_config({"RAG_SYNC_WORKERS": value}, cwd=tmp_path)
