@@ -147,9 +147,10 @@ def create_app(
         one; a problem appears in errors prefixed "documents:" and is not a
         failure.
 
-        ignored counts the files and folders a .miniragignore rule excluded
-        from the scan, a folder once; a file indexed before its rule was
-        added is deleted from the index and counted under deleted.
+        ignored counts the files and folders a .miniragignore rule or a
+        RAG_EXCLUDE pattern excluded from the
+        scan, a folder once; a file indexed before its rule was added is
+        deleted from the index and counted under deleted.
 
         unreadable counts indexed sources this installation cannot read
         because an optional extra is absent (images need [ocr], and so does
@@ -498,8 +499,8 @@ def create_app(
         Indexed files under one are listed as "unlisted": still indexed and
         searchable, not checked against the disk.
 
-        `ignored`, present when a .miniragignore rule excluded anything,
-        counts the files and folders it left out, a folder once.
+        `ignored`, present when a .miniragignore rule or a RAG_EXCLUDE
+        pattern excluded anything, counts the files and folders it left out, a folder once.
 
         `labels`, `dateFrom` and `dateTo` filter as in query_documents;
         sort="date" lists newest first, documents without a date last. Rows

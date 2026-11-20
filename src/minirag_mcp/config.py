@@ -184,6 +184,12 @@ def _opt_float(env: Mapping[str, str], key: str, lo: float) -> float | None:
 
 def _exclude(env: Mapping[str, str]) -> tuple[str, ...]:
     patterns = tuple(p.strip() for p in env.get("RAG_EXCLUDE", "").split(";") if p.strip())
+    for p in patterns:
+        if p.startswith("#"):
+            raise ConfigError(
+                f"RAG_EXCLUDE: {p!r} starts with '#', which git reads as a comment and so "
+                "matches nothing; write \\# to match a leading #"
+            )
     try:
         check_patterns(patterns)
     except ValueError as e:

@@ -327,7 +327,7 @@ def test_list_sorted_by_date_puts_undated_last(tmp_path, root, store, fake_embed
     index(store, fake_embedder, root, "c_new.md", {}, "2026-10-20")
     index(store, fake_embedder, root, "d_tie.md", {}, "2026-10-01")
 
-    payload = list_payload(store, [root], sort="date")
+    payload = list_payload(store, [root], sort="date", exclude=())
 
     assert [Path(f["source"]).name for f in payload["files"]] == [
         "c_new.md",
@@ -336,7 +336,7 @@ def test_list_sorted_by_date_puts_undated_last(tmp_path, root, store, fake_embed
         "a_undated.md",
     ]
     with pytest.raises(QueryError, match="sort"):
-        list_payload(store, [root], sort="size")
+        list_payload(store, [root], sort="size", exclude=())
 
 
 def test_a_filtered_listing_keeps_matches_and_counts_unread_files_as_unlabelled(
@@ -349,7 +349,9 @@ def test_a_filtered_listing_keeps_matches_and_counts_unread_files_as_unlabelled(
     index(store, fake_embedder, root, "pilot/d.md", {}, create=True)
     (root / "new.md").write_text("never ingested")
 
-    payload = list_payload(store, [root], labels={"type": "minutes"}, label_source=label_source)
+    payload = list_payload(
+        store, [root], labels={"type": "minutes"}, label_source=label_source, exclude=()
+    )
 
     assert [f["source"] for f in payload["files"]] == [a]
     assert payload["files"][0]["labels"]["type"]["value"] == "minutes"
@@ -420,7 +422,7 @@ def test_an_embedder_without_backend_flags_reads_as_in_process(tmp_path, root, s
 
 def test_a_listing_without_a_filter_has_exactly_the_old_keys(tmp_path, root, store, fake_embedder):
     index(store, fake_embedder, root, "a.md", {})
-    payload = list_payload(store, [root])
+    payload = list_payload(store, [root], exclude=())
     assert set(payload) == {"files", "unlistedFolders"}
     assert set(payload["files"][0]) == {
         "source",
@@ -452,7 +454,7 @@ def test_a_filter_on_an_index_without_label_columns_is_refused(
             label_source=label_source,
         )
     with pytest.raises(QueryError, match="write access"):
-        list_payload(old, [root], date_from="2026-10-01", label_source=label_source)
+        list_payload(old, [root], date_from="2026-10-01", label_source=label_source, exclude=())
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         assert run_query(old, fake_embedder, make_config(root, tmp_path), "x")["results"]

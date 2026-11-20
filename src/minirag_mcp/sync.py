@@ -162,7 +162,8 @@ def _run_sync_unlocked(
     scope: Path | None,
     on_event: Callable[[str], None] | None,
     large_tables: list[Path] | None = None,
-    exclude: Sequence[str] = (),
+    *,
+    exclude: Sequence[str],
 ) -> tuple[dict[str, int], list[dict]]:
     """Scan `roots`, diff against the store, ingest and delete accordingly. The caller holds
     the sync lock (`acquire_sync_lock`) and has checked the index is not `rebuild pending`:

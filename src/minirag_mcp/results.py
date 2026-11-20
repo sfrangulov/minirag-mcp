@@ -855,7 +855,7 @@ def list_payload(
     date_to: str | None = None,
     sort: str | None = None,
     label_source: LabelerSource | None = None,
-    exclude: Sequence[str] = (),
+    exclude: Sequence[str],
 ) -> dict:
     """`list_files` and `minirag-mcp list`, as one implementation.
 

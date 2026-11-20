@@ -70,9 +70,11 @@ def test_a_pattern_excludes_a_subfolder_of_a_root_with_no_file(root):
     assert sorted(str(p.relative_to(root)) for p in ignored) == ["drafts", "sub/drafts"]
 
 
-def test_anchored_and_unanchored_patterns(root):
+def test_anchored_patterns_are_relative_to_each_root_and_unanchored_match_at_any_depth(root):
     got = rel_paths(scan_roots([root], exclude=("/top.md", "sub/drafts")), root)
     assert got == ["a.md", "drafts/d.md", "sub/top.md", "x.tmp.md"]
+    got = rel_paths(scan_roots([root], exclude=("top.md",)), root)
+    assert got == ["a.md", "drafts/d.md", "sub/drafts/e.md", "x.tmp.md"]
 
 
 def test_one_pattern_applies_to_every_root(tmp_path, root):
@@ -133,13 +135,9 @@ async def test_status_counts_the_patterns(root, env, fake_embedder):
     async with Client(create_app(load_config(env), embedder=fake_embedder)) as c:
         st = (await c.call_tool("status", {})).data
     assert st["excludePatterns"] == 3
-
-
-async def test_status_says_nothing_without_patterns(root, env, fake_embedder):
     del env["RAG_EXCLUDE"]
     async with Client(create_app(load_config(env), embedder=fake_embedder)) as c:
-        st = (await c.call_tool("status", {})).data
-    assert "excludePatterns" not in st
+        assert "excludePatterns" not in (await c.call_tool("status", {})).data
 
 
 async def test_list_files_and_a_scoped_sync_honour_the_patterns(
@@ -161,3 +159,44 @@ def test_cli_status_counts_the_patterns_too(root, env, capsys, monkeypatch):
     monkeypatch.setenv("RAG_EXCLUDE", "drafts/;*.tmp.md")
     code, out, _ = run_cli(["status", *flags(env), "--json"], capsys)
     assert code == 0 and json.loads(out)["excludePatterns"] == 2
+
+
+def test_a_pattern_only_its_lowercased_form_rejects_is_a_config_error_naming_it(tmp_path):
+    with pytest.raises(ConfigError, match=r"RAG_EXCLUDE.*\[Z-a\]"):
+        load_config({"BASE_DIR": str(tmp_path), "RAG_EXCLUDE": "[Z-a]"})
+
+
+def test_an_item_starting_with_a_hash_is_a_config_error(tmp_path):
+    with pytest.raises(ConfigError, match=r"RAG_EXCLUDE.*'#notes'.*\\#"):
+        load_config({"BASE_DIR": str(tmp_path), "RAG_EXCLUDE": "drafts/;#notes"})
+
+
+def test_an_escaped_hash_matches_a_leading_hash(tmp_path):
+    root = tmp_path / "docs"
+    root.mkdir()
+    for name in ("#a.md", "b.md"):
+        (root / name).write_text("# x\n\nBody.")
+    assert rel_paths(scan_roots([root], exclude=("\\#a.md",)), root) == ["b.md"]
+
+
+def test_an_empty_item_does_not_shift_which_pattern_is_named(tmp_path):
+    from minirag_mcp.ingest import ignore
+
+    (tmp_path / "drafts").mkdir()
+    rules = ignore.load(tmp_path, exclude=("", "drafts/"))
+    assert rules.source("drafts", True) == "RAG_EXCLUDE pattern 'drafts/'"
+
+
+def test_the_list_note_credits_either_source(root, env, capsys, monkeypatch):
+    monkeypatch.setenv("RAG_EXCLUDE", env["RAG_EXCLUDE"])
+    code, _, err = run_cli(["list", *flags(env)], capsys)
+    assert code == 0 and "excluded by .miniragignore or RAG_EXCLUDE" in err
+
+
+def test_ingesting_a_folder_honours_the_patterns(root, env, capsys, monkeypatch):
+    monkeypatch.setenv("RAG_EXCLUDE", env["RAG_EXCLUDE"])
+    code, out, _ = run_cli(["ingest", str(root), *flags(env), "--json"], capsys)
+    names = [i["source"] for i in json.loads(out)["ingested"]]
+    assert code == 0 and len(names) == 4 and not any("drafts" in n for n in names)
+    code, _, err = run_cli(["ingest", str(root / "drafts"), *flags(env)], capsys)
+    assert code == 1 and "is excluded by RAG_EXCLUDE pattern 'drafts/'" in err

@@ -622,7 +622,10 @@ def list_cmd(
     for folder in payload["unlistedFolders"]:
         print(f"warn: {folder['path']}: {folder['message']}", file=sys.stderr)
     if n := payload.get("ignored"):
-        print(f"note: {n} file(s) and folder(s) excluded by {IGNORE_FILE}", file=sys.stderr)
+        print(
+            f"note: {n} file(s) and folder(s) excluded by {IGNORE_FILE} or RAG_EXCLUDE",
+            file=sys.stderr,
+        )
     _warn_filter(payload)
 
 

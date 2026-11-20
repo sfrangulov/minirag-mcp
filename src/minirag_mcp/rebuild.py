@@ -111,7 +111,7 @@ def rebuild(
             None,
             on_event,
             large,
-            config.exclude,
+            exclude=config.exclude,
         )
         restored = _restore(current, pipeline, errors, on_event, large)
         if problem := target.update_indices():

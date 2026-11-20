@@ -61,8 +61,7 @@ class Rules:
     _configured: int = 0  # the first this many of `_lines` are RAG_EXCLUDE patterns
 
     def excludes(self, rel: str, is_dir: bool) -> bool:
-        rel = _nfc(rel) + ("/" if is_dir else "")
-        return self._exact.match_file(rel) or self._folded.match_file(rel.lower())
+        return self.source(rel, is_dir) is not None
 
     def source(self, rel: str, is_dir: bool) -> Path | str | None:
         """What excludes `rel`: this rule file, or a description of the RAG_EXCLUDE
@@ -92,6 +91,7 @@ def check_patterns(patterns: Sequence[str]) -> None:
     for pattern in patterns:
         try:
             pathspec.GitIgnoreSpec.from_lines([_nfc(pattern)])
+            pathspec.GitIgnoreSpec.from_lines([_nfc(pattern).lower()])
         except Exception as e:
             raise ValueError(f"{pattern!r} cannot be parsed: {e}") from e
 
@@ -106,7 +106,7 @@ def load(root: Path, *, strict: bool = False, exclude: Sequence[str] = ()) -> Ru
     explicit ingest reads it, any file that is there and cannot be read is an error.
     """
     path = Path(root) / IGNORE_FILE
-    configured = tuple(_nfc(p) for p in exclude)
+    configured = tuple(_nfc(p) for p in exclude if p.strip())
     try:
         text = path.read_text(encoding="utf-8-sig")
     except FileNotFoundError:
@@ -137,6 +137,8 @@ def load(root: Path, *, strict: bool = False, exclude: Sequence[str] = ()) -> Ru
 def _rules(file: Path | None, configured: tuple[str, ...], lines: list[str]) -> Rules | None:
     if file is None and not configured:
         return None
+    # Attribution is by index, which holds only because no configured item is empty
+    # (pathspec drops those): `load` filters them.
     every = [*configured, *lines]
     exact = pathspec.GitIgnoreSpec.from_lines(every)
     folded = pathspec.GitIgnoreSpec.from_lines([line.lower() for line in every])
