@@ -706,6 +706,14 @@ Rollback for this task: copy both backups back, then run the bootout and bootstr
 
 ### Task 9: v2 constraints file and `indexes.toml`
 
+> **Added 2026-11-20 (owner, bd minirag-mcp-g7q.13.2):** the owner's cloud-synced project folder
+> is indexed in place instead of through the mirroring script: it becomes a root of the index,
+> exclusions go into the index's `exclude` key (g7q.2.1), large tables are skipped with
+> `max_table_rows` (g7q.16), local-only notes are a second root, the reference subfolders are roots
+> of the reference index, and every index's `db` stays outside the cloud folder. The mirroring
+> script and the existing mirrors are left untouched as the rollback path. Paths and folder names
+> are in the private handover only.
+
 **Files (outside the repository):** `$CONSTRAINTS_V2` (new) and `$MINIRAG_CONFIG` (new).
 
 **Interfaces:**
@@ -792,6 +800,13 @@ Run: `for db in <1.x db of each index>; do test ! -e "$db/index.json" && find "$
 Expected: no file newer than the marker, and each `.minirag` holds only `lancedb`, `v2` and (if present) `classify.toml` and pending markers. There must be no `lancedb.next`, no `lancedb.previous` and no `index.json` in `lancedb`.
 
 ### Task 11: The server under launchd
+
+> **Added 2026-11-20 (bd minirag-mcp-g7q.13.1):** macOS privacy (TCC) denies a LaunchAgent access
+> to ~/Documents, ~/Desktop and ~/Library/CloudStorage unless the binary launchd starts was granted
+> Files and Folders / Full Disk Access. Find the exact binary the plist starts, grant it access,
+> and verify through the running server that a real sync reads every root (counts above zero, no
+> held roots). The README documents the step. If access cannot be granted to a stable path, run
+> the server as a login item from the user session instead.
 
 **Files (outside the repository):** `~/Library/LaunchAgents/local.minirag-mcp.plist` (new, from the template).
 
