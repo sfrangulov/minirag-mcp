@@ -1,13 +1,16 @@
-"""Preparers for spawned sync workers, which import this module by name."""
+"""Preparers and embedders for spawned sync workers, which import this module by name."""
 
 from __future__ import annotations
 
+import multiprocessing
 import os
 from pathlib import Path
 
+from conftest import FakeEmbedder
 from minirag_mcp.endpoints import EndpointError
 
 SLOW_ROUTER = "http://router.test/v1/embeddings did not answer within 120 s"
+CRASH_MARK = "KILLS-ITS-WORKER"
 
 
 class Preparer:
@@ -49,3 +52,15 @@ class Unloadable:
 
     def __reduce__(self):
         return broken_factory, ()
+
+
+class CrashingEmbedder(FakeEmbedder):
+    """Kills the worker process embedding a text that holds `CRASH_MARK`, as a native abort
+    would. In the process that runs the tests it raises instead."""
+
+    def embed_documents(self, texts):
+        if any(CRASH_MARK in t for t in texts):
+            if multiprocessing.parent_process() is None:
+                raise RuntimeError(f"{CRASH_MARK} embedded outside a worker")
+            os._exit(3)
+        return super().embed_documents(texts)

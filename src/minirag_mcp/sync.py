@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import functools
 import threading
 import uuid
 from collections.abc import Callable, Sequence
@@ -9,13 +11,17 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
-from minirag_mcp import ocr
+from minirag_mcp import ocr, parallel
 from minirag_mcp.identity import RebuildInfo, acquire_sync_lock
 from minirag_mcp.ingest.ignore import IgnoredFileError, scope_excluded_by
 from minirag_mcp.ingest.pipeline import Pipeline
 from minirag_mcp.ingest.scanner import compute_diff, scan_roots
 from minirag_mcp.scope import is_under
-from minirag_mcp.store import Store
+from minirag_mcp.store import IndexBusyError, Store
+
+# Endpoint failures in a row after which a parallel sync stops handing out files: every
+# file needs the endpoint, and each failure can have waited out its whole timeout.
+ENDPOINT_FAILURES_TO_STOP = 3
 
 # Told what a rebuild rebuilds and why when it starts, before its counts are known.
 OnRebuild = Callable[[RebuildInfo], None]
@@ -74,6 +80,79 @@ class SyncJob:
         }
 
 
+def _ingest_in_workers(
+    pipeline: Pipeline,
+    store: Store,
+    paths: Sequence[Path],
+    workers: int,
+    indexed: set[str],
+    ingested: Callable[[str], None],
+    failed: Callable[[str, str], None],
+) -> int:
+    """Prepare `paths` in `workers` processes and store them from this one, in batches,
+    labelled in the caller's labelling job. How many were never prepared because the
+    embedding endpoint stopped answering.
+
+    `indexed` gains each source as it is stored, so that a later batch holding it again
+    replaces its chunks instead of appending a second copy.
+    """
+    config = pipeline.config
+    # Once, before any worker starts: the batches are written with `replace_sources`, which
+    # this hook does not precede. On a fresh index it records the probe and arms the
+    # embedder, and each worker's copy of the embedder carries that.
+    if pipeline.before_store is not None:
+        pipeline.before_store()
+    if ocr.available():
+        # Fetched here so that the workers do not race each other to download it. Each file
+        # that needs it then fails with its own message.
+        with contextlib.suppress(ocr.OcrError):
+            ocr.ensure_tessdata(config.cache_dir, config.ocr_lang)
+    make = functools.partial(
+        parallel.worker_pipeline, config, pipeline.embedder, parallel.worker_threads(workers)
+    )
+    writer = parallel.BatchWriter(store, indexed=indexed)
+    # The sources added since the writer last reported: those a refused write drops.
+    held: list[str] = []
+
+    def write(call: Callable[..., list[parallel.Written]], *args) -> None:
+        try:
+            results = call(*args)
+        except IndexBusyError as e:
+            for source in held:
+                failed(source, str(e))
+            held.clear()
+            return
+        if results:
+            held.clear()
+        for source, error in results:
+            if error is None:
+                indexed.add(source)
+                ingested(source)
+            else:
+                failed(source, error)
+
+    read = in_a_row = not_read = 0
+    with contextlib.closing(parallel.prepare_files(make, paths, workers=workers)) as prepared:
+        for result in prepared:
+            read += 1
+            in_a_row = in_a_row + 1 if result.endpoint_failed else 0
+            if result.error is not None:
+                failed(str(result.path), result.error)
+                if in_a_row >= ENDPOINT_FAILURES_TO_STOP:
+                    not_read = len(paths) - read
+                    break
+                continue
+            try:
+                records, _ = pipeline.records(result.document)
+            except Exception as e:
+                failed(str(result.path), str(e))
+                continue
+            held.append(result.document.source)
+            write(writer.add, result.document.source, records)
+    write(writer.flush)
+    return not_read
+
+
 def _run_sync_unlocked(
     pipeline: Pipeline,
     store: Store,
@@ -103,9 +182,10 @@ def _run_sync_unlocked(
     blind: list[tuple[Path, str | None]] = []
     ignored: list[Path] = []
     entries = scan_roots(list(roots), blind=blind, ignored=ignored)
+    listing = store.list_sources()
     diff = compute_diff(
         entries,
-        store.list_sources(),
+        listing,
         max_file_size=max_file_size,
         scope=scope,
         roots=roots,
@@ -159,16 +239,22 @@ def _run_sync_unlocked(
             }
         )
 
+    def failed(source: str, error: str) -> None:
+        counts["failed"] += 1
+        errors.append({"source": source, "error": error})
+        emit(f"failed {source}: {error}")
+
+    def ingested(source: str) -> None:
+        counts["ingested"] += 1
+        emit(f"ingested {source}")
+
     def ingest(path: Path) -> bool:
         try:
             pipeline.ingest_file(path, rules_checked=True)
         except Exception as e:  # per-file failures never abort the job
-            counts["failed"] += 1
-            errors.append({"source": str(path), "error": str(e)})
-            emit(f"failed {path}: {e}")
+            failed(str(path), str(e))
             return False
-        counts["ingested"] += 1
-        emit(f"ingested {path}")
+        ingested(str(path))
         return True
 
     # One labelling job for the whole run, so the model is loaded at most once and the
@@ -192,8 +278,30 @@ def _run_sync_unlocked(
                 counts["deleted"] += 1
                 emit(f"deleted {move.source}")
 
-        for path in diff.to_ingest:
-            ingest(path)
+        workers = parallel.worker_count(
+            pipeline.config.sync_workers,
+            len(diff.to_ingest),
+            default=parallel.default_workers(
+                parallel.physical_cores(),
+                parallel.total_memory(),
+                parallel.worker_footprint(pipeline.embedder),
+            ),
+        )
+        if workers == 1:
+            for path in diff.to_ingest:
+                ingest(path)
+        else:
+            indexed = {info.source for info in listing}
+            not_read = _ingest_in_workers(
+                pipeline, store, diff.to_ingest, workers, indexed, ingested, failed
+            )
+            if not_read:
+                # Not one error per file: they were never read, and the next sync reads
+                # them, their hashes unchanged.
+                counts["failed"] += not_read
+                stopped = f"embedding: endpoint unreachable, {not_read} files not synced"
+                errors.append({"source": str(store.db_path), "error": stopped})
+                emit(stopped)
 
         for source in diff.to_delete:
             store.delete_source(source)

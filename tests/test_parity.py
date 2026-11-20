@@ -239,6 +239,29 @@ async def test_both_shells_refuse_a_scoped_sync_of_a_pending_index_the_same_way(
     assert (st["indexState"], st["indexGeneration"]) == ("rebuild pending", 1)
 
 
+async def test_a_parallel_sync_counts_the_same_through_both_shells(
+    root, tmp_path, capsys, monkeypatch, fake_embedder, inline_workers
+):
+    monkeypatch.setattr(cli, "_make_embedder", lambda cfg: fake_embedder)
+    for i in range(7):
+        (root / f"doc{i}.md").write_text(f"# Doc {i}\n\nBody of document {i}.")
+    monkeypatch.setenv("RAG_SYNC_WORKERS", "2")
+    envs = {
+        shell: {"BASE_DIR": str(root), "DB_PATH": str(tmp_path / shell), "RAG_SYNC_WORKERS": "2"}
+        for shell in ("cli", "mcp")
+    }
+
+    code, out, _ = run_cli(["sync", *_flags(envs["cli"]), "--json"], capsys)
+    async with Client(create_app(load_config(envs["mcp"]), embedder=fake_embedder)) as c:
+        job = (await c.call_tool("sync_start", {})).data["jobId"]
+        status = await _finished_job(c, job)
+
+    cli_counts = json.loads(out)["counts"]
+    assert code == 0 and status["state"] == "succeeded", status["error"]
+    assert cli_counts == status["counts"] and cli_counts["ingested"] == 8
+    assert inline_workers == [2, 2]
+
+
 async def test_an_empty_query_is_refused_by_both(
     root, tmp_path, capsys, monkeypatch, fake_embedder
 ):

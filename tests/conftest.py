@@ -6,11 +6,12 @@ import hashlib
 import ipaddress
 import json
 import math
+import pickle
 import re
 import socket
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -24,7 +25,7 @@ from tokenizers.pre_tokenizers import Whitespace
 from tokenizers.processors import TemplateProcessing
 
 import minirag_mcp.embedder as embedder_mod
-from minirag_mcp import security
+from minirag_mcp import parallel, security
 from minirag_mcp.chunker import SCHEME_VERSION
 from minirag_mcp.config import Config
 from minirag_mcp.identity import (
@@ -335,6 +336,27 @@ class FakeModelFactory:
 @pytest.fixture
 def model_factory() -> FakeModelFactory:
     return FakeModelFactory()
+
+
+@pytest.fixture
+def inline_workers(monkeypatch) -> list[int]:
+    """`parallel.prepare_files` in this process, one path at a time as it is read: a
+    preparer built once from a pickled copy of the factory, as a worker builds its own,
+    and each path prepared by `parallel.prepare_one`. Each call's `workers` is appended,
+    at the call, to the list returned."""
+    calls: list[int] = []
+
+    def prepared(factory: bytes, paths: list[Path]) -> Iterator[parallel.Prepared]:
+        preparer = pickle.loads(factory)()
+        for path in paths:
+            yield parallel.prepare_one(preparer, path)
+
+    def prepare_files(make_preparer, paths, *, workers):
+        calls.append(workers)
+        return prepared(pickle.dumps(make_preparer), list(paths))
+
+    monkeypatch.setattr(parallel, "prepare_files", prepare_files)
+    return calls
 
 
 @pytest.fixture
