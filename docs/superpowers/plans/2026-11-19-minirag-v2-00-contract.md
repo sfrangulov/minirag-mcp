@@ -13,7 +13,7 @@ Plans, executed in this order (each leaves `uv run pytest -q`, `ruff check src t
 2. `-02-ingest.md` — struck-through text (kept, marked `~~...~~` across chunk splits),
    Tesseract OCR, parallel sync. g7q.6, .9, .12 (that item), .14.
 3. `-03-server.md` — `indexes.toml`, the registry, `serve`, `index` argument, `list_indexes`,
-   `connect`, CLI `--index`, instructions, LaunchAgent template. g7q.2.
+   ~~`connect`~~ (deferred, bd g7q.2.2), CLI `--index`, instructions, LaunchAgent template. g7q.2.
 4. `-04-release.md` — release mechanics, README, joint check and baseline (g7q.5), `2.0.0a1`,
    the owner's migration (g7q.13).
 
@@ -35,8 +35,8 @@ Plans, executed in this order (each leaves `uv run pytest -q`, `ruff check src t
 | `parallel.py` | 2.6-2.8 | `prepare_files`, `worker_pipeline`, `BatchWriter`, `default_workers`, `worker_count`, `physical_cores`, `total_memory`, `worker_footprint`, `worker_threads` (sync.py only) |
 | `indexes.py` | 3.1 | `ServerConfig`, `load_server_config(path, env)`, `default_config_path(env=None)`, `INDEX_KEYS` |
 | `registry.py` | 3.2, 3.3 | `Connection`, `UNRESTRICTED`, `Use`, `IndexRegistry` (`from_file`, `single`, `open`, `resolve`, `refresh`, `reload`), `IndexEntry` (`.handle`, `runtime()`, `state()`), `IndexRefused`, `IndexUnavailable` (`EmbedderPool` reduced to `embedder.py`'s model cache, ruling S5) |
-| `http_server.py`, `bridge.py` | 3.7, 3.8 | `serve`, `ensure_token`, `parse_connection`; `run_bridge` |
-| `docs/launchd/local.minirag-mcp.plist` | 3.9 | label `local.minirag-mcp`, placeholders `__UVX__`, `__VERSION__`, `__HOME__` (plan 4 copies it) |
+| `http_server.py`, ~~`bridge.py`~~ | 3.7, ~~3.8~~ | `serve`, `ensure_token`, `parse_connection`; ~~`run_bridge`~~ **Superseded (owner, 2026-11-20; plan 3 Task 8 deferred: bd g7q.2.2):** no bridge; Claude Desktop runs one `minirag-mcp --index NAME` stdio server per index |
+| `docs/launchd/local.minirag-mcp.plist` | 3.9 | label `local.minirag-mcp`, placeholders `__UVX__`, `__VERSION__`, `__HOME__` (plan 4 copies it). **Corrected (2026-11-21, plan 4 pre-flight ruling R2):** a fourth placeholder, `__PYTHON__`, pins the interpreter macOS privacy (TCC) has granted access to the indexed folders (plan 3 Task 9), and the template installs `minirag-mcp[ocr]` |
 
 ## Rules the plans agreed
 

@@ -209,8 +209,12 @@ only) and rejects requests carrying a non-loopback `Origin`, per the MCP transpo
 DNS rebinding.
 
 **Clients** — Claude Code and Codex connect over HTTP directly. Claude Desktop's local config
-runs stdio only: `minirag-mcp connect <index> [--allow a,b]` is a thin stdio-to-HTTP bridge to
-the running server (token read from the same file).
+runs stdio only: ~~`minirag-mcp connect <index> [--allow a,b]` is a thin stdio-to-HTTP bridge to
+the running server (token read from the same file).~~ **Superseded (owner, 2026-11-20; plan 3
+Task 8 deferred: bd g7q.2.2):** there is no `connect`. Claude Desktop gets one entry per index,
+`minirag-mcp --index NAME`: a stdio server for that index of `indexes.toml`, the same core over
+the same index on disk, with its models through the endpoints the file configures. An entry
+reaches its own index only; another index takes another entry.
 
 **Single-index mode** — `minirag-mcp` configured by environment variables, one index per
 process over stdio, stays as a *way of configuring*, not as 1.x behaviour: it runs the same v2
@@ -400,8 +404,9 @@ on the owner's GPU). `find_mentions` (literal search) is unchanged.
   single-index mode; nobody is pointed at it until v2 is the default.
 - g7q.13, last: router presets on the owner's machine, `indexes.toml` for the owner's three
   corpora (each re-embedded with e5 and prefixes), clients switched to HTTP URLs (Desktop via
-  `connect`), regenerated constraints for the pinned `uvx` installs; 1.x indexes kept until
-  v2 is confirmed on them.
+  ~~`connect`~~ one `minirag-mcp --index NAME` entry per index: **superseded (owner,
+  2026-11-20; plan 3 Task 8 deferred: bd g7q.2.2)**, see section 1, Clients), regenerated
+  constraints for the pinned `uvx` installs; 1.x indexes kept until v2 is confirmed on them.
 
 ## Calls made during design (owner to check)
 
@@ -436,7 +441,8 @@ on the owner's GPU). `find_mentions` (literal search) is unchanged.
   index sharing a registry), as long as the behaviour above holds.
 - The `index.json` schema details and the atomic swap mechanics on macOS and Linux.
 - Worker/batch sizes for parallel sync; how workers share the embedding endpoint.
-- The `connect` bridge's implementation.
+- ~~The `connect` bridge's implementation.~~ Deferred (owner, 2026-11-20; bd g7q.2.2): see
+  section 1, Clients.
 - Test design, following CLAUDE.md: each fix's test must fail on the unfixed code.
 
 ## Deferred
