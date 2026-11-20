@@ -1581,6 +1581,16 @@ version**: a release that ships without it cannot be registered at all, and no
 re-run fixes that — only the next release does. If the wait times out, publish
 the PyPI release and re-run the workflow.
 
+Only a final release (`vMAJOR.MINOR.PATCH`) is registered. A pre-release tag such
+as `v2.0.0a1` still has its `server.json` versions checked against the tag, then
+the run ends green with a notice and the registry entry is left as it is. The
+registry's code ranks a non-semver version such as `2.0.0a1` below every semver
+one, but its versioning guide says a version that fails to parse is always marked
+latest; and a semver pre-release such as `2.0.0-alpha.1` would outrank `1.1.1` by
+semver itself. A registry version can never be withdrawn, so a pre-release would
+become what registry clients install by default. Checked 2026-11-20 against
+registry release v1.8.10.
+
 ## License
 
 MIT — see [LICENSE](LICENSE). `src/minirag_mcp/ingest/vtt.py` is adapted from
