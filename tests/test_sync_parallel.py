@@ -10,6 +10,7 @@ import signal
 import subprocess
 import sys
 import sysconfig
+import threading
 from collections import Counter
 from pathlib import Path
 
@@ -230,6 +231,50 @@ def test_a_small_sync_stays_in_this_process(tmp_path, fake_embedder, monkeypatch
     monkeypatch.setattr(parallel, "prepare_files", refuse)
     counts, errors = sync(h)
     assert counts["ingested"] == 3 and errors == []
+
+
+def test_two_indexes_syncing_at_once_run_one_worker_pool_at_a_time(tmp_path, monkeypatch):
+    """Each pool sizes itself against the whole machine, so two at once would over-commit
+    its memory: the second index's pool waits for the first's to end."""
+    pools: list[str] = []
+    syncs: list[int] = []
+    second_sync, second_pool = threading.Event(), threading.Event()
+
+    class Recorded(parallel.ProcessPoolExecutor):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            pools.append("start")
+            if pools.count("start") == 2:
+                second_pool.set()
+
+        def shutdown(self, *args, **kwargs):
+            super().shutdown(*args, **kwargs)
+            if "end" not in pools:
+                # The first pool lives on until the other sync reaches its pool phase.
+                second_sync.wait(60)
+                second_pool.wait(0.5)
+            pools.append("end")
+
+    real = parallel.prepare_files
+
+    def entering(make_preparer, paths, *, workers):
+        syncs.append(workers)
+        if len(syncs) == 2:
+            second_sync.set()
+        return real(make_preparer, paths, workers=workers)
+
+    monkeypatch.setattr(parallel, "ProcessPoolExecutor", Recorded)
+    monkeypatch.setattr(parallel, "prepare_files", entering)
+    handles = []
+    for name in ("one", "two"):
+        (tmp_path / name).mkdir()
+        handles.append(corpus(tmp_path / name, FakeEmbedder(), 8)[1])
+    jobs = [h.start_sync(None) for h in handles]
+    for h in handles:
+        h.sync.wait(120)
+    done = [h.sync.status(job) for h, job in zip(handles, jobs, strict=True)]
+    assert [(j.state, j.counts["ingested"]) for j in done] == [("succeeded", 8)] * 2
+    assert syncs == [2, 2] and pools == ["start", "end", "start", "end"]
 
 
 def test_failures_in_a_parallel_sync_are_counted_like_serial_ones(

@@ -8,6 +8,7 @@ import pickle
 import re
 import subprocess
 import sys
+import threading
 from collections import deque
 from collections.abc import Callable, Container, Generator, Iterator, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
@@ -239,6 +240,11 @@ def _run(
     return []
 
 
+# Every pool sizes itself against the whole machine, so in one process, which may serve
+# several indexes, only one runs at a time; the sync of another index waits for it.
+_POOL_GATE = threading.Lock()
+
+
 def prepare_files(
     make_preparer: Callable[[], Preparer], paths: Sequence[Path], *, workers: int
 ) -> Iterator[Prepared]:
@@ -248,14 +254,18 @@ def prepare_files(
     dies takes its pool down with those files. They are prepared again one at a time in a
     one-worker pool, replaced whenever a file breaks it, so only a file that kills its
     worker fails, with WORKER_DIED; a fresh pool then takes the rest.
+
+    While one call's pools run in this process, another call starts none until that call
+    has ended; closing its iterator ends it.
     """
     factory = pickle.dumps(make_preparer)
     waiting = deque(paths)
-    while waiting:
-        suspects = deque((yield from _run(factory, waiting, workers, 2 * workers)))
-        while suspects:
-            for path in (yield from _run(factory, suspects, 1, 1)):
-                yield Prepared(path, None, WORKER_DIED)
+    with _POOL_GATE:
+        while waiting:
+            suspects = deque((yield from _run(factory, waiting, workers, 2 * workers)))
+            while suspects:
+                for path in (yield from _run(factory, suspects, 1, 1)):
+                    yield Prepared(path, None, WORKER_DIED)
 
 
 class BatchWriter:
