@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
+from contextvars import ContextVar
 from functools import wraps
 from pathlib import Path
 from typing import Annotated, Literal
@@ -48,6 +49,8 @@ INDEX_ARG_DOC = (
 IndexArg = Annotated[str | None, Field(description=INDEX_ARG_DOC)]
 # What a request may use when the path middleware put no connection in its scope.
 _NO_CONNECTION = Connection(None, frozenset())
+# The index the tool call being answered opened, which names its failures.
+_ANSWERING: ContextVar[IndexEntry | None] = ContextVar("minirag_answering", default=None)
 
 
 def _scopes(scope: str | list[str] | None) -> tuple[str, ...]:
@@ -108,7 +111,9 @@ def create_app(
 
     def opened(index: str | None, use: Use) -> tuple[IndexEntry, OpenIndex]:
         registry.refresh()
-        return registry.open(current_connection(fallback), index, use)
+        entry, runtime = registry.open(current_connection(fallback), index, use)
+        _ANSWERING.set(entry)
+        return entry, runtime
 
     def refusing(entry: IndexEntry) -> AbstractContextManager[None]:
         return registry.refusals(current_connection(fallback), entry)
@@ -119,14 +124,15 @@ def create_app(
     def guard(fn):
         @wraps(fn)
         def inner(*args, **kwargs):
+            answering = _ANSWERING.set(None)
             try:
                 return fn(*args, **kwargs)
             except ToolError:
                 raise
-            except KeyError as e:
-                raise ToolError(str(e.args[0]) if e.args else str(e)) from e
             except Exception as e:
-                raise ToolError(str(e)) from e
+                raise ToolError(registry.failure(_ANSWERING.get(), e)) from e
+            finally:
+                _ANSWERING.reset(answering)
 
         return inner
 

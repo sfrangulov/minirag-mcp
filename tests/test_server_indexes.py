@@ -87,8 +87,8 @@ async def test_a_file_under_another_reachable_index_is_refused_naming_it(make, i
         r = await c.call_tool(tool, PATH_ARGS[tool](str(beta_md)), raise_on_error=False)
     assert _text(r) == (
         f"Index 'alpha': {beta_md} is outside its roots ({indexes_file.roots['alpha']}) but "
-        "under those of index 'beta': pass index=\"beta\" to reach it. Other reachable "
-        "indexes: beta, gamma."
+        "under those of index 'beta', which answers for it. Other reachable indexes: beta, "
+        "gamma."
     )
 
 
@@ -475,3 +475,20 @@ async def test_a_broken_edit_is_reported_and_the_old_indexes_keep_answering(make
     assert found["index"] == "alpha" and [s["source"] for s in found["sources"]] == [str(alpha_md)]
     assert "line 2" in listed["configError"]
     assert [row["name"] for row in listed["indexes"]] == ["alpha", "beta", "gamma"]
+
+
+async def test_an_index_a_broken_edit_adds_is_refused_saying_why_the_edit_did_not_load(
+    make, indexes_file
+):
+    table = '\n[index.delta]\nroots = ["~/corpora/alpha/sub"]\ntokn_budget = 100\n'
+    async with Client(make()) as c:
+        indexes_file.write(indexes_file.text + table)
+        r = await c.call_tool(
+            "query_documents", {"query": "x", "index": "delta"}, raise_on_error=False
+        )
+        st = (await c.call_tool("status", {})).data
+    assert _text(r) == (
+        "Unknown index 'delta'. Reachable indexes: alpha, beta, gamma. indexes.toml did not "
+        f"load: {st['configError']}; the indexes it listed before are serving."
+    )
+    assert "unknown key 'tokn_budget' in [index.delta]" in st["configError"]

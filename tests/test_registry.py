@@ -556,6 +556,32 @@ def test_a_broken_edit_keeps_the_previous_indexes_and_says_why(indexes_file, fak
     )
 
 
+@pytest.mark.parametrize(
+    "conn, requested, whose",
+    [
+        (Connection("alpha", None), "delta", ""),
+        (Connection("delta", None), None, " (this connection's default)"),
+    ],
+)
+def test_an_index_a_broken_edit_adds_is_refused_with_why_the_edit_did_not_load(
+    indexes_file, fake_embedder, conn, requested, whose
+):
+    reg = file_registry(indexes_file, lambda c, s: fake_embedder)
+    indexes_file.write(indexes_file.text + DELTA + "tokn_budget = 100\n")
+    reg.refresh()
+    assert "unknown key 'tokn_budget' in [index.delta]" in reg.config_error
+    with pytest.raises(IndexRefused) as refused:
+        reg.open(conn, requested, Use.READ)
+    assert str(refused.value) == (
+        f"Unknown index 'delta'{whose}. Reachable indexes: alpha, beta, gamma. "
+        f"indexes.toml did not load: {reg.config_error}; the indexes it listed before are "
+        "serving."
+    )
+    indexes_file.write(indexes_file.text + DELTA)
+    reg.refresh()
+    assert reg.open(conn, requested, Use.READ)[0].name == "delta"
+
+
 def test_a_deleted_file_keeps_the_previous_indexes(indexes_file, fake_embedder):
     reg = file_registry(indexes_file, lambda c, s: fake_embedder)
     indexes_file.path.unlink()

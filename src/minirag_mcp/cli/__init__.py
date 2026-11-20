@@ -413,7 +413,7 @@ def ingest(
                     seen.add(resolved)
                     files.append(c)
     except Exception as e:  # a path outside the roots, or a scan-time filesystem error
-        _fail(str(e))
+        _fail(registry.failure(entry, e))
     done: list[IngestResult] = []
     # One job, so the model is loaded once for the whole run, not once per file.
     with pipeline.job() as report:
@@ -422,7 +422,7 @@ def ingest(
                 with registry.refusals(_CONNECTION, entry):
                     done.append(pipeline.ingest_file(f, rules_checked=f in scanned))
             except Exception as e:  # per-file failures never abort the batch
-                failures.append({"source": str(f), "error": str(e)})
+                failures.append({"source": str(f), "error": registry.failure(entry, e)})
     notes = entry.handle.notes()
     payload = {"ingested": [ingest_reply(r, notes) for r in done], "failed": failures}
     human = "\n".join([f"ingested {len(done)} file(s):"] + [f"  {r.source}" for r in done])
@@ -455,7 +455,7 @@ def ingest_url(
         with pipeline.job() as report, registry.refusals(_CONNECTION, entry):
             r = pipeline.ingest_url(url, source=source, title=title)
     except Exception as e:
-        _fail(str(e))
+        _fail(registry.failure(entry, e))
     reply = ingest_reply(r, entry.handle.notes())
     _emit(with_index(reply, entry), json, f"ingested {r.source} ({r.chunk_count} chunks)")
     _warn(reply.get("warnings", []))
@@ -526,7 +526,7 @@ def query(
     if top_k < 1:
         _fail(f"--top-k must be at least 1, got {top_k}")
     labels = _parse_labels(label)
-    _, entry, opened = _open(Use.READ, base_dir, db_path, cache_dir, model_name)
+    registry, entry, opened = _open(Use.READ, base_dir, db_path, cache_dir, model_name)
     cfg = entry.config
     try:
         payload = run_query(
@@ -543,7 +543,7 @@ def query(
             reranker=opened.reranker,
         )
     except (QueryError, EmbedderUnavailableError) as e:
-        _fail(str(e))
+        _fail(registry.failure(entry, e))
         raise AssertionError from e  # unreachable
     if payload["results"]:
         human = "\n".join(_result_line(r) for r in payload["results"])
@@ -616,7 +616,7 @@ def find(
     starts with a dash goes after `--`, and every option before it.
     """
     labels = _parse_labels(label)
-    _, entry, opened = _open(Use.READ, base_dir, db_path, cache_dir, model_name)
+    registry, entry, opened = _open(Use.READ, base_dir, db_path, cache_dir, model_name)
     cfg = entry.config
     try:
         payload = run_find(
@@ -633,7 +633,7 @@ def find(
             label_source=opened.labels,
         )
     except QueryError as e:
-        _fail(str(e))
+        _fail(registry.failure(entry, e))
         raise AssertionError from e  # unreachable
     _emit(with_index(payload, entry), json, _find_human(payload))
     _warn_filter(payload)
@@ -740,7 +740,7 @@ def list_cmd(
     named in a warning on stderr and in unlistedFolders with --json.
     """
     labels = _parse_labels(label)
-    _, entry, opened = _open(Use.READ, base_dir, db_path, cache_dir, model_name)
+    registry, entry, opened = _open(Use.READ, base_dir, db_path, cache_dir, model_name)
     cfg = entry.config
     try:
         payload = list_payload(
@@ -756,7 +756,7 @@ def list_cmd(
             label_source=opened.labels,
         )
     except QueryError as e:
-        _fail(str(e))
+        _fail(registry.failure(entry, e))
         raise AssertionError from e  # unreachable
     human = "\n".join(
         f"[{f['state']}] {f['source']} ({f['chunkCount']} chunks)"

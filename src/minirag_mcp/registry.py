@@ -448,7 +448,9 @@ class IndexRegistry:
         entry = entries.get(name)
         if entry is None:
             whose = " (this connection's default)" if requested is None else ""
-            raise IndexRefused(f"Unknown index {name!r}{whose}. Reachable indexes: {reachable}.")
+            raise IndexRefused(
+                f"Unknown index {name!r}{whose}. Reachable indexes: {reachable}.{self._unloaded()}"
+            )
         if not connection.reachable(name):
             if connection.alone:
                 raise IndexRefused(
@@ -461,6 +463,23 @@ class IndexRegistry:
                 f"Reachable indexes: {reachable}."
             )
         return entry
+
+    def failure(self, entry: IndexEntry | None, error: Exception) -> str:
+        """What a call is told of `error`. In file mode, where several indexes answer, a
+        failure of the work `entry` was opened for is named for it; a refusal names its
+        index already."""
+        message = str(error.args[0]) if isinstance(error, KeyError) and error.args else str(error)
+        if entry is None or self.path is None or isinstance(error, IndexRefused):
+            return message
+        return f"Index {entry.name!r}: {message}"
+
+    def _unloaded(self) -> str:
+        """Why the file's last change is not served, as a closing sentence: an index it
+        adds is unknown until it loads."""
+        if self.path is None or self.config_error is None:
+            return ""
+        error = self.config_error.rstrip(".")
+        return f" {self.path.name} did not load: {error}; the indexes it listed before are serving."
 
     def _others(
         self, entries: Mapping[str, IndexEntry], connection: Connection, name: str
@@ -527,7 +546,7 @@ class IndexRegistry:
         if holder is not None and connection.alone:
             why += f" but under those of index {holder!r}, which is served by {_own_entry(holder)}"
         elif holder is not None:
-            why += f' but under those of index {holder!r}: pass index="{holder}" to reach it'
+            why += f" but under those of index {holder!r}, which answers for it"
         else:
             why += (
                 ", and no other index this connection may use holds it; a folder is reached "

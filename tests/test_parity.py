@@ -23,7 +23,7 @@ from index_helpers import file_registry, run_meta
 from lookalike_texts import MINUTES, REGULATION_V1, REGULATION_V2
 from minirag_mcp import ocr, ocr_vision
 from minirag_mcp.config import default_db_path, load_config
-from minirag_mcp.embedder import E5_LARGE, Embedder
+from minirag_mcp.embedder import E5_LARGE, Embedder, EmbedderUnavailableError
 from minirag_mcp.labels import Labeler
 from minirag_mcp.labels.model import ModelError
 from minirag_mcp.registry import UNRESTRICTED, Connection
@@ -1220,7 +1220,7 @@ async def test_a_path_outside_the_named_index_is_refused_the_same_way_by_both(
     assert is_error and code == 1 and text == _last_error(err)
     assert text.startswith(f"Index 'alpha': {path} is outside its roots ({alpha})")
     if held_by == "another index":
-        assert "under those of index 'beta': pass index=\"beta\" to reach it" in text
+        assert "under those of index 'beta', which answers for it." in text
     else:
         assert (
             f"a folder is reached by adding it to an index's roots in {indexes_file.path}" in text
@@ -1246,3 +1246,63 @@ async def test_an_index_of_the_file_recorded_at_another_width_is_refused_alike_b
     assert is_error and code == 1 and text == refusal
     assert refusal.startswith("Index 'beta' is unavailable: ")
     assert f"built with {E5_LARGE}, at 16 dimensions, but it makes 1024-dimensional" in refusal
+
+
+class _QueryFails(FakeEmbedder):
+    """Opens its index, then cannot embed a query, as a model that cannot be loaded."""
+
+    def embed_query(self, text: str) -> list[float]:
+        raise EmbedderUnavailableError("Embedding model fake could not be loaded: gone")
+
+
+@pytest.fixture
+def failing_beta(indexes_file, monkeypatch):
+    """Both shells over `indexes_file`, embedding with `_QueryFails`: the server, and the
+    CLI's options that select beta."""
+    monkeypatch.setenv("HOME", indexes_file.env["HOME"])
+    embedder = _QueryFails()
+    monkeypatch.setattr(cli, "_make_embedder", lambda cfg: embedder)
+    app = create_app(file_registry(indexes_file, lambda c, s: embedder))
+    return app, ["--config", str(indexes_file.path), "--index", "beta"]
+
+
+async def test_a_model_failing_in_a_named_index_names_it_the_same_way_in_both(failing_beta, capsys):
+    """With several indexes a failure that is not a refusal must still say which index
+    failed."""
+    app, beta = failing_beta
+    is_error, text = await _call(app, "query_documents", {"query": "x", "index": "beta"})
+    code, _, err = run_meta([*beta, "query", "x"], capsys)
+    assert is_error and code == 1 and text == _last_error(err)
+    assert text == "Index 'beta': Embedding model fake could not be loaded: gone"
+
+
+async def test_a_file_failing_to_parse_in_a_named_index_names_it_the_same_way_in_both(
+    failing_beta, indexes_file, capsys
+):
+    app, beta = failing_beta
+    broken = indexes_file.roots["beta"] / "broken.vtt"
+    broken.write_text("WEBVTT\n\nhello there\nno timing\n", encoding="utf-8")
+    is_error, text = await _call(app, "ingest_file", {"filePath": str(broken), "index": "beta"})
+    code, out, err = run_meta([*beta, "ingest", str(broken), "--json"], capsys)
+    [failed] = json.loads(out)["failed"]
+    assert is_error and code == 1 and text == failed["error"]
+    assert f"warn: {broken}: {text}" in err
+    assert text == (
+        f"Index 'beta': Failed to convert {broken}: a block that is neither a cue nor a note: "
+        "'hello there'"
+    )
+
+
+async def test_a_refused_search_in_a_named_index_names_it_the_same_way_in_both(
+    failing_beta, capsys
+):
+    app, beta = failing_beta
+    calls = [
+        ("find_mentions", {"terms": " "}, ["find", " "]),
+        ("list_files", {"dateFrom": "2026-01-01"}, ["list", "--date-from", "2026-01-01"]),
+    ]
+    for tool, args, command in calls:
+        is_error, text = await _call(app, tool, {**args, "index": "beta"})
+        code, _, err = run_meta([*beta, *command], capsys)
+        assert is_error and code == 1 and text == _last_error(err), tool
+        assert text.startswith("Index 'beta': "), text
