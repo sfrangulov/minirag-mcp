@@ -253,6 +253,24 @@ def test_host_name_drops_the_port_and_brackets_and_ignores_case(value, name):
 
 
 @pytest.mark.parametrize(
+    "value",
+    [
+        "[::1]evil.example",
+        "[::1].evil.example:80",
+        "[::1]:80x",
+        "[::1]:",
+        "[::1",
+        "localhost:evil",
+        "localhost:",
+        "127.0.0.1:8765x",
+    ],
+)
+def test_host_name_reads_no_host_when_anything_but_a_port_follows_it(value):
+    assert security.host_name(value) == ""
+    assert not security.is_loopback_name(value)
+
+
+@pytest.mark.parametrize(
     "value, loopback",
     [
         ("127.0.0.1", True),

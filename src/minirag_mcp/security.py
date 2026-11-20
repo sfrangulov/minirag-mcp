@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+import re
 import socket
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -28,16 +29,23 @@ _BLOCKED_KINDS = (
 # Matched as names, never parsed as addresses: how `ipaddress` reads `::ffff:127.0.0.1`
 # varies by patch release (see `_blocked_kind`), and a name list has no such edge.
 LOOPBACK_NAMES = ("127.0.0.1", "localhost", "::1")
+# What may follow a host: nothing, or a port.
+_PORT = re.compile(r"(?::[0-9]+)?")
 
 
 def host_name(value: str) -> str:
     """The host of `value`, a host or a `Host` header, without its port or IPv6 brackets,
-    in lowercase."""
+    in lowercase; "" when anything but a port follows the host, so that no trailing text
+    can ride on a loopback name."""
     name = value.strip().lower()
     if name.startswith("["):
-        return name[1 : name.find("]")] if "]" in name else name
+        end = name.find("]")
+        if end < 0 or not _PORT.fullmatch(name, end + 1):
+            return ""
+        return name[1:end]
     if name.count(":") == 1:
-        return name.split(":", 1)[0]
+        host, port = name.split(":")
+        return host if _PORT.fullmatch(f":{port}") else ""
     return name
 
 

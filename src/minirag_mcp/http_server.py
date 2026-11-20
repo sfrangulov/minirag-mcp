@@ -15,6 +15,7 @@ scope, under `CONNECTION_SCOPE_KEY`.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hmac
 import os
 import secrets
@@ -75,12 +76,22 @@ def ensure_token(path: Path) -> str:
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError:
-        pass
+        return read_token(path)
     except OSError as e:
         raise ConfigError(f"{path}: cannot create the token file: {e.strerror or e}") from e
-    else:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(secrets.token_urlsafe(32) + "\n")
+    unsaved = memoryview((secrets.token_urlsafe(32) + "\n").encode("ascii"))
+    try:
+        try:
+            while unsaved:
+                unsaved = unsaved[os.write(fd, unsaved) :]
+        finally:
+            os.close(fd)
+    except OSError as e:
+        # An empty or partial file would be refused, or read as a shorter token, at every
+        # start after this one.
+        with contextlib.suppress(OSError):
+            path.unlink()
+        raise ConfigError(f"{path}: cannot write the token file: {e.strerror or e}") from e
     return read_token(path)
 
 
@@ -100,11 +111,26 @@ def parse_connection(path: str, query_string: str) -> Connection | None:
     return Connection(default, frozenset(name for name in names if name))
 
 
-def _origin_host(origin: str) -> str | None:
+def _origin_host(origin: str) -> str:
+    """The host of the one origin `origin` names; "" for an opaque, malformed or listed
+    one."""
+    if any(c.isspace() for c in origin):
+        return ""
     try:
-        return urlsplit(origin).hostname
+        authority = urlsplit(origin).netloc
     except ValueError:
-        return None
+        return ""
+    return host_name(authority)
+
+
+def _checked(token: str, allowed_hosts: Collection[str]) -> tuple[bytes, frozenset[str]]:
+    if not token.strip():
+        raise ValueError("the bearer token is empty: any request would carry it")
+    hosts = frozenset(allowed_hosts)
+    # host_name reads "" from a value it cannot read a host from.
+    if "" in hosts:
+        raise ValueError("an allowed host is empty: a Host or Origin without a host would pass")
+    return token.encode("utf-8"), hosts
 
 
 class LoopbackGuard:
@@ -114,13 +140,18 @@ class LoopbackGuard:
 
     def __init__(self, app: ASGIApp, *, token: str, allowed_hosts: Collection[str]) -> None:
         self.app = app
-        self._token = token.encode("utf-8")
-        self._hosts = frozenset(allowed_hosts)
+        self._token, self._hosts = _checked(token, allowed_hosts)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http":
+        if scope["type"] == "lifespan":
             await self.app(scope, receive, send)
             return
+        if scope["type"] == "websocket":
+            # Closed before it is accepted, which the server answers with 403.
+            await send({"type": "websocket.close", "code": 1008})
+            return
+        if scope["type"] != "http":
+            raise RuntimeError(f"minirag-mcp serve answers no {scope['type']!r} connection")
         headers = Headers(scope=scope)
         if host_name(headers.get("host", "")) not in self._hosts:
             refusal = PlainTextResponse(MISDIRECTED, status_code=421)
@@ -163,14 +194,19 @@ class IndexPathMiddleware:
 
 
 def build_http_app(mcp: FastMCP, *, token: str, allowed_hosts: Collection[str]) -> Starlette:
-    """`mcp` over streamable HTTP, behind the guard and the path middleware."""
+    """`mcp` over streamable HTTP, behind the guard and the path middleware. ValueError for
+    an empty token or allowed host, here rather than at the first request."""
+    _checked(token, allowed_hosts)
+
+    # A closure, not Middleware(LoopbackGuard, token=...): Middleware's repr prints its
+    # arguments, so the token would show wherever the app's middleware list is printed.
+    def loopback_guard(app: ASGIApp) -> LoopbackGuard:
+        return LoopbackGuard(app, token=token, allowed_hosts=allowed_hosts)
+
     return mcp.http_app(
         path=MCP_PATH,
         transport="http",
-        middleware=[
-            Middleware(LoopbackGuard, token=token, allowed_hosts=allowed_hosts),
-            Middleware(IndexPathMiddleware),
-        ],
+        middleware=[Middleware(loopback_guard), Middleware(IndexPathMiddleware)],
     )
 
 

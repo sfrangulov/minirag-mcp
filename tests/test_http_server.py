@@ -5,8 +5,12 @@ connection may use."""
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import errno
+import json
 import os
 import re
+import secrets
 import signal
 import socket
 import stat
@@ -20,15 +24,20 @@ from urllib.parse import urlsplit
 import httpx
 import pytest
 import uvicorn
-from fastmcp import Client
+from fastmcp import Client, FastMCP
 from fastmcp.client.transports import StreamableHttpTransport
+from starlette.applications import Starlette
 from starlette.middleware import Middleware
+from starlette.routing import WebSocketRoute
+from starlette.testclient import TestClient
+from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from http_helpers import AUTH, INITIALIZE, MCP_HEADERS, TOKEN, serving
 from index_helpers import file_registry, run_meta
 from minirag_mcp.config import ConfigError
 from minirag_mcp.http_server import (
     LoopbackGuard,
+    build_http_app,
     ensure_token,
     parse_connection,
     read_token,
@@ -70,6 +79,28 @@ def test_an_empty_token_file_is_refused(tmp_path):
     p.chmod(0o600)
     with pytest.raises(ConfigError, match=f"{re.escape(str(p))}: .*empty"):
         ensure_token(p)
+
+
+@pytest.mark.parametrize("written", [0, 3])
+def test_a_token_that_cannot_be_written_leaves_no_token_file(tmp_path, monkeypatch, written):
+    p = tmp_path / "token"
+    write, calls = os.write, []
+
+    def disk_full(fd, data):
+        calls.append(fd)
+        if len(calls) == 1 and written:
+            return write(fd, bytes(data[:written]))
+        raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+
+    monkeypatch.setattr(secrets, "token_urlsafe", lambda n: "the-token-that-was-never-saved")
+    monkeypatch.setattr(os, "write", disk_full)
+    with pytest.raises(ConfigError) as refused:
+        ensure_token(p)
+    monkeypatch.undo()
+    message = str(refused.value)
+    assert message.startswith(f"{p}: ") and os.strerror(errno.ENOSPC) in message
+    assert "the-token" not in message
+    assert not p.exists()
 
 
 @pytest.mark.parametrize(
@@ -144,6 +175,125 @@ async def test_the_bearer_scheme_is_matched_in_any_case(site):
 async def test_an_unknown_path_is_not_found(site, path):
     r = await _post(f"{site}{path}", **AUTH)
     assert (r.status_code, r.text) == (404, NOT_FOUND)
+
+
+@pytest.mark.parametrize("token", ["", " ", "  \n"])
+def test_an_empty_token_is_refused_before_any_request(token):
+    async def app(scope, receive, send) -> None: ...
+
+    with pytest.raises(ValueError, match="token"):
+        LoopbackGuard(app, token=token, allowed_hosts=LOOPBACK_NAMES)
+    with pytest.raises(ValueError, match="token"):
+        build_http_app(FastMCP("x"), token=token, allowed_hosts=LOOPBACK_NAMES)
+
+
+def test_an_empty_allowed_host_is_refused_before_any_request():
+    async def app(scope, receive, send) -> None: ...
+
+    with pytest.raises(ValueError, match="host"):
+        LoopbackGuard(app, token=TOKEN, allowed_hosts=(*LOOPBACK_NAMES, ""))
+
+
+def test_the_app_never_prints_the_token(indexes_file, fake_embedder):
+    registry = file_registry(indexes_file, lambda c, s: fake_embedder)
+    app = build_http_app(create_app(registry), token=TOKEN, allowed_hosts=LOOPBACK_NAMES)
+    assert TOKEN not in repr(app.user_middleware)
+
+
+def test_a_websocket_is_refused_by_the_guard_even_with_the_token():
+    started: list[str] = []
+
+    @contextlib.asynccontextmanager
+    async def lifespan(app):
+        started.append("lifespan")
+        yield
+
+    async def accept(websocket: WebSocket) -> None:
+        await websocket.accept()
+        await websocket.send_text("open")
+        await websocket.close()
+
+    app = Starlette(routes=[WebSocketRoute("/mcp", accept)], lifespan=lifespan)
+    headers = {"Host": "127.0.0.1", **AUTH}
+    with TestClient(app) as client, client.websocket_connect("/mcp", headers=headers) as ws:
+        assert ws.receive_text() == "open"
+    guarded = LoopbackGuard(app, token=TOKEN, allowed_hosts=LOOPBACK_NAMES)
+    with TestClient(guarded) as client, pytest.raises(WebSocketDisconnect) as refused:
+        with client.websocket_connect("/mcp", headers=headers):
+            pass
+    assert refused.value.code == 1008
+    assert started == ["lifespan", "lifespan"]
+
+
+@pytest.mark.parametrize("host", ["[::1]evil.example", "[::1].evil.example:80", "localhost:evil"])
+async def test_a_host_with_anything_but_a_port_after_it_is_refused(site, host):
+    r = await _post(f"{site}/mcp/alpha", Host=host, **AUTH)
+    assert (r.status_code, r.text) == (421, "Misdirected Request: Host must be a loopback name")
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "http://localhost:5173 http://evil.example",
+        "http://localhost:5173\thttp://evil.example",
+        # urlsplit deletes tabs, which would leave http://localhost:5173.
+        "http://local\thost:5173",
+        "http://localhost:5173evil",
+        "http://[::1]evil.example",
+    ],
+)
+async def test_an_origin_that_is_not_one_loopback_origin_is_refused(site, origin):
+    r = await _post(f"{site}/mcp/alpha", Origin=origin, **AUTH)
+    assert (r.status_code, r.text) == (403, "Forbidden: Origin is not a loopback origin")
+
+
+# Pins: each passed before the hardening round too.
+
+
+async def test_an_unknown_path_without_the_token_is_unauthorized_not_missing(site):
+    r = await _post(f"{site}/api")
+    assert r.status_code == 401
+
+
+async def test_a_preflight_without_the_token_is_refused_without_cors_headers(site):
+    async with httpx.AsyncClient() as http:
+        r = await http.options(
+            f"{site}/mcp/alpha",
+            headers={
+                "Origin": "http://localhost:5173",
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "authorization, content-type",
+            },
+        )
+    assert r.status_code == 401
+    assert not [name for name in r.headers if name.lower().startswith("access-control-")]
+
+
+async def test_a_request_without_a_host_is_misdirected(site):
+    parts = urlsplit(site)
+    body = json.dumps(INITIALIZE).encode()
+    headers = {**MCP_HEADERS, **AUTH, "Content-Length": str(len(body))}
+    head = "POST /mcp/alpha HTTP/1.0\r\n" + "".join(f"{k}: {v}\r\n" for k, v in headers.items())
+    reader, writer = await asyncio.open_connection(parts.hostname, parts.port)
+    try:
+        writer.write(head.encode() + b"\r\n" + body)
+        await writer.drain()
+        status_line = await reader.readline()
+    finally:
+        writer.close()
+        await writer.wait_closed()
+    assert status_line.split()[1] == b"421"
+
+
+@pytest.mark.parametrize("host", ["[::1]:{port}", "LOCALHOST", "LOCALHOST:{port}"])
+async def test_a_bracketed_or_uppercase_loopback_host_is_served(site, host):
+    r = await _post(f"{site}/mcp/alpha", Host=host.format(port=urlsplit(site).port), **AUTH)
+    assert r.status_code == 200, r.text
+
+
+async def test_an_empty_origin_is_refused(site):
+    r = await _post(f"{site}/mcp/alpha", Origin="", **AUTH)
+    assert (r.status_code, r.text) == (403, "Forbidden: Origin is not a loopback origin")
 
 
 async def test_the_url_names_the_default_and_the_allow_list(site):
