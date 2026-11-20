@@ -14,7 +14,8 @@ import requests
 
 class EndpointError(Exception):
     """A call to an endpoint failed; the message names the URL and the cause. `timed_out`:
-    the endpoint did not connect or answer within the timeout."""
+    it accepted the connection but did not answer within the timeout. A busy server still
+    completes the handshake in the kernel, so a connect timeout is not that."""
 
     def __init__(self, *args: object, timed_out: bool = False) -> None:
         super().__init__(*args)
@@ -73,7 +74,7 @@ def request_json(
             payload = {**body, "model": endpoint.name}
             response = session.post(url, json=payload, headers=headers, timeout=endpoint.timeout)
     except requests.RequestException as exc:
-        timed_out = isinstance(exc, requests.Timeout)
+        timed_out = isinstance(exc, requests.ReadTimeout)
         raise EndpointError(f"cannot reach {url}: {exc}", timed_out=timed_out) from exc
     status = response.status_code
     if not response.ok:

@@ -324,14 +324,16 @@ class IndexHandle:
         except Exception as e:
             return IndexState.UNAVAILABLE, str(e)
 
-    def _opened(self) -> _Opened:
+    def _opened(self, *, write: bool = False) -> _Opened:
+        """The open generation. A known mismatch is checked again within QUERY_TIMEOUT for a
+        read, and within the endpoint's own timeout for a `write`."""
         current = self._current
         if current is None or current.watch.stale():
             with self._lock:
                 if self._current is current:
                     self._current = self._reopen(current, {})
                 current = self._current
-        self._refuse_mismatch(current.index.embedder, timeout=QUERY_TIMEOUT)
+        self._refuse_mismatch(current.index.embedder, timeout=None if write else QUERY_TIMEOUT)
         return current
 
     def _reopen(self, current: _Opened | None, keep: Mapping[EmbeddingScheme, object]) -> _Opened:
@@ -364,12 +366,18 @@ class IndexHandle:
         that outlasts `timeout` passes nothing."""
         if not now and embedder.probe_error is None:
             return
+        unchecked = False
         try:
-            embedder.verify(timeout=timeout)
+            unchecked = embedder.verify(timeout=timeout)
         except EmbedderUnavailableError:
             pass
-        if embedder.probe_error is not None:
-            raise IndexUnavailableError(embedder.probe_error)
+        if (why := embedder.probe_error) is not None:
+            if unchecked:
+                why += (
+                    f" That was found by an earlier check: the endpoint did not answer within "
+                    f"{timeout:g} s, so it could not be re-checked now."
+                )
+            raise IndexUnavailableError(why)
 
     def _build(
         self, pool: Mapping[EmbeddingScheme, object], reranker: RerankEndpoint | None
@@ -430,7 +438,7 @@ class IndexHandle:
 
     def ensure_probe(self) -> None:
         """What the open generation's pipeline calls before every write (`_BeforeStore`)."""
-        self._opened().before_store()
+        self._opened(write=True).before_store()
 
     def _identity(self, embedding: EmbeddingScheme, chunking: ChunkingScheme) -> IndexIdentity:
         """The recorded identity; a folder without one is stamped with these schemes before
@@ -510,7 +518,7 @@ class IndexHandle:
         """The pipeline the ingest tools and commands write through; RebuildPendingError
         while the index needs a rebuild, which leaves it to searches and deletes until an
         unscoped sync rebuilds it. The served model is checked before it is handed out."""
-        opened = self._opened()
+        opened = self._opened(write=True)
         state, why = index_state(self.config, opened.configured)
         if state is IndexState.REBUILD_PENDING:
             raise self._pending(
@@ -531,7 +539,7 @@ class IndexHandle:
         written. SyncLockBusy while another sync of the index runs.
         """
         # Opened first: a 1.x index is refused before the lock file is made inside it.
-        self._opened()
+        self._opened(write=True)
         lock = acquire_sync_lock(self.config.db_path)
         try:
             return self._sync_held(scope, on_event, None)
@@ -541,7 +549,7 @@ class IndexHandle:
     def start_sync(self, scope: Path | None = None) -> str:
         """`run_sync` as a background job of `sync`; its job id. The refusal of a scoped
         sync on a `rebuild pending` index is raised here, before any job starts."""
-        opened = self._opened()
+        opened = self._opened(write=True)
         if scope is not None:
             state, why = index_state(self.config, opened.configured)
             if state is IndexState.REBUILD_PENDING:
@@ -568,7 +576,7 @@ class IndexHandle:
     ) -> tuple[dict[str, int], list[dict], RebuildInfo | None]:
         """`run_sync` for a caller holding the sync lock (`acquire_sync_lock`). A rebuild
         is announced to `on_event`, and to `on_rebuild` with its kind and reasons."""
-        opened = self._opened()
+        opened = self._opened(write=True)
         state, why = index_state(self.config, opened.configured)
         if state is IndexState.UNAVAILABLE:
             raise IndexUnavailableError(why)

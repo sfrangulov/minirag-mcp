@@ -3,6 +3,7 @@ import re
 import socket
 
 import pytest
+import requests
 
 import minirag_mcp.endpoints as endpoints
 from conftest import FakeEmbedder
@@ -124,6 +125,24 @@ def test_a_silent_endpoint_times_out_naming_the_url():
         with pytest.raises(EndpointError, match=re.escape(url)) as raised:
             EmbeddingEndpoint(Endpoint(url, "e5", timeout=0.3)).embed(["a"])
     assert raised.value.timed_out is True
+
+
+@pytest.mark.parametrize(
+    ("raised", "timed_out"),
+    [(requests.ReadTimeout("read timed out"), True), (requests.ConnectTimeout("no reply"), False)],
+    ids=["read", "connect"],
+)
+def test_only_a_read_timeout_counts_as_timed_out(raised, timed_out):
+    """A busy server still completes the handshake in the kernel: one that does not is down."""
+
+    class Failing:
+        def post(self, *args, **kwargs):
+            raise raised
+
+    url = "http://127.0.0.1:9/v1/embeddings"
+    with pytest.raises(EndpointError, match=re.escape(url)) as error:
+        request_json(Endpoint(url, "e5"), url, {"input": ["a"]}, session=Failing())
+    assert error.value.timed_out is timed_out
 
 
 def test_an_embeddings_reply_without_data_is_an_endpoint_error(fake_llama):

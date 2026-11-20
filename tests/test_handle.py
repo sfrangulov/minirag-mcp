@@ -870,18 +870,57 @@ def test_a_known_mismatch_stays_known_when_a_read_cannot_check_in_time(
     h.ingest_pipeline().ingest_data("Budgets.", source="s")
     embedder = h.get().embedder
     fake_llama.vector_salt = "bge-m3"
-    with pytest.raises(IndexUnavailableError, match=E5_LARGE):
+    with pytest.raises(IndexUnavailableError, match=E5_LARGE) as checked:
         h.ingest_pipeline()
+    assert "re-checked" not in str(checked.value)
     fake_llama.vector_salt = ""
     monkeypatch.setattr(handle_mod, "QUERY_TIMEOUT", 0.2)
     fake_llama.delay = 1.0
     started = time.monotonic()
-    with pytest.raises(IndexUnavailableError, match=E5_LARGE):
+    with pytest.raises(IndexUnavailableError, match=E5_LARGE) as unchecked:
         h.get()
     assert time.monotonic() - started < 0.8
+    assert "could not be re-checked" in str(unchecked.value)
+    assert "within 0.2 s" in str(unchecked.value)
     assert embedder.warning is None
     fake_llama.delay = 0.0
     assert h.get().embedder is embedder and embedder.probe_error is None
+
+
+def _sync_job(h: IndexHandle) -> None:
+    job = h.start_sync()
+    h.sync.wait()
+    assert h.sync.status(job).error is None
+
+
+@pytest.mark.parametrize(
+    "write",
+    [
+        lambda h: h.ingest_pipeline(),
+        lambda h: h.run_sync(None),
+        _sync_job,
+        # What the job's thread runs, after a mismatch may have become known.
+        lambda h: h._run_held(None, None),
+        lambda h: h.ensure_probe(),
+    ],
+    ids=["ingest", "sync", "sync-job", "sync-job-body", "before-store"],
+)
+def test_a_write_waits_out_a_slow_endpoint_to_clear_a_known_mismatch(
+    fake_llama, tmp_path, tokenizer_file, stub_text_embedding, monkeypatch, write
+):
+    """A router fixed but slow to answer is checked within its own timeout before a write,
+    not refused after QUERY_TIMEOUT for what an earlier check found."""
+    h = _served(tmp_path, fake_llama)
+    h.ingest_pipeline().ingest_data("Budgets.", source="s")
+    embedder = h.get().embedder
+    fake_llama.vector_salt = "bge-m3"
+    with pytest.raises(IndexUnavailableError, match=E5_LARGE):
+        h.ingest_pipeline()
+    fake_llama.vector_salt = ""
+    monkeypatch.setattr(handle_mod, "QUERY_TIMEOUT", 0.2)
+    fake_llama.delay = 0.6
+    write(h)
+    assert embedder.probe_error is None and embedder.warning is None
 
 
 def test_a_rebuild_by_another_process_makes_the_index_syncing(tmp_path, fake_embedder):

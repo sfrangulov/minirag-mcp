@@ -262,20 +262,21 @@ class Embedder:
     def has_reference(self) -> bool:
         return self.model_name in REFERENCE_PROBES
 
-    def verify(self, *, timeout: float | None = None) -> None:
+    def verify(self, *, timeout: float | None = None) -> bool:
         """Check a configured, reachable endpoint against the expected probe now. An
         unreachable one falls back as an embed would, and the fallback checks itself; the
-        model is never loaded. A check that outlasts `timeout` changes nothing, so the
-        endpoint is checked again before its next use."""
+        model is never loaded. True when a healthy endpoint did not answer within
+        `timeout`: that changes nothing, so it is checked again before its next use."""
         if self.endpoint is None or self._expected is None or not self._endpoint_due():
-            return
+            return False
         try:
             self._check_endpoint(timeout)
         except EndpointError as e:
-            if timeout is not None and e.timed_out:
-                return
+            if timeout is not None and e.timed_out and self._warning is None:
+                return True
             if self.allow_fallback:
                 self._fall_back(e)
+        return False
 
     def _probe_text(self) -> str:
         return PASSAGE_PREFIX + PROBE_TEXT if self.prefixes == "e5" else PROBE_TEXT
@@ -486,8 +487,9 @@ class Embedder:
                 if not self.allow_fallback:
                     raise
                 # This embedder also serves a sync's document batches, and a router busy
-                # with them answers a query late: a slow query must not move them in-process.
-                if query and e.timed_out:
+                # with them answers a query late: a slow query must not move them in-process
+                # while the endpoint is healthy. A retry of one fallen back falls back again.
+                if query and e.timed_out and self._warning is None:
                     note = (
                         f"The embedding endpoint {self.endpoint.endpoint.url} did not answer "
                         f"within {QUERY_TIMEOUT:g} s, so this query was embedded in-process "

@@ -5,14 +5,17 @@ import re
 import threading
 import time
 from importlib.resources import files
+from types import SimpleNamespace
 
 import pytest
+import requests
 from tokenizers import Tokenizer, pre_tokenizers
 from tokenizers.models import Unigram, WordLevel
 from tokenizers.pre_tokenizers import Whitespace
 from tokenizers.processors import TemplateProcessing
 
 import minirag_mcp.embedder as embedder_mod
+import minirag_mcp.endpoints as endpoints_mod
 from minirag_mcp.chunker import MODEL_MAX_TOKENS, chunk_markdown
 from minirag_mcp.config import DEFAULT_MODEL, load_config
 from minirag_mcp.embedder import (
@@ -709,6 +712,49 @@ def test_a_query_to_an_endpoint_that_is_down_still_falls_back(
     with pytest.warns(RuntimeWarning, match="unreachable"):
         _, note = emb.embed_query_noted("beta")
     assert note is None and emb.backend == "in-process (endpoint unreachable)"
+
+
+def test_a_query_whose_connection_times_out_still_falls_back(
+    tmp_path, stub_text_embedding, tokenizer_file, monkeypatch
+):
+    class Unconnectable:
+        def post(self, *args, **kwargs):
+            raise requests.ConnectTimeout("no SYN-ACK")
+
+    monkeypatch.setattr(endpoints_mod, "_session", Unconnectable)
+    emb = dead(tmp_path, "http://127.0.0.1:9")
+    with pytest.warns(RuntimeWarning, match="unreachable"):
+        _, note = emb.embed_query_noted("beta")
+    assert note is None and emb.backend == "in-process (endpoint unreachable)"
+
+
+@pytest.mark.parametrize(
+    "retry",
+    [lambda emb: emb.embed_query_noted("beta")[1], lambda emb: emb.verify(timeout=0.2)],
+    ids=["query", "check"],
+)
+def test_a_retry_that_times_out_keeps_a_fallen_back_endpoint_off_for_the_interval(
+    tmp_path, fake_llama, stub_text_embedding, tokenizer_file, monkeypatch, retry
+):
+    """A slow call leaves the endpoint in use only while it is healthy: otherwise every
+    later call would wait it out again, and a reply would carry two contradictory notes."""
+    now = [1000.0]
+    monkeypatch.setattr(embedder_mod, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    monkeypatch.setattr(embedder_mod, "QUERY_TIMEOUT", 0.2)
+    emb = armed(tmp_path, fake_llama)
+    fake_llama.fail["/v1/embeddings"] = (503, "Loading model")
+    with pytest.warns(RuntimeWarning, match="503"):
+        emb.embed_documents(["alpha"])
+    del fake_llama.fail["/v1/embeddings"]
+    now[0] += 61
+    fake_llama.delay = 1.0
+    assert not retry(emb)
+    assert "timed out" in emb.warning
+    fake_llama.delay = 0.0
+    now[0] += 1
+    seen = len(fake_llama.requests)
+    emb.embed_query("gamma")
+    assert len(fake_llama.requests) == seen
 
 
 def test_only_the_query_embedded_in_process_carries_a_note(
