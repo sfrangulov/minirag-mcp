@@ -11,6 +11,7 @@ import platformdirs
 
 from minirag_mcp.embedder import E5_LARGE, MODEL_WINDOWS, default_budget, model_window
 from minirag_mcp.endpoints import Endpoint, EndpointError, read_api_key
+from minirag_mcp.ingest.ignore import check_patterns
 from minirag_mcp.ocr import DEFAULT_LANGUAGES, SECOND_READER_BELOW, tesseract_languages
 
 DEFAULT_MODEL = E5_LARGE
@@ -80,6 +81,7 @@ class Config:
     index_name: str | None = None
     sync_workers: int | None = None
     max_table_rows: int | None = None
+    exclude: tuple[str, ...] = ()
 
 
 def default_db_path(roots: Sequence[Path]) -> Path:
@@ -180,6 +182,15 @@ def _opt_float(env: Mapping[str, str], key: str, lo: float) -> float | None:
     return val
 
 
+def _exclude(env: Mapping[str, str]) -> tuple[str, ...]:
+    patterns = tuple(p.strip() for p in env.get("RAG_EXCLUDE", "").split(";") if p.strip())
+    try:
+        check_patterns(patterns)
+    except ValueError as e:
+        raise ConfigError(f"RAG_EXCLUDE: {e}") from e
+    return patterns
+
+
 def load_config(
     env: Mapping[str, str],
     *,
@@ -278,4 +289,5 @@ def load_config(
         classify_endpoint=_endpoint(env, "CLASSIFY_URL", "CLASSIFY_MODEL", api_key),
         sync_workers=sync_workers,
         max_table_rows=max_table_rows,
+        exclude=_exclude(env),
     )

@@ -416,7 +416,10 @@ class Pipeline:
         RAG_MAX_TABLE_ROWS, and counting again would read each of them twice.
         """
         # Refused rather than indexed: the next sync would take it out again, silently.
-        if not rules_checked and (by := ignore.excluded_by(path, self.config.roots)) is not None:
+        if (
+            not rules_checked
+            and (by := ignore.excluded_by(path, self.config.roots, self.config.exclude)) is not None
+        ):
             raise IgnoredFileError(f"{path} is excluded by {by}; remove its rule to index it")
         info = self._checked_stat(path)
         limit = self.config.max_table_rows

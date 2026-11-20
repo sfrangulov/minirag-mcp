@@ -238,11 +238,14 @@ def ingest(
         for raw in paths:
             p = resolve_in_roots(raw, cfg.roots, require_absolute=False)
             blind: list[tuple[Path, str | None]] = []
-            if p.is_dir() and (by := excluded_by(p, cfg.roots)) is not None:
+            if p.is_dir() and (by := excluded_by(p, cfg.roots, cfg.exclude)) is not None:
                 failures.append({"source": str(p), "error": f"{p} is excluded by {by}"})
                 continue
             if p.is_dir():
-                candidates = [e.path for e in scan_roots([p], blind=blind, rule_roots=cfg.roots)]
+                candidates = [
+                    e.path
+                    for e in scan_roots([p], blind=blind, rule_roots=cfg.roots, exclude=cfg.exclude)
+                ]
                 scanned.update(candidates)
             else:
                 candidates = [p]
@@ -599,6 +602,7 @@ def list_cmd(
             opened.store,
             cfg.roots,
             tuple(scope or ()),
+            exclude=cfg.exclude,
             labels=labels,
             date_from=date_from,
             date_to=date_to,

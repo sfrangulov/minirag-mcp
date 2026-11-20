@@ -131,6 +131,7 @@ def scan_roots(
     blind: list[tuple[Path, str | None]] | None = None,
     ignored: list[Path] | None = None,
     rule_roots: Sequence[Path] | None = None,
+    exclude: Sequence[str] = (),
 ) -> list[ScanEntry]:
     """Recursively scan roots for files with whitelisted extensions.
 
@@ -158,7 +159,8 @@ def scan_roots(
     caller comparing the result with the index must not read the absence of files under
     them as deletion.
 
-    Every path is held to the `.miniragignore` of each configured root above it:
+    Every path is held to the `.miniragignore` of each configured root above it, behind
+    the RAG_EXCLUDE patterns `exclude`, which apply to every root:
     `rule_roots`, which default to `roots` and differ only when a folder inside a root
     is scanned on its own. A folder a rule excludes is not walked, and a symlink whose
     target a rule excludes is left out too. When `ignored` is given, it collects every
@@ -177,7 +179,7 @@ def scan_roots(
         if blind is not None:
             blind.append((Path(error.filename), error.strerror or str(error)))
 
-    ignorer = ignore.Ignorer(rule_roots or roots)
+    ignorer = ignore.Ignorer(rule_roots or roots, exclude=exclude)
     broken = ignorer.broken()
     seen_ignored: set[Path] = set()
 

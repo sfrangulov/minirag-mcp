@@ -594,6 +594,7 @@ class IndexHandle:
             self.config.max_file_size,
             scope,
             on_event,
+            exclude=self.config.exclude,
         )
         return counts, errors, None
 

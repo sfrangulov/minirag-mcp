@@ -346,6 +346,19 @@ to keep out. That root is reported the way a folder that cannot be listed is: in
 A `sync` or `list_files` scope inside an excluded folder is refused rather than
 answered with zeros.
 
+#### `RAG_EXCLUDE`: the same rules without a file in the root
+
+A shared or read-only folder can be indexed in place by keeping the patterns in
+minirag's own configuration instead: `RAG_EXCLUDE` holds `.gitignore` patterns
+separated by `;`, e.g. `RAG_EXCLUDE="drafts/;*.tmp.docx;/personal/"`. They apply to
+every root exactly as if written at the top of its `.miniragignore`, ahead of it:
+anchored patterns (`/x/y`, `x/y`) are relative to each root, and a root's own file
+comes last, so it can re-include with `!` what a pattern took out. Everywhere a
+`.miniragignore` takes effect, they do too, and `ingest_file` names `RAG_EXCLUDE`
+and the matching pattern when it refuses a file. A pattern the parser rejects stops
+the server at load, naming it. `status` reports the number of patterns as
+`excludePatterns`.
+
 Hidden files and folders, Office lock files (`~$…`), `node_modules`,
 `__pycache__` and virtualenvs are skipped with or without one.
 
@@ -1310,6 +1323,7 @@ merges with them.
 | `CACHE_DIR` | platformdirs user cache dir, e.g. `~/Library/Caches/minirag-mcp/models` on macOS | Embedding model cache. Global by default so the ~220 MB model is downloaded once and shared across every corpus, not duplicated per project. |
 | `MODEL_NAME` | `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` | fastembed model id. **Changing this makes existing vectors incompatible with new queries** (different model, different embedding space — even a same-dimension model isn't comparable) — pair a `MODEL_NAME` change with a new `DB_PATH` or a full re-ingest. |
 | `MAX_FILE_SIZE` | `104857600` (100 MB) | Per-file size limit, enforced before parsing. |
+| `RAG_EXCLUDE` | unset (no patterns) | `.gitignore` patterns separated by `;` (surrounding whitespace stripped, empty items ignored), held to every root as if written at the top of its `.miniragignore`, ahead of the file's own rules. See [Excluding files](#excluding-files). A pattern the parser rejects is a configuration error naming it. `status` reports the count as `excludePatterns`. |
 | `RAG_MAX_TABLE_ROWS` | unset (no limit) | An `.xlsx` or `.csv` holding more data rows than this is not indexed: an export of tens of thousands of rows takes long to index and is no use to search. Rows are counted before parsing, over all sheets, as the rows that hold a value (never the extent a sheet declares, which for a formatted column is 1,048,576), and counting stops past the limit. `sync` counts every table it would read again and no other, skips those above the limit as `largeTables` with an `errors` entry each, not as failures, and deletes the indexed ones among them; `ingest_file` and `ingest` refuse one. `status` reports it as `maxTableRows`. Set, an integer of at least 1. |
 | `CHUNK_TOKEN_BUDGET` | `110` | Retrieval-unit size, in the embedding model's own tokens. Range 16–128; the upper bound is the model's trained sequence length, past which the encoder does not see the text at all. See [Chunking](#chunking). |
 | `RAG_HYBRID_WEIGHT` | `0.6` | See [Search Tuning](#search-tuning). |

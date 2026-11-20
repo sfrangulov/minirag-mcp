@@ -1,8 +1,13 @@
-"""`.miniragignore`: gitignore rules per document root.
+"""`.miniragignore`: gitignore rules per document root, and `RAG_EXCLUDE`.
 
 One file at the top of each root, matched against paths relative to that root by
 pathspec's implementation of git's rules. When roots nest, a path is excluded if the
 rules of any root above it exclude it, so neither root's walk can get round the other's.
+
+`RAG_EXCLUDE` patterns are held to every root as if written at the top of its file, ahead
+of it: the file's own rules come last, so it can re-include with `!` what a pattern took
+out. They exist so that a shared folder can be indexed in place without a file written
+into it.
 
 Matching ignores case and Unicode composition, as git does on macOS by default: a rule
 written `private/` has to keep out `Private/`, and a folder name macOS stored decomposed
@@ -43,16 +48,35 @@ def _nfc(s: str) -> str:
     return unicodedata.normalize("NFC", s)
 
 
+EXCLUDE_VAR = "RAG_EXCLUDE"
+
+
 @dataclass(frozen=True)
 class Rules:
-    file: Path
+    file: Path | None
     count: int
     _exact: pathspec.GitIgnoreSpec
     _folded: pathspec.GitIgnoreSpec
+    _lines: tuple[str, ...] = ()
+    _configured: int = 0  # the first this many of `_lines` are RAG_EXCLUDE patterns
 
     def excludes(self, rel: str, is_dir: bool) -> bool:
         rel = _nfc(rel) + ("/" if is_dir else "")
         return self._exact.match_file(rel) or self._folded.match_file(rel.lower())
+
+    def source(self, rel: str, is_dir: bool) -> Path | str | None:
+        """What excludes `rel`: this rule file, or a description of the RAG_EXCLUDE
+        pattern. None when nothing does."""
+        rel = _nfc(rel) + ("/" if is_dir else "")
+        for spec, text in ((self._exact, rel), (self._folded, rel.lower())):
+            hit = spec.check_file(text)
+            if hit.include and hit.index is not None:
+                if hit.index < self._configured:
+                    return f"{EXCLUDE_VAR} pattern {self._lines[hit.index]!r}"
+                break
+        else:
+            return None
+        return self.file
 
 
 def _listable(folder: Path) -> bool:
@@ -63,14 +87,26 @@ def _listable(folder: Path) -> bool:
         return False
 
 
-def load(root: Path, *, strict: bool = False) -> Rules | None:
+def check_patterns(patterns: Sequence[str]) -> None:
+    """Raise ValueError naming the first RAG_EXCLUDE pattern the parser rejects."""
+    for pattern in patterns:
+        try:
+            pathspec.GitIgnoreSpec.from_lines([_nfc(pattern)])
+        except Exception as e:
+            raise ValueError(f"{pattern!r} cannot be parsed: {e}") from e
+
+
+def load(root: Path, *, strict: bool = False, exclude: Sequence[str] = ()) -> Rules | None:
     """The rules at the top of `root`, or None when it has none.
+
+    `exclude` are the RAG_EXCLUDE patterns, ahead of the file's own lines.
 
     Not strict, as a scan reads it, a root that cannot even be listed has no rules: the
     scan reports that folder itself, and nothing in it can be indexed. Strict, as an
     explicit ingest reads it, any file that is there and cannot be read is an error.
     """
     path = Path(root) / IGNORE_FILE
+    configured = tuple(_nfc(p) for p in exclude)
     try:
         text = path.read_text(encoding="utf-8-sig")
     except FileNotFoundError:
@@ -79,7 +115,7 @@ def load(root: Path, *, strict: bool = False) -> Rules | None:
                 f"{path} is a link to a file that is not there, so its rules cannot be "
                 "applied; fix or remove it."
             ) from None
-        return None
+        return _rules(None, configured, [])
     except NotADirectoryError:
         return None
     except (OSError, UnicodeDecodeError) as e:
@@ -93,19 +129,27 @@ def load(root: Path, *, strict: bool = False) -> Rules | None:
         ) from e
     lines = [_nfc(line) for line in text.splitlines()]
     try:
-        exact = pathspec.GitIgnoreSpec.from_lines(lines)
-        folded = pathspec.GitIgnoreSpec.from_lines([line.lower() for line in lines])
+        return _rules(path, configured, lines)
     except Exception as e:
         raise IgnoreFileError(f"{path} has a rule that cannot be parsed: {e}") from e
+
+
+def _rules(file: Path | None, configured: tuple[str, ...], lines: list[str]) -> Rules | None:
+    if file is None and not configured:
+        return None
+    every = [*configured, *lines]
+    exact = pathspec.GitIgnoreSpec.from_lines(every)
+    folded = pathspec.GitIgnoreSpec.from_lines([line.lower() for line in every])
     count = sum(1 for line in lines if line.strip() and not line.lstrip().startswith("#"))
-    return Rules(path, count, exact, folded)
+    return Rules(file, count, exact, folded, tuple(every), len(configured))
 
 
 class Ignorer:
     """The rules of every configured root, each file read once for the life of this."""
 
-    def __init__(self, roots: Sequence[Path], *, strict: bool = False):
+    def __init__(self, roots: Sequence[Path], *, strict: bool = False, exclude: Sequence[str] = ()):
         self._strict = strict
+        self._exclude = tuple(p for p in exclude if p.strip())
         self._cache: dict[Path, Rules | None | IgnoreFileError] = {}
         self._ids: dict[str, tuple[int, int] | None] = {}
         self._roots: dict[tuple[int, int], Path] = {}
@@ -140,7 +184,7 @@ class Ignorer:
     def rules(self, root: Path) -> Rules | None:
         if root not in self._cache:
             try:
-                self._cache[root] = load(root, strict=self._strict)
+                self._cache[root] = load(root, strict=self._strict, exclude=self._exclude)
             except IgnoreFileError as e:
                 self._cache[root] = e
         got = self._cache[root]
@@ -157,19 +201,23 @@ class Ignorer:
                 out.append((root, folder))
         return out
 
-    def matches(self, path: Path, is_dir: bool) -> Path | None:
-        """The ignore file that excludes `path` itself, checked against every root above
-        it. A walk calls this top-down, so the folders above were checked on the way."""
+    def matches(self, path: Path, is_dir: bool) -> Path | str | None:
+        """What excludes `path` itself (an ignore file, or a RAG_EXCLUDE pattern), checked
+        against every root above it. A walk calls this top-down, so the folders above were
+        checked on the way."""
         for root, folder in self._owners(path):
             if folder == path:
                 continue
             rules = self.rules(root)
-            if rules is not None and rules.excludes(path.relative_to(folder).as_posix(), is_dir):
-                return rules.file
+            if rules is None:
+                continue
+            if found := rules.source(path.relative_to(folder).as_posix(), is_dir):
+                return found
         return None
 
-    def excluded_by(self, path: Path) -> Path | None:
-        """The ignore file that excludes `path` or any folder above it.
+    def excluded_by(self, path: Path) -> Path | str | None:
+        """What excludes `path` or any folder above it: an ignore file, or a RAG_EXCLUDE
+        pattern, described.
 
         A folder a rule excludes takes everything below it along, as in git, which is
         also what a walk that never enters it does.
@@ -180,25 +228,29 @@ class Ignorer:
                 continue
             rel = path.relative_to(folder).parts
             for depth in range(1, len(rel)):
-                if rules.excludes("/".join(rel[:depth]), is_dir=True):
-                    return rules.file
-            if rel and rules.excludes("/".join(rel), is_dir=path.is_dir()):
-                return rules.file
+                if found := rules.source("/".join(rel[:depth]), is_dir=True):
+                    return found
+            if rel and (found := rules.source("/".join(rel), is_dir=path.is_dir())):
+                return found
         return None
 
 
-def excluded_by(path: Path, roots: Sequence[Path]) -> Path | None:
-    """The ignore file that excludes a path the caller named, read strictly."""
-    return Ignorer(roots, strict=True).excluded_by(path)
+def excluded_by(
+    path: Path, roots: Sequence[Path], exclude: Sequence[str] = ()
+) -> Path | str | None:
+    """What excludes a path the caller named, read strictly."""
+    return Ignorer(roots, strict=True, exclude=exclude).excluded_by(path)
 
 
-def scope_excluded_by(scope: Path, roots: Sequence[Path]) -> Path | None:
-    """The ignore file that excludes a sync or listing scope, or None.
+def scope_excluded_by(
+    scope: Path, roots: Sequence[Path], exclude: Sequence[str] = ()
+) -> Path | str | None:
+    """What excludes a sync or listing scope, or None.
 
     Not strict, and silent about a rule file it cannot read: the scan that follows
     reports that root as held, which is the answer such a scope has always had.
     """
     try:
-        return Ignorer(roots).excluded_by(scope)
+        return Ignorer(roots, exclude=exclude).excluded_by(scope)
     except IgnoreFileError:
         return None

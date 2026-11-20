@@ -373,6 +373,8 @@ def status_payload(config: Config, handle: IndexHandle) -> dict:
         **ocr_status(config),
         **ignore_status(config.roots),
     }
+    if config.exclude:
+        out["excludePatterns"] = len(config.exclude)
     if config.max_table_rows is not None:
         out["maxTableRows"] = config.max_table_rows
     state, why = handle.state()
@@ -853,6 +855,7 @@ def list_payload(
     date_to: str | None = None,
     sort: str | None = None,
     label_source: LabelerSource | None = None,
+    exclude: Sequence[str] = (),
 ) -> dict:
     """`list_files` and `minirag-mcp list`, as one implementation.
 
@@ -868,11 +871,11 @@ def list_payload(
         raise QueryError(f"sort must be 'date', got {sort!r}")
     label_filter, labeler = _parse_filter(store, labels, date_from, date_to, label_source)
     for scope in scopes:
-        if (by := ignore.scope_excluded_by(Path(scope), roots)) is not None:
+        if (by := ignore.scope_excluded_by(Path(scope), roots, exclude)) is not None:
             raise QueryError(f"{scope} is excluded by {by}; nothing under it is listed")
     blind: list[tuple[Path, str | None]] = []
     ignored: list[Path] = []
-    entries = scan_roots(roots, blind=blind, ignored=ignored)
+    entries = scan_roots(roots, blind=blind, ignored=ignored, exclude=exclude)
     if scopes:
         entries = [e for e in entries if any(is_under(str(e.path), p) for p in scopes)]
         ignored = [p for p in ignored if any(is_under(str(p), s) for s in scopes)]

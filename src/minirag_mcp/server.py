@@ -113,7 +113,7 @@ def create_app(
         scope = None
         if path is not None:
             scope = resolve_in_roots(path, c.config.roots)
-            if (by := scope_excluded_by(scope, c.config.roots)) is not None:
+            if (by := scope_excluded_by(scope, c.config.roots, c.config.exclude)) is not None:
                 raise ToolError(f"{scope} is excluded by {by}; nothing under it can be synced")
         return {"jobId": h.start_sync(scope)}
 
@@ -510,6 +510,7 @@ def create_app(
             c.store,
             c.config.roots,
             _scopes(scope),
+            exclude=c.config.exclude,
             labels=labels,
             date_from=dateFrom,
             date_to=dateTo,
@@ -593,6 +594,9 @@ def create_app(
 
         ignoreFiles, present when a root has a .miniragignore: each file with
         its number of rules, or the error that stops scanning under its root.
+
+        excludePatterns, present when RAG_EXCLUDE is set, is the number of
+        patterns it holds.
 
         maxTableRows, present only when RAG_MAX_TABLE_ROWS is set, is the
         number of data rows above which an .xlsx or .csv is not indexed.

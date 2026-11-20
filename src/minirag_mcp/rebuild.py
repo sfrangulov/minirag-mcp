@@ -104,7 +104,14 @@ def rebuild(
             )
         large: list[Path] = []
         counts, errors = _run_sync_unlocked(
-            pipeline, target, config.roots, config.max_file_size, None, on_event, large
+            pipeline,
+            target,
+            config.roots,
+            config.max_file_size,
+            None,
+            on_event,
+            large,
+            config.exclude,
         )
         restored = _restore(current, pipeline, errors, on_event, large)
         if problem := target.update_indices():
@@ -159,7 +166,7 @@ def _restore(
     config = current.config
     blind: list[tuple[Path, str | None]] = []
     ignored: list[Path] = []
-    entries = scan_roots(list(config.roots), blind=blind, ignored=ignored)
+    entries = scan_roots(list(config.roots), blind=blind, ignored=ignored, exclude=config.exclude)
     indexed = current.store.list_sources()
     diff = compute_diff(
         entries,

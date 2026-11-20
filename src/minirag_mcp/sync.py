@@ -162,6 +162,7 @@ def _run_sync_unlocked(
     scope: Path | None,
     on_event: Callable[[str], None] | None,
     large_tables: list[Path] | None = None,
+    exclude: Sequence[str] = (),
 ) -> tuple[dict[str, int], list[dict]]:
     """Scan `roots`, diff against the store, ingest and delete accordingly. The caller holds
     the sync lock (`acquire_sync_lock`) and has checked the index is not `rebuild pending`:
@@ -175,7 +176,7 @@ def _run_sync_unlocked(
     files: the diff comes back empty and the job "succeeds" with all-zero counts.
     """
     scope = scope.resolve() if scope is not None else None
-    if scope is not None and (by := scope_excluded_by(scope, roots)) is not None:
+    if scope is not None and (by := scope_excluded_by(scope, roots, exclude)) is not None:
         # A silent no-op otherwise: every count zero, exit 0, nothing synced.
         raise IgnoredFileError(f"{scope} is excluded by {by}; nothing under it can be synced")
 
@@ -185,7 +186,7 @@ def _run_sync_unlocked(
 
     blind: list[tuple[Path, str | None]] = []
     ignored: list[Path] = []
-    entries = scan_roots(list(roots), blind=blind, ignored=ignored)
+    entries = scan_roots(list(roots), blind=blind, ignored=ignored, exclude=exclude)
     listing = store.list_sources()
     diff = compute_diff(
         entries,
