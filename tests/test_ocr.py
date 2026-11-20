@@ -273,6 +273,59 @@ def test_an_image_file_keeps_its_recorded_dpi(fake_tess, cfg, tmp_path):
     ocr.ocr_image(without, cfg)
     assert fake_tess.api.resolutions == []
 
+    implausible = tmp_path / "50dpi.png"
+    Image.new("L", (8, 8), 255).save(implausible, dpi=(50, 50))
+    ocr.ocr_image(implausible, cfg)
+    assert fake_tess.api.resolutions == []
+
+
+@pytest.mark.parametrize(
+    "mode,suffix,white,ink",
+    [
+        ("I;16", ".png", 65535, 40 * 257),
+        ("I", ".tiff", 65535, 40 * 257),
+        ("I", ".tiff", 255, 40),
+        ("F", ".tiff", 1.0, 40 / 255),
+    ],
+)
+def test_a_high_depth_grayscale_frame_reaches_the_engine_as_8_bit(
+    fake_tess, cfg, tmp_path, mode, suffix, white, ink
+):
+    """A 16-bit scan converted without scaling has every value above 255 clipped to
+    white, so its text vanishes; a floating-point frame in the 0-1 range turns black."""
+    fake_tess.reply = lambda image: "text"
+    frame = Image.new(mode, (20, 20), white)
+    frame.putpixel((5, 5), ink)
+    path = tmp_path / f"scan{suffix}"
+    frame.save(path)
+    ocr.ocr_image(path, cfg)
+    seen = fake_tess.api.images[0].convert("L")
+    assert (seen.getpixel((0, 0)), seen.getpixel((5, 5))) == (255, 40)
+
+
+def test_a_big_endian_16_bit_frame_is_scaled_too():
+    """Pillow computes no extrema for I;16B, the mode of big-endian 16-bit data."""
+    frame = Image.new("I;16B", (20, 20), 65535)
+    frame.putpixel((5, 5), 40 * 257)
+    seen = ocr._on_white(frame).convert("L")
+    assert (seen.getpixel((0, 0)), seen.getpixel((5, 5))) == (255, 40)
+
+
+@pytest.mark.parametrize("mode,background,ink", [("RGB", (0, 0, 0), (40, 40, 40)), ("L", 0, 40)])
+def test_a_colour_key_transparency_is_read_on_white(
+    fake_tess, cfg, tmp_path, mode, background, ink
+):
+    """PNG can mark one colour transparent without an alpha channel. Passed on as it is,
+    a frame keyed on black reads as a black page."""
+    fake_tess.reply = lambda image: "text"
+    frame = Image.new(mode, (20, 20), background)
+    frame.putpixel((5, 5), ink)
+    png = tmp_path / "keyed.png"
+    frame.save(png, transparency=background)
+    ocr.ocr_image(png, cfg)
+    seen = fake_tess.api.images[0].convert("L")
+    assert (seen.getpixel((0, 0)), seen.getpixel((5, 5))) == (255, 40)
+
 
 def test_an_image_with_transparency_is_read_on_white(fake_tess, cfg, tmp_path):
     """An exported diagram or a screenshot: black text on a transparent background

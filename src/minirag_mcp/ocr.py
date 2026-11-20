@@ -98,7 +98,11 @@ def _engine(config: Config) -> tuple[PyTessBaseAPI, threading.Lock]:
 
 def _recognize(image: Image.Image, config: Config, path: Path, *, dpi: int | None) -> str:
     """The page's text in Tesseract's own reading order: block by block, so the columns
-    of a two-column page stay apart. `dpi` None lets Tesseract estimate it."""
+    of a two-column page stay apart.
+
+    With `dpi` None no resolution is set here. tesserocr hands a frame without a format
+    to Tesseract as BMP, and Pillow writes 96 dpi into every BMP it saves.
+    """
     api, lock = _engine(config)
     # The handle is not thread-safe, and SetImage resets the source resolution, so the
     # three calls only ever run together. Never call DetectOrientationScript on this
@@ -183,16 +187,35 @@ def _decoded_frames(path: Path) -> Iterator[tuple[Image.Image, int | None]]:
 def _on_white(frame: Image.Image) -> Image.Image:
     from PIL import Image
 
+    frame = _eight_bit(frame)
     # A copy, even of a frame that needs no conversion: tesserocr hands Tesseract an
     # image re-encoded in its own format, which recompresses a JPEG or WebP frame
-    # lossily. A copy has no format and goes as a lossless BMP.
-    if frame.mode in ("1", "L", "RGB"):
+    # lossily. A copy has no format and goes as a lossless BMP. `transparency` is a
+    # colour key, PNG's alternative to an alpha channel.
+    if frame.mode in ("1", "L", "RGB") and "transparency" not in frame.info:
         return frame.copy()
     # Dropping the alpha channel of black text on a transparent background (an exported
     # diagram, a screenshot) leaves a black page.
     page = Image.new("RGBA", frame.size, (255, 255, 255, 255))
     page.alpha_composite(frame.convert("RGBA"))
     return page.convert("RGB")
+
+
+def _eight_bit(frame: Image.Image) -> Image.Image:
+    """A 16-bit, 32-bit or floating-point grayscale frame as 8-bit `L`; others unchanged.
+
+    Pillow's own conversion clips every value above 255 to white, so a 16-bit scan would
+    arrive as an empty page. The scale is read from the frame's brightest value, because
+    `I` and `F` do not record their bit depth: up to 1 is a fraction of white, up to 255
+    is 8-bit already, anything brighter is 16-bit.
+    """
+    if not frame.mode.startswith(("I", "F")):
+        return frame
+    # Through `F`, which each of these modes converts to: Pillow has no extrema for I;16B.
+    values = frame.convert("F")
+    _, brightest = values.getextrema()
+    scale = 255 if brightest <= 1 else 1 if brightest <= 255 else 1 / 257
+    return values.point(lambda v: v * scale).convert("L")
 
 
 def _recorded_dpi(frame: Image.Image) -> int | None:
