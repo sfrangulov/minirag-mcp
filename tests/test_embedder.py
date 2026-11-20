@@ -991,16 +991,24 @@ def test_the_shipped_reference_probes_cover_the_known_models():
 @pytest.mark.slow
 def test_the_shipped_reference_probes_match_the_cached_models(monkeypatch):
     import importlib.util
+    import os
     from pathlib import Path
 
     import platformdirs
 
-    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    shared = os.environ.get("MINIRAG_TEST_MODEL_CACHE")
+    cache = Path(shared) if shared else platformdirs.user_cache_path("minirag-mcp") / "models"
+    absent = [m for m in _shipped() if not Embedder(m, cache).has_local_copy()]
+    if not absent:
+        monkeypatch.setenv("HF_HUB_OFFLINE", "1")
     script = Path(__file__).parent.parent / "scripts" / "generate_probes.py"
     spec = importlib.util.spec_from_file_location("generate_probes", script)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    fresh = module.compute(platformdirs.user_cache_path("minirag-mcp") / "models")
+    try:
+        fresh = module.compute(cache)
+    except EmbedderUnavailableError as exc:
+        pytest.fail(f"cannot obtain the model(s) {absent or 'cached in ' + str(cache)}: {exc}")
     for model, vector in _shipped().items():
         assert embedder_mod.cosine(vector, fresh[model]) > 0.9999, model
 
