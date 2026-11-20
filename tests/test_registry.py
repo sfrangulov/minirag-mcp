@@ -8,12 +8,13 @@ import time
 import pytest
 
 import minirag_mcp.registry as registry_mod
-from conftest import FakeEmbedder
+from conftest import FakeEmbedder, stamp_identity
 from index_helpers import file_registry
 from minirag_mcp.config import ConfigError, load_config
 from minirag_mcp.embedder import E5_LARGE, MINILM, EmbedderUnavailableError
 from minirag_mcp.handle import IndexHandle
 from minirag_mcp.identity import PROBE_TEXT, IndexState, record_probe
+from minirag_mcp.lock import SyncLockBusy
 from minirag_mcp.registry import (
     SINGLE_INDEX_NAME,
     UNRESTRICTED,
@@ -733,3 +734,113 @@ def test_the_environment_mode_has_no_file_to_reload(tmp_path, fake_embedder, cap
     reg.reload()
     assert reg.names == ("default",) and reg.config_error is None
     assert capsys.readouterr().err == ""
+
+
+def test_a_retired_handle_that_fails_to_close_is_told_and_the_rest_still_close(
+    indexes_file, fake_embedder, monkeypatch, capsys
+):
+    reg = file_registry(indexes_file, lambda c, s: fake_embedder)
+    attempts = []
+
+    def close(self):
+        attempts.append(self.config.index_name)
+        if self.config.index_name == "beta":
+            raise OSError("socket already gone")
+
+    monkeypatch.setattr(IndexHandle, "close", close)
+    indexes_file.write(_without(_without(indexes_file.text, "beta"), "gamma"))
+    reg.refresh()
+    capsys.readouterr()
+    indexes_file.write(indexes_file.text + DELTA)
+    reg.refresh()
+    assert attempts == ["beta", "gamma"]
+    assert reg.names == ("alpha", "beta", "gamma", "delta")
+    assert capsys.readouterr().err == (
+        "minirag-mcp: could not close the previous handle of index 'beta': socket already gone\n"
+        f"minirag-mcp: reloaded {indexes_file.path}: alpha, beta, gamma, delta\n"
+    )
+    reg.refresh()
+    assert attempts == ["beta", "gamma"]
+
+
+def test_a_replaced_index_reports_its_predecessors_sync_and_answers_for_its_job(indexes_file):
+    held = HeldEmbedder()
+    reg = file_registry(indexes_file, lambda c, s: held)
+    old = reg.resolve(UNRESTRICTED, "alpha")
+    job = old.handle.start_sync(None)
+    try:
+        assert held.entered.wait(10)
+        indexes_file.write(_with(indexes_file.text, "alpha", "hybrid_weight = 0.9"))
+        reg.refresh()
+        new = reg.resolve(UNRESTRICTED, "alpha")
+        assert new.handle is not old.handle
+        assert new.state() == (IndexState.SYNCING, "")
+        assert new.sync_status(job).state == "running"
+        with pytest.raises(SyncLockBusy, match="Another sync of this index"):
+            new.handle.start_sync(None)
+    finally:
+        held.release.set()
+        old.handle.sync.wait()
+    reg.refresh()
+    assert old.handle.sync_running is False
+    # The refresh that closes the replaced handle runs first in the very call that polls.
+    assert new.sync_status(job).state == "succeeded"
+    assert new.state() == (IndexState.READY, "")
+
+
+def test_an_embedding_table_edit_replaces_only_the_indexes_that_embed_with_its_model(
+    indexes_file,
+):
+    reg = file_registry(indexes_file, lambda c, s: FakeEmbedder(s.model, dim=s.dim))
+    alpha = reg.resolve(UNRESTRICTED, "alpha")
+    # Built with MiniLM, configured with e5: until a rebuild it embeds with MiniLM.
+    stamp_identity(alpha.config, FakeEmbedder(MINILM, dim=384))
+    before = {n: reg.resolve(UNRESTRICTED, n).handle for n in reg.names}
+    indexes_file.write(
+        f'[embedding."{MINILM}"]\nurl = "http://127.0.0.1:9/v1/embeddings"\nname = "minilm"\n\n'
+        + indexes_file.text
+    )
+    reg.refresh()
+    assert reg.config_error is None
+    after = {n: reg.resolve(UNRESTRICTED, n).handle for n in reg.names}
+    assert after["beta"] is before["beta"]
+    assert after["alpha"] is not before["alpha"] and after["gamma"] is not before["gamma"]
+
+
+def test_a_load_that_failed_outside_the_file_is_retried_on_the_next_refresh(
+    indexes_file, fake_embedder, capsys
+):
+    reg = file_registry(indexes_file, lambda c, s: fake_embedder)
+    key = indexes_file.path.parent / "key"
+    indexes_file.write(f'[server]\napi_key_file = "{key}"\n\n' + indexes_file.text)
+    reg.refresh()
+    assert "api_key_file" in reg.config_error
+    key.write_text("secret\n", encoding="utf-8")
+    reg.refresh()
+    assert reg.config_error is None
+    assert capsys.readouterr().err.endswith(
+        f"minirag-mcp: reloaded {indexes_file.path}: alpha, beta, gamma\n"
+    )
+
+
+def test_the_latest_sync_job_passes_through_every_replacement(indexes_file):
+    held = HeldEmbedder()
+    reg = file_registry(indexes_file, lambda c, s: held)
+    first_handle = reg.resolve(UNRESTRICTED, "alpha").handle
+    first = first_handle.start_sync(None)
+    try:
+        assert held.entered.wait(10)
+        for weight in ("0.8", "0.9"):
+            indexes_file.write(_with(indexes_file.text, "alpha", f"hybrid_weight = {weight}"))
+            reg.refresh()
+        assert reg.resolve(UNRESTRICTED, "alpha").state() == (IndexState.SYNCING, "")
+        assert reg.resolve(UNRESTRICTED, "alpha").sync_status(first).state == "running"
+    finally:
+        held.release.set()
+        first_handle.sync.wait()
+    entry = reg.resolve(UNRESTRICTED, "alpha")
+    second = entry.handle.start_sync(None)
+    entry.handle.sync.wait()
+    indexes_file.write(_with(indexes_file.text, "alpha", "hybrid_weight = 0.7"))
+    reg.refresh()
+    assert reg.resolve(UNRESTRICTED, "alpha").sync_status(second).state == "succeeded"

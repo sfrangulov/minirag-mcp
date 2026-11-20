@@ -118,9 +118,21 @@ def test_second_process_is_refused_and_told_who_holds_it(holder):
 
     msg = str(excinfo.value)
     assert str(holder.proc.pid) in msg, msg
-    assert "syncing this index" in msg and "different DB_PATH" in msg, msg
+    assert "Another sync of this index" in msg and "different DB_PATH" in msg, msg
     assert excinfo.value.pid == holder.proc.pid
     assert excinfo.value.path == holder.lock_file
+
+
+def test_a_second_sync_in_this_process_is_not_called_another_process(tmp_path):
+    """A reload replaces an index's handle while its sync runs; the new handle's sync
+    meets the lock of the old one's, held by this very process."""
+    with sync_lock(tmp_path):
+        with pytest.raises(SyncLockBusy) as excinfo:
+            with sync_lock(tmp_path):
+                pytest.fail("acquired a lock this process is holding")
+    msg = str(excinfo.value)
+    assert msg.startswith("Another sync of this index") and "process" not in msg.split(".")[0]
+    assert f"PID {os.getpid()}" in msg, msg
 
 
 def test_holder_writes_its_pid_and_start_time_while_held(holder):
@@ -246,7 +258,7 @@ def test_unreadable_holder_info_degrades_to_a_generic_message(held, contents):
             pass
 
     msg = str(excinfo.value)
-    assert "Another minirag-mcp process is syncing this index" in msg, msg
+    assert "Another sync of this index is running" in msg, msg
     assert "different DB_PATH" in msg, msg
     assert "PID" not in msg, msg  # no pid invented for one we could not read
     assert excinfo.value.pid is None
@@ -261,8 +273,8 @@ def test_message_reports_how_long_the_holder_has_been_running(held):
             pass
 
     assert (
-        str(excinfo.value) == "Another minirag-mcp process (PID 12345) has been syncing "
-        "this index for 4m12s. Wait for it to finish, or use a different DB_PATH."
+        str(excinfo.value) == "Another sync of this index (minirag-mcp PID 12345) has been "
+        "running for 4m12s. Wait for it to finish, or use a different DB_PATH."
     )
 
 
@@ -287,7 +299,7 @@ def test_an_unparseable_start_time_still_names_the_holder(held):
     with pytest.raises(SyncLockBusy) as excinfo:
         with sync_lock(held.path.parent):
             pass
-    assert "(PID 4242) is syncing this index" in str(excinfo.value)
+    assert "(minirag-mcp PID 4242) is running" in str(excinfo.value)
     assert excinfo.value.pid == 4242
 
 
@@ -295,7 +307,7 @@ def test_a_start_time_in_the_future_does_not_render_a_duration(held):
     """Clock skew between two machines sharing a mount, or a stamp from the future."""
     ahead = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
     held.path.write_text(json.dumps({"pid": 7, "startedAt": ahead}))
-    with pytest.raises(SyncLockBusy, match=r"\(PID 7\) is syncing this index"):
+    with pytest.raises(SyncLockBusy, match=r"\(minirag-mcp PID 7\) is running"):
         with sync_lock(held.path.parent):
             pass
 

@@ -147,7 +147,7 @@ async def test_sync_start_is_a_tool_error_while_another_process_syncs(app):
     mcp, root = app
     async with Client(mcp) as c:
         with sync_lock(root / ".minirag" / "v2"):
-            with pytest.raises(ToolError, match="syncing this index") as excinfo:
+            with pytest.raises(ToolError, match="Another sync of this index") as excinfo:
                 await c.call_tool("sync_start", {})
             assert "DB_PATH" in str(excinfo.value)
 

@@ -68,6 +68,11 @@ class SyncJob:
     # Set when a rebuild starts, its counts None until the job has finished.
     rebuild: RebuildInfo | None = None
 
+    @property
+    def running(self) -> bool:
+        """Whether the job is pending or running."""
+        return self.state in ("pending", "running")
+
     def to_dict(self) -> dict:
         return {
             "jobId": self.job_id,
@@ -390,7 +395,12 @@ class SyncManager:
     def running(self) -> bool:
         """Whether this manager's latest job is pending or running."""
         job = self._job
-        return job is not None and job.state in ("pending", "running")
+        return job is not None and job.running
+
+    @property
+    def latest_job(self) -> SyncJob | None:
+        """The latest job's record, finished or not; None before the first."""
+        return self._job
 
     def start(self, scope: Path | None = None) -> str:
         """Start a background sync, or raise if one is already running.

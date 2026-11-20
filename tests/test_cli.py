@@ -215,7 +215,7 @@ def test_sync_refuses_while_another_process_holds_the_lock(corpus, capsys):
             run(["sync", "--base-dir", str(corpus)])
     assert exc.value.code == 1
     captured = capsys.readouterr()
-    assert "syncing this index" in captured.err and "DB_PATH" in captured.err
+    assert "Another sync of this index" in captured.err and "DB_PATH" in captured.err
     assert "Traceback" not in captured.err
     assert captured.out == ""  # no counts printed for a run that never happened
 

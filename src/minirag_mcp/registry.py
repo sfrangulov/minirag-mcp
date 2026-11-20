@@ -25,9 +25,11 @@ from pathlib import Path
 from minirag_mcp.config import Config, ConfigError
 from minirag_mcp.embedder import UnknownModelError
 from minirag_mcp.handle import IndexHandle, IndexUnavailableError, OpenIndex, RebuildPendingError
-from minirag_mcp.identity import EmbeddingScheme, IndexState
+from minirag_mcp.identity import EmbeddingScheme, IdentityError, IndexState, read_identity
 from minirag_mcp.indexes import ServerConfig, load_server_config
 from minirag_mcp.labels.labeler import ModelFactory
+from minirag_mcp.store import IndexOpenError
+from minirag_mcp.sync import SyncJob
 
 SINGLE_INDEX_NAME = "default"
 # Where `http_server` puts a request's `Connection` in its ASGI scope.
@@ -95,6 +97,9 @@ class IndexEntry:
     config: Config
     description: str
     handle: IndexHandle
+    # The latest sync job of the handle a reload replaced with this one. While it runs the
+    # index is syncing; it is polled through this entry, its outcome too.
+    predecessor_job: SyncJob | None = None
 
     def runtime(self) -> OpenIndex:
         """The open index; IndexUnavailable while it cannot be opened, tried again on the
@@ -105,7 +110,18 @@ class IndexEntry:
             raise IndexUnavailable(self.name, _reason(e)) from e
 
     def state(self) -> tuple[IndexState, str]:
+        job = self.predecessor_job
+        if job is not None and job.running:
+            return IndexState.SYNCING, ""
         return self.handle.state()
+
+    def sync_status(self, job_id: str) -> SyncJob:
+        """The sync job `job_id` of this index: the handle's latest, or the predecessor's.
+        KeyError for any other."""
+        job = self.predecessor_job
+        if job is not None and job.job_id == job_id:
+            return job
+        return self.handle.sync.status(job_id)
 
 
 def _admitted(entry: IndexEntry) -> OpenIndex | None:
@@ -142,12 +158,33 @@ def _entry(
     description: str,
     embedder_factory: RegistryEmbedderFactory | None,
     model_factory: ModelFactory | None,
+    predecessor_job: SyncJob | None = None,
 ) -> IndexEntry:
     # Without a factory each handle builds and owns its embedders, so each index checks its
     # own recorded probe; indexes of one model still share its loaded model (embedder.py).
     factory = None if embedder_factory is None else _entry_factory(config, embedder_factory)
     handle = IndexHandle(config, embedder_factory=factory, model_factory=model_factory)
-    return IndexEntry(name, config, description, handle)
+    return IndexEntry(name, config, description, handle, predecessor_job)
+
+
+def _serves(old: Config, new: Config) -> bool:
+    """Whether a handle built for `old` serves an index configured as `new` as one built
+    for `new` would. Every Config carries the endpoint of every [embedding] table, and only
+    those of the models the index embeds with count: its own, and the one its vectors were
+    made with, which embeds its queries until a rebuild."""
+    if old == new:
+        return True
+    try:
+        recorded = read_identity(new.db_path)
+    except (IdentityError, IndexOpenError):
+        return False
+    models = {new.model_name} | ({recorded.embedding.model} if recorded is not None else set())
+
+    def narrowed(config: Config) -> Config:
+        endpoints = {m: e for m, e in config.embed_endpoints.items() if m in models}
+        return replace(config, embed_endpoints=endpoints)
+
+    return narrowed(old) == narrowed(new)
 
 
 @dataclass(frozen=True)
@@ -162,15 +199,19 @@ class _Source:
     def entries(
         self, server: ServerConfig, previous: Mapping[str, IndexEntry]
     ) -> dict[str, IndexEntry]:
-        """The entries `server` configures. An index whose Config is unchanged keeps its
-        handle, and its entry too unless its description changed."""
+        """The entries `server` configures. An index its previous handle still serves keeps
+        that handle, and its entry too unless its description changed. A replaced handle's
+        latest sync job, or else the one it inherited, passes to its replacement."""
         entries = {}
         for name, config in server.indexes.items():
             description = server.descriptions[name]
             kept = previous.get(name)
-            if kept is None or kept.config != config:
+            if kept is None or not _serves(kept.config, config):
+                # A handle's own job is the later one: the sync lock refuses it while the
+                # job it inherited runs.
+                job = None if kept is None else kept.handle.sync_job or kept.predecessor_job
                 entries[name] = _entry(
-                    name, config, description, self.embedder_factory, self.model_factory
+                    name, config, description, self.embedder_factory, self.model_factory, job
                 )
             elif kept.description != description:
                 entries[name] = replace(kept, description=description)
@@ -293,7 +334,9 @@ class IndexRegistry:
         when the error differs from the last one told. The caller holds the reload lock.
 
         `digest` is stored last: a refresh that finds it stored skips the reload lock, so
-        it must not find it before this load has taken effect."""
+        it must not find it before this load has taken effect. A failed load stores none,
+        so the next refresh loads again: the cause may lie outside the file, such as a key
+        file it names."""
         source = self._source
         try:
             server = load_server_config(source.path, source.env)
@@ -301,7 +344,7 @@ class IndexRegistry:
         except Exception as e:
             error = str(e) if isinstance(e, (ConfigError, OSError)) else f"{type(e).__name__}: {e}"
             self.config_error = error
-            self._digest = digest
+            self._digest = None
             if asked or error != self._told:
                 self._told = error
                 print(
@@ -340,7 +383,14 @@ class IndexRegistry:
             for handle in retired:
                 (self._retired if handle.sync_running else ended).append(handle)
         for handle in ended:
-            handle.close()
+            try:
+                handle.close()
+            except Exception as e:
+                print(
+                    "minirag-mcp: could not close the previous handle of index "
+                    f"{handle.config.index_name!r}: {e}",
+                    file=sys.stderr,
+                )
 
     @property
     def names(self) -> tuple[str, ...]:

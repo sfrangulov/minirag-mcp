@@ -81,7 +81,7 @@ _CONTENTION_ERRNOS = frozenset({errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES})
 
 
 class SyncLockBusy(Exception):
-    """Another process holds the sync lock for this index.
+    """Another sync holds the sync lock for this index, in this process or another.
 
     `pid` and `started_at` describe the holder when it could be read from the
     lock file, and are None when it could not (see `_read_holder`). The message
@@ -172,10 +172,11 @@ def _warn_unlocked(path: Path, e: OSError) -> None:
 def _busy_message(path: Path, pid: int | None, started_at: str | None) -> str:
     tail = "Wait for it to finish, or use a different DB_PATH."
     if pid is None:
-        return f"Another minirag-mcp process is syncing this index (lock: {path}). {tail}"
+        return f"Another sync of this index is running (lock: {path}). {tail}"
     elapsed = _elapsed(started_at)
-    doing = f"has been syncing this index for {elapsed}" if elapsed else "is syncing this index"
-    return f"Another minirag-mcp process (PID {pid}) {doing}. {tail}"
+    doing = f"has been running for {elapsed}" if elapsed else "is running"
+    # The holder may be this process: a reload replaces a handle whose sync still runs.
+    return f"Another sync of this index (minirag-mcp PID {pid}) {doing}. {tail}"
 
 
 class SyncLock:
@@ -307,8 +308,8 @@ def is_held(db_path: Path) -> bool:
 def sync_lock(db_path: Path) -> Iterator[SyncLock]:
     """Hold the sync lock for `db_path` for the duration of the block.
 
-    Raises SyncLockBusy immediately — never blocks — if another process is
-    already syncing this index.
+    Raises SyncLockBusy immediately — never blocks — if another sync of this index
+    holds it, in this process or another.
     """
     lock = SyncLock(db_path)
     lock.acquire()

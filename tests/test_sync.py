@@ -418,7 +418,7 @@ def test_run_sync_refuses_while_another_process_syncs(env):
     cfg, store, pipeline, root, h = env
     seed(root)
     with sync_lock(store.db_path):
-        with pytest.raises(SyncLockBusy, match="syncing this index"):
+        with pytest.raises(SyncLockBusy, match="Another sync of this index"):
             sync(h)
     # Once the rival is gone the very same call goes through.
     counts, _ = sync(h)
@@ -437,7 +437,7 @@ def test_manager_start_refuses_immediately_and_records_nothing(env):
     mgr = h.sync
 
     with sync_lock(store.db_path):
-        with pytest.raises(SyncLockBusy, match="syncing this index"):
+        with pytest.raises(SyncLockBusy, match="Another sync of this index"):
             mgr.start()
 
     job_id = mgr.start()  # not wedged by the refusal

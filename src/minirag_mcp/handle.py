@@ -59,7 +59,7 @@ from minirag_mcp.labels.labeler import ModelFactory
 from minirag_mcp.labels.model import default_model_factory
 from minirag_mcp.results import embedder_notes
 from minirag_mcp.store import IndexBusyError, IndexOpenError, Store
-from minirag_mcp.sync import OnRebuild, SyncManager, _run_sync_unlocked
+from minirag_mcp.sync import OnRebuild, SyncJob, SyncManager, _run_sync_unlocked
 
 EmbedderFactory = Callable[[EmbeddingScheme], object]
 
@@ -311,10 +311,16 @@ class IndexHandle:
         return self._sync
 
     @property
+    def sync_job(self) -> SyncJob | None:
+        """The latest sync job of this handle, finished or not; never opens the index."""
+        sync = self._sync
+        return sync.latest_job if sync is not None else None
+
+    @property
     def sync_running(self) -> bool:
         """Whether a sync job of this handle is pending or running; never opens the index."""
-        sync = self._sync
-        return sync is not None and sync.running
+        job = self.sync_job
+        return job is not None and job.running
 
     def state(self) -> tuple[IndexState, str]:
         """The index's state and why; never raises. An index that cannot be opened is

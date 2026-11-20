@@ -179,7 +179,7 @@ def create_app(
         them also in errors), which are null until then.
         """
         entry, _ = opened(Use.READ)
-        return entry.handle.sync.status(jobId).to_dict()
+        return entry.sync_status(jobId).to_dict()
 
     @mcp.tool
     @guard
