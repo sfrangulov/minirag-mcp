@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import multiprocessing
 import os
+import time
 from pathlib import Path
 
 from conftest import FakeEmbedder
@@ -11,11 +12,13 @@ from minirag_mcp.endpoints import EndpointError
 
 SLOW_ROUTER = "http://router.test/v1/embeddings did not answer within 120 s"
 CRASH_MARK = "KILLS-ITS-WORKER"
+NEVER_RELEASED = "held until its limit: nothing released it"
 
 
 class Preparer:
-    """Reads a file as its own document; told to, writes to stdout, dies, raises, or
-    fails as an embedding endpoint that timed out."""
+    """Reads a file as its own document; told to, writes to stdout, dies, raises, fails as
+    an embedding endpoint that timed out, or holds one file until the file `release` names
+    exists."""
 
     def __init__(
         self,
@@ -24,11 +27,15 @@ class Preparer:
         fail_on: str = "",
         endpoint_down_on: str = "",
         shout: bool = False,
+        hold_on: str = "",
+        release: str = "",
     ) -> None:
         self.crash_on = crash_on
         self.fail_on = fail_on
         self.endpoint_down_on = endpoint_down_on
         self.shout = shout
+        self.hold_on = hold_on
+        self.release = release
 
     def prepare_file(self, path: Path, *, rules_checked: bool) -> str:
         if self.shout:
@@ -40,6 +47,12 @@ class Preparer:
             raise ValueError(f"cannot read {path.name}")
         if path.name == self.endpoint_down_on:
             raise EndpointError(SLOW_ROUTER, timed_out=True)
+        if path.name == self.hold_on:
+            deadline = time.monotonic() + 30
+            while not Path(self.release).exists():
+                if time.monotonic() > deadline:
+                    return NEVER_RELEASED
+                time.sleep(0.01)
         return path.read_text()
 
 

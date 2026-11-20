@@ -93,25 +93,57 @@ def paths(tmp_path):
     return files
 
 
-def test_every_path_comes_back_in_input_order(paths):
+def by_name(results) -> dict[str, parallel.Prepared]:
+    got = list(results)
+    named = {g.path.name: g for g in got}
+    assert len(named) == len(got)
+    return named
+
+
+def test_every_path_comes_back_exactly_once(paths):
     got = list(parallel.prepare_files(Preparer, paths, workers=2))
-    assert [g.path for g in got] == paths
-    assert [g.document for g in got] == [f"text {i}" for i in range(20)]
-    assert all(g.error is None for g in got)
+    assert sorted(g.path for g in got) == paths
+    assert all(g.document == g.path.read_text() and g.error is None for g in got)
+
+
+def test_a_slow_file_does_not_hold_back_the_files_after_it(paths, tmp_path):
+    release = tmp_path / "release"
+    make = partial(Preparer, hold_on=paths[0].name, release=str(release))
+    got = []
+    for g in parallel.prepare_files(make, paths, workers=2):
+        got.append(g)
+        if len(got) == len(paths) - 1:
+            release.touch()
+    assert sorted(g.path for g in got[:-1]) == paths[1:]
+    assert (got[-1].path, got[-1].document) == (paths[0], "text 0")
+
+
+def test_no_more_than_twice_the_workers_are_in_flight(paths, monkeypatch):
+    submitted: list = []
+
+    class Counting(parallel.ProcessPoolExecutor):
+        def submit(self, fn, /, *args, **kwargs):
+            submitted.append(args[0])
+            return super().submit(fn, *args, **kwargs)
+
+    monkeypatch.setattr(parallel, "ProcessPoolExecutor", Counting)
+    # Handed to the pool and not yet handed back, as each result comes back.
+    in_flight = [
+        len(submitted) - i for i, _ in enumerate(parallel.prepare_files(Preparer, paths, workers=2))
+    ]
+    assert max(in_flight) == 4 and sorted(submitted) == paths
 
 
 def test_a_file_that_raises_fails_alone(paths):
-    got = list(parallel.prepare_files(partial(Preparer, fail_on="05.md"), paths, workers=2))
-    assert (got[5].document, got[5].error) == (None, "cannot read 05.md")
-    assert all(g.error is None for i, g in enumerate(got) if i != 5)
+    got = by_name(parallel.prepare_files(partial(Preparer, fail_on="05.md"), paths, workers=2))
+    assert (got["05.md"].document, got["05.md"].error) == (None, "cannot read 05.md")
+    assert len(got) == 20 and all(g.error is None for n, g in got.items() if n != "05.md")
 
 
 def test_a_worker_that_dies_fails_only_its_own_file(paths):
-    got = list(parallel.prepare_files(partial(Preparer, crash_on="07.md"), paths, workers=2))
-    assert [g.path for g in got] == paths and got[7].error == parallel.WORKER_DIED
-    assert [g.document for i, g in enumerate(got) if i != 7] == [
-        f"text {i}" for i in range(20) if i != 7
-    ]
+    got = by_name(parallel.prepare_files(partial(Preparer, crash_on="07.md"), paths, workers=2))
+    assert sorted(got) == [p.name for p in paths] and got["07.md"].error == parallel.WORKER_DIED
+    assert all(g.document == f"text {int(n[:2])}" for n, g in got.items() if n != "07.md")
 
 
 def test_a_preparer_that_cannot_be_built_fails_each_file_with_its_reason(paths):
@@ -132,16 +164,16 @@ def test_workers_never_write_to_stdout(paths, capfd):
 
 def test_closing_early_stops_every_worker(paths):
     got = parallel.prepare_files(Preparer, paths, workers=2)
-    assert next(got).document == "text 0"
+    assert next(got).error is None
     got.close()
     assert multiprocessing.active_children() == []
 
 
 def test_an_endpoint_failure_comes_back_marked(paths):
     make = partial(Preparer, fail_on="01.md", endpoint_down_on="02.md")
-    got = list(parallel.prepare_files(make, paths[:4], workers=2))
-    assert [g.endpoint_failed for g in got] == [False, False, True, False]
-    assert (got[2].document, got[2].error) == (None, SLOW_ROUTER)
+    got = by_name(parallel.prepare_files(make, paths[:4], workers=2))
+    assert {n for n, g in got.items() if g.endpoint_failed} == {"02.md"}
+    assert (got["02.md"].document, got["02.md"].error) == (None, SLOW_ROUTER)
 
 
 def test_worker_pipeline_prepares_like_the_parent(tmp_path, fake_embedder):

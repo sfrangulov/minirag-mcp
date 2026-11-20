@@ -10,7 +10,7 @@ import subprocess
 import sys
 from collections import deque
 from collections.abc import Callable, Container, Generator, Iterator, Sequence
-from concurrent.futures import Future, ProcessPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, Protocol
@@ -175,8 +175,8 @@ def _prepare(path: Path) -> Prepared:
 def _run(
     make_preparer: bytes, waiting: deque[Path], workers: int, in_flight: int
 ) -> Generator[Prepared, None, list[Path]]:
-    """Prepare paths from the left of `waiting` in one pool, in order. Returns the paths
-    the pool had in flight when it broke, else []."""
+    """Prepare paths from the left of `waiting` in one pool, each yielded as it finishes.
+    Returns the paths the pool had in flight when it broke, else []."""
     pool = ProcessPoolExecutor(
         workers,
         # Spawn, never fork: the parent may be the MCP server with LanceDB and sync threads
@@ -185,17 +185,19 @@ def _run(
         initializer=_init_worker,
         initargs=(make_preparer,),
     )
-    running: deque[tuple[Path, Future[Prepared]]] = deque()
+    running: dict[Future[Prepared], Path] = {}
     try:
         while waiting or running:
             while waiting and len(running) < in_flight:
-                running.append((waiting[0], pool.submit(_prepare, waiting[0])))
+                running[pool.submit(_prepare, waiting[0])] = waiting[0]
                 waiting.popleft()
-            result = running[0][1].result()
-            running.popleft()
-            yield result
+            done, _ = wait(running, return_when=FIRST_COMPLETED)
+            for future in done:
+                result = future.result()
+                del running[future]
+                yield result
     except BrokenProcessPool:
-        return [path for path, _ in running]
+        return list(running.values())
     finally:
         pool.shutdown(wait=True, cancel_futures=True)
     return []
@@ -204,12 +206,12 @@ def _run(
 def prepare_files(
     make_preparer: Callable[[], Preparer], paths: Sequence[Path], *, workers: int
 ) -> Iterator[Prepared]:
-    """Each of `paths` prepared in one of `workers` processes, in input order.
+    """Each of `paths` prepared in one of `workers` processes, yielded as it finishes.
 
-    A worker that dies takes its pool down with the files the pool had in flight. Those are
-    prepared again one at a time in a one-worker pool, replaced whenever a file breaks it,
-    so only a file that kills its worker fails, with WORKER_DIED; a fresh pool then takes
-    the rest.
+    At most twice `workers` files are handed to the pool and not yet yielded. A worker that
+    dies takes its pool down with those files. They are prepared again one at a time in a
+    one-worker pool, replaced whenever a file breaks it, so only a file that kills its
+    worker fails, with WORKER_DIED; a fresh pool then takes the rest.
     """
     factory = pickle.dumps(make_preparer)
     waiting = deque(paths)
