@@ -10,7 +10,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from minirag_mcp import ocr
-from minirag_mcp.config import Config
 from minirag_mcp.identity import RebuildInfo, acquire_sync_lock
 from minirag_mcp.ingest.ignore import IgnoredFileError, scope_excluded_by
 from minirag_mcp.ingest.pipeline import Pipeline
@@ -18,9 +17,11 @@ from minirag_mcp.ingest.scanner import compute_diff, scan_roots
 from minirag_mcp.scope import is_under
 from minirag_mcp.store import Store
 
+# Told what a rebuild rebuilds and why when it starts, before its counts are known.
+OnRebuild = Callable[[RebuildInfo], None]
 # One sync of the index, or of `scope` inside it: its counts, its per-file errors, and the
 # rebuild it made, if any. Run with the sync lock already held.
-SyncRun = Callable[[Path | None], tuple[dict[str, int], list[dict], RebuildInfo | None]]
+SyncRun = Callable[[Path | None, OnRebuild], tuple[dict[str, int], list[dict], RebuildInfo | None]]
 
 
 class SyncBusyError(Exception):
@@ -57,6 +58,7 @@ class SyncJob:
     )
     errors: list[dict] = field(default_factory=list)
     error: str | None = None
+    # Set when a rebuild starts, its counts None until the job has finished.
     rebuild: RebuildInfo | None = None
 
     def to_dict(self) -> dict:
@@ -72,35 +74,6 @@ class SyncJob:
         }
 
 
-def run_sync(
-    pipeline: Pipeline,
-    store: Store,
-    roots: Sequence[Path],
-    max_file_size: int,
-    scope: Path | None = None,
-    on_event: Callable[[str], None] | None = None,
-) -> tuple[dict[str, int], list[dict]]:
-    """Scan `roots`, diff against the store, ingest/delete accordingly.
-
-    Holds the cross-process sync lock (see `minirag_mcp.lock`) for the whole
-    run and raises `SyncLockBusy` if another process is already syncing this
-    index. `SyncManager` does not come through here — it takes the same lock
-    itself, earlier, and calls its `run`.
-
-    `scope`, if given, is resolved to its canonical form (`Path.resolve()`)
-    before use, matching `Config.roots` (which are always resolved). Without
-    this, a non-canonical scope (e.g. an unresolved `/tmp` on macOS, where
-    the real path is `/private/tmp`) silently matches zero files: the diff
-    comes back empty, the job "succeeds" with all-zero counts, and no error
-    is ever raised.
-    """
-    lock = acquire_sync_lock(store.db_path)
-    try:
-        return _run_sync_unlocked(pipeline, store, roots, max_file_size, scope, on_event)
-    finally:
-        lock.release()
-
-
 def _run_sync_unlocked(
     pipeline: Pipeline,
     store: Store,
@@ -109,7 +82,15 @@ def _run_sync_unlocked(
     scope: Path | None,
     on_event: Callable[[str], None] | None,
 ) -> tuple[dict[str, int], list[dict]]:
-    """The body of `run_sync`. The caller must already hold the sync lock."""
+    """Scan `roots`, diff against the store, ingest and delete accordingly. The caller holds
+    the sync lock (`acquire_sync_lock`) and has checked the index is not `rebuild pending`:
+    `IndexHandle.run_sync` and the rebuild do both.
+
+    `scope`, if given, is resolved to its canonical form before use, matching
+    `Config.roots` (which are always resolved). Without this, a non-canonical scope (an
+    unresolved `/tmp` on macOS, whose real path is `/private/tmp`) silently matches zero
+    files: the diff comes back empty and the job "succeeds" with all-zero counts.
+    """
     scope = scope.resolve() if scope is not None else None
     if scope is not None and (by := scope_excluded_by(scope, roots)) is not None:
         # A silent no-op otherwise: every count zero, exit 0, nothing synced.
@@ -259,19 +240,9 @@ def _run_sync_unlocked(
 
 
 class SyncManager:
-    def __init__(
-        self, pipeline: Pipeline, store: Store, config: Config, *, run: SyncRun | None = None
-    ):
-        """`run` syncs; without it, `pipeline` and `store` are synced as `run_sync` would."""
-        self._db_path = store.db_path
-        if run is None:
-
-            def run(scope: Path | None):
-                counts, errors = _run_sync_unlocked(
-                    pipeline, store, config.roots, config.max_file_size, scope, None
-                )
-                return counts, errors, None
-
+    def __init__(self, db_path: Path, run: SyncRun):
+        """Runs `run` as one background job at a time, holding the sync lock of `db_path`."""
+        self._db_path = db_path
         self._run = run
         self._lock = threading.Lock()
         self._job: SyncJob | None = None
@@ -335,8 +306,12 @@ class SyncManager:
             # reported failed rather than left reading 'running', which would hold
             # the in-process guard shut for the lifetime of the process.
             terminal = "failed"
+
+            def rebuilding(info: RebuildInfo) -> None:
+                job.rebuild = info
+
             try:
-                counts, errors, rebuilt = self._run(scope)
+                counts, errors, rebuilt = self._run(scope, rebuilding)
             except Exception as e:  # catastrophic failure (scan error, DB down, ...)
                 job.error = str(e)
             else:

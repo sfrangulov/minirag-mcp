@@ -617,6 +617,53 @@ def test_verify_checks_the_endpoint_and_never_loads_the_model(
     assert gone.probe_error is None and stub_text_embedding.model_names == []
 
 
+def test_an_endpoint_that_answers_is_checked_again_once_the_interval_has_passed(
+    tmp_path, fake_llama, tokenizer_file, monkeypatch
+):
+    """A router restarted with its preset pointing at another model of the same width
+    reconnects without a failure, so only checking it again finds the change."""
+    emb = armed(tmp_path, fake_llama)
+    emb.embed_query("hello")
+    fake_llama.vector_salt = "bge-m3"
+    monkeypatch.setattr(embedder_mod, "ENDPOINT_RETRY_SECONDS", 0.0)
+    with pytest.raises(ProbeMismatchError):
+        emb.embed_query("hello")
+    with pytest.raises(ProbeMismatchError):
+        emb.embed_documents(["a chunk"])
+    assert emb.probe_error is not None
+
+
+def test_a_mismatch_of_the_fallback_is_forgotten_once_the_endpoint_serves_again(
+    tmp_path, fake_llama, stub_text_embedding, tokenizer_file, monkeypatch
+):
+    fake_llama.vector_salt = "gguf"  # the vectors the index recorded; fastembed's differ
+    emb = armed(tmp_path, fake_llama)
+    fake_llama.fail["/v1/embeddings"] = (503, "Loading model")
+    with pytest.warns(RuntimeWarning, match="503"), pytest.raises(ProbeMismatchError):
+        emb.embed_documents(["alpha"])
+    assert "fastembed's" in emb.probe_error
+    del fake_llama.fail["/v1/embeddings"]
+    monkeypatch.setattr(embedder_mod, "ENDPOINT_RETRY_SECONDS", 0.0)
+    emb.verify()
+    assert emb.backend == "endpoint" and emb.probe_error is None
+    emb.embed_documents(["beta"])
+
+
+def test_a_hung_endpoint_holds_a_query_for_the_query_timeout_only(
+    tmp_path, fake_llama, stub_text_embedding, tokenizer_file, monkeypatch
+):
+    """A document batch may take long; a query waits seconds, then falls back."""
+    monkeypatch.setattr(embedder_mod, "QUERY_TIMEOUT", 0.2, raising=False)
+    fake_llama.delay = 1.0
+    emb = e5(tmp_path, fake_llama)
+    with pytest.warns(RuntimeWarning, match="unreachable"):
+        emb.embed_query("beta")
+    assert emb.backend == "in-process (endpoint unreachable)"
+    documents = e5(tmp_path, fake_llama)
+    documents.embed_documents(["alpha"])
+    assert documents.backend == "endpoint"
+
+
 def _shipped() -> dict[str, list[float]]:
     return json.loads(files("minirag_mcp").joinpath("probes.json").read_text(encoding="utf-8"))
 

@@ -12,8 +12,8 @@ from lookalike_texts import (
     SPEC_WAREHOUSE,
 )
 from minirag_mcp.chunker import join_document
-from minirag_mcp.config import Config
-from minirag_mcp.ingest.pipeline import Pipeline
+from minirag_mcp.config import DEFAULT_MODEL, Config
+from minirag_mcp.handle import IndexHandle
 from minirag_mcp.lookalike import overlap, signature
 from minirag_mcp.results import run_find, run_query, signature_status
 from minirag_mcp.store import SIGNATURE_TABLE, Store
@@ -32,7 +32,7 @@ def make_config(root: Path, tmp_path: Path) -> Config:
         roots=(root,),
         db_path=tmp_path / "db",
         cache_dir=tmp_path / "cache",
-        model_name="fake",
+        model_name=DEFAULT_MODEL,
         max_file_size=1_000_000,
         token_budget=200,
         hybrid_weight=0.6,
@@ -50,11 +50,10 @@ def corpus(tmp_path, fake_embedder):
         (root / rel).parent.mkdir(parents=True, exist_ok=True)
         (root / rel).write_text(text)
     config = make_config(root, tmp_path)
-    store = Store(config.db_path, dim=fake_embedder.dim)
-    pipeline = Pipeline(store, fake_embedder, config)
+    opened = IndexHandle(config, embedder_factory=lambda scheme: fake_embedder).get()
     for rel in FILES:
-        pipeline.ingest_file(root / rel)
-    return root, config, store, fake_embedder
+        opened.pipeline.ingest_file(root / rel)
+    return root, config, opened.store, fake_embedder
 
 
 def src(root, rel):
@@ -158,8 +157,6 @@ def test_a_signatures_table_that_cannot_be_read_leaves_search_and_sync_working(c
     import lancedb
     import pyarrow as pa
 
-    from minirag_mcp.sync import run_sync
-
     root, config, store, embedder = corpus
     db = lancedb.connect(str(config.db_path))
     db.drop_table(SIGNATURE_TABLE)
@@ -179,8 +176,9 @@ def test_a_signatures_table_that_cannot_be_read_leaves_search_and_sync_working(c
         got = run_query(store, embedder, config, "regulation")
     assert got["results"] and all("lookAlikes" not in s for s in got["sources"])
     assert signature_status(store)["unsignedSourceCount"] == len(FILES)
-    pipeline = Pipeline(store, embedder, config)
-    counts, errors = run_sync(pipeline, store, config.roots, config.max_file_size)
+    syncing = IndexHandle(config, embedder_factory=lambda scheme: embedder)
+    with pytest.warns(RuntimeWarning, match="look-alike signatures"):
+        counts, errors, _ = syncing.run_sync(None)
     assert counts["failed"] == 0
     assert any(e["error"].startswith("lookAlikes:") for e in errors)
 

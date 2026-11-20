@@ -475,6 +475,8 @@ class Store:
         # chunks table and in the documents table
         self.missing_fts_indices: tuple[str, ...] = ()
         self.missing_document_fts_indices: tuple[str, ...] = ()
+        # Whether a failed whole-document query was warned about; once is enough.
+        self._document_query_warned = False
         # The stemmer configured, and the one the FTS indexes really use. They differ only
         # while a language change could not be written (see _ensure_fts_indices).
         self.fts_language = fts_language
@@ -1495,7 +1497,15 @@ class Store:
             if scope_clause:
                 q = q.where(scope_clause)
             rows = sorted(q.to_list(), key=lambda r: (-r["_score"], r["source"]))
-        except Exception:
+        except Exception as e:
+            if not self._document_query_warned:
+                self._document_query_warned = True
+                warnings.warn(
+                    f"Ranking documents as a whole failed in the index at {self.db_path}: {e}. "
+                    "Search answers without that ranking until it works again.",
+                    RuntimeWarning,
+                    stacklevel=4,
+                )
             return {}
         ranks: dict[str, int] = {}
         for rank, row in enumerate(rows):

@@ -98,12 +98,15 @@ class _Client:
         self.__dict__.update(state)
         self._lock = threading.Lock()
 
-    def _post(self, body: dict) -> dict:
+    def _post(self, body: dict, timeout: float | None = None) -> dict:
         with self._lock:
             if self._session is None:
                 self._session = _session()
             session = self._session
-        return request_json(self.endpoint, self.endpoint.url, body, session=session)
+        endpoint = self.endpoint
+        if timeout is not None:
+            endpoint = replace(endpoint, timeout=min(endpoint.timeout, timeout))
+        return request_json(endpoint, endpoint.url, body, session=session)
 
     def close(self) -> None:
         with self._lock:
@@ -113,16 +116,17 @@ class _Client:
 
 
 class EmbeddingEndpoint(_Client):
-    def embed(self, texts: Sequence[str]) -> list[list[float]]:
+    def embed(self, texts: Sequence[str], *, timeout: float | None = None) -> list[list[float]]:
+        """`timeout`, when given, shortens the endpoint's own for each request."""
         vectors: list[list[float]] = []
         for start in range(0, len(texts), EMBED_BATCH):
             batch = list(texts[start : start + EMBED_BATCH])
-            vectors += self._embed_batch(batch)
+            vectors += self._embed_batch(batch, timeout)
         return vectors
 
-    def _embed_batch(self, batch: list[str]) -> list[list[float]]:
+    def _embed_batch(self, batch: list[str], timeout: float | None) -> list[list[float]]:
         url = self.endpoint.url
-        reply = self._post({"input": batch})
+        reply = self._post({"input": batch}, timeout)
         try:
             rows = sorted(reply["data"], key=lambda row: row["index"])
             if [row["index"] for row in rows] != list(range(len(batch))):

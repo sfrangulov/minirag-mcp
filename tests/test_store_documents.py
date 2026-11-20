@@ -442,8 +442,11 @@ def test_a_failing_document_query_degrades_to_no_bonus(store, monkeypatch):
 
     without = store.search("alpha beta", V(1.0), top_k=3, hybrid_weight=0.6)
     monkeypatch.setattr(store._documents, "search", failing)
-    got = store.search("alpha beta", V(1.0), top_k=3, hybrid_weight=0.6, document_weight=0.5)
-    assert calls == ["fts"]
+    with pytest.warns(RuntimeWarning, match="FTS index unavailable") as warned:
+        got = store.search("alpha beta", V(1.0), top_k=3, hybrid_weight=0.6, document_weight=0.5)
+        store.search("alpha beta", V(1.0), top_k=3, hybrid_weight=0.6, document_weight=0.5)
+    assert calls == ["fts", "fts"]
+    assert len([w for w in warned if "FTS index unavailable" in str(w.message)]) == 1
     assert ranked(got) == ranked(without)
     assert [r.score for r in got] == pytest.approx([r.score for r in without])
 

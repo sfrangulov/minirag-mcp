@@ -163,14 +163,16 @@ def create_app(
         when it is a root, when indexed files are under it, or when the sync
         was started for it or for a path inside it.
 
-        rebuild is null unless the sync rebuilt the index (only a sync without
-        a path rebuilds, and only a "rebuild pending" index): then kind
-        ("reembed": the stored text embedded again; "reingest": the roots read
-        again), reasons (what changed, as status's rebuildReasons named it),
-        generation (the rebuilt index's), reembedded (chunks embedded again)
-        and restored (documents the roots could not give back — ingested data
-        and URLs, files this installation could not read again — stored again
-        from their indexed text, each file among them also in errors).
+        rebuild is null unless the sync rebuilds the index (only a sync without
+        a path rebuilds, and only a "rebuild pending" index). From the moment
+        the rebuild starts it names kind ("reembed": the stored text embedded
+        again; "reingest": the roots read again, which can take hours) and
+        reasons (what changed, as status's rebuildReasons named it); once the
+        job has finished also generation (the rebuilt index's), reembedded
+        (chunks embedded again) and restored (documents the roots could not
+        give back — ingested data and URLs, files this installation could not
+        read again — stored again from their indexed text, each file among
+        them also in errors), which are null until then.
         """
         return live().sync.status(jobId).to_dict()
 
