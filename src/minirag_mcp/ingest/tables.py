@@ -9,6 +9,11 @@ from itertools import pairwise
 from pathlib import Path
 from typing import BinaryIO
 
+try:
+    from lzma import LZMAError
+except ImportError:  # a Python built without liblzma: zipfile raises RuntimeError instead
+    LZMAError = RuntimeError
+
 # The formats this package indexes as tables; .xls and .xlsm are not indexed at all.
 TABLE_EXTENSIONS = frozenset({".xlsx", ".csv"})
 CHUNK = 1 << 20
@@ -16,9 +21,20 @@ CHUNK = 1 << 20
 # `<rowBreaks>` out.
 _ROW = re.compile(rb"<(?:[A-Za-z_][\w.-]*:)?row[\s/>]")
 _VALUE = re.compile(rb"<(?:[A-Za-z_][\w.-]*:)?(?:v|is)>")
+_END = re.compile(rb"</(?:[A-Za-z_][\w.-]*:)?sheetData>")
 _SHEET = re.compile(r"xl/worksheets/[^/]+\.xml")
-# What stops a file being read as a zip or as bytes, and so stops its parse too.
-_UNREADABLE = (OSError, EOFError, zipfile.BadZipFile, zlib.error, NotImplementedError, RuntimeError)
+# What stops a file being read as a zip or as bytes, and so stops its parse too. A
+# ValueError is what zipfile raises for an entry name flagged UTF-8 that is not.
+_UNREADABLE = (
+    OSError,
+    EOFError,
+    ValueError,
+    zipfile.BadZipFile,
+    zlib.error,
+    LZMAError,
+    NotImplementedError,
+    RuntimeError,
+)
 
 
 def data_rows(path: Path, limit: int) -> int | None:
@@ -75,25 +91,32 @@ def _xlsx_rows(path: Path, limit: int) -> int:
 def _sheet_rows(part: BinaryIO, limit: int) -> int:
     """One sheet's rows holding a value, counted no further than `limit + 1`.
 
-    A row is judged from its start to the next row's start, so the part of the stream
-    after the last start found is carried into the next chunk: a row the chunk boundary
-    cuts is judged once, whole.
+    A row is judged from its start to the next row's start, or to the end of the sheet's
+    rows, so the part of the stream after the last start found is carried into the next
+    chunk: a row the chunk boundary cuts is judged once, whole. Nothing after the end of
+    the rows is read; carried along, a long tail would be scanned again with every chunk.
     """
     rows = 0
     carry = b""
     while chunk := part.read(CHUNK):
         buf = carry + chunk
-        starts = [m.start() for m in _ROW.finditer(buf)]
+        found = _END.search(buf)
+        stop = found.start() if found else len(buf)
+        starts = [m.start() for m in _ROW.finditer(buf, 0, stop)]
         if not starts:
+            if found:
+                return rows
             # Before the first row; only a tag the boundary cuts is carried.
             cut = buf.rfind(b"<")
             carry = buf[cut:] if cut >= 0 and buf.find(b">", cut) < 0 else b""
             continue
-        for begin, end in pairwise(starts):
+        for begin, end in pairwise([*starts, stop] if found else starts):
             if _VALUE.search(buf, begin, end):
                 rows += 1
                 if rows > limit:
                     return rows
+        if found:
+            return rows
         carry = buf[starts[-1] :]
     if _ROW.match(carry) and _VALUE.search(carry):
         rows += 1

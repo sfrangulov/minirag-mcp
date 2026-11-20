@@ -99,6 +99,23 @@ def test_a_row_cut_by_a_chunk_boundary_counts_once(tmp_path):
     assert counted == dict.fromkeys(range(1, len(first)), 2)
 
 
+def test_a_sheet_is_read_no_further_than_the_end_of_its_rows(tmp_path):
+    """Wherever the boundary cuts `</sheetData>`. The tail after it is never read: here,
+    reading it to the end would fail the member's CRC."""
+    end = "</sheetData>"
+    head = sheet("").split("<sheetData>")[0] + "<sheetData>"
+    tail = '<mergeCells count="1"><mergeCell ref="A1:B1"/></mergeCells>' + " " * 2 * tables.CHUNK
+    counted = {}
+    for before in range(len(end) + 1):
+        pad = tables.CHUNK - len(head) - len(valued(1)) - before
+        body = head + " " * pad + valued(1) + end + tail + "<!-- TAIL -->" + "</worksheet>"
+        assert body.index(end) + before == tables.CHUNK
+        path = xlsx(tmp_path / f"t{before}.xlsx", body, compression=zipfile.ZIP_STORED)
+        path.write_bytes(path.read_bytes().replace(b"<!-- TAIL -->", b"<!-- TAIX -->"))
+        counted[before] = data_rows(path, 100)
+    assert counted == dict.fromkeys(range(len(end) + 1), 1)
+
+
 def test_the_rows_of_every_sheet_are_summed(tmp_path):
     one = sheet("".join(valued(r) for r in range(1, 4)))
     two = sheet("".join(valued(r) for r in range(1, 5)))
@@ -131,6 +148,32 @@ def test_what_is_not_a_readable_table_is_left_to_the_parse(tmp_path):
     assert data_rows(tmp_path / "zip.xlsx", 1) is None
     assert data_rows(tmp_path / "missing.csv", 1) is None
     assert data_rows(tmp_path / "t.md", 1) is None
+
+
+def bad_name(path: Path) -> Path:
+    """An xlsx whose sheet's name is flagged UTF-8 but is not: the zip module raises a
+    ValueError opening it."""
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("xl/worksheets/sheé.xml", sheet(valued(1)))
+    path.write_bytes(path.read_bytes().replace("é".encode(), b"\xff\xfe"))
+    return path
+
+
+def corrupt_lzma(path: Path) -> Path:
+    xlsx(path, sheet("".join(valued(r) for r in range(1, 400))), compression=zipfile.ZIP_LZMA)
+    with zipfile.ZipFile(path) as z:
+        info = z.getinfo("xl/worksheets/sheet1.xml")
+    raw = bytearray(path.read_bytes())
+    start = info.header_offset + 30 + len(info.filename) + len(info.extra) + 9
+    for i in range(start, start + info.compress_size - 9, 5):
+        raw[i] ^= 0xFF
+    path.write_bytes(bytes(raw))
+    return path
+
+
+def test_a_zip_the_zip_module_cannot_read_is_left_to_the_parse(tmp_path):
+    assert data_rows(bad_name(tmp_path / "name.xlsx"), 1) is None
+    assert data_rows(corrupt_lzma(tmp_path / "lzma.xlsx"), 1) is None
 
 
 def test_a_workbook_written_by_openpyxl_counts_as_its_values_say(tmp_path):
@@ -209,6 +252,14 @@ def test_a_table_that_grows_over_the_limit_leaves_the_index(root, tmp_path, fake
     assert (counts["deleted"], counts["largeTables"], counts["failed"]) == (1, 2, 0)
     assert {"source": str(grown), "error": SKIPPED} in errors
     assert h.get().store.get_source(str(grown)) is None
+
+
+def test_a_table_the_count_cannot_read_fails_alone_in_its_parse(root, tmp_path, fake_embedder):
+    broken = bad_name(root / "broken.xlsx")
+    h = handle(root, tmp_path, fake_embedder, RAG_MAX_TABLE_ROWS=str(LIMIT))
+    counts, errors = run_sync(h)
+    assert (counts["ingested"], counts["largeTables"], counts["failed"]) == (2, 1, 1)
+    assert [e["source"] for e in errors] == [str(root / "big.csv"), str(broken)]
 
 
 def test_a_sync_without_a_limit_reads_every_table(root, tmp_path, fake_embedder):

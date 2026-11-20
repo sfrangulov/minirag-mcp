@@ -9,7 +9,7 @@ rebuilt index replaces it.
 from __future__ import annotations
 
 import shutil
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from minirag_mcp import __version__, ocr
@@ -102,10 +102,11 @@ def rebuild(
             reembedded = target.copy_reembedded(
                 current.store, new.embed_documents, on_event=on_event
             )
+        large: list[Path] = []
         counts, errors = _run_sync_unlocked(
-            pipeline, target, config.roots, config.max_file_size, None, on_event
+            pipeline, target, config.roots, config.max_file_size, None, on_event, large
         )
-        restored = _restore(current, pipeline, errors, on_event)
+        restored = _restore(current, pipeline, errors, on_event, large)
         if problem := target.update_indices():
             errors.append({"source": str(staging), "error": problem})
         seal_staging(
@@ -139,14 +140,17 @@ def _restore(
     pipeline: Pipeline,
     errors: list[dict],
     on_event: Callable[[str], None] | None,
+    large_tables: Sequence[Path],
 ) -> int:
     """Store again, from its stored text, every source of `current` the rebuilt index
     lacks and a sync of `current` would keep; how many.
 
     Kept: what was ingested from data or a URL, and a file this installation could not
     read again, or whose folder it could not see into. Not kept: a file gone from disk, or
-    excluded by a rule, or moved, or a changed table over RAG_MAX_TABLE_ROWS, which
-    `compute_diff` decides as for any sync.
+    excluded by a rule, or moved, which `compute_diff` decides as for any sync, nor one of
+    `large_tables`, those the rebuild's own sync left out for RAG_MAX_TABLE_ROWS. A reingest
+    reads every table again, so this includes one indexed, unchanged, before the limit
+    was set.
 
     Also stored again: a file read with OCR before, which an installation without OCR read
     again from its text layer alone. A PDF with any text layer reads without error then,
@@ -164,9 +168,10 @@ def _restore(
         roots=config.roots,
         blind=blind,
         ignored=ignored,
-        max_table_rows=config.max_table_rows,
     )
-    gone = set(diff.to_delete) | {m.source for m in diff.moved}
+    gone = (
+        set(diff.to_delete) | {m.source for m in diff.moved} | {str(path) for path in large_tables}
+    )
     rebuilt = {info.source: info for info in pipeline.store.list_sources()}
     ocr_lost = not ocr.available()
     restored = 0

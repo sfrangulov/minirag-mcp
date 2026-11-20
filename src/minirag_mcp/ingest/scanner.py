@@ -337,7 +337,7 @@ def compute_diff(
     A table it would read (`tables.TABLE_EXTENSIONS`) holding more than `max_table_rows`
     data rows is in `large_tables` instead, and an indexed one also in `to_delete`, as a
     file a new ignore rule excludes is: by policy it is no longer indexable. Only what
-    would be read is counted, so an unchanged or moved table costs nothing and stays.
+    would be read is counted, so a table left as indexed, or moved, costs nothing and stays.
 
     Args:
         entries: Scanned disk files.

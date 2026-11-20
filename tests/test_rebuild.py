@@ -353,6 +353,21 @@ def test_a_rebuild_does_not_keep_a_table_that_grew_over_the_limit(corpus, models
     assert [e["source"] for e in errors] == [str(table)]
 
 
+def test_a_reingest_leaves_out_an_unchanged_table_over_a_new_limit(corpus, models):
+    """The rebuild reads it again and skips it; its stored text does not put it back."""
+    table = corpus / "t.csv"
+    table.write_text("".join(f"{i},v{i}\n" for i in range(9)))
+    built(corpus, models)
+    h = handle(corpus, models, MODEL_NAME=MINILM, CHUNK_TOKEN_BUDGET="32", RAG_MAX_TABLE_ROWS="5")
+
+    counts, errors, info = h.run_sync(None)
+
+    skipped = "skipped: more than 5 data rows exceeds RAG_MAX_TABLE_ROWS (5)"
+    assert (info.kind, info.restored, counts["largeTables"]) == ("reingest", 0, 1)
+    assert errors == [{"source": str(table), "error": skipped}]
+    assert h.get().store.get_source(str(table)) is None
+
+
 def test_a_reingest_keeps_the_files_of_a_root_it_cannot_see(tmp_path, models):
     docs, drive = tmp_path / "docs", tmp_path / "drive"
     docs.mkdir()

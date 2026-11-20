@@ -161,10 +161,13 @@ def _run_sync_unlocked(
     max_file_size: int,
     scope: Path | None,
     on_event: Callable[[str], None] | None,
+    large_tables: list[Path] | None = None,
 ) -> tuple[dict[str, int], list[dict]]:
     """Scan `roots`, diff against the store, ingest and delete accordingly. The caller holds
     the sync lock (`acquire_sync_lock`) and has checked the index is not `rebuild pending`:
     `IndexHandle.run_sync` and the rebuild do both.
+
+    When `large_tables` is given, it collects the tables left out for RAG_MAX_TABLE_ROWS.
 
     `scope`, if given, is resolved to its canonical form before use, matching
     `Config.roots` (which are always resolved). Without this, a non-canonical scope (an
@@ -195,6 +198,8 @@ def _run_sync_unlocked(
         record_pages="pages" not in store.missing_columns,
         max_table_rows=pipeline.config.max_table_rows,
     )
+    if large_tables is not None:
+        large_tables.extend(diff.large_tables)
     counts = {
         "scanned": len(diff.to_ingest)
         + len(diff.moved)

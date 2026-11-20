@@ -160,8 +160,9 @@ def create_app(
         largeTables counts the .xlsx and .csv files the sync would have read
         but left out for holding more data rows than RAG_MAX_TABLE_ROWS; each
         appears in errors as "skipped: ...", and is not a failure. One already
-        indexed is deleted from the index and counted under deleted. Only new
-        and changed files are counted, so an unchanged one stays as indexed.
+        indexed is deleted from the index and counted under deleted. The rows
+        of every table the sync would read again are counted, and of no other,
+        so one it leaves as indexed stays indexed whatever its size.
 
         A folder the scan could not see into (a missing root, one without read
         permission, an empty folder where a root was mounted) also appears in
