@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import sys
+import types
 
 import pytest
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
 from minirag_mcp import ocr, ocr_vision
 from minirag_mcp.config import load_config
+
+# conftest replaces `read_lines` in every fast test; the fake-Vision tests below need the real one.
+_READ_LINES = ocr_vision.read_lines
 
 
 @pytest.mark.parametrize(
@@ -106,6 +112,156 @@ def test_a_box_turned_upright_and_back_lands_on_itself(turns):
     assert ocr_vision._page_box(inked, turns, size) == box
 
 
+# --- read_lines against a fake Vision that frames boxes as the real one does ----------
+
+
+class _FakeVision:
+    """Stands in for pyobjc's objc, Quartz and Vision. Each request answers from `script`
+    (one list of (text, page box) per band request, in order), the way Vision does: it
+    sees the image it was handed, and reports a box normalised to the region it was asked
+    to read, from that region's bottom left."""
+
+    def __init__(self, script, page_size):
+        self.script, self.page_size = script, page_size
+        self.received: tuple[int, int] | None = None
+
+    def install(self, monkeypatch):
+        fake = self
+
+        class Request:
+            @classmethod
+            def alloc(cls):
+                return cls()
+
+            def init(self):
+                return self
+
+            def setRecognitionLevel_(self, level):
+                pass
+
+            def setRecognitionLanguages_(self, languages):
+                pass
+
+            def setUsesLanguageCorrection_(self, flag):
+                pass
+
+            def setRegionOfInterest_(self, region):
+                self.region = region
+
+            def results(self):
+                return self.answers
+
+        class Handler:
+            @classmethod
+            def alloc(cls):
+                return cls()
+
+            def initWithData_options_(self, data, options):
+                fake.received = Image.open(io.BytesIO(data)).size
+                return self
+
+            def performRequests_error_(self, requests, error):
+                width, height = fake.received
+                for request, lines in zip(requests, fake.script, strict=True):
+                    request.answers = [
+                        _observation(text, box, request.region, fake.page_size, (width, height))
+                        for text, box in lines
+                    ]
+                return True, None
+
+        pairs = {
+            "objc": {"autorelease_pool": contextlib.nullcontext},
+            "Quartz": {"CGRectMake": lambda x, y, w, h: _rect(x, y, w, h)},
+            "Vision": {
+                "VNImageRequestHandler": Handler,
+                "VNRecognizeTextRequest": Request,
+                "VNRequestTextRecognitionLevelAccurate": 1,
+            },
+        }
+        for name, members in pairs.items():
+            module = types.ModuleType(name)
+            module.__dict__.update(members)
+            monkeypatch.setitem(sys.modules, name, module)
+
+
+def _rect(x, y, w, h):
+    return types.SimpleNamespace(
+        origin=types.SimpleNamespace(x=x, y=y), size=types.SimpleNamespace(width=w, height=h)
+    )
+
+
+def _observation(text, page_box, region, page_size, seen_size):
+    """`page_box` (upright page pixels, from the top left) as Vision reports it."""
+    sx, sy = seen_size[0] / page_size[0], seen_size[1] / page_size[1]
+    x0, y0, x1, y1 = (page_box[0] * sx, page_box[1] * sy, page_box[2] * sx, page_box[3] * sy)
+    band_top = (1 - region.origin.y - region.size.height) * seen_size[1]
+    band_height = region.size.height * seen_size[1]
+    box = _rect(
+        x0 / seen_size[0],
+        1 - (y1 - band_top) / band_height,
+        (x1 - x0) / seen_size[0],
+        (y1 - y0) / band_height,
+    )
+    candidate = types.SimpleNamespace(string=lambda: text)
+    return types.SimpleNamespace(topCandidates_=lambda n: [candidate], boundingBox=lambda: box)
+
+
+def _read(monkeypatch, script, page_size, turns=0, scanned_size=None):
+    fake = _FakeVision(script, page_size)
+    fake.install(monkeypatch)
+    page = Image.new("L", scanned_size or page_size, 255)
+    return fake, _READ_LINES(page, turns, ["en-US"])
+
+
+def test_vision_reads_a_copy_three_quarters_the_size_and_its_boxes_land_in_full_pixels(
+    monkeypatch,
+):
+    box = (400, 1000, 1600, 1100)
+    fake, lines = _read(monkeypatch, [[("alpha", box)], []], (2000, 2800))
+    assert fake.received == (1500, 2100)
+    [line] = lines
+    assert line.box == pytest.approx(box, abs=2)
+
+
+@pytest.mark.parametrize("turns", [1, 2, 3])
+def test_a_turned_page_is_read_scaled_and_its_boxes_come_back_in_the_scanned_frame(
+    monkeypatch, turns
+):
+    scanned = (2000, 2800)
+    upright = scanned[::-1] if turns % 2 else scanned
+    box = (400, 1000, 1600, 1100)  # on the upright page
+    fake, lines = _read(monkeypatch, [[], [("alpha", box)]], upright, turns, scanned)
+    assert fake.received == (round(upright[0] * 0.75), round(upright[1] * 0.75))
+    [line] = lines
+    assert line.box == pytest.approx(ocr_vision._page_box(box, turns, scanned), abs=2)
+
+
+def test_lines_come_back_in_the_order_vision_gave_them_band_by_band(monkeypatch):
+    """Vision reads a two-column page column by column: that order is its reading order."""
+    script = [
+        [
+            ("L1", (100, 100, 900, 160)),
+            ("L2", (100, 300, 900, 360)),
+            ("R1", (1100, 100, 1900, 160)),
+            ("R2", (1100, 300, 1900, 360)),
+        ],
+        [("L3", (100, 2000, 900, 2060)), ("R3", (1100, 2000, 1900, 2060))],
+    ]
+    _, lines = _read(monkeypatch, script, (2000, 2800))
+    assert [line.text for line in lines] == ["L1", "L2", "R1", "R2", "L3", "R3"]
+
+
+def test_a_band_that_reads_nothing_costs_the_page_only_what_that_band_alone_read(monkeypatch):
+    script = [[("top", (100, 100, 900, 160))], []]
+    _, lines = _read(monkeypatch, script, (2000, 2800))
+    assert [line.text for line in lines] == ["top"]
+    tess = [
+        ocr.Line((100, 100, 900, 160), "top", starts_paragraph=True),
+        ocr.Line((100, 2000, 900, 2060), "bottom"),
+    ]
+    assert ocr.splice(tess, lines) == "top\nbottom"
+
+
 # --- real Vision -----------------------------------------------------------------------
 
 needs_vision = pytest.mark.skipif(
@@ -177,3 +333,27 @@ def test_real_vision_recovers_words_tesseract_lost_on_a_degraded_page(tmp_path):
     text, engine = ocr.ocr_image(path, cfg)
     assert engine == ocr.ENGINE_TESSERACT_VISION
     assert lost <= _words(text)
+
+
+def _rss_mb() -> float:
+    import resource
+
+    # ru_maxrss is bytes on macOS
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20
+
+
+@pytest.mark.slow
+@needs_vision
+@pytest.mark.skipif(sys.platform != "darwin", reason="the raw-CGImage leak is macOS's")
+def test_real_vision_over_a_hundred_pages_does_not_grow_the_process():
+    """Vision kept ~16-20 MB per page read from a raw CGImage; read from PNG bytes it is freed."""
+    font = ImageFont.truetype(_ARIAL, 44)
+    page = Image.new("L", (2480, 3508), 255)
+    draw = ImageDraw.Draw(page)
+    for i in range(30):
+        draw.text((150, 150 + 105 * i), f"Line {i + 1} delivery number {700 + i}", font=font)
+    ocr_vision.read_lines(page, 0, ["en-US"])  # the model loads once, outside the measure
+    before = _rss_mb()
+    for _ in range(100):
+        ocr_vision.read_lines(page, 0, ["en-US"])
+    assert _rss_mb() - before < 100

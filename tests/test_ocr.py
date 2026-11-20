@@ -908,7 +908,7 @@ def test_splice_keeps_a_line_vision_does_not_overlap():
     assert ocr.splice(tess, vision) == "alpha\nBETA"
 
 
-def test_splice_appends_what_only_vision_found_after_the_page_in_row_order():
+def test_splice_appends_what_only_vision_found_after_the_page_in_visions_own_order():
     tess = [_tess((0, 0, 100, 20), "alpha", True)]
     vision = [
         ocr.Line((0, 0, 100, 21), "ALPHA"),
@@ -916,7 +916,24 @@ def test_splice_appends_what_only_vision_found_after_the_page_in_row_order():
         ocr.Line((150, 100, 300, 120), "right"),
         ocr.Line((0, 102, 140, 118), "left"),
     ]
-    assert ocr.splice(tess, vision) == "ALPHA\n\nleft\nright\nbelow"
+    assert ocr.splice(tess, vision) == "ALPHA\n\nbelow\nright\nleft"
+
+
+def test_splice_does_not_interleave_the_columns_vision_read_one_after_the_other():
+    tess = [_tess((0, 0, 100, 20), "alpha", True)]
+    vision = [
+        ocr.Line((0, 100, 90, 120), "L1"),
+        ocr.Line((0, 140, 90, 160), "L2"),
+        ocr.Line((200, 100, 290, 120), "R1"),
+        ocr.Line((200, 140, 290, 160), "R2"),
+    ]
+    assert ocr.splice(tess, vision) == "alpha\n\nL1\nL2\nR1\nR2"
+
+
+def test_splice_keeps_every_tesseract_line_in_a_region_vision_read_nothing_of():
+    tess = [_tess((0, y, 100, y + 20), f"t{y}", y == 0) for y in (0, 40, 600, 640, 680)]
+    vision = [ocr.Line((0, 39, 100, 61), "V40")]
+    assert ocr.splice(tess, vision) == "t0\nV40\nt600\nt640\nt680"
 
 
 def test_splice_emits_one_vision_line_over_two_tesseract_lines_once():

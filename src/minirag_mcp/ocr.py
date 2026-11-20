@@ -225,8 +225,9 @@ def splice(tess_lines: Sequence[Line], vision_lines: Sequence[Line]) -> str:
     A Tesseract line Vision overlaps is replaced by the Vision lines over it not used
     yet, left to right, so a Vision line across two Tesseract lines comes out once; one
     Vision has nothing over is kept. Vision lines over no Tesseract line, text Tesseract
-    never found, follow the page as a paragraph of their own, row by row. Both readings
-    are boxed on the upright page: rows and left to right mean nothing on a sideways one.
+    never found, follow the page as a paragraph of their own in the order Vision gave
+    them. Both readings are boxed on the upright page: left to right means nothing on a
+    sideways one.
     """
     used: set[int] = set()
     out: list[str] = []
@@ -245,7 +246,7 @@ def splice(tess_lines: Sequence[Line], vision_lines: Sequence[Line]) -> str:
     rest = [seen for i, seen in enumerate(vision_lines) if i not in used]
     if rest and out:
         out.append("")
-    out.extend(seen.text for seen in _rows(rest))
+    out.extend(seen.text for seen in rest)
     return "\n".join(out)
 
 
@@ -256,22 +257,6 @@ def _same_line(a: Box, b: Box) -> bool:
     across = min(a[2], b[2]) - max(a[0], b[0])
     down = min(a[3], b[3]) - max(a[1], b[1])
     return across > 0 and down > min(a[3] - a[1], b[3] - b[1]) / 2
-
-
-def _rows(lines: Sequence[Line]) -> list[Line]:
-    """`lines` top to bottom and, within a row, left to right. A line joins a row when
-    its middle lies within the height of the row's first line."""
-
-    def middle(line: Line) -> float:
-        return (line.box[1] + line.box[3]) / 2
-
-    rows: list[list[Line]] = []
-    for line in sorted(lines, key=middle):
-        if rows and rows[-1][0].box[1] <= middle(line) <= rows[-1][0].box[3]:
-            rows[-1].append(line)
-        else:
-            rows.append([line])
-    return [line for row in rows for line in sorted(row, key=lambda line: line.box[0])]
 
 
 def _upright_box(box: Box, turns: int, size: tuple[int, int]) -> Box:

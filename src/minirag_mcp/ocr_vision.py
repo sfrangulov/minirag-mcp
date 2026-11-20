@@ -22,6 +22,10 @@ _LANGUAGES = {"rus": "ru-RU", "eng": "en-US"}  # ru-RU exists at the accurate le
 # halves, each reaching 15% of a half past the midline: a line cut by one edge is whole
 # in the other band.
 _BANDS = ((0.0, 0.575), (0.425, 1.0))
+# Vision reads the page at this share of its pixels (225 dpi for a 300-dpi render). Measured
+# against full size on real scans: fewer bands lose lines and the character error rate falls
+# no further; below it small text starts to go. Tesseract keeps the full-resolution page.
+_VISION_SCALE = 0.75
 
 
 class _Seen(NamedTuple):
@@ -57,11 +61,18 @@ def read_lines(image: Image.Image, turns: int, languages: list[str]) -> list[Lin
     import objc
     import Quartz
     import Vision
+    from PIL import Image
 
     from minirag_mcp.ocr import Line
 
     upright = image.rotate(90 * turns, expand=True) if turns else image
+    full_width, full_height = upright.size
+    upright = upright.resize(
+        (max(1, round(full_width * _VISION_SCALE)), max(1, round(full_height * _VISION_SCALE))),
+        Image.Resampling.LANCZOS,
+    )
     width, height = upright.size
+    across, down = full_width / width, full_height / height
     # A PNG, not a CGImage over the raw pixels: Vision keeps a copy of the region it read
     # out of such a CGImage, about 20 MB per band of an A4 page at 300 dpi, and never
     # frees it (measured with pyobjc 13). One it decodes from a PNG is freed.
@@ -85,7 +96,14 @@ def read_lines(image: Image.Image, turns: int, languages: list[str]) -> list[Lin
                     continue
                 found = observation.boundingBox()
                 normalised = (found.origin.x, found.origin.y, found.size.width, found.size.height)
-                seen.append(_Seen(band, _pixel_box(normalised, band, width), text))
+                x0, y0, x1, y1 = _pixel_box(normalised, band, width)
+                seen.append(
+                    _Seen(
+                        (band[0] * down, band[1] * down),
+                        (x0 * across, y0 * down, x1 * across, y1 * down),
+                        text,
+                    )
+                )
     return [Line(_page_box(line.box, turns, image.size), line.text) for line in _deduplicated(seen)]
 
 
