@@ -85,7 +85,7 @@ def test_cli_read_reconstructs_a_multi_chunk_table_like_the_server(corpus, capsy
     delimiter = "| --- | --- | --- |"
     rows = [
         f"| {i} | Показатель номер {i} по форме статистической отчетности | месяц |"
-        for i in range(30)
+        for i in range(50)
     ]
     doc = corpus / "table.md"
     doc.write_text(

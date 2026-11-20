@@ -26,7 +26,7 @@ from minirag_mcp.identity import PROBE_COSINE, PROBE_TEXT
 MINILM = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 E5_LARGE = "intfloat/multilingual-e5-large"
 MODEL_WINDOWS: dict[str, int] = {E5_LARGE: 512, MINILM: 128}
-DEFAULT_BUDGETS: dict[str, int] = {E5_LARGE: 110, MINILM: 110}
+DEFAULT_BUDGETS: dict[str, int] = {E5_LARGE: 250, MINILM: 110}
 # Looser than PROBE_COSINE: a quantized GGUF is the same model with slightly other
 # vectors, and an unrelated model sits near 0.
 REFERENCE_PROBE_COSINE = 0.99

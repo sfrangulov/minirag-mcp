@@ -23,7 +23,7 @@ import minirag_mcp.store as store_mod
 from conftest import FakeEmbedder
 from minirag_mcp.chunker import join_document
 from minirag_mcp.config import load_config
-from minirag_mcp.embedder import E5_LARGE, MINILM
+from minirag_mcp.embedder import E5_LARGE, MINILM, default_budget
 from minirag_mcp.handle import IndexHandle, RebuildPendingError
 from minirag_mcp.identity import (
     INDEX_FILE,
@@ -110,8 +110,15 @@ def parses(monkeypatch) -> Parses:
     return seen
 
 
+# Both models chunk at MiniLM's budget unless a test sets one, so switching between them
+# changes the embedding alone.
+SAME_BUDGET = str(default_budget(MINILM))
+
+
 def handle(root: Path, models: dict, model_factory=None, **env: str) -> IndexHandle:
-    config = load_config({"BASE_DIR": str(root), **env}, cwd=root)
+    config = load_config(
+        {"BASE_DIR": str(root), "CHUNK_TOKEN_BUDGET": SAME_BUDGET, **env}, cwd=root
+    )
     return IndexHandle(
         config, embedder_factory=lambda scheme: models[scheme.model], model_factory=model_factory
     )
@@ -496,7 +503,8 @@ def _crash(root: Path, crash_in: str) -> subprocess.CompletedProcess:
         "        os._exit(9)\n"
         f"models = {{{MINILM!r}: FakeEmbedder({MINILM!r}, salt='minilm'),\n"
         f"          {E5_LARGE!r}: Dying({E5_LARGE!r}, salt='e5')}}\n"
-        f"config = load_config({{'BASE_DIR': {str(root)!r}}}, cwd=Path({str(root)!r}))\n"
+        f"env = {{'BASE_DIR': {str(root)!r}, 'CHUNK_TOKEN_BUDGET': {SAME_BUDGET!r}}}\n"
+        f"config = load_config(env, cwd=Path({str(root)!r}))\n"
         "IndexHandle(config, embedder_factory=lambda s: models[s.model]).run_sync(None)\n"
     )
     unset = ("BASE_DIR", "BASE_DIRS", "DB_PATH", "MODEL_NAME", "CHUNK_TOKEN_BUDGET")

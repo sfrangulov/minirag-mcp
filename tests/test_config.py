@@ -23,6 +23,10 @@ def test_defaults_from_cwd(tmp_path):
     assert "minirag-mcp" in str(cfg.cache_dir)  # platformdirs cache, not cwd-relative
 
 
+def test_e5_default_budget_is_the_measured_one(tmp_path):
+    assert load_config({}, cwd=tmp_path).token_budget == 250  # g7q.1 notes, 2026-11
+
+
 def test_base_dir_env(tmp_path):
     cfg = load_config({"BASE_DIR": str(tmp_path)}, cwd=Path("/"))
     assert cfg.roots == (tmp_path.resolve(),)

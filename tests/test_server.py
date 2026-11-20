@@ -345,7 +345,7 @@ async def test_read_file_reconstructs_the_document_rather_than_concatenating_chu
     delimiter = "| --- | --- | --- |"
     rows = [
         f"| {i} | Показатель номер {i} по форме статистической отчетности | месяц |"
-        for i in range(30)
+        for i in range(50)
     ]
     doc = root / "table.md"
     doc.write_text(

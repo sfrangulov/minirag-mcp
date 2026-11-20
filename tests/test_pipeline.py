@@ -471,7 +471,7 @@ def test_chunks_carry_a_parent_id_scoped_to_their_source(pipe):
     f = root / "spec.md"
     f.write_text(
         "# 1 Хранение\n\n"
-        + " ".join(f"Правило {i} про хранение запасов." for i in range(40))
+        + " ".join(f"Правило {i} про хранение запасов." for i in range(120))
         + "\n\n# 2 Выдача\n\nКоротко про выдачу.",
         encoding="utf-8",
     )
@@ -496,7 +496,7 @@ def test_the_stored_chunks_respect_the_token_budget(pipe):
     counter = FakeEmbedder().count_tokens
     chunks = store.all_chunks(str(f))
     assert len(chunks) > 1
-    assert all(counter(c.text) <= 110 for c in chunks)
+    assert all(counter(c.text) <= p.config.token_budget for c in chunks)
 
 
 def test_a_smaller_budget_produces_more_chunks(tmp_path, fake_embedder):
