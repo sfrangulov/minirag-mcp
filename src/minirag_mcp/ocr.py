@@ -40,6 +40,11 @@ DPI = 300
 # A page Tesseract reads with a lower mean word confidence is read again by Apple Vision
 # where it exists. RAG_OCR_SECOND_READER_BELOW overrides it, in percent.
 SECOND_READER_BELOW = 0.85
+# A Vision line that shares a line with several Tesseract lines reads each one it covers
+# this share of in height. Over the two halves of a line Tesseract split it covers about
+# 90% of each; on a page tilted about 2 degrees a full-width line's box at 300 dpi is over
+# two line pitches tall, and covers about half of each neighbour's.
+_SPLICE_COVER = 0.75
 
 Box = tuple[float, float, float, float]  # left, top, right, bottom; pixels from the top left
 
@@ -222,21 +227,22 @@ def _read(
 def splice(tess_lines: Sequence[Line], vision_lines: Sequence[Line]) -> str:
     """Tesseract's lines in Tesseract's order, each as Vision read it.
 
-    A Tesseract line Vision overlaps is replaced by the Vision lines over it not used
-    yet, left to right, so a Vision line across two Tesseract lines comes out once; one
-    Vision has nothing over is kept. Vision lines over no Tesseract line, text Tesseract
+    A Tesseract line is replaced by the Vision lines that read it and are not used yet,
+    left to right, so a Vision line across two Tesseract lines comes out once; one no
+    Vision line reads is kept. Vision lines that read no Tesseract line, text Tesseract
     never found, follow the page as a paragraph of their own in the order Vision gave
     them. Both readings are boxed on the upright page: left to right means nothing on a
     sideways one.
     """
+    reads = [_read_by(seen.box, tess_lines) for seen in vision_lines]
     used: set[int] = set()
     out: list[str] = []
     paragraph = False
-    for line in tess_lines:
-        over = [i for i, seen in enumerate(vision_lines) if _same_line(line.box, seen.box)]
-        fresh = sorted(set(over) - used, key=lambda i: vision_lines[i].box[0])
-        texts = [vision_lines[i].text for i in fresh] if over else [line.text]
-        used.update(over)
+    for t, line in enumerate(tess_lines):
+        readings = [i for i, lines in enumerate(reads) if t in lines]
+        fresh = sorted(set(readings) - used, key=lambda i: vision_lines[i].box[0])
+        texts = [vision_lines[i].text for i in fresh] if readings else [line.text]
+        used.update(readings)
         paragraph = paragraph or line.starts_paragraph
         if texts:
             if paragraph and out:
@@ -248,6 +254,22 @@ def splice(tess_lines: Sequence[Line], vision_lines: Sequence[Line]) -> str:
         out.append("")
     out.extend(seen.text for seen in rest)
     return "\n".join(out)
+
+
+def _read_by(box: Box, tess_lines: Sequence[Line]) -> set[int]:
+    """The Tesseract lines a Vision line boxed `box` reads: the only one it shares a line
+    with, or of several, each it covers `_SPLICE_COVER` of. On a tilted page a box reaches
+    over its neighbours, and a line Vision missed must not go out as a neighbour's reading."""
+    shared = [t for t, line in enumerate(tess_lines) if _same_line(line.box, box)]
+    if len(shared) == 1:
+        return set(shared)
+    return {t for t in shared if _covered(tess_lines[t].box, box) >= _SPLICE_COVER}
+
+
+def _covered(a: Box, b: Box) -> float:
+    """The share of `a`'s height `b` covers; `a` is one `b` shares a line with, so it has
+    a height."""
+    return (min(a[3], b[3]) - max(a[1], b[1])) / (a[3] - a[1])
 
 
 def _same_line(a: Box, b: Box) -> bool:

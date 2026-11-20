@@ -124,6 +124,7 @@ class _FakeVision:
     def __init__(self, script, page_size):
         self.script, self.page_size = script, page_size
         self.received: tuple[int, int] | None = None
+        self.image: Image.Image | None = None
 
     def install(self, monkeypatch):
         fake = self
@@ -157,7 +158,8 @@ class _FakeVision:
                 return cls()
 
             def initWithData_options_(self, data, options):
-                fake.received = Image.open(io.BytesIO(data)).size
+                fake.image = Image.open(io.BytesIO(data))
+                fake.received = fake.image.size
                 return self
 
             def performRequests_error_(self, requests, error):
@@ -221,6 +223,18 @@ def test_vision_reads_a_copy_three_quarters_the_size_and_its_boxes_land_in_full_
     assert fake.received == (1500, 2100)
     [line] = lines
     assert line.box == pytest.approx(box, abs=2)
+
+
+def test_a_bilevel_page_keeps_its_thinnest_strokes_in_visions_smaller_copy(monkeypatch):
+    """Pillow scales a mode "1" image by nearest neighbour whatever it is asked for, which
+    drops every fourth row at 0.75: a fax's one-pixel stroke on such a row would vanish."""
+    fake = _FakeVision([[], []], (2000, 2800))
+    fake.install(monkeypatch)
+    page = Image.new("1", (2000, 2800), 255)
+    ImageDraw.Draw(page).line((100, 1001, 1900, 1001), fill=0)
+    assert page.resize((1500, 2100), Image.Resampling.LANCZOS).getextrema() == (255, 255)
+    _READ_LINES(page, 0, ["en-US"])
+    assert fake.image.getextrema()[0] < 128
 
 
 @pytest.mark.parametrize("turns", [1, 2, 3])

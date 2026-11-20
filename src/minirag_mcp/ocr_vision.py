@@ -66,6 +66,10 @@ def read_lines(image: Image.Image, turns: int, languages: list[str]) -> list[Lin
     from minirag_mcp.ocr import Line
 
     upright = image.rotate(90 * turns, expand=True) if turns else image
+    if upright.mode == "1":
+        # Pillow scales a bilevel image by nearest neighbour whatever filter it is given,
+        # which at 0.75 drops every fourth row and column, one-pixel strokes with them.
+        upright = upright.convert("L")
     full_width, full_height = upright.size
     upright = upright.resize(
         (max(1, round(full_width * _VISION_SCALE)), max(1, round(full_height * _VISION_SCALE))),

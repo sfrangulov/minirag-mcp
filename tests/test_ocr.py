@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import random
 import sys
 import threading
 import time
@@ -981,6 +982,47 @@ def test_lines_overlap_by_more_than_half_the_smaller_height(top, same):
 
 def test_splice_of_nothing_is_empty():
     assert ocr.splice([], []) == ""
+
+
+def _tilted(k: int) -> tuple[int, int, int, int]:
+    """Line `k` of a page tilted about 2 degrees, at a 60 px pitch: at 300 dpi its
+    full-width box is 130 px tall, and reaches more than halfway into each neighbour's."""
+    return (0, 60 * k, 2400, 60 * k + 130)
+
+
+def test_splice_keeps_a_line_only_tesseract_read_on_a_tilted_page():
+    tess = [_tess(_tilted(k), f"t{k}", k == 0) for k in range(6)]
+    vision = [ocr.Line(_tilted(k), f"V{k}") for k in range(6) if k != 3]
+    assert ocr.splice(tess, vision) == "V0\nV1\nV2\nt3\nV4\nV5"
+
+
+def test_a_vision_line_no_tesseract_line_is_clearly_read_by_follows_the_page():
+    """Tesseract missed line 2 and Vision line 1: Vision's line 2 covers half of each
+    Tesseract line beside it, and reads neither."""
+    tess = [_tess(_tilted(k), f"t{k}", k == 0) for k in (0, 1, 3)]
+    vision = [ocr.Line(_tilted(k), f"V{k}") for k in (0, 2)]
+    assert ocr.splice(tess, vision) == "V0\nt1\nt3\n\nV2"
+
+
+def test_splice_loses_and_repeats_no_line_from_flat_pages_to_tilted_ones():
+    """Boxes from 0.6 to 3.2 pitches tall (flat to about 3 degrees), each line boxed a few
+    pixels apart by the two readers, and a third of the lines unread by Vision: every line
+    comes out once, in order, as Vision read it where it did."""
+    rng = random.Random(0)
+    for _ in range(300):
+        pitch = rng.randint(40, 70)
+        height = round(pitch * rng.uniform(0.6, 3.2))
+        tess, vision, expected = [], [], []
+        for k in range(rng.randint(2, 12)):
+            box = (rng.randint(0, 40), k * pitch, 2400 - rng.randint(0, 40), k * pitch + height)
+            tess.append(_tess(box, f"t{k}", k == 0))
+            if rng.random() < 2 / 3:
+                seen = tuple(edge + rng.randint(-3, 3) for edge in box)
+                vision.append(ocr.Line(seen, f"V{k}"))
+                expected.append(f"V{k}")
+            else:
+                expected.append(f"t{k}")
+        assert ocr.splice(tess, vision) == "\n".join(expected), (pitch, height)
 
 
 def _font(size: int = 44) -> ImageFont.FreeTypeFont:
