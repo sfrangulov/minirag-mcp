@@ -39,8 +39,7 @@ from minirag_mcp.results import (
     run_query,
     with_index,
 )
-from minirag_mcp.security import SecurityError, resolve_in_roots
-from minirag_mcp.store import IndexBusyError
+from minirag_mcp.security import SecurityError
 
 app = App(name="minirag-mcp", version=__version__)
 
@@ -160,8 +159,17 @@ def _open(
     db_path: str | None,
     cache_dir: str | None,
     model_name: str | None,
-) -> tuple[IndexEntry, OpenIndex]:
-    return _open_in(_registry(base_dir, db_path, cache_dir, model_name), use)
+) -> tuple[IndexRegistry, IndexEntry, OpenIndex]:
+    registry = _registry(base_dir, db_path, cache_dir, model_name)
+    return (registry, *_open_in(registry, use))
+
+
+def _inside(registry: IndexRegistry, entry: IndexEntry, path: str) -> Path:
+    try:
+        return registry.in_roots(_CONNECTION, entry, path, require_absolute=False)
+    except (SecurityError, IndexRefused) as e:
+        _fail(str(e))
+        raise AssertionError from e  # unreachable
 
 
 def _emit(payload: dict, as_json: bool, human: str) -> None:
@@ -240,7 +248,7 @@ def ingest(
     json: JsonFlag = False,
 ):
     """Ingest files or directories (recursive)."""
-    entry, opened = _open(Use.INGEST, base_dir, db_path, cache_dir, model_name)
+    registry, entry, opened = _open(Use.INGEST, base_dir, db_path, cache_dir, model_name)
     cfg, pipeline = entry.config, opened.pipeline
     files: list[Path] = []
     # Already held to the rules by their scan; only files named directly are checked again.
@@ -249,7 +257,7 @@ def ingest(
     failures: list[dict] = []
     try:
         for raw in paths:
-            p = resolve_in_roots(raw, cfg.roots, require_absolute=False)
+            p = registry.in_roots(_CONNECTION, entry, raw, require_absolute=False)
             blind: list[tuple[Path, str | None]] = []
             if (
                 p.is_dir()
@@ -281,14 +289,15 @@ def ingest(
                 if resolved not in seen:
                     seen.add(resolved)
                     files.append(c)
-    except Exception as e:  # SecurityError or a scan-time filesystem error
+    except Exception as e:  # a path outside the roots, or a scan-time filesystem error
         _fail(str(e))
     done: list[IngestResult] = []
     # One job, so the model is loaded once for the whole run, not once per file.
     with pipeline.job() as report:
         for f in files:
             try:
-                done.append(pipeline.ingest_file(f, rules_checked=f in scanned))
+                with registry.refusals(_CONNECTION, entry):
+                    done.append(pipeline.ingest_file(f, rules_checked=f in scanned))
             except Exception as e:  # per-file failures never abort the batch
                 failures.append({"source": str(f), "error": str(e)})
     notes = entry.handle.notes()
@@ -317,10 +326,10 @@ def ingest_url(
     json: JsonFlag = False,
 ):
     """Fetch an http(s) URL and index it."""
-    entry, opened = _open(Use.INGEST, base_dir, db_path, cache_dir, model_name)
+    registry, entry, opened = _open(Use.INGEST, base_dir, db_path, cache_dir, model_name)
     pipeline = opened.pipeline
     try:
-        with pipeline.job() as report:
+        with pipeline.job() as report, registry.refusals(_CONNECTION, entry):
             r = pipeline.ingest_url(url, source=source, title=title)
     except Exception as e:
         _fail(str(e))
@@ -346,19 +355,14 @@ def sync(
     configuration changed since it was built ("rebuild pending" in status) is rebuilt by a
     sync without a path, and a sync with one is refused.
     """
-    registry = _registry(base_dir, db_path, cache_dir, model_name)
-    entry, _ = _open_in(registry, Use.SYNC)
-    scope = None
-    if path is not None:
-        try:
-            scope = resolve_in_roots(path, entry.config.roots, require_absolute=False)
-        except SecurityError as e:
-            _fail(str(e))
+    registry, entry, _ = _open(Use.SYNC, base_dir, db_path, cache_dir, model_name)
+    scope = None if path is None else _inside(registry, entry, path)
     try:
         with registry.refusals(_CONNECTION, entry):
-            counts, errors, rebuilt = entry.handle.run_sync(
-                scope, on_event=lambda m: print(m, file=sys.stderr)
-            )
+            lock = entry.handle.admit_sync(scope)
+        counts, errors, rebuilt = entry.handle.run_admitted(
+            scope, lock, on_event=lambda m: print(m, file=sys.stderr)
+        )
     except Exception as e:  # a refusal, a busy lock, a rebuild that stopped before its swap
         _fail(str(e))
         raise AssertionError from e  # unreachable
@@ -399,7 +403,7 @@ def query(
     if top_k < 1:
         _fail(f"--top-k must be at least 1, got {top_k}")
     labels = _parse_labels(label)
-    entry, opened = _open(Use.READ, base_dir, db_path, cache_dir, model_name)
+    _, entry, opened = _open(Use.READ, base_dir, db_path, cache_dir, model_name)
     cfg = entry.config
     try:
         payload = run_query(
@@ -489,7 +493,7 @@ def find(
     starts with a dash goes after `--`, and every option before it.
     """
     labels = _parse_labels(label)
-    entry, opened = _open(Use.READ, base_dir, db_path, cache_dir, model_name)
+    _, entry, opened = _open(Use.READ, base_dir, db_path, cache_dir, model_name)
     cfg = entry.config
     try:
         payload = run_find(
@@ -527,13 +531,9 @@ def read_neighbors(
     json: JsonFlag = False,
 ):
     """Read chunks around a given chunk index."""
-    entry, opened = _open(Use.READ, base_dir, db_path, cache_dir, model_name)
-    cfg = entry.config
+    registry, entry, opened = _open(Use.READ, base_dir, db_path, cache_dir, model_name)
     if file_path is not None:
-        try:
-            key = str(resolve_in_roots(file_path, cfg.roots, require_absolute=False))
-        except SecurityError as e:
-            _fail(str(e))
+        key = str(_inside(registry, entry, file_path))
     elif source is not None:
         key = source
     else:
@@ -567,13 +567,9 @@ def read(
     chunk repeats to carry it into its own vector is emitted once, where the document
     had it.
     """
-    entry, opened = _open(Use.READ, base_dir, db_path, cache_dir, model_name)
-    cfg = entry.config
+    registry, entry, opened = _open(Use.READ, base_dir, db_path, cache_dir, model_name)
     if path is not None:
-        try:
-            key = str(resolve_in_roots(path, cfg.roots, require_absolute=False))
-        except SecurityError as e:
-            _fail(str(e))
+        key = str(_inside(registry, entry, path))
     elif source is not None:
         key = source
     else:
@@ -621,7 +617,7 @@ def list_cmd(
     named in a warning on stderr and in unlistedFolders with --json.
     """
     labels = _parse_labels(label)
-    entry, opened = _open(Use.READ, base_dir, db_path, cache_dir, model_name)
+    _, entry, opened = _open(Use.READ, base_dir, db_path, cache_dir, model_name)
     cfg = entry.config
     try:
         payload = list_payload(
@@ -694,20 +690,17 @@ def delete(
     json: JsonFlag = False,
 ):
     """Delete an indexed file (by path) or data/url item (by --source)."""
-    entry, opened = _open(Use.READ, base_dir, db_path, cache_dir, model_name)
-    cfg = entry.config
+    registry, entry, opened = _open(Use.READ, base_dir, db_path, cache_dir, model_name)
     if path is not None:
-        try:
-            key = str(resolve_in_roots(path, cfg.roots, require_absolute=False))
-        except SecurityError as e:
-            _fail(str(e))
+        key = str(_inside(registry, entry, path))
     elif source is not None:
         key = source
     else:
         _fail("provide a path or --source")
     try:
-        deleted = opened.store.delete_source(key)
-    except IndexBusyError as e:  # a rebuild runs, or swapped another index in meanwhile
+        with registry.refusals(_CONNECTION, entry):
+            deleted = opened.store.delete_source(key)
+    except IndexRefused as e:  # a rebuild runs, or swapped another index in meanwhile
         _fail(str(e))
         raise AssertionError from e  # unreachable
     if deleted == 0:
@@ -737,11 +730,10 @@ def classify_try(
 
     Nothing is embedded or stored.
     """
-    entry, opened = _open(Use.READ, base_dir, db_path, cache_dir, model_name)
-    cfg = entry.config
+    registry, entry, opened = _open(Use.READ, base_dir, db_path, cache_dir, model_name)
     pipeline = opened.pipeline
     try:
-        target = resolve_in_roots(path, cfg.roots, require_absolute=False)
+        target = registry.in_roots(_CONNECTION, entry, path, require_absolute=False)
         preview = pipeline.preview_labels(target)
     except Exception as e:  # labels off, a path outside the roots, a file it cannot read
         _fail(str(e))

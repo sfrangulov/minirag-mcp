@@ -11,13 +11,13 @@ import time
 import pytest
 from fastmcp import Client
 
+from conftest import SYNC_POLL_SECONDS, SYNC_TIMEOUT_SECONDS, await_sync
 from index_helpers import file_registry
 from minirag_mcp import ocr, parallel
 from minirag_mcp.embedder import E5_LARGE, MINILM
 from minirag_mcp.identity import IndexState
 from minirag_mcp.registry import Connection
 from minirag_mcp.server import create_app
-from test_server import SYNC_POLL_SECONDS, SYNC_TIMEOUT_SECONDS, await_sync
 
 
 @pytest.fixture
@@ -70,11 +70,119 @@ async def test_a_named_index_takes_reads_and_writes(make, indexes_file):
     assert [s["source"] for s in default["sources"]] == [str(alpha_md)]
 
 
-async def test_a_file_outside_the_default_indexs_roots_is_refused(make, indexes_file):
+# How each tool that takes a path is handed one.
+PATH_ARGS = {
+    "sync_start": lambda path: {"path": path},
+    "ingest_file": lambda path: {"filePath": path},
+    "read_chunk_neighbors": lambda path: {"filePath": path, "chunkIndex": 0},
+    "read_file": lambda path: {"filePath": path},
+    "delete_file": lambda path: {"filePath": path},
+}
+
+
+@pytest.mark.parametrize("tool", sorted(PATH_ARGS))
+async def test_a_file_under_another_reachable_index_is_refused_naming_it(make, indexes_file, tool):
     beta_md = indexes_file.roots["beta"] / "beta.md"
     async with Client(make()) as c:
-        r = await c.call_tool("ingest_file", {"filePath": str(beta_md)}, raise_on_error=False)
-    assert "outside" in _text(r)
+        r = await c.call_tool(tool, PATH_ARGS[tool](str(beta_md)), raise_on_error=False)
+    assert _text(r) == (
+        f"Index 'alpha': {beta_md} is outside its roots ({indexes_file.roots['alpha']}) but "
+        "under those of index 'beta': pass index=\"beta\" to reach it. Other reachable "
+        "indexes: beta, gamma."
+    )
+
+
+async def test_a_file_under_no_reachable_index_is_refused_naming_where_roots_are_set(
+    make, indexes_file
+):
+    alpha = indexes_file.roots["alpha"]
+    beta_md = indexes_file.roots["beta"] / "beta.md"
+    async with Client(make(default="alpha", allow=frozenset())) as c:
+        hidden = await c.call_tool("read_file", {"filePath": str(beta_md)}, raise_on_error=False)
+    async with Client(make()) as c:
+        nowhere = await c.call_tool(
+            "ingest_file", {"filePath": str(indexes_file.path)}, raise_on_error=False
+        )
+    remedy = (
+        "and no other index this connection may use holds it; a folder is reached by adding "
+        f"it to an index's roots in {indexes_file.path}."
+    )
+    assert _text(hidden) == f"Index 'alpha': {beta_md} is outside its roots ({alpha}), {remedy}"
+    assert _text(nowhere) == (
+        f"Index 'alpha': {indexes_file.path} is outside its roots ({alpha}), {remedy} Other "
+        "reachable indexes: beta, gamma."
+    )
+
+
+def _every_tool(path: str) -> dict[str, dict]:
+    """Arguments each tool but list_indexes is called with: valid, but for the index."""
+    return {
+        "sync_start": {},
+        "sync_status": {"jobId": "0"},
+        "ingest_file": {"filePath": path},
+        "ingest_data": {"data": "x", "source": "s"},
+        "ingest_url": {"url": "https://example.com/x"},
+        "query_documents": {"query": "x"},
+        "find_mentions": {"terms": "x"},
+        "read_chunk_neighbors": {"filePath": path, "chunkIndex": 0},
+        "read_file": {"filePath": path},
+        "list_files": {},
+        "delete_file": {"filePath": path},
+        "status": {},
+    }
+
+
+async def test_the_allow_list_test_calls_every_tool(make):
+    async with Client(make()) as c:
+        served = {t.name for t in await c.list_tools()}
+    assert set(_every_tool("")) == served - {"list_indexes"}
+
+
+@pytest.mark.parametrize("tool", sorted(_every_tool("")))
+async def test_every_tool_refuses_an_index_outside_the_allow_list_and_never_opens_it(
+    make, indexes_file, fake_embedder, tool
+):
+    made = []
+
+    def factory(config, scheme):
+        made.append(config.index_name)
+        return fake_embedder
+
+    gamma_md = indexes_file.roots["gamma"] / "gamma.md"
+    args = {**_every_tool(str(gamma_md))[tool], "index": "gamma"}
+    async with Client(make(allow=frozenset({"beta"}), factory=factory)) as c:
+        r = await c.call_tool(tool, args, raise_on_error=False)
+    assert _text(r) == (
+        "Index 'gamma' is not allowed on this connection (allow=beta). Reachable indexes: "
+        "alpha, beta."
+    )
+    assert "gamma" not in made and not (indexes_file.roots["gamma"] / ".minirag").exists()
+
+
+async def test_a_write_during_a_rebuild_is_refused_naming_the_index_and_the_others(
+    make, indexes_file
+):
+    from minirag_mcp.identity import begin_staging
+    from minirag_mcp.lock import sync_lock
+
+    beta_md = str(indexes_file.roots["beta"] / "beta.md")
+    db = indexes_file.roots["beta"] / ".minirag" / "v2"
+    async with Client(make()) as c:
+        await c.call_tool("ingest_file", {"filePath": beta_md, "index": "beta"})
+        with sync_lock(db):
+            begin_staging(db)
+            refused = [
+                await c.call_tool(tool, {**args, "index": "beta"}, raise_on_error=False)
+                for tool, args in (
+                    ("ingest_file", {"filePath": beta_md}),
+                    ("ingest_data", {"data": "x", "source": "s"}),
+                    ("delete_file", {"filePath": beta_md}),
+                )
+            ]
+    for r in refused:
+        text = _text(r)
+        assert text.startswith(f"Index 'beta': {db} is being rebuilt into "), text
+        assert text.endswith(" sync finished. Other reachable indexes: alpha, gamma."), text
 
 
 async def test_refusals_reach_the_client_naming_the_reachable_indexes(make):
@@ -282,16 +390,17 @@ async def test_a_sync_waiting_for_another_indexs_workers_says_so(make, indexes_f
         )
     )
     async with Client(make()) as c:
-        # What another index's sync holds while its workers run.
-        parallel._POOL_GATE.acquire()
         try:
-            job = (await c.call_tool("sync_start", {})).data["jobId"]
-            waiting = await _poll(c, job, lambda st: st["waiting"])
-        finally:
-            parallel._POOL_GATE.release()
-        try:
+            # What another index's sync holds while its workers run.
+            parallel._POOL_GATE.acquire()
+            try:
+                job = (await c.call_tool("sync_start", {})).data["jobId"]
+                waiting = await _poll(c, job, lambda st: st["waiting"])
+            finally:
+                parallel._POOL_GATE.release()
             started = await _poll(c, job, lambda st: not st["waiting"])
         finally:
+            # Else the job's thread holds the gate, and every later pool waits for it.
             go.set()
         done = await await_sync(c, job)
     assert (waiting["state"], waiting["waiting"]) == ("running", parallel.POOL_WAIT)

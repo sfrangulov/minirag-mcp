@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import ipaddress
 import json
@@ -16,6 +17,7 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
 import pytest
@@ -39,6 +41,9 @@ from minirag_mcp.identity import (
 )
 from minirag_mcp.labels.model import ModelError
 from minirag_mcp.labels.taxonomy import ModelSpec
+
+if TYPE_CHECKING:
+    from fastmcp import Client
 
 PUBLIC_IP = "93.184.216.34"
 # The name the redirect guard must refuse, and the address it stands for. The address
@@ -110,6 +115,37 @@ class FakeEmbedder:
 
     def has_local_copy(self) -> bool:
         return True
+
+
+SYNC_TIMEOUT_SECONDS = 30.0
+SYNC_POLL_SECONDS = 0.02
+
+
+async def await_sync(client: Client, job_id: str, index: str | None = None) -> dict:
+    """Poll `sync_status` until the job reaches a terminal state, and return it.
+
+    Bounded by wall-clock time rather than by an attempt count: sync runs on a
+    background thread, so how many polls fit before it finishes is a property of
+    the machine, not of the job. A fixed number of no-wait iterations passes on a
+    fast laptop and races on a loaded CI runner — a bigger number would only move
+    the threshold, not remove it. Yielding between polls also lets the event loop
+    run, so this finishes as soon as the job does and costs one poll interval
+    locally.
+    """
+    deadline = time.monotonic() + SYNC_TIMEOUT_SECONDS
+    st: dict | None = None
+    args = {"jobId": job_id} if index is None else {"jobId": job_id, "index": index}
+    while True:
+        st = (await client.call_tool("sync_status", args)).data
+        if st["state"] in ("succeeded", "failed"):
+            return st
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                f"sync job {job_id} did not finish within {SYNC_TIMEOUT_SECONDS:g}s; "
+                f"last state={st['state']!r} counts={st['counts']} "
+                f"errors={st['errors']} error={st['error']!r}"
+            )
+        await asyncio.sleep(SYNC_POLL_SECONDS)
 
 
 @pytest.fixture

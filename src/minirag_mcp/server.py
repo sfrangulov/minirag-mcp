@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable, Mapping
+from contextlib import AbstractContextManager
 from functools import wraps
 from pathlib import Path
 from typing import Annotated, Literal
@@ -38,7 +39,6 @@ from minirag_mcp.results import (
     run_query,
     with_index,
 )
-from minirag_mcp.security import resolve_in_roots
 
 INDEX_ARG_DOC = (
     "Which index to use. Omit it for this connection's default; name another only when the "
@@ -110,6 +110,12 @@ def create_app(
         registry.refresh()
         return registry.open(current_connection(fallback), index, use)
 
+    def refusing(entry: IndexEntry) -> AbstractContextManager[None]:
+        return registry.refusals(current_connection(fallback), entry)
+
+    def inside(entry: IndexEntry, path: str) -> Path:
+        return registry.in_roots(current_connection(fallback), entry, path)
+
     def guard(fn):
         @wraps(fn)
         def inner(*args, **kwargs):
@@ -154,18 +160,16 @@ def create_app(
         The reply's `index` is where the job runs; pass it to sync_status when it is not
         the default.
         """
-        registry.refresh()
-        connection = current_connection(fallback)
-        entry, c = registry.open(connection, index, Use.SYNC)
+        entry, c = opened(index, Use.SYNC)
         scope = None
         if path is not None:
-            scope = resolve_in_roots(path, c.config.roots)
+            scope = inside(entry, path)
             by = scope_excluded_by(
                 scope, c.config.roots, c.config.exclude, exclude_source=c.config.exclude_source
             )
             if by is not None:
                 raise ToolError(f"{scope} is excluded by {by}; nothing under it can be synced")
-        with registry.refusals(connection, entry):
+        with refusing(entry):
             job_id = entry.handle.start_sync(scope)
         return with_index({"jobId": job_id}, entry)
 
@@ -268,8 +272,10 @@ def create_app(
         above MAX_FILE_SIZE or a table above RAG_MAX_TABLE_ROWS data rows.
         """
         entry, c = opened(index, Use.INGEST)
-        path = resolve_in_roots(filePath, c.config.roots)
-        return with_index(ingest_reply(c.pipeline.ingest_file(path), entry.handle.notes()), entry)
+        path = inside(entry, filePath)
+        with refusing(entry):
+            done = c.pipeline.ingest_file(path)
+        return with_index(ingest_reply(done, entry.handle.notes()), entry)
 
     @mcp.tool
     @guard
@@ -290,11 +296,9 @@ def create_app(
         ingest_file.
         """
         entry, c = opened(index, Use.INGEST)
-        reply = ingest_reply(
-            c.pipeline.ingest_data(data, source=source, fmt=format, title=title),
-            entry.handle.notes(),
-        )
-        return with_index(reply, entry)
+        with refusing(entry):
+            done = c.pipeline.ingest_data(data, source=source, fmt=format, title=title)
+        return with_index(ingest_reply(done, entry.handle.notes()), entry)
 
     @mcp.tool
     @guard
@@ -313,10 +317,9 @@ def create_app(
         are as in ingest_file.
         """
         entry, c = opened(index, Use.INGEST)
-        reply = ingest_reply(
-            c.pipeline.ingest_url(url, source=source, title=title), entry.handle.notes()
-        )
-        return with_index(reply, entry)
+        with refusing(entry):
+            done = c.pipeline.ingest_url(url, source=source, title=title)
+        return with_index(ingest_reply(done, entry.handle.notes()), entry)
 
     @mcp.tool
     @guard
@@ -498,7 +501,7 @@ def create_app(
         """
         entry, c = opened(index, Use.READ)
         if filePath is not None:
-            key = str(resolve_in_roots(filePath, c.config.roots))
+            key = str(inside(entry, filePath))
         elif source is not None:
             key = source
         else:
@@ -527,7 +530,7 @@ def create_app(
         entry, c = opened(index, Use.READ)
         not_indexed_hint = ""
         if filePath is not None:
-            key = str(resolve_in_roots(filePath, c.config.roots))
+            key = str(inside(entry, filePath))
             p = Path(key)
             if not p.exists():
                 raise ToolError(f"File does not exist: {key}")
@@ -620,12 +623,13 @@ def create_app(
         """
         entry, c = opened(index, Use.READ)
         if filePath is not None:
-            key = str(resolve_in_roots(filePath, c.config.roots))
+            key = str(inside(entry, filePath))
         elif source is not None:
             key = source
         else:
             raise ToolError("Provide filePath or source")
-        deleted = c.store.delete_source(key)
+        with refusing(entry):
+            deleted = c.store.delete_source(key)
         if deleted == 0:
             raise ToolError(f"Source not found in index: {key}")
         return with_index({"source": key, "deletedChunks": deleted}, entry)

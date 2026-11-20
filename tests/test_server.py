@@ -1,11 +1,8 @@
-import asyncio
-import time
-
 import pytest
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
-from conftest import stamp_identity
+from conftest import await_sync, stamp_identity
 from minirag_mcp import ocr
 from minirag_mcp.chunker import SCHEME_VERSION
 from minirag_mcp.config import load_config
@@ -14,36 +11,6 @@ from minirag_mcp.server import create_app
 from minirag_mcp.store import MAX_TOP_K, ChunkRecord, Store
 
 # pytest-asyncio runs in auto mode (see pyproject) — bare `async def` tests are collected as-is.
-
-SYNC_TIMEOUT_SECONDS = 30.0
-SYNC_POLL_SECONDS = 0.02
-
-
-async def await_sync(client: Client, job_id: str, index: str | None = None) -> dict:
-    """Poll `sync_status` until the job reaches a terminal state, and return it.
-
-    Bounded by wall-clock time rather than by an attempt count: sync runs on a
-    background thread, so how many polls fit before it finishes is a property of
-    the machine, not of the job. A fixed number of no-wait iterations passes on a
-    fast laptop and races on a loaded CI runner — a bigger number would only move
-    the threshold, not remove it. Yielding between polls also lets the event loop
-    run, so this finishes as soon as the job does and costs one poll interval
-    locally.
-    """
-    deadline = time.monotonic() + SYNC_TIMEOUT_SECONDS
-    st: dict | None = None
-    args = {"jobId": job_id} if index is None else {"jobId": job_id, "index": index}
-    while True:
-        st = (await client.call_tool("sync_status", args)).data
-        if st["state"] in ("succeeded", "failed"):
-            return st
-        if time.monotonic() >= deadline:
-            raise AssertionError(
-                f"sync job {job_id} did not finish within {SYNC_TIMEOUT_SECONDS:g}s; "
-                f"last state={st['state']!r} counts={st['counts']} "
-                f"errors={st['errors']} error={st['error']!r}"
-            )
-        await asyncio.sleep(SYNC_POLL_SECONDS)
 
 
 @pytest.fixture

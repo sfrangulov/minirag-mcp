@@ -30,7 +30,8 @@ from minirag_mcp.identity import EmbeddingScheme, IdentityError, IndexState, rea
 from minirag_mcp.indexes import ServerConfig, load_server_config
 from minirag_mcp.labels.labeler import ModelFactory
 from minirag_mcp.lock import SyncLockBusy
-from minirag_mcp.store import IndexOpenError
+from minirag_mcp.security import OutsideRootsError, resolve_in_roots, within
+from minirag_mcp.store import IndexBusyError, IndexOpenError
 from minirag_mcp.sync import SyncBusyError, SyncJob
 
 SINGLE_INDEX_NAME = "default"
@@ -468,11 +469,13 @@ class IndexRegistry:
 
     @contextmanager
     def refusals(self, connection: Connection, entry: IndexEntry) -> Iterator[None]:
-        """Refusals the handle of `entry` raises in the block, named as `open` names its
-        own: a sync it does not start, an index it cannot serve as it stands."""
+        """Refusals raised in the block, named as `open` names its own: a sync the handle of
+        `entry` does not start, a write its store turns away, an index it cannot serve as
+        it stands, and, in file mode, a path outside its roots. A block holds only what
+        precedes work: a failure of the work itself is not a refusal."""
         try:
             yield
-        except (RebuildPendingError, SyncBusyError, SyncLockBusy) as e:
+        except (RebuildPendingError, SyncBusyError, SyncLockBusy, IndexBusyError) as e:
             others = self._others(self._snapshot(), connection, entry.name)
             why = str(e)
             if isinstance(e, SyncLockBusy) and self.path is not None:
@@ -481,3 +484,39 @@ class IndexRegistry:
         except IndexUnavailableError as e:
             others = self._others(self._snapshot(), connection, entry.name)
             raise IndexUnavailable(entry.name, _reason(e), others) from e
+        except OutsideRootsError as e:
+            # The environment's text names BASE_DIRS, which configures that one index.
+            if self.path is None:
+                raise
+            raise self._outside(connection, entry, e) from e
+
+    def _outside(
+        self, connection: Connection, entry: IndexEntry, error: OutsideRootsError
+    ) -> IndexRefused:
+        """A path outside the roots of `entry`, and the reachable index whose roots hold it:
+        the one a call that forgot `index` meant."""
+        entries = self._snapshot()
+        others = self._others(entries, connection, entry.name)
+        roots = ", ".join(str(root) for root in entry.config.roots)
+        why = f"{error.requested} is outside its roots ({roots})"
+        holder = next((n for n in others if within(error.path, entries[n].config.roots)), None)
+        if holder is not None:
+            why += f' but under those of index {holder!r}: pass index="{holder}" to reach it'
+        else:
+            why += (
+                ", and no other index this connection may use holds it; a folder is reached "
+                f"by adding it to an index's roots in {self.path}"
+            )
+        return _refused(entry.name, why, others)
+
+    def in_roots(
+        self,
+        connection: Connection,
+        entry: IndexEntry,
+        path: str,
+        *,
+        require_absolute: bool = True,
+    ) -> Path:
+        """`path` resolved inside the roots of `entry`, or refused as `refusals` words it."""
+        with self.refusals(connection, entry):
+            return resolve_in_roots(path, entry.config.roots, require_absolute=require_absolute)

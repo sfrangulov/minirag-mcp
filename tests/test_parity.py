@@ -579,7 +579,80 @@ async def test_both_shells_refuse_a_delete_while_the_index_is_rebuilt(
 
     refusal = _last_error(err)
     assert is_error and code == 1 and out == ""
-    assert "is being rebuilt into" in refusal and text.endswith(refusal)
+    assert "is being rebuilt into" in refusal and text == refusal
+    assert refusal.startswith("Index 'default': ")
+
+
+async def test_both_shells_refuse_an_ingest_while_the_index_is_rebuilt(
+    root, tmp_path, capsys, monkeypatch, fake_embedder, public_dns
+):
+    import minirag_mcp.ingest.pipeline as pmod
+    from minirag_mcp.identity import begin_staging
+    from minirag_mcp.ingest.parser import ParsedDoc
+    from minirag_mcp.lock import sync_lock
+
+    monkeypatch.setattr(pmod, "parse_url", lambda url, **kw: ParsedDoc("# R\n\nNotes.", "R"))
+    monkeypatch.setattr(cli, "_make_embedder", lambda cfg: fake_embedder)
+    env = {"BASE_DIR": str(root), "DB_PATH": str(tmp_path / "db")}
+    assert run_cli(["sync", *_flags(env)], capsys)[0] == 0
+    a_md = str(root / "sub" / "a.md")
+    with sync_lock(Path(env["DB_PATH"])):
+        begin_staging(Path(env["DB_PATH"]))
+        async with Client(create_app(load_config(env), embedder=fake_embedder)) as c:
+            by_file = await c.call_tool("ingest_file", {"filePath": a_md}, raise_on_error=False)
+            by_url = await c.call_tool(
+                "ingest_url", {"url": "https://example.com/p"}, raise_on_error=False
+            )
+        code, out, _ = run_cli(["ingest", a_md, *_flags(env), "--json"], capsys)
+        code_u, _, err_u = run_cli(["ingest-url", "https://example.com/q", *_flags(env)], capsys)
+
+    [failure] = json.loads(out)["failed"]
+    refusal = by_file.content[0].text
+    assert by_file.is_error and code == 1 and failure["error"] == refusal
+    assert by_url.is_error and code_u == 1 and by_url.content[0].text == _last_error(err_u)
+    assert refusal.startswith("Index 'default': ") and "is being rebuilt into" in refusal
+    assert by_url.content[0].text == refusal
+
+
+async def test_a_rebuild_that_fails_in_its_job_is_reported_alike_and_unwrapped_by_both(
+    root, tmp_path, capsys, monkeypatch, fake_embedder
+):
+    """Only what refuses a sync before it starts names the index: a rebuild that fails in
+    the job is the job's failure, and the index still answers from what it holds."""
+
+    class Unverified(FakeEmbedder):
+        prefixes = "e5"
+
+        def reference_error(self, vector):
+            return "the endpoint serves another model"
+
+    monkeypatch.setattr(cli, "_make_embedder", lambda cfg: fake_embedder)
+    envs = {shell: {"BASE_DIR": str(root), "DB_PATH": str(tmp_path / shell)} for shell in "ab"}
+    for env in envs.values():
+        assert run_cli(["sync", *_flags(env)], capsys)[0] == 0
+    other = Unverified()
+    monkeypatch.setattr(cli, "_make_embedder", lambda cfg: other)
+
+    code, _, err = run_cli(["sync", *_flags(envs["a"])], capsys)
+    async with Client(create_app(load_config(envs["b"]), embedder=other)) as c:
+        job = (await c.call_tool("sync_start", {})).data["jobId"]
+        status = await _finished_job(c, job)
+
+    assert code == 1 and status["state"] == "failed"
+    assert _last_error(err) == status["error"] == "the endpoint serves another model"
+
+
+async def test_a_path_outside_the_roots_is_refused_the_same_way_by_both(
+    root, tmp_path, capsys, monkeypatch, fake_embedder
+):
+    monkeypatch.setattr(cli, "_make_embedder", lambda cfg: fake_embedder)
+    env = {"BASE_DIR": str(root), "DB_PATH": str(tmp_path / "db")}
+    elsewhere = str(tmp_path / "elsewhere.md")
+    is_error, text = await call_mcp(env, "read_file", {"filePath": elsewhere}, fake_embedder)
+    code, _, err = run_cli(["read", elsewhere, *_flags(env)], capsys)
+    assert is_error and code == 1 and text == _last_error(err)
+    assert text.startswith(f"Path outside configured document roots: {elsewhere}.")
+    assert "BASE_DIRS" in text
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root reads a chmod 000 folder anyway")

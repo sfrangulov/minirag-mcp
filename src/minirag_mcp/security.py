@@ -49,6 +49,15 @@ class SecurityError(Exception):
     pass
 
 
+class OutsideRootsError(SecurityError):
+    """A path outside every root it was checked against; `path` is where it resolves to."""
+
+    def __init__(self, message: str, *, requested: str, path: Path) -> None:
+        super().__init__(message)
+        self.requested = requested
+        self.path = path
+
+
 class URLResolutionError(Exception):
     """A URL's host could not be resolved. A fetch problem, not a security verdict."""
 
@@ -63,15 +72,24 @@ def resolve_in_roots(
             "query_documents or list_files result is one."
         )
     real = p.resolve()  # follows symlinks; the check below sees the true target
-    real_roots = [root.resolve() for root in roots]
-    for real_root in real_roots:
-        if real == real_root or real_root in real.parents:
-            return real
-    raise SecurityError(
+    if within(real, roots):
+        return real
+    raise OutsideRootsError(
         f"Path outside configured document roots: {path_str}. This server reads only "
-        f"under {', '.join(map(str, real_roots))}; a file elsewhere is out of reach until "
-        "its folder is added to BASE_DIRS and the server restarted."
+        f"under {', '.join(str(root.resolve()) for root in roots)}; a file elsewhere is out "
+        "of reach until its folder is added to BASE_DIRS and the server restarted.",
+        requested=path_str,
+        path=real,
     )
+
+
+def within(real: Path, roots: Sequence[Path]) -> bool:
+    """Whether the resolved path `real` is one of `roots` or under one."""
+    for root in roots:
+        real_root = root.resolve()
+        if real == real_root or real_root in real.parents:
+            return True
+    return False
 
 
 def _blocked_kind(ip: IPAddress) -> str | None:

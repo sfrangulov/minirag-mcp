@@ -57,6 +57,7 @@ from minirag_mcp.labels import LabelerSource
 from minirag_mcp.labels.endpoint_model import endpoint_model_factory
 from minirag_mcp.labels.labeler import ModelFactory
 from minirag_mcp.labels.model import default_model_factory
+from minirag_mcp.lock import SyncLock
 from minirag_mcp.results import embedder_notes
 from minirag_mcp.store import IndexBusyError, IndexOpenError, Store
 from minirag_mcp.sync import OnEvent, OnRebuild, SyncJob, SyncManager, _run_sync_unlocked
@@ -550,23 +551,40 @@ class IndexHandle:
         rebuilt generation; a scoped one is refused with RebuildPendingError, nothing
         written. SyncLockBusy while another sync of the index runs.
         """
-        # Opened first: a 1.x index is refused before the lock file is made inside it.
-        self._opened(write=True)
-        lock = acquire_sync_lock(self.config.db_path)
+        return self.run_admitted(scope, self.admit_sync(scope), on_event)
+
+    def admit_sync(self, scope: Path | None) -> SyncLock:
+        """The sync lock, held for a sync of the index or of `scope` inside it, once nothing
+        refuses that sync: what `start_sync` refuses before a job starts, raised here before
+        any work. `run_admitted` runs the sync and releases the lock."""
+        self._admit(scope)
+        return acquire_sync_lock(self.config.db_path)
+
+    def run_admitted(
+        self, scope: Path | None, lock: SyncLock, on_event: Callable[[str], None] | None = None
+    ) -> tuple[dict[str, int], list[dict], RebuildInfo | None]:
+        """`run_sync` for the sync `admit_sync` admitted, releasing its lock."""
         try:
             return self._sync_held(scope, on_event, None)
         finally:
             lock.release()
 
     def start_sync(self, scope: Path | None = None) -> str:
-        """`run_sync` as a background job of `sync`; its job id. The refusal of a scoped
-        sync on a `rebuild pending` index is raised here, before any job starts."""
+        """`run_sync` as a background job of `sync`; its job id. Every refusal is raised
+        here, before any job starts."""
+        self._admit(scope)
+        return self.sync.start(scope)
+
+    def _admit(self, scope: Path | None) -> None:
+        """Refuse a sync of the index, or of `scope` inside it, that cannot start: an index
+        that cannot be written as it stands, or a scoped sync of a `rebuild pending` one.
+        Before the sync lock is taken: a 1.x index is refused before the lock file is made
+        inside it."""
         opened = self._opened(write=True)
         if scope is not None:
             state, why = index_state(self.config, opened.configured)
             if state is IndexState.REBUILD_PENDING:
                 raise self._scoped_refusal(why, scope)
-        return self.sync.start(scope)
 
     def _scoped_refusal(self, why: str, scope: Path) -> RebuildPendingError:
         return self._pending(
