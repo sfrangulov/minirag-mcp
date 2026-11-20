@@ -10,6 +10,7 @@ import pytest
 from fastmcp import Client, FastMCP
 
 import minirag_mcp.cli as cli
+from index_helpers import run_meta
 from minirag_mcp.__main__ import main
 from minirag_mcp.embedder import MINILM
 
@@ -24,16 +25,6 @@ def home(indexes_file, monkeypatch):
     """The process's HOME is the one the file's `~/corpora/...` roots are under."""
     monkeypatch.setenv("HOME", indexes_file.env["HOME"])
     return indexes_file
-
-
-def run_meta(tokens, capsys) -> tuple[int, str, str]:
-    try:
-        cli.app.meta(tokens, result_action="return_value", exit_on_error=False)
-        code = 0
-    except SystemExit as e:
-        code = e.code
-    captured = capsys.readouterr()
-    return code, captured.out, captured.err
 
 
 def _cfg(indexes_file) -> list[str]:
@@ -102,6 +93,19 @@ def test_config_without_index_is_refused_rather_than_ignored(home, tmp_path, cap
     assert not (tmp_path / "db").exists()
 
 
+def test_an_empty_label_reaches_the_command(home, tmp_path, capsys):
+    env_flags = ["--base-dir", str(home.roots["alpha"]), "--db-path", str(tmp_path / "db")]
+    code, out, err = run_meta(["query", "x", "--label", "", *env_flags], capsys)
+    assert (code, out) == (1, "") and "--label takes facet=value, got ''" in err
+
+
+def test_index_is_refused_with_indexes_rather_than_ignored(home, capsys):
+    for name in ("beta", "delta"):
+        code, out, err = run_meta([*_cfg(home), "--index", name, "indexes"], capsys)
+        assert (code, out) == (1, ""), name
+        assert "`indexes` lists every index" in err and "--index" in err, name
+
+
 def test_indexes_lists_every_index_in_the_file(home, capsys):
     code, out, _ = run_meta([*_cfg(home), "indexes", "--json"], capsys)
     payload = json.loads(out)
@@ -137,8 +141,8 @@ def test_indexes_prints_why_an_index_is_unavailable_in_place_of_its_counts(home,
 
 def test_a_missing_indexes_toml_is_a_clean_error(tmp_path, capsys):
     missing = tmp_path / "nowhere" / "indexes.toml"
-    for command in (["list"], ["status"], ["indexes"]):
-        code, out, err = run_meta(["--config", str(missing), "--index", "a", *command], capsys)
+    for command in (["--index", "a", "list"], ["--index", "a", "status"], ["indexes"]):
+        code, out, err = run_meta(["--config", str(missing), *command], capsys)
         assert (code, out) == (1, ""), command
         assert str(missing) in err and "Traceback" not in err, command
 

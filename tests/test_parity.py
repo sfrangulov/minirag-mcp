@@ -19,7 +19,7 @@ from fastmcp import Client
 import minirag_mcp.cli as cli
 import minirag_mcp.embedder as embedder_mod
 from conftest import FakeEmbedder, stamp_identity
-from index_helpers import file_registry
+from index_helpers import file_registry, run_meta
 from lookalike_texts import MINUTES, REGULATION_V1, REGULATION_V2
 from minirag_mcp import ocr, ocr_vision
 from minirag_mcp.config import default_db_path, load_config
@@ -283,6 +283,26 @@ async def test_an_empty_query_is_refused_by_both(
     code, _, err = run_cli(["query", "   ", *_flags(env)], capsys)
     assert is_error and "query must not be empty" in text
     assert code == 1 and "query must not be empty" in err
+
+
+@pytest.mark.parametrize(
+    "tool,args,command",
+    [
+        ("query_documents", {"query": ""}, ["query", ""]),
+        ("find_mentions", {"terms": ["", "alpha"]}, ["find", "", "alpha"]),
+    ],
+)
+async def test_an_empty_argument_reaches_the_core_through_the_entry_point(
+    root, tmp_path, capsys, monkeypatch, fake_embedder, tool, args, command
+):
+    """The options around a command are read first, and an empty argument passes on to the
+    command as it is, to be refused as the server refuses it."""
+    monkeypatch.setattr(cli, "_make_embedder", lambda cfg: fake_embedder)
+    env = {"BASE_DIR": str(root), "DB_PATH": str(tmp_path / "db")}
+    is_error, text = await call_mcp(env, tool, args, fake_embedder)
+    code, out, err = run_meta([*command, *_flags(env), "--json"], capsys)
+    assert is_error and (code, out) == (1, "") and text == _last_error(err)
+    assert text in ("query must not be empty", "a term must not be empty")
 
 
 @pytest.mark.parametrize(
@@ -1116,16 +1136,6 @@ async def test_status_reports_undocumented_documents_the_same_way_in_both(
 
 
 # --- file mode: indexes.toml, `--index` in the CLI and `index` in the server ----------
-
-
-def run_meta(tokens, capsys) -> tuple[int, str, str]:
-    try:
-        cli.app.meta(tokens, result_action="return_value", exit_on_error=False)
-        code = 0
-    except SystemExit as e:
-        code = e.code
-    captured = capsys.readouterr()
-    return code, captured.out, captured.err
 
 
 @pytest.fixture

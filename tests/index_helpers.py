@@ -65,3 +65,17 @@ def file_registry(indexes_file: IndexesFile, embedder_factory, **kw) -> IndexReg
     return IndexRegistry.from_file(
         indexes_file.path, indexes_file.env, embedder_factory=embedder_factory, **kw
     )
+
+
+def run_meta(tokens: list[str], capsys) -> tuple[int, str, str]:
+    """The CLI as its entry point runs it, with the options around the command read first:
+    the exit code, stdout and stderr."""
+    import minirag_mcp.cli as cli  # imported here for the reason file_registry gives
+
+    try:
+        cli.app.meta(tokens, result_action="return_value", exit_on_error=False)
+        code = 0
+    except SystemExit as e:
+        code = e.code
+    captured = capsys.readouterr()
+    return code, captured.out, captured.err

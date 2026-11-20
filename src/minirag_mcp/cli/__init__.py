@@ -132,8 +132,12 @@ CONFIG_WITHOUT_INDEX = (
     "the index the environment variables configure"
 )
 
-# The `--` that puts a `find` term starting with a dash after it is the command's to read.
-app.meta.end_of_options_delimiter = ""
+# The `--` before a `find` term that starts with a dash is the command's to read, so the
+# options around the command are given a delimiter no argument equals: NUL, which argv
+# cannot hold. Not "": cyclopts compares every token to it and would drop an empty
+# argument. --index and --config are therefore read anywhere, even after `--`:
+# `find foo -- --index beta` searches beta for foo.
+app.meta.end_of_options_delimiter = "\0"
 
 
 @app.meta.default
@@ -816,6 +820,11 @@ def indexes(*, json: JsonFlag = False) -> None:
     gives why in place of its counts, and --json also the reason a syncing or "rebuild
     pending" index is not ready.
     """
+    if _SELECTION.get().index is not None:
+        _fail(
+            "`indexes` lists every index of indexes.toml; --index selects the one another "
+            "command uses and cannot be combined with it"
+        )
     payload = list_indexes_payload(_file_registry(), UNRESTRICTED)
     _emit(payload, json, "\n".join(_index_line(row) for row in payload["indexes"]))
 

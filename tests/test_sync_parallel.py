@@ -511,11 +511,16 @@ ENTRY_POINTS = {
 }
 
 
+@pytest.mark.parametrize("served", ["environment", "--index"])
 @pytest.mark.parametrize("entry", ENTRY_POINTS)
-def test_a_parallel_sync_under_each_entry_point_finishes_with_stdout_untouched(tmp_path, entry):
+def test_a_parallel_sync_under_each_entry_point_finishes_with_stdout_untouched(
+    tmp_path, entry, served
+):
     """Spawned workers run the parent's main script again, as `__mp_main__`, with the
     parent's argv. A script that starts the server unguarded starts one in every worker, on
-    the client's stdin and stdout, and the sync waits for those workers forever."""
+    the client's stdin and stdout, and the sync waits for those workers forever. The server
+    is the environment's, or with `--config X --index NAME` the one of that index, whose
+    arguments the workers get too."""
     kind, target = ENTRY_POINTS[entry]
     if kind == "path" and not Path(target).is_file():
         pytest.skip(f"{target} is not installed")
@@ -524,14 +529,23 @@ def test_a_parallel_sync_under_each_entry_point_finishes_with_stdout_untouched(t
     for i in range(8):
         (root / f"{i}.md").write_text(f"# Doc {i}\n\nBody of document {i}.", encoding="utf-8")
     env = {k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "TMPDIR", "SYSTEMROOT")}
-    env |= {
-        "BASE_DIR": str(root),
-        "DB_PATH": str(tmp_path / "db"),
-        "CACHE_DIR": str(tmp_path / "cache"),
-        "RAG_SYNC_WORKERS": "2",
-        "ENTRY_KIND": kind,
-        "ENTRY": target,
-    }
+    env |= {"ENTRY_KIND": kind, "ENTRY": target}
+    if served == "environment":
+        env |= {
+            "BASE_DIR": str(root),
+            "DB_PATH": str(tmp_path / "db"),
+            "CACHE_DIR": str(tmp_path / "cache"),
+            "RAG_SYNC_WORKERS": "2",
+        }
+    else:
+        config = tmp_path / "indexes.toml"
+        config.write_text(
+            f"[server]\ncache_dir = {json.dumps(str(tmp_path / 'cache'))}\n\n"
+            f"[index.docs]\nroots = [{json.dumps(str(root))}]\n"
+            f"db = {json.dumps(str(tmp_path / 'db'))}\nsync_workers = 2\n",
+            encoding="utf-8",
+        )
+        env["ENTRY_ARGS"] = json.dumps(["--config", str(config), "--index", "docs"])
     out, err = tmp_path / "stdout", tmp_path / "stderr"
     with out.open("wb") as stdout, err.open("wb") as stderr:
         # stdin stays open, as a client's pipe does, so a server started in a worker waits.
