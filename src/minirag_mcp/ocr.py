@@ -159,7 +159,8 @@ def _layout(api: PyTessBaseAPI) -> tuple[list[Line], list[int]]:
     """Tesseract's lines, and the orientation of each block that holds one.
 
     An empty page still has an iterator, and it raises for its text ("No text returned"),
-    as it may for a block with no text in it.
+    as it may for a line with no text in it. Such a line hands the start of its block and
+    paragraph on to the next line that has text.
     """
     from tesserocr import RIL
 
@@ -168,16 +169,20 @@ def _layout(api: PyTessBaseAPI) -> tuple[list[Line], list[int]]:
     iterator = api.GetIterator()
     if iterator is None:
         return lines, orientations
+    block = paragraph = False
     while True:
+        block = block or bool(iterator.IsAtBeginningOf(RIL.BLOCK))
+        paragraph = paragraph or bool(iterator.IsAtBeginningOf(RIL.PARA))
         box = iterator.BoundingBox(RIL.TEXTLINE)
         try:
             text = iterator.GetUTF8Text(RIL.TEXTLINE).strip()
         except RuntimeError:
             text = ""
         if box is not None and text:
-            if iterator.IsAtBeginningOf(RIL.BLOCK):
+            if block:
                 orientations.append(int(iterator.Orientation()[0]))
-            lines.append(Line(tuple(box), text, bool(iterator.IsAtBeginningOf(RIL.PARA))))
+            lines.append(Line(tuple(box), text, paragraph))
+            block = paragraph = False
         if not iterator.Next(RIL.TEXTLINE):
             return lines, orientations
 
@@ -204,6 +209,8 @@ def _read(
             path,
             e,
         )
+        return recognized.text, False
+    if not seen:
         return recognized.text, False
 
     def upright(line: Line) -> Line:

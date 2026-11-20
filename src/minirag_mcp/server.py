@@ -591,7 +591,8 @@ def create_app(
         be indexed then, and ocrHint says what to install. ocrSecondReader,
         present on macOS beside an engine, is "vision" when Apple Vision
         re-reads the pages Tesseract is unsure of (ocrEngine
-        "tesseract+vision"), or "unavailable" when its bindings are missing.
+        "tesseract+vision"), "unavailable" when its bindings are missing, or
+        "off" when RAG_OCR_SECOND_READER_BELOW is 0.
 
         labels, present only when the corpus has a classify.toml: its facets,
         value descriptions and document counts, unlabelled and uncertain

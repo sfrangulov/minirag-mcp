@@ -312,25 +312,29 @@ def ignore_status(roots: Sequence[Path]) -> dict:
     return {"ignoreFiles": files} if files else {}
 
 
-def ocr_status() -> dict:
+def ocr_status(config: Config) -> dict:
     """The OCR half of `status`, identical for the server and the CLI.
 
     Measured, not configured: the extra is either importable in this interpreter or it
-    is not, and the whole of the feature turns on that one answer. Nothing here reads
-    the index, so the server reports it alongside the fields that do not need one.
+    is not, and the whole of the feature turns on that one answer. The second reader is
+    the exception, since the owner can turn it off. Nothing here reads the index, so the
+    server reports it alongside the fields that do not need one.
     """
     if ocr.available():
-        return {"ocr": ocr.ENGINE_TESSERACT, **_second_reader_status()}
+        return {"ocr": ocr.ENGINE_TESSERACT, **_second_reader_status(config)}
     return {
         "ocr": "unavailable",
         "ocrHint": f"scanned PDFs and images cannot be indexed; {ocr.INSTALL_HINT}",
     }
 
 
-def _second_reader_status() -> dict:
-    """Apple Vision, on the platform that has it: whether its bindings are installed."""
+def _second_reader_status(config: Config) -> dict:
+    """Apple Vision, on the platform that has it: turned off, or whether its bindings
+    are installed."""
     if not ocr_vision.supported():
         return {}
+    if config.ocr_second_reader_below == 0:
+        return {"ocrSecondReader": "off"}
     return {"ocrSecondReader": "vision" if ocr_vision.available() else "unavailable"}
 
 
@@ -366,7 +370,7 @@ def status_payload(config: Config, handle: IndexHandle) -> dict:
         "model": config.model_name,
         "hybridWeight": config.hybrid_weight,
         "chunkScheme": SCHEME_VERSION,
-        **ocr_status(),
+        **ocr_status(config),
         **ignore_status(config.roots),
     }
     state, why = handle.state()

@@ -663,6 +663,29 @@ def test_a_line_the_iterator_has_no_text_for_is_left_out(fake_tess, cfg, tmp_pat
     assert got.turns == 0
 
 
+def test_a_line_without_text_hands_its_block_and_paragraph_start_on(fake_tess, cfg, tmp_path):
+    """Its block's orientation still counts, and the blank line before its paragraph
+    still comes, at the next line that has text."""
+    fake_tess.texts = [
+        _Reading(
+            "body\n\nnext paragraph\n",
+            80,
+            [
+                _Line((0, 0, 90, 30), None, block=True, para=True, orientation=3),
+                _Line((0, 40, 90, 70), "body", orientation=3),
+                _Line((0, 80, 90, 110), None, para=True, orientation=3),
+                _Line((0, 120, 90, 150), "next paragraph", orientation=3),
+            ],
+        )
+    ]
+    got = ocr._recognize(_image(), cfg, tmp_path / "p.png", dpi=None)
+    assert got.lines == (
+        ocr.Line((0, 40, 90, 70), "body", starts_paragraph=True),
+        ocr.Line((0, 120, 90, 150), "next paragraph", starts_paragraph=True),
+    )
+    assert got.turns == 3
+
+
 # --- Apple Vision re-reads the pages Tesseract is unsure of ------------------------------
 
 
@@ -759,6 +782,24 @@ def test_a_page_tesseract_found_no_words_on_is_read_by_vision(
         "Печать",
         ocr.ENGINE_TESSERACT_VISION,
     )
+
+
+@pytest.mark.parametrize("how", ["image", "pdf"])
+@pytest.mark.parametrize(
+    "tesseract", ["", "  Dogovor   postavki\nnomer 7OO\n\n"], ids=["blank", "unsure"]
+)
+def test_a_page_vision_finds_nothing_on_keeps_tesseracts_text_and_name(
+    fake_tess, vision, monkeypatch, cfg, tmp_path, how, tesseract
+):
+    """A blank page (the back of a duplex scan) is routine: Vision reads it too, adds
+    nothing, and the document must read and be named as it is on any other platform."""
+    fake_tess.texts = [_reading(tesseract, 0 if not tesseract else 70)]
+    vision.lines = []
+    assert _read_one_page(how, monkeypatch, cfg, tmp_path) == (
+        tesseract.strip(),
+        ocr.ENGINE_TESSERACT,
+    )
+    assert len(vision.calls) == 1
 
 
 @pytest.mark.parametrize(

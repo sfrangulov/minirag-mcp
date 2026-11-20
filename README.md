@@ -407,9 +407,10 @@ What the extra changes:
   found after the page. On hand-checked regions of such pages this halved the
   character error rate. The same corpus can therefore index slightly different
   text on macOS than on Linux or Windows: a document with a page read this way
-  has the `ocrEngine` `tesseract+vision`, and `RAG_OCR_SECOND_READER_BELOW=0`
-  turns the second reader off. A page Vision fails on keeps Tesseract's text
-  and logs a warning naming the file and page.
+  has the `ocrEngine` `tesseract+vision` (a page Vision finds nothing on, such as
+  the blank back of a duplex scan, does not count), and
+  `RAG_OCR_SECOND_READER_BELOW=0` turns the second reader off. A page Vision fails
+  on keeps Tesseract's text and logs a warning naming the file and page.
 - **Image files become documents.** `.png` `.jpg` `.jpeg` `.tiff` `.tif` `.bmp`
   `.webp` join the scan whitelist, titled from the filename by the same rules as
   everything else. A multi-page TIFF — what a scanner or a fax gateway writes —
@@ -434,8 +435,9 @@ prints `[ocr:tesseract]` after the line for such a file.
 Whether this install can OCR at all is a `status` field in both shells: `ocr`
 names the engine (`"tesseract"`) or reads `"unavailable"`, and when it is
 unavailable a second key, `ocrHint`, carries the install command. On macOS,
-`ocrSecondReader` says whether Apple Vision is there to re-read (`"vision"`) or
-its bindings are missing (`"unavailable"`).
+`ocrSecondReader` says whether Apple Vision is there to re-read (`"vision"`), its
+bindings are missing (`"unavailable"`), or `RAG_OCR_SECOND_READER_BELOW=0` has
+turned it off (`"off"`).
 
 **OCR text is not authoritative over the source scan.** Measured on real scans
 against 83 hand-checked lines, Tesseract read all 83, with a character error rate

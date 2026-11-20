@@ -282,24 +282,31 @@ async def test_an_empty_query_is_refused_by_both(
 
 
 @pytest.mark.parametrize(
-    "tesseract,macos,bindings,expected",
+    "tesseract,macos,bindings,below,expected",
     [
-        (True, True, True, "vision"),
-        (True, True, False, "unavailable"),
-        (True, False, False, None),
-        (False, True, True, None),
+        (True, True, True, None, "vision"),
+        (True, True, True, "70", "vision"),
+        (True, True, False, None, "unavailable"),
+        (True, True, True, "0", "off"),
+        (True, True, False, "0", "off"),
+        (True, False, False, None, None),
+        (True, False, False, "0", None),
+        (False, True, True, None, None),
     ],
 )
 async def test_status_names_the_second_reader_the_same_in_both_shells(
-    root, tmp_path, capsys, monkeypatch, fake_embedder, tesseract, macos, bindings, expected
+    root, tmp_path, capsys, monkeypatch, fake_embedder, tesseract, macos, bindings, below, expected
 ):
     """Present only where Apple Vision could be: on macOS, and only beside an OCR engine
-    for it to second."""
+    for it to second. RAG_OCR_SECOND_READER_BELOW=0 is the owner turning it off."""
     monkeypatch.setattr(cli, "_make_embedder", lambda cfg: fake_embedder)
     monkeypatch.setattr(ocr, "available", lambda: tesseract)
     monkeypatch.setattr(ocr_vision, "supported", lambda: macos)
     monkeypatch.setattr(ocr_vision, "available", lambda: macos and bindings)
     env = {"BASE_DIR": str(root), "DB_PATH": str(tmp_path / "db")}
+    if below is not None:
+        env["RAG_OCR_SECOND_READER_BELOW"] = below
+        monkeypatch.setenv("RAG_OCR_SECOND_READER_BELOW", below)
     is_error, st = await call_mcp(env, "status", {}, fake_embedder)
     code, out, _ = run_cli(["status", *_flags(env), "--json"], capsys)
     assert not is_error and code == 0 and json.loads(out) == st
