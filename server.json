@@ -37,25 +37,25 @@
         },
         {
           "name": "DB_PATH",
-          "description": "LanceDB index directory. Defaults to <first root>/.minirag/lancedb, so each corpus gets its own index.",
+          "description": "Index directory. Defaults to <first root>/.minirag/v2, so each corpus gets its own index. A minirag 1.x index is never written to: pointing DB_PATH at one is refused.",
           "isRequired": false,
           "isSecret": false,
           "format": "filepath"
         },
         {
           "name": "CACHE_DIR",
-          "description": "Embedding model cache. Defaults to the platform user cache dir, so the ~220 MB model is downloaded once and shared.",
+          "description": "Model cache. Defaults to the platform user cache dir, so the 2.24 GB default embedding model is downloaded once and shared.",
           "isRequired": false,
           "isSecret": false,
           "format": "filepath"
         },
         {
           "name": "MODEL_NAME",
-          "description": "fastembed model id. Changing it makes existing vectors incompatible with new queries; pair with a new DB_PATH or a full re-ingest.",
+          "description": "fastembed model id (2.24 GB for the default; sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2, the 1.x default, is 0.22 GB). Changing it makes the index 'rebuild pending': it keeps answering with the model it was built with until the next sync without a path rebuilds it.",
           "isRequired": false,
           "isSecret": false,
           "format": "string",
-          "default": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+          "default": "intfloat/multilingual-e5-large"
         },
         {
           "name": "MAX_FILE_SIZE",
@@ -67,11 +67,11 @@
         },
         {
           "name": "CHUNK_TOKEN_BUDGET",
-          "description": "Retrieval-unit size in the embedding model's own tokens. Range 16-128; the ceiling is the model's trained sequence length.",
+          "description": "Retrieval-unit size in the embedding model's own tokens. Defaults to 250 for intfloat/multilingual-e5-large and 110 for any other model. Range 16 to the model's window: 512 for e5, 128 for MiniLM and for a model minirag does not know.",
           "isRequired": false,
           "isSecret": false,
           "format": "number",
-          "default": "110"
+          "default": "250"
         },
         {
           "name": "RAG_HYBRID_WEIGHT",

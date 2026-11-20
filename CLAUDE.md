@@ -58,7 +58,7 @@ Everything runs through `uv`. There is no other supported invocation.
 ```bash
 uv sync                                   # install, including dev dependencies
 uv run pytest -q                          # fast suite; the gate for every change
-uv run pytest -m slow -q                  # real embedding model, ~220 MB download
+uv run pytest -m slow -q                  # real embedding models, ~2.5 GB download
 uv run --extra classify env MINIRAG_TEST_GGUF=<gguf> pytest -m classify -q  # real choice model
 uv run ruff check src tests               # lint
 uv run ruff format --check src tests      # formatting (src and tests only, see below)

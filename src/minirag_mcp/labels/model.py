@@ -1,8 +1,8 @@
 """In-process choice model behind the [classify] extra: a GGUF read out as letter probabilities.
 
-llama_cpp, numpy and huggingface_hub are imported lazily inside functions: the core
-package must import and run without the extra. Nothing here may write to stdout, which
-is the MCP stdio channel; llama.cpp logs go to stderr.
+llama_cpp and numpy are imported lazily inside functions: the core package must import
+and run without the extra. Nothing here may write to stdout, which is the MCP stdio
+channel; llama.cpp logs go to stderr.
 """
 
 from __future__ import annotations

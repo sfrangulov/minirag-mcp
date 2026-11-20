@@ -60,7 +60,7 @@ class FakeEmbedder:
     """Deterministic 8-dim embeddings from sha256 — same text, same vector.
 
     `count_tokens` stands in for the real tokenizer so chunking can be tested without
-    a 220 MB download. It is a word/punctuation tokenizer plus the two special tokens
+    a 2.24 GB download. It is a word/punctuation tokenizer plus the two special tokens
     every sentence-transformers model wraps a sequence in: not the model's own
     segmentation, but the same *shape* — monotonic in length, and never zero — which is
     all the packer's budget arithmetic depends on.
