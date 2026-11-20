@@ -115,7 +115,8 @@ async def test_both_shells_refuse_a_1x_index_naming_the_v2_path(
     _, st = await call_mcp(env, "status", {}, fake_embedder)
     code, out, _ = run_cli(["status", *_flags(env), "--json"], capsys)
     assert code == 0 and json.loads(out) == st
-    assert (st["indexState"], st["indexError"]) == ("unavailable", refusal)
+    assert st["indexState"] == "unavailable"
+    assert refusal == f"Index 'default' is unavailable: {st['indexError']}"
     assert "chunkCount" not in st and "indexGeneration" not in st
     assert sorted(p.relative_to(db) for p in db.rglob("*")) == before
 
@@ -409,6 +410,16 @@ async def test_a_model_that_cannot_load_is_reported_by_both(root, tmp_path, caps
     code, _, err = run_cli(["query", "alpha", *_flags(env)], capsys)
     assert is_error and "could not be loaded" in text
     assert code == 1 and "could not be loaded" in err
+
+
+async def test_an_unknown_model_is_refused_the_same_way_by_both(root, tmp_path, capsys):
+    env = {"BASE_DIR": str(root), "DB_PATH": str(tmp_path / "db"), "MODEL_NAME": "x/unknown"}
+    is_error, text = await call_mcp(env, "query_documents", {"query": "alpha"}, None)
+    code, _, err = run_cli(["query", "alpha", *_flags(env), "--model-name", "x/unknown"], capsys)
+    refusal = _last_error(err)
+    assert is_error and code == 1 and text.endswith(refusal)
+    assert refusal.startswith("Index 'default' is unavailable: Model 'x/unknown' is not in")
+    assert refusal.endswith(" — see fastembed's supported models.")
 
 
 async def test_both_shells_report_the_embedding_backend(

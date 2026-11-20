@@ -25,6 +25,7 @@ from tokenizers.pre_tokenizers import Whitespace
 from tokenizers.processors import TemplateProcessing
 
 import minirag_mcp.embedder as embedder_mod
+import minirag_mcp.handle as handle_mod
 from index_helpers import IndexesFile, make_indexes_file
 from minirag_mcp import ocr, ocr_vision, parallel, security
 from minirag_mcp.chunker import SCHEME_VERSION
@@ -34,6 +35,7 @@ from minirag_mcp.identity import (
     ChunkingScheme,
     EmbeddingScheme,
     IndexIdentity,
+    IndexState,
     create_identity,
 )
 from minirag_mcp.labels.model import ModelError
@@ -119,6 +121,19 @@ def fake_embedder() -> FakeEmbedder:
 @pytest.fixture
 def indexes_file(tmp_path) -> IndexesFile:
     return make_indexes_file(tmp_path)
+
+
+@pytest.fixture
+def index_states(monkeypatch) -> dict[str, tuple[IndexState, str]]:
+    """The state `IndexHandle` reads for each index, by `config.index_name` ("default" in the
+    environment mode); an index not named here is ready."""
+    states: dict[str, tuple[IndexState, str]] = {}
+
+    def index_state(config: Config, embedder) -> tuple[IndexState, str]:
+        return states.get(config.index_name or "default", (IndexState.READY, ""))
+
+    monkeypatch.setattr(handle_mod, "index_state", index_state)
+    return states
 
 
 @pytest.fixture(autouse=True)

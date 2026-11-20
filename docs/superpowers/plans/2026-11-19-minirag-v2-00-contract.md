@@ -23,7 +23,7 @@ Plans, executed in this order (each leaves `uv run pytest -q`, `ruff check src t
 |---|---|---|
 | `endpoints.py` | 1.1 | `Endpoint(url, name, api_key=None, timeout=120.0)`, `EndpointError`, `read_api_key(path)`, `EmbeddingEndpoint.embed`, `RerankEndpoint.scores`, `.last_error` |
 | `config.py` | 1.2; 2.3, 2.6 | `DEFAULT_MODEL` (e5-large), `default_db_path(roots)` = `<first root>/.minirag/v2`; `Config` + `document_weight`, `rerank_top`, `embed_endpoints: Mapping[str, Endpoint]` (fastembed id -> endpoint), `rerank_endpoint`, `classify_endpoint`, `index_name` (plan 1); `sync_workers`, `ocr_lang` in Tesseract spelling (plan 2) |
-| `embedder.py` | 1.2, 1.3, 1.10 | `Embedder(model_name, cache_dir, *, endpoint=None, prefixes=None, threads=None, allow_fallback=True)`: picklable, public `threads`, `allow_fallback`, `prefixes`, `backend`, `warning`, `max_tokens`, `prefix_tokens`, `expect_probe`, `probe_vector`, `verify`, `probe_error`; `known_model`, `prefix_rule`, `model_window`, `default_budget` |
+| `embedder.py` | 1.2, 1.3, 1.10 | `Embedder(model_name, cache_dir, *, endpoint=None, prefixes=None, threads=None, allow_fallback=True)`: picklable, public `threads`, `allow_fallback`, `prefixes`, `backend`, `warning`, `max_tokens`, `prefix_tokens`, `expect_probe`, `probe_vector`, `verify`, `probe_error`; `known_model`, `prefix_rule`, `model_window`, `default_budget`; the process-wide cache of loaded fastembed models keyed `(model_name, cache_dir, threads)`, `clear_loaded_models()` (plan 3, ruling S5) |
 | `identity.py` | 1.4 | `IndexIdentity`, `EmbeddingScheme`, `ChunkingScheme`, `IndexState` (`ready`, `rebuild pending`, `syncing`, `unavailable`), `read_identity`, `index_state`, `differences`, `rebuild_kind`, `staging_dir`, `previous_dir`, `swap_in`, `recover_swap`, `rebuild_running`, `RebuildInfo` |
 | `handle.py` | 1.5, 1.9-1.11 | `make_embedder(config, scheme, *, threads=None)`, `configured_scheme(config)`, `EmbedderFactory`, `OpenIndex(config, store, embedder, pipeline, labels, identity, reranker)`, `IndexHandle(config, *, embedder_factory, model_factory)` with `get()`, `state()`, `.sync`, `run_sync(scope, on_event)`, `ensure_probe()`, `notes()`; `IndexUnavailableError` |
 | `rebuild.py` | 1.11 | `rebuild(current, make, on_event)` |
@@ -34,7 +34,7 @@ Plans, executed in this order (each leaves `uv run pytest -q`, `ruff check src t
 | `labels/endpoint_model.py` | 1.6 | `EndpointChoiceModel`, `endpoint_model_factory`; `LabelerSource.backend` |
 | `parallel.py` | 2.6-2.8 | `prepare_files`, `worker_pipeline`, `BatchWriter`, `default_workers`, `worker_count`, `physical_cores`, `total_memory`, `worker_footprint`, `worker_threads` (sync.py only) |
 | `indexes.py` | 3.1 | `ServerConfig`, `load_server_config(path, env)`, `default_config_path(env=None)`, `INDEX_KEYS` |
-| `registry.py` | 3.2, 3.3 | `Connection`, `UNRESTRICTED`, `Use`, `IndexRegistry` (`from_file`, `single`, `open`, `resolve`, `refresh`, `reload`), `IndexEntry` (`.handle`, `runtime()`, `state()`), `EmbedderPool`, `IndexRefused`, `IndexUnavailable` |
+| `registry.py` | 3.2, 3.3 | `Connection`, `UNRESTRICTED`, `Use`, `IndexRegistry` (`from_file`, `single`, `open`, `resolve`, `refresh`, `reload`), `IndexEntry` (`.handle`, `runtime()`, `state()`), `IndexRefused`, `IndexUnavailable` (`EmbedderPool` reduced to `embedder.py`'s model cache, ruling S5) |
 | `http_server.py`, `bridge.py` | 3.7, 3.8 | `serve`, `ensure_token`, `parse_connection`; `run_bridge` |
 | `docs/launchd/local.minirag-mcp.plist` | 3.9 | label `local.minirag-mcp`, placeholders `__UVX__`, `__VERSION__`, `__HOME__` (plan 4 copies it) |
 
@@ -46,10 +46,14 @@ Plans, executed in this order (each leaves `uv run pytest -q`, `ruff check src t
   (`IndexEntry.handle`); the registry keeps no `OpenIndex` of its own, so every call goes
   through `handle.get()`.
 - **Building embedders.** `make_embedder(config, scheme)` is the one constructor; it picks
-  `config.embed_endpoints[scheme.model]` when present. Plan 3's `EmbedderPool` memoizes it on
-  `(scheme, cache_dir, endpoint)` so indexes of one model share one embedder in `serve`. Sync
-  workers never build one: they get the pipeline's embedder by pickle, so they embed with the
-  recorded scheme and carry its expected probe.
+  `config.embed_endpoints[scheme.model]` when present. Each `IndexHandle` builds and owns its
+  own embedders, so each index checks its own recorded probe and keeps its own fallback state;
+  indexes of one model share only the loaded fastembed model, through `embedder.py`'s
+  process-wide cache keyed `(model_name, cache_dir, threads)`, consulted when an embedder loads
+  its model (after the no-download gate of an endpoint's fallback) and never pickled (plan 3,
+  ruling S5, which replaces the `EmbedderPool` of shared embedders). Sync workers never build
+  one: they get the pipeline's embedder by pickle, so they embed with the recorded scheme and
+  carry its expected probe.
 - **The probe.** The handle passes each generation's pipeline a `_BeforeStore` as
   `before_store` (`IndexHandle.ensure_probe()` calls the open one); `store_prepared` calls
   it before each `replace_source`; the parallel sync calls `pipeline.before_store()` once
@@ -64,7 +68,8 @@ Plans, executed in this order (each leaves `uv run pytest -q`, `ruff check src t
   Workers never fall back in-process: an unreachable endpoint fails the file, and 3
   consecutive failures stop dispatch with one loud error; the serial path keeps the fallback.
   `parallel.prepare_files` yields each file as it finishes, not in input order (2026-11-20,
-  ruling I1).
+  ruling I1). In one process one `prepare_files` call's pools run at a time, so a second
+  index's sync waits for the first's pool (plan 3, ruling S18).
 - **Status and result flags.** Plan 1's `status_payload(config, handle)` is the per-index
   status (`indexState`, `indexGeneration`, `embedding`, `embeddingBackend`, `reranker`,
   `chunkBudget`, `rebuildReasons`, `indexError`, labels `backend`); plan 3's `index_status`

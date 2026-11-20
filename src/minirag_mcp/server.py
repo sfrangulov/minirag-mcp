@@ -14,9 +14,10 @@ from fastmcp.exceptions import ToolError
 from minirag_mcp import __version__
 from minirag_mcp.chunker import join_document
 from minirag_mcp.config import Config, ConfigError, load_config
-from minirag_mcp.handle import IndexHandle, OpenIndex
+from minirag_mcp.handle import OpenIndex
 from minirag_mcp.ingest.ignore import scope_excluded_by
 from minirag_mcp.instructions import build_instructions
+from minirag_mcp.registry import SINGLE_INDEX_NAME, Connection, IndexEntry, IndexRegistry, Use
 from minirag_mcp.results import (
     DEFAULT_FIND_LIMIT,
     ingest_reply,
@@ -49,23 +50,16 @@ def create_app(
     # server whose configuration failed to load still tells the client how to use it —
     # same reason `status` keeps answering.
     mcp = FastMCP("minirag-mcp", instructions=build_instructions(env))
-    handle = (
-        None
-        if config is None or config_error is not None
-        else IndexHandle(
-            config,
-            embedder_factory=None if embedder is None else (lambda scheme: embedder),
-            model_factory=model_factory,
-        )
+    registry = IndexRegistry.single(
+        config,
+        error=config_error,
+        embedder_factory=None if embedder is None else (lambda c, s: embedder),
+        model_factory=model_factory,
     )
+    connection = Connection(SINGLE_INDEX_NAME, None)
 
-    def live() -> IndexHandle:
-        if handle is None:
-            raise ToolError(f"Configuration error: {config_error or 'no configuration'}")
-        return handle
-
-    def opened() -> OpenIndex:
-        return live().get()
+    def opened(use: Use) -> tuple[IndexEntry, OpenIndex]:
+        return registry.open(connection, None, use)
 
     def guard(fn):
         @wraps(fn)
@@ -108,8 +102,7 @@ def create_app(
         index answers from its existing vectors until the rebuilt one replaces
         it, and refuses writes meanwhile. A sync with a path is refused there.
         """
-        h = live()
-        c = h.get()
+        entry, c = opened(Use.SYNC)
         scope = None
         if path is not None:
             scope = resolve_in_roots(path, c.config.roots)
@@ -118,7 +111,7 @@ def create_app(
             )
             if by is not None:
                 raise ToolError(f"{scope} is excluded by {by}; nothing under it can be synced")
-        return {"jobId": h.start_sync(scope)}
+        return {"jobId": entry.handle.start_sync(scope)}
 
     @mcp.tool
     @guard
@@ -185,7 +178,8 @@ def create_app(
         read again — stored again from their indexed text, each file among
         them also in errors), which are null until then.
         """
-        return live().sync.status(jobId).to_dict()
+        entry, _ = opened(Use.READ)
+        return entry.handle.sync.status(jobId).to_dict()
 
     @mcp.tool
     @guard
@@ -204,10 +198,9 @@ def create_app(
         pending"), until an unscoped sync_start rebuilds it, and for a file
         above MAX_FILE_SIZE or a table above RAG_MAX_TABLE_ROWS data rows.
         """
-        h = live()
-        pipeline = h.ingest_pipeline()
-        path = resolve_in_roots(filePath, h.config.roots)
-        return ingest_reply(pipeline.ingest_file(path), h.notes())
+        entry, c = opened(Use.INGEST)
+        path = resolve_in_roots(filePath, c.config.roots)
+        return ingest_reply(c.pipeline.ingest_file(path), entry.handle.notes())
 
     @mcp.tool
     @guard
@@ -221,10 +214,10 @@ def create_app(
         `warnings` and the refusal while a rebuild is pending are as in
         ingest_file.
         """
-        h = live()
+        entry, c = opened(Use.INGEST)
         return ingest_reply(
-            h.ingest_pipeline().ingest_data(data, source=source, fmt=format, title=title),
-            h.notes(),
+            c.pipeline.ingest_data(data, source=source, fmt=format, title=title),
+            entry.handle.notes(),
         )
 
     @mcp.tool
@@ -241,9 +234,9 @@ def create_app(
         `labelProblem`, `warnings` and the refusal while a rebuild is pending
         are as in ingest_file.
         """
-        h = live()
+        entry, c = opened(Use.INGEST)
         return ingest_reply(
-            h.ingest_pipeline().ingest_url(url, source=source, title=title), h.notes()
+            c.pipeline.ingest_url(url, source=source, title=title), entry.handle.notes()
         )
 
     @mcp.tool
@@ -324,7 +317,7 @@ def create_app(
         only for having no label or no date; each `sources` row carries its
         `labels` and `date`.
         """
-        c = opened()
+        _, c = opened(Use.READ)
         return run_query(
             c.store,
             c.embedder,
@@ -387,7 +380,7 @@ def create_app(
         and dateTo filter as in query_documents, and citations follow its
         rule: each document's `displayPath`, verbatim.
         """
-        c = opened()
+        _, c = opened(Use.READ)
         return run_find(
             c.store,
             c.config.roots,
@@ -419,7 +412,7 @@ def create_app(
         default to 1). A chunk of a PDF carries `pages` as in
         query_documents.
         """
-        c = opened()
+        _, c = opened(Use.READ)
         if filePath is not None:
             key = str(resolve_in_roots(filePath, c.config.roots))
         elif source is not None:
@@ -445,7 +438,7 @@ def create_app(
         responses — prefer read_chunk_neighbors when only the context
         around one chunk is needed.
         """
-        c = opened()
+        _, c = opened(Use.READ)
         not_indexed_hint = ""
         if filePath is not None:
             key = str(resolve_in_roots(filePath, c.config.roots))
@@ -509,7 +502,7 @@ def create_app(
         sort="date" lists newest first, documents without a date last. Rows
         carry `labels` and `date` when present.
         """
-        c = opened()
+        _, c = opened(Use.READ)
         return list_payload(
             c.store,
             c.config.roots,
@@ -533,7 +526,7 @@ def create_app(
         index entry — a file left in place under a document root is
         re-ingested by a later sync_start.
         """
-        c = opened()
+        _, c = opened(Use.READ)
         if filePath is not None:
             key = str(resolve_in_roots(filePath, c.config.roots))
         elif source is not None:
@@ -619,9 +612,13 @@ def create_app(
         counts, and the model state, with modelHint saying why when it is
         "unavailable" — or the file's error.
         """
-        if handle is None:
-            return {"version": __version__, "configError": config_error or "no configuration"}
-        return status_payload(config, handle)
+        if not registry.names:
+            return {
+                "version": __version__,
+                "configError": registry.config_error or "no configuration",
+            }
+        entry = registry.resolve(connection, None)
+        return status_payload(entry.config, entry.handle)
 
     return mcp
 

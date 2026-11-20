@@ -14,17 +14,20 @@ from cyclopts import App, Parameter
 from minirag_mcp import __version__
 from minirag_mcp.chunker import join_document
 from minirag_mcp.config import Config, ConfigError, load_config
-from minirag_mcp.embedder import EmbedderUnavailableError, UnknownModelError
-from minirag_mcp.handle import (
-    IndexHandle,
-    IndexUnavailableError,
-    OpenIndex,
-    RebuildPendingError,
-)
-from minirag_mcp.identity import REASON_SEPARATOR
+from minirag_mcp.embedder import EmbedderUnavailableError
+from minirag_mcp.handle import OpenIndex, make_embedder
+from minirag_mcp.identity import REASON_SEPARATOR, EmbeddingScheme
 from minirag_mcp.ingest.ignore import IGNORE_FILE, excluded_by
 from minirag_mcp.ingest.pipeline import IngestResult, Pipeline
 from minirag_mcp.ingest.scanner import scan_roots
+from minirag_mcp.registry import (
+    SINGLE_INDEX_NAME,
+    Connection,
+    IndexEntry,
+    IndexRefused,
+    IndexRegistry,
+    Use,
+)
 from minirag_mcp.results import (
     DEFAULT_FIND_LIMIT,
     QueryError,
@@ -36,7 +39,7 @@ from minirag_mcp.results import (
     status_payload,
 )
 from minirag_mcp.security import SecurityError, resolve_in_roots
-from minirag_mcp.store import DimensionMismatchError, IndexBusyError, IndexOpenError
+from minirag_mcp.store import IndexBusyError
 
 app = App(name="minirag-mcp", version=__version__)
 
@@ -113,40 +116,32 @@ def _load_cfg(
     )
 
 
-def _handle(cfg: Config) -> IndexHandle:
+def _cli_embedder(cfg: Config, scheme: EmbeddingScheme) -> object:
+    # Looked up on every call, so that a test's patch of _make_embedder applies.
     emb = _make_embedder(cfg)
-    return IndexHandle(
-        cfg,
-        embedder_factory=None if emb is None else (lambda scheme: emb),
-        model_factory=_make_model_factory(),
+    return emb if emb is not None else make_embedder(cfg, scheme)
+
+
+def _single(cfg: Config) -> IndexRegistry:
+    return IndexRegistry.single(
+        cfg, embedder_factory=_cli_embedder, model_factory=_make_model_factory()
     )
 
 
-def _load(
+_CONNECTION = Connection(SINGLE_INDEX_NAME, None)
+
+
+def _open(
+    use: Use,
     base_dir: list[str] | None,
     db_path: str | None,
     cache_dir: str | None,
     model_name: str | None,
-) -> tuple[Config, IndexHandle, OpenIndex]:
+) -> tuple[IndexEntry, OpenIndex]:
     try:
         cfg = _load_cfg(base_dir, db_path, cache_dir, model_name)
-        handle = _handle(cfg)
-        return cfg, handle, handle.get()
-    except ConfigError as e:
-        _fail(str(e))
-        raise AssertionError from e  # unreachable
-    except UnknownModelError as e:
-        _fail(f"{e} — see fastembed's supported models")
-        raise AssertionError from e  # unreachable
-    except (DimensionMismatchError, IndexOpenError, IndexUnavailableError) as e:
-        _fail(str(e))
-        raise AssertionError from e  # unreachable
-
-
-def _ingest_pipeline(handle: IndexHandle) -> Pipeline:
-    try:
-        return handle.ingest_pipeline()
-    except (RebuildPendingError, IndexUnavailableError) as e:
+        return _single(cfg).open(_CONNECTION, None, use)
+    except (ConfigError, IndexRefused) as e:
         _fail(str(e))
         raise AssertionError from e  # unreachable
 
@@ -227,8 +222,8 @@ def ingest(
     json: JsonFlag = False,
 ):
     """Ingest files or directories (recursive)."""
-    cfg, handle, _ = _load(base_dir, db_path, cache_dir, model_name)
-    pipeline = _ingest_pipeline(handle)
+    entry, opened = _open(Use.INGEST, base_dir, db_path, cache_dir, model_name)
+    cfg, pipeline = entry.config, opened.pipeline
     files: list[Path] = []
     # Already held to the rules by their scan; only files named directly are checked again.
     scanned: set[Path] = set()
@@ -278,7 +273,7 @@ def ingest(
                 done.append(pipeline.ingest_file(f, rules_checked=f in scanned))
             except Exception as e:  # per-file failures never abort the batch
                 failures.append({"source": str(f), "error": str(e)})
-    notes = handle.notes()
+    notes = entry.handle.notes()
     payload = {"ingested": [ingest_reply(r, notes) for r in done], "failed": failures}
     human = "\n".join([f"ingested {len(done)} file(s):"] + [f"  {r.source}" for r in done])
     _emit(payload, json, human)
@@ -304,14 +299,14 @@ def ingest_url(
     json: JsonFlag = False,
 ):
     """Fetch an http(s) URL and index it."""
-    _, handle, _ = _load(base_dir, db_path, cache_dir, model_name)
-    pipeline = _ingest_pipeline(handle)
+    entry, opened = _open(Use.INGEST, base_dir, db_path, cache_dir, model_name)
+    pipeline = opened.pipeline
     try:
         with pipeline.job() as report:
             r = pipeline.ingest_url(url, source=source, title=title)
     except Exception as e:
         _fail(str(e))
-    reply = ingest_reply(r, handle.notes())
+    reply = ingest_reply(r, entry.handle.notes())
     _emit(reply, json, f"ingested {r.source} ({r.chunk_count} chunks)")
     _warn(reply.get("warnings", []))
     _warn_labelling(pipeline, report.problems)
@@ -333,15 +328,15 @@ def sync(
     configuration changed since it was built ("rebuild pending" in status) is rebuilt by a
     sync without a path, and a sync with one is refused.
     """
-    cfg, handle, _ = _load(base_dir, db_path, cache_dir, model_name)
+    entry, _ = _open(Use.SYNC, base_dir, db_path, cache_dir, model_name)
     scope = None
     if path is not None:
         try:
-            scope = resolve_in_roots(path, cfg.roots, require_absolute=False)
+            scope = resolve_in_roots(path, entry.config.roots, require_absolute=False)
         except SecurityError as e:
             _fail(str(e))
     try:
-        counts, errors, rebuilt = handle.run_sync(
+        counts, errors, rebuilt = entry.handle.run_sync(
             scope, on_event=lambda m: print(m, file=sys.stderr)
         )
     except Exception as e:  # a refusal, a busy lock, a rebuild that stopped before its swap
@@ -384,7 +379,8 @@ def query(
     if top_k < 1:
         _fail(f"--top-k must be at least 1, got {top_k}")
     labels = _parse_labels(label)
-    cfg, _, opened = _load(base_dir, db_path, cache_dir, model_name)
+    entry, opened = _open(Use.READ, base_dir, db_path, cache_dir, model_name)
+    cfg = entry.config
     try:
         payload = run_query(
             opened.store,
@@ -473,7 +469,8 @@ def find(
     starts with a dash goes after `--`, and every option before it.
     """
     labels = _parse_labels(label)
-    cfg, _, opened = _load(base_dir, db_path, cache_dir, model_name)
+    entry, opened = _open(Use.READ, base_dir, db_path, cache_dir, model_name)
+    cfg = entry.config
     try:
         payload = run_find(
             opened.store,
@@ -510,7 +507,8 @@ def read_neighbors(
     json: JsonFlag = False,
 ):
     """Read chunks around a given chunk index."""
-    cfg, _, opened = _load(base_dir, db_path, cache_dir, model_name)
+    entry, opened = _open(Use.READ, base_dir, db_path, cache_dir, model_name)
+    cfg = entry.config
     if file_path is not None:
         try:
             key = str(resolve_in_roots(file_path, cfg.roots, require_absolute=False))
@@ -549,7 +547,8 @@ def read(
     chunk repeats to carry it into its own vector is emitted once, where the document
     had it.
     """
-    cfg, _, opened = _load(base_dir, db_path, cache_dir, model_name)
+    entry, opened = _open(Use.READ, base_dir, db_path, cache_dir, model_name)
+    cfg = entry.config
     if path is not None:
         try:
             key = str(resolve_in_roots(path, cfg.roots, require_absolute=False))
@@ -602,7 +601,8 @@ def list_cmd(
     named in a warning on stderr and in unlistedFolders with --json.
     """
     labels = _parse_labels(label)
-    cfg, _, opened = _load(base_dir, db_path, cache_dir, model_name)
+    entry, opened = _open(Use.READ, base_dir, db_path, cache_dir, model_name)
+    cfg = entry.config
     try:
         payload = list_payload(
             opened.store,
@@ -655,7 +655,8 @@ def status(
         payload = {"version": __version__, "configError": str(e)}
         _emit(payload, json, "\n".join(f"{k}: {v}" for k, v in payload.items()))
         return
-    payload = status_payload(cfg, _handle(cfg))
+    entry = _single(cfg).resolve(_CONNECTION, None)
+    payload = status_payload(entry.config, entry.handle)
     human = "\n".join(f"{k}: {v}" for k, v in payload.items())
     _emit(payload, json, human)
 
@@ -672,7 +673,8 @@ def delete(
     json: JsonFlag = False,
 ):
     """Delete an indexed file (by path) or data/url item (by --source)."""
-    cfg, _, opened = _load(base_dir, db_path, cache_dir, model_name)
+    entry, opened = _open(Use.READ, base_dir, db_path, cache_dir, model_name)
+    cfg = entry.config
     if path is not None:
         try:
             key = str(resolve_in_roots(path, cfg.roots, require_absolute=False))
@@ -710,7 +712,8 @@ def classify_try(
 
     Nothing is embedded or stored.
     """
-    cfg, _, opened = _load(base_dir, db_path, cache_dir, model_name)
+    entry, opened = _open(Use.READ, base_dir, db_path, cache_dir, model_name)
+    cfg = entry.config
     pipeline = opened.pipeline
     try:
         target = resolve_in_roots(path, cfg.roots, require_absolute=False)

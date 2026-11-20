@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from minirag_mcp.registry import IndexRegistry
+
 CORPORA = {
     "alpha": ("alpha.md", "# Alpha\n\nAlpha body about apricots and audits."),
     "beta": ("beta.md", "# Beta\n\nBeta body about bananas and budgets."),
@@ -51,3 +53,9 @@ def make_indexes_file(tmp_path: Path) -> IndexesFile:
     made = IndexesFile(path, {"HOME": str(tmp_path)}, roots, INDEXES_TOML)
     made.write(INDEXES_TOML)
     return made
+
+
+def file_registry(indexes_file: IndexesFile, embedder_factory, **kw) -> IndexRegistry:
+    return IndexRegistry.from_file(
+        indexes_file.path, indexes_file.env, embedder_factory=embedder_factory, **kw
+    )
