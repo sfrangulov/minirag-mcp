@@ -476,7 +476,7 @@ Run: `git push && git push origin v2.0.0a1`
 Write release notes to `$SCRATCH/notes-2.0.0a1.md`; the repository keeps no CHANGELOG, so these notes are the changelog. They cover:
 - that this is a test release and 1.1.1 stays the default;
 - the install lines from the README v2 section;
-- what changed for a 1.x user: default model e5 (2.24 GB), index at `.minirag/v2/` (a 1.x index is never written), `[ocr]` is now Tesseract (`RAG_OCR_LANG` in Tesseract spelling, `eslav`/`en` still accepted), struck-through `.docx` text no longer indexed, parallel sync (`RAG_SYNC_WORKERS`), `serve`, `connect`, `--index`, the endpoints, document BM25 and the reranker;
+- what changed for a 1.x user: default model e5 (2.24 GB), index at `.minirag/v2/` (a 1.x index is never written), `[ocr]` is now Tesseract (`RAG_OCR_LANG` in Tesseract spelling, `eslav`/`en` still accepted), ~~struck-through `.docx` text no longer indexed~~ struck-through text still indexed but marked `~~...~~` in every chunk that holds it, double strikethrough included (owner, 2026-11-19), parallel sync (`RAG_SYNC_WORKERS`), `serve`, `connect`, `--index`, the endpoints, document BM25 and the reranker;
 - a link to `#v2-pre-release`.
 
 Then run:

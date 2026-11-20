@@ -10,8 +10,8 @@ Plans, executed in this order (each leaves `uv run pytest -q`, `ruff check src t
 
 1. `-01-core.md` — endpoints, embedder, index identity and rebuilds, `IndexHandle`, document
    BM25, reranking, classify endpoint, v2 config, chunk-budget measurement. g7q.1, .3, .4, .7.
-2. `-02-ingest.md` — struck-through `.docx` text, Tesseract OCR, parallel sync. g7q.6, .9,
-   .12 (that item), .14.
+2. `-02-ingest.md` — struck-through text (kept, marked `~~...~~` across chunk splits),
+   Tesseract OCR, parallel sync. g7q.6, .9, .12 (that item), .14.
 3. `-03-server.md` — `indexes.toml`, the registry, `serve`, `index` argument, `list_indexes`,
    `connect`, CLI `--index`, instructions, LaunchAgent template. g7q.2.
 4. `-04-release.md` — release mechanics, README, joint check and baseline (g7q.5), `2.0.0a1`,
@@ -23,16 +23,16 @@ Plans, executed in this order (each leaves `uv run pytest -q`, `ruff check src t
 |---|---|---|
 | `endpoints.py` | 1.1 | `Endpoint(url, name, api_key=None, timeout=120.0)`, `EndpointError`, `read_api_key(path)`, `EmbeddingEndpoint.embed`, `RerankEndpoint.scores`, `.last_error` |
 | `config.py` | 1.2; 2.3, 2.6 | `DEFAULT_MODEL` (e5-large), `default_db_path(roots)` = `<first root>/.minirag/v2`; `Config` + `document_weight`, `rerank_top`, `embed_endpoints: Mapping[str, Endpoint]` (fastembed id -> endpoint), `rerank_endpoint`, `classify_endpoint`, `index_name` (plan 1); `sync_workers`, `ocr_lang` in Tesseract spelling (plan 2) |
-| `embedder.py` | 1.2, 1.3, 1.10 | `Embedder(model_name, cache_dir, *, endpoint=None, prefixes=None, threads=None)`: picklable, public `threads`, `prefixes`, `backend`, `warning`, `max_tokens`, `prefix_tokens`, `expect_probe`, `probe_vector`, `verify`, `probe_error`; `known_model`, `prefix_rule`, `model_window`, `default_budget` |
+| `embedder.py` | 1.2, 1.3, 1.10 | `Embedder(model_name, cache_dir, *, endpoint=None, prefixes=None, threads=None, allow_fallback=True)`: picklable, public `threads`, `allow_fallback`, `prefixes`, `backend`, `warning`, `max_tokens`, `prefix_tokens`, `expect_probe`, `probe_vector`, `verify`, `probe_error`; `known_model`, `prefix_rule`, `model_window`, `default_budget` |
 | `identity.py` | 1.4 | `IndexIdentity`, `EmbeddingScheme`, `ChunkingScheme`, `IndexState` (`ready`, `rebuild pending`, `syncing`, `unavailable`), `read_identity`, `index_state`, `differences`, `rebuild_kind`, `staging_dir`, `previous_dir`, `swap_in`, `recover_swap`, `rebuild_running`, `RebuildInfo` |
 | `handle.py` | 1.5, 1.9-1.11 | `make_embedder(config, scheme, *, threads=None)`, `configured_scheme(config)`, `EmbedderFactory`, `OpenIndex(config, store, embedder, pipeline, labels, identity, reranker)`, `IndexHandle(config, *, embedder_factory, model_factory)` with `get()`, `state()`, `.sync`, `run_sync(scope, on_event)`, `ensure_probe()`, `notes()`; `IndexUnavailableError` |
 | `rebuild.py` | 1.11 | `rebuild(current, make, on_event)` |
 | `store.py` | 1.7, 1.8, 1.11; 2.5 | `documents` table; `_document_row`, `_write_documents`, `_delete_documents`, `backfill_documents`; `search(..., document_weight, reranker, rerank_top)`; `copy_reembedded`; `IndexBusyError`; `replace_sources(batch, *, indexed)` (plan 2) |
 | `ingest/pipeline.py` | 1.3, 1.10, 1.11; 2.4 | `Pipeline(store, embedder, config, labels=None, *, before_store=None)`, `.before_store`, `reingest_stored`; `PreparedDocument` (with `embedding_warning`), `prepare`, `prepare_file`, `records`, `store_prepared` (plan 2) |
-| `sync.py` | 1.3, 1.7, 1.9, 1.11; 2.9 | `_run_sync_unlocked(pipeline, store, roots, max_file_size, scope, on_event)`, `SyncManager(pipeline, store, config, *, run=None)`, `.running`, `SyncJob.rebuild` |
+| `sync.py` | 1.3, 1.7, 1.9, 1.11; 2.9 | `_run_sync_unlocked(pipeline, store, roots, max_file_size, scope, on_event)`, `SyncManager(db_path, run)`, `.running`, `SyncJob.rebuild` |
 | `results.py` | 1.3-1.9; 3.4 | `embedding_status`, `embedder_notes`, `ingest_reply(r, notes)`, `rerank_status`, `documents_status`, `status_payload(config, handle)` (plan 1); `with_index`, `index_status`, `registry_status`, `list_indexes_payload` (plan 3) |
 | `labels/endpoint_model.py` | 1.6 | `EndpointChoiceModel`, `endpoint_model_factory`; `LabelerSource.backend` |
-| `parallel.py` | 2.6-2.8 | `prepare_files`, `worker_pipeline`, `BatchWriter`, `default_workers`, `worker_count` (sync.py only) |
+| `parallel.py` | 2.6-2.8 | `prepare_files`, `worker_pipeline`, `BatchWriter`, `default_workers`, `worker_count`, `physical_cores`, `total_memory`, `worker_footprint`, `worker_threads` (sync.py only) |
 | `indexes.py` | 3.1 | `ServerConfig`, `load_server_config(path, env)`, `default_config_path(env=None)`, `INDEX_KEYS` |
 | `registry.py` | 3.2, 3.3 | `Connection`, `UNRESTRICTED`, `Use`, `IndexRegistry` (`from_file`, `single`, `open`, `resolve`, `refresh`, `reload`), `IndexEntry` (`.handle`, `runtime()`, `state()`), `EmbedderPool`, `IndexRefused`, `IndexUnavailable` |
 | `http_server.py`, `bridge.py` | 3.7, 3.8 | `serve`, `ensure_token`, `parse_connection`; `run_bridge` |
@@ -50,7 +50,8 @@ Plans, executed in this order (each leaves `uv run pytest -q`, `ruff check src t
   `(scheme, cache_dir, endpoint)` so indexes of one model share one embedder in `serve`. Sync
   workers never build one: they get the pipeline's embedder by pickle, so they embed with the
   recorded scheme and carry its expected probe.
-- **The probe.** The handle passes `before_store=self.ensure_probe`; `store_prepared` calls
+- **The probe.** The handle passes each generation's pipeline a `_BeforeStore` as
+  `before_store` (`IndexHandle.ensure_probe()` calls the open one); `store_prepared` calls
   it before each `replace_source`; the parallel sync calls `pipeline.before_store()` once
   before starting workers. A rebuild arms its new embedder itself.
 - **Batched writes.** `Store.replace_sources` writes chunk rows in one commit, document rows

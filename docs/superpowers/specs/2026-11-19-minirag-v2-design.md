@@ -341,10 +341,15 @@ on the owner's GPU). `find_mentions` (literal search) is unchanged.
   taken in Tesseract's own reading order; `assemble_lines`, which interleaves the columns of
   two-column pages for every engine (g7q.14), is no longer on this path. `ocr_engine` becomes
   `tesseract`. `RAG_OCR_LANG` maps to Tesseract language codes.
-- **Parser noise** (g7q.12) — struck-through `.docx` text is dropped at parse time (deleted
-  requirements are searchable as current today: a correctness fix). The other items —
-  boilerplate and table-header titles, transcript block headers, PDF leader dots, spreadsheet
-  `Unnamed: N`/`NaN` — are fixed only if the ruler shows they move retrieval.
+- **Parser noise** (g7q.12) — ~~struck-through `.docx` text is dropped at parse time (deleted
+  requirements are searchable as current today: a correctness fix).~~ **Superseded (owner,
+  2026-11-19):** struck-through text is still text — it records what was removed — so it is
+  kept, and marked: every chunk that holds struck text carries `~~...~~` around it (a chunk
+  boundary inside a struck run closes the markers at the end of one chunk and re-opens them
+  at the start of the next), double strikethrough is marked like single, and the server
+  instructions say that `~~...~~` marks deleted text, never to be cited as current. The other
+  items — boilerplate and table-header titles, transcript block headers, PDF leader dots,
+  spreadsheet `Unnamed: N`/`NaN` — are fixed only if the ruler shows they move retrieval.
 
 ### 6. Measurement gates
 
@@ -387,7 +392,9 @@ on the owner's GPU). `find_mentions` (literal search) is unchanged.
 - Endpoints fall back to in-process models loudly rather than failing searches.
 - v2 indexes default to `<first root>/.minirag/v2/`.
 - Rebuilds keep one previous copy (disk cost: one index).
-- Struck-through text is dropped in v2 without a ruler measurement (correctness).
+- ~~Struck-through text is dropped in v2 without a ruler measurement (correctness).~~
+  Superseded (owner, 2026-11-19): struck-through text is kept and marked `~~...~~` in every
+  chunk that holds it, without a ruler measurement (correctness).
 - Sync stays triggered as today (agent or CLI); no file watcher in v2. A rebuild after a
   configuration change also waits for an explicit sync; until then the index answers from
   its recorded scheme.
