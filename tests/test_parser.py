@@ -1,11 +1,15 @@
+import zipfile
+
 import pytest
 
 from conftest import SECRET_BODY
+from docx_builder import build_docx, para, run, table
 from minirag_mcp.ingest.parser import (
     MAX_REDIRECTS,
     SUPPORTED_EXTENSIONS,
     ParsedDoc,
     ParserError,
+    _docx_stream,
     _is_boilerplate_heading,
     _is_informative_stem,
     _strip_extension_suffix,
@@ -651,3 +655,63 @@ def test_cp1251_text_still_converts(tmp_path):
         "Приказ о командировке сотрудника отдела продаж в Казань.\n".encode("cp1251") * 20
     )
     assert "командировке" in parse_file(f).markdown
+
+
+# --- struck-through .docx text: kept, and marked `~~...~~` -------------------------
+
+
+def test_a_double_struck_docx_run_is_marked_like_a_single_struck_one(tmp_path):
+    """mammoth reads `w:strike` only, so double-struck text — deleted text, to the
+    author — arrived with no marker at all and read as current."""
+    body = para(run("kept "), run("DOUBLESTRUCK", "<w:dstrike/>"), run(" tail"))
+    body += table((para(run("CELLDOUBLE", "<w:b/><w:dstrike/>")),))
+    md = parse_file(build_docx(tmp_path / "spec.docx", body)).markdown
+    assert "kept ~~DOUBLESTRUCK~~ tail" in md
+    assert "~~CELLDOUBLE~~" in md
+
+
+def test_struck_docx_runs_keep_their_markers(tmp_path):
+    body = (
+        para(run("Keep this. "), run("OLDCLAUSE 4.2", "<w:strike/>"), run(" and the tail."))
+        + table((para(run("cell kept")), para(run("CELLSTRUCK", "<w:strike/>"))))
+        + para(run("WHOLEPARA", "<w:b/><w:strike/>"))
+    )
+    md = parse_file(build_docx(tmp_path / "spec.docx", body)).markdown
+    assert "Keep this. ~~OLDCLAUSE 4.2~~ and the tail." in md
+    assert "| cell kept | ~~CELLSTRUCK~~ |" in md
+    assert "~~WHOLEPARA~~" in md
+
+
+def test_docx_literal_tildes_and_switched_off_strikes_stay_unmarked(tmp_path):
+    body = para(run("Literal ~~tildes~~ stay")) + para(
+        run("off", '<w:strike w:val="0"/>'),
+        run(" false", '<w:strike w:val="false"/>'),
+        run(" doubleoff", '<w:dstrike w:val="0"/>'),
+        run(" doublefalse", '<w:dstrike w:val="false"/>'),
+    )
+    md = parse_file(build_docx(tmp_path / "spec.docx", body)).markdown
+    assert "Literal ~~tildes~~ stay" in md
+    assert "off false doubleoff doublefalse" in md
+
+
+def _truncated_docx(tmp_path):
+    whole = build_docx(tmp_path / "whole.docx", para(run("x", "<w:dstrike/>"))).read_bytes()
+    bad = tmp_path / "bad.docx"
+    bad.write_bytes(whole[: len(whole) // 2])
+    return bad
+
+
+def test_a_docx_that_is_not_a_zip_still_fails_to_convert(tmp_path):
+    with pytest.raises(ParserError, match=r"Failed to convert .*bad\.docx"):
+        parse_file(_truncated_docx(tmp_path))
+
+
+def test_only_a_docx_with_double_strike_is_rewritten(tmp_path):
+    plain = build_docx(tmp_path / "plain.docx", para(run("x", "<w:strike/>")))
+    assert _docx_stream(plain) is None
+    assert _docx_stream(_truncated_docx(tmp_path)) is None
+    double = build_docx(tmp_path / "double.docx", para(run("x", "<w:dstrike/>")))
+    with zipfile.ZipFile(double) as original, zipfile.ZipFile(_docx_stream(double)) as copy:
+        assert copy.namelist() == original.namelist()
+        xml = copy.read("word/document.xml")
+    assert b"<w:strike/>" in xml and b"dstrike" not in xml
