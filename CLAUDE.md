@@ -81,9 +81,11 @@ extra back out.
 
 ## Architecture Overview
 
-An MCP server and a CLI over one index. Both are thin shells around the same core
-and hold no business logic of their own — a behavior change belongs in the core, and
-anything user-visible must appear identically through both.
+An MCP server and a CLI over the same indexes: the one the environment variables
+configure, or the named ones of `indexes.toml`, each call answered by one of them. Both
+are thin shells around the same core and hold no business logic of their own — a
+behavior change belongs in the core, and anything user-visible must appear identically
+through both.
 
 ```
 src/minirag_mcp/

@@ -18,6 +18,9 @@
 
   The token is in ~/.config/minirag/token. Logs go to ~/Library/Logs/minirag-mcp.log.
 
+  The [ocr] extra reads scanned PDFs and images; without it a sync fails each of them.
+  On macOS it also installs Apple Vision's bindings, the second reader of unsure pages.
+
   Why the interpreter is pinned: macOS privacy (TCC) grants access to Documents,
   Desktop and similar folders per binary, and a LaunchAgent cannot ask for it. Point
   __PYTHON__ at the interpreter that has been granted access to the folders you index,
@@ -37,7 +40,7 @@
     <string>--python</string>
     <string>__PYTHON__</string>
     <string>--from</string>
-    <string>minirag-mcp==__VERSION__</string>
+    <string>minirag-mcp[ocr]==__VERSION__</string>
     <string>minirag-mcp</string>
     <string>serve</string>
   </array>

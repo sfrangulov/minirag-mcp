@@ -28,7 +28,7 @@ def test_the_launch_agent_template_runs_serve():
         "--python",
         "/opt/python3",
         "--from",
-        "minirag-mcp==2.0.0a1",
+        "minirag-mcp[ocr]==2.0.0a1",
         "minirag-mcp",
         "serve",
     ]
