@@ -310,6 +310,12 @@ class IndexHandle:
         self._opened()
         return self._sync
 
+    @property
+    def sync_running(self) -> bool:
+        """Whether a sync job of this handle is pending or running; never opens the index."""
+        sync = self._sync
+        return sync is not None and sync.running
+
     def state(self) -> tuple[IndexState, str]:
         """The index's state and why; never raises. An index that cannot be opened is
         unavailable, with the open's error as the reason. It is syncing while a sync of this

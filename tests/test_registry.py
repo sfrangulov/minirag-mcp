@@ -7,6 +7,7 @@ import time
 
 import pytest
 
+import minirag_mcp.registry as registry_mod
 from conftest import FakeEmbedder
 from index_helpers import file_registry
 from minirag_mcp.config import ConfigError, load_config
@@ -405,3 +406,330 @@ def test_the_environment_mode_is_one_index_named_default(tmp_path, fake_embedder
     assert broken.names == ()
     with pytest.raises(IndexRefused, match="Configuration error: BASE_DIRS"):
         broken.open(Connection("default", None), None, Use.READ)
+
+
+DELTA = '\n[index.delta]\nroots = ["~/corpora/alpha/sub"]\n'
+RESTART = "; host/port/token_file changes apply after a restart"
+
+
+def _without(text: str, name: str) -> str:
+    """`text` with its `[index.NAME]` table left out."""
+    return "\n\n".join(t for t in text.split("\n\n") if not t.startswith(f"[index.{name}]"))
+
+
+def _with(text: str, name: str, line: str) -> str:
+    """`text` with `line` added to its `[index.NAME]` table."""
+    header = f"[index.{name}]\n"
+    return text.replace(header, header + line + "\n")
+
+
+def _counted_loads(monkeypatch, delay: float = 0.0) -> list:
+    """Every call of the registry's `load_server_config` from now on, each `delay` s long."""
+    real = registry_mod.load_server_config
+    loads = []
+
+    def counted(path, env):
+        loads.append(path)
+        time.sleep(delay)
+        return real(path, env)
+
+    monkeypatch.setattr(registry_mod, "load_server_config", counted)
+    return loads
+
+
+def _closes(monkeypatch) -> list[IndexHandle]:
+    """Every handle `IndexHandle.close()` is called on from now on."""
+    real = IndexHandle.close
+    closed = []
+
+    def spy(self):
+        closed.append(self)
+        real(self)
+
+    monkeypatch.setattr(IndexHandle, "close", spy)
+    return closed
+
+
+def test_an_edited_file_is_reloaded_on_the_next_refresh(indexes_file, fake_embedder):
+    reg = file_registry(indexes_file, lambda c, s: fake_embedder)
+    indexes_file.write(indexes_file.text + DELTA)
+    reg.refresh()
+    assert reg.names == ("alpha", "beta", "gamma", "delta")
+
+
+def test_an_unchanged_file_is_not_parsed_again(indexes_file, fake_embedder, monkeypatch):
+    loads = _counted_loads(monkeypatch)
+    reg = file_registry(indexes_file, lambda c, s: fake_embedder)
+    for _ in range(3):
+        reg.refresh()
+    assert len(loads) == 1
+
+
+def test_an_unchanged_index_keeps_its_open_runtime(indexes_file, fake_embedder):
+    reg = file_registry(indexes_file, lambda c, s: fake_embedder)
+    entry = reg.resolve(UNRESTRICTED, "alpha")
+    before = entry.runtime()
+    indexes_file.write(indexes_file.text.replace("Beta documents", "Beta papers"))
+    reg.refresh()
+    assert reg.resolve(UNRESTRICTED, "alpha") is entry
+    assert reg.resolve(UNRESTRICTED, "alpha").runtime() is before
+
+
+def test_an_index_whose_description_alone_changed_keeps_its_open_runtime(
+    indexes_file, fake_embedder, monkeypatch
+):
+    reg = file_registry(indexes_file, lambda c, s: fake_embedder)
+    closed = _closes(monkeypatch)
+    before = reg.resolve(UNRESTRICTED, "beta").runtime()
+    indexes_file.write(indexes_file.text.replace("Beta documents", "Beta papers"))
+    reg.refresh()
+    reg.refresh()
+    entry = reg.resolve(UNRESTRICTED, "beta")
+    assert entry.description == "Beta papers" and entry.runtime() is before and closed == []
+
+
+def test_a_changed_index_is_reopened_with_its_new_settings(indexes_file, fake_embedder):
+    made = []
+    reg = file_registry(indexes_file, lambda c, s: made.append(c.index_name) or fake_embedder)
+    before = reg.resolve(UNRESTRICTED, "alpha").runtime()
+    indexes_file.write(_with(indexes_file.text, "alpha", "hybrid_weight = 0.9"))
+    reg.refresh()
+    assert made == ["alpha"]
+    after = reg.resolve(UNRESTRICTED, "alpha").runtime()
+    assert after is not before and after.config.hybrid_weight == 0.9
+
+
+def test_a_removed_index_stops_answering_and_keeps_its_data(indexes_file, fake_embedder):
+    reg = file_registry(indexes_file, lambda c, s: fake_embedder)
+    _, rt = reg.open(UNRESTRICTED, "beta", Use.INGEST)
+    rt.pipeline.ingest_file(indexes_file.roots["beta"] / "beta.md")
+    indexes_file.write(_without(indexes_file.text, "beta"))
+    reg.refresh()
+    assert reg.names == ("alpha", "gamma")
+    with pytest.raises(IndexRefused, match="Unknown index 'beta'"):
+        reg.open(UNRESTRICTED, "beta", Use.READ)
+    assert (indexes_file.roots["beta"] / ".minirag" / "v2").is_dir()
+
+
+def test_a_broken_edit_keeps_the_previous_indexes_and_says_why(indexes_file, fake_embedder, capsys):
+    reg = file_registry(indexes_file, lambda c, s: fake_embedder)
+    indexes_file.write("[server]\nport 8765\n")
+    reg.refresh()
+    assert reg.names == ("alpha", "beta", "gamma") and "line 2" in reg.config_error
+    err = capsys.readouterr().err
+    assert err.startswith(
+        f"minirag-mcp: could not reload {indexes_file.path}, still serving alpha, beta, gamma: "
+    )
+    assert err.endswith(f"{reg.config_error}\n") and err.count("\n") == 1
+    reg.open(UNRESTRICTED, "beta", Use.READ)
+    indexes_file.write(indexes_file.text)
+    reg.refresh()
+    assert reg.config_error is None
+    assert capsys.readouterr().err == (
+        f"minirag-mcp: reloaded {indexes_file.path}: alpha, beta, gamma\n"
+    )
+
+
+def test_a_deleted_file_keeps_the_previous_indexes(indexes_file, fake_embedder):
+    reg = file_registry(indexes_file, lambda c, s: fake_embedder)
+    indexes_file.path.unlink()
+    reg.refresh()
+    assert reg.names == ("alpha", "beta", "gamma")
+    assert str(indexes_file.path) in reg.config_error
+    reg.open(UNRESTRICTED, "alpha", Use.READ)
+
+
+def test_reload_reads_the_file_even_when_it_did_not_change(
+    indexes_file, fake_embedder, monkeypatch, capsys
+):
+    loads = _counted_loads(monkeypatch)
+    reg = file_registry(indexes_file, lambda c, s: fake_embedder)
+    reg.reload()
+    assert len(loads) == 2
+    assert capsys.readouterr().err == (
+        f"minirag-mcp: reloaded {indexes_file.path}: alpha, beta, gamma\n"
+    )
+
+
+def test_a_file_that_stays_broken_is_told_once_per_error_unless_a_reload_asks(
+    indexes_file, fake_embedder, capsys
+):
+    reg = file_registry(indexes_file, lambda c, s: fake_embedder)
+    indexes_file.path.unlink()
+    for _ in range(3):
+        reg.refresh()
+    assert capsys.readouterr().err.count("could not reload") == 1
+    indexes_file.write("[server]\nport 8765\n")
+    for _ in range(3):
+        reg.refresh()
+    err = capsys.readouterr().err
+    assert err.count("could not reload") == 1 and "line 2" in err
+    reg.reload()
+    assert capsys.readouterr().err.count("could not reload") == 1
+
+
+def test_a_refresh_during_a_reload_waits_for_it_and_loads_nothing_again(
+    indexes_file, fake_embedder, monkeypatch, capsys
+):
+    reg = file_registry(indexes_file, lambda c, s: fake_embedder)
+    entered, release = threading.Event(), threading.Event()
+    real = registry_mod.load_server_config
+    loads = []
+
+    def held(path, env):
+        loads.append(path)
+        entered.set()
+        assert release.wait(10)
+        return real(path, env)
+
+    monkeypatch.setattr(registry_mod, "load_server_config", held)
+    indexes_file.write(indexes_file.text + DELTA)
+    seen = []
+    first = threading.Thread(target=reg.refresh)
+    second = threading.Thread(target=lambda: (reg.refresh(), seen.append(reg.names)))
+    first.start()
+    try:
+        assert entered.wait(10)
+        second.start()
+        second.join(0.3)
+    finally:
+        release.set()
+        first.join()
+        if second.ident is not None:
+            second.join()
+    assert seen == [("alpha", "beta", "gamma", "delta")]
+    assert len(loads) == 1 and capsys.readouterr().err.count("reloaded") == 1
+
+
+def test_a_reload_is_not_held_up_by_an_index_being_opened(indexes_file, fake_embedder):
+    entered, release = threading.Event(), threading.Event()
+
+    def factory(config, scheme):
+        if config.index_name == "alpha":
+            entered.set()
+            release.wait(10)
+        return fake_embedder
+
+    reg = file_registry(indexes_file, factory)
+    opening = threading.Thread(target=reg.open, args=(UNRESTRICTED, "alpha", Use.READ))
+    reloading = threading.Thread(target=reg.reload)
+    opening.start()
+    try:
+        assert entered.wait(10)
+        indexes_file.write(_without(indexes_file.text, "alpha"))
+        reloading.start()
+        reloading.join(5)
+        assert not reloading.is_alive() and opening.is_alive()
+        assert reg.names == ("beta", "gamma")
+    finally:
+        release.set()
+        opening.join()
+        if reloading.ident is not None:
+            reloading.join()
+
+
+def test_a_retired_handle_is_closed_by_a_refresh_once_its_sync_has_ended(indexes_file, monkeypatch):
+    held = HeldEmbedder()
+    reg = file_registry(indexes_file, lambda c, s: held)
+    closed = _closes(monkeypatch)
+    old = reg.resolve(UNRESTRICTED, "alpha").handle
+    old.start_sync(None)
+    try:
+        assert held.entered.wait(10)
+        indexes_file.write(_with(indexes_file.text, "alpha", "hybrid_weight = 0.9"))
+        reg.reload()
+        reg.refresh()
+        assert reg.resolve(UNRESTRICTED, "alpha").handle is not old and closed == []
+    finally:
+        held.release.set()
+        old.sync.wait()
+    assert old.sync_running is False
+    reg.reload()
+    assert closed == []
+    reg.refresh()
+    assert closed == [old]
+    reg.refresh()
+    assert closed == [old]
+
+
+class _PausingReader:
+    """A connection that reaches every index, and holds at the first name it is asked about
+    until `go` is set."""
+
+    def __init__(self) -> None:
+        self.paused, self.go = threading.Event(), threading.Event()
+
+    def reachable(self, name: str) -> bool:
+        if not self.paused.is_set():
+            self.paused.set()
+            assert self.go.wait(10)
+        return True
+
+
+def test_a_reader_iterating_the_indexes_while_a_reload_swaps_them_sees_one_list(
+    indexes_file, fake_embedder
+):
+    reg = file_registry(indexes_file, lambda c, s: fake_embedder)
+    reader = _PausingReader()
+    seen, failed = [], []
+
+    def read() -> None:
+        try:
+            seen.append(reg.reachable(reader))
+        except Exception as e:
+            failed.append(e)
+
+    reading = threading.Thread(target=read)
+    reading.start()
+    try:
+        assert reader.paused.wait(10)
+        indexes_file.write(_without(indexes_file.text, "beta"))
+        reg.reload()
+    finally:
+        reader.go.set()
+        reading.join()
+    assert failed == [] and seen == [("alpha", "beta", "gamma")]
+    assert reg.names == ("alpha", "gamma")
+
+
+def test_a_changed_server_address_is_said_to_wait_for_a_restart(
+    indexes_file, fake_embedder, capsys
+):
+    reg = file_registry(indexes_file, lambda c, s: fake_embedder)
+    path = indexes_file.path
+    moved = "[server]\nport = 9000\n\n" + indexes_file.text
+    indexes_file.write(moved)
+    reg.refresh()
+    assert capsys.readouterr().err == f"minirag-mcp: reloaded {path}: alpha, beta, gamma{RESTART}\n"
+    assert reg.server.port == 9000 and reg.config_error is None
+    # The running server still listens where it started.
+    indexes_file.write(_without(moved, "gamma"))
+    reg.refresh()
+    assert capsys.readouterr().err == f"minirag-mcp: reloaded {path}: alpha, beta{RESTART}\n"
+    indexes_file.write(indexes_file.text)
+    reg.refresh()
+    assert capsys.readouterr().err == f"minirag-mcp: reloaded {path}: alpha, beta, gamma\n"
+
+
+def test_refresh_and_reload_never_raise(indexes_file, fake_embedder, monkeypatch, capsys):
+    reg = file_registry(indexes_file, lambda c, s: fake_embedder)
+
+    def broken(path, env):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(registry_mod, "load_server_config", broken)
+    indexes_file.write(indexes_file.text + DELTA)
+    reg.refresh()
+    reg.reload()
+    assert reg.names == ("alpha", "beta", "gamma") and reg.config_error == "RuntimeError: boom"
+    assert capsys.readouterr().err.count("could not reload") == 2
+
+
+def test_the_environment_mode_has_no_file_to_reload(tmp_path, fake_embedder, capsys):
+    reg = IndexRegistry.single(
+        load_config({"BASE_DIR": str(tmp_path)}), embedder_factory=lambda c, s: fake_embedder
+    )
+    reg.refresh()
+    reg.reload()
+    assert reg.names == ("default",) and reg.config_error is None
+    assert capsys.readouterr().err == ""

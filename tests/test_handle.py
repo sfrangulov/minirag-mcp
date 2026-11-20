@@ -507,6 +507,21 @@ def test_a_running_sync_makes_the_index_syncing(tmp_path):
     assert h.state() == (IndexState.READY, "")
 
 
+def test_sync_running_says_whether_a_job_runs_and_opens_nothing(tmp_path):
+    (tmp_path / "a.md").write_text("# Alpha\n\nAlpha body about tokens.")
+    emb = _Blocking()
+    made = []
+    h = IndexHandle(cfg(tmp_path), embedder_factory=lambda s: made.append(s) or emb)
+    assert h.sync_running is False
+    assert made == [] and not (tmp_path / ".minirag").exists()
+    job = h.start_sync()
+    assert emb.entered.wait(30)
+    assert h.sync_running is True
+    emb.released.set()
+    assert _finished(h.sync, job) == "succeeded"
+    assert h.sync_running is False
+
+
 def test_state_never_raises(tmp_path, fake_embedder):
     db = tmp_path / "db"
     db.write_text("not a folder")
