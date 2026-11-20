@@ -3,7 +3,7 @@ import zipfile
 import pytest
 
 from conftest import SECRET_BODY
-from docx_builder import build_docx, para, run, table
+from docx_builder import build_docx, para, run, styles, table
 from minirag_mcp.ingest.parser import (
     MAX_REDIRECTS,
     SUPPORTED_EXTENSIONS,
@@ -661,13 +661,22 @@ def test_cp1251_text_still_converts(tmp_path):
 
 
 def test_a_double_struck_docx_run_is_marked_like_a_single_struck_one(tmp_path):
-    """mammoth reads `w:strike` only, so double-struck text — deleted text, to the
-    author — arrived with no marker at all and read as current."""
+    """mammoth reads `w:strike` only; double-struck text is deleted text to its author,
+    and has to arrive marked like single strike."""
     body = para(run("kept "), run("DOUBLESTRUCK", "<w:dstrike/>"), run(" tail"))
     body += table((para(run("CELLDOUBLE", "<w:b/><w:dstrike/>")),))
     md = parse_file(build_docx(tmp_path / "spec.docx", body)).markdown
     assert "kept ~~DOUBLESTRUCK~~ tail" in md
     assert "~~CELLDOUBLE~~" in md
+
+
+def test_a_double_strike_written_as_an_element_pair_still_converts(tmp_path):
+    """mammoth reads `styles.xml` with expat, which refuses a start tag the rewrite
+    renamed and an end tag it did not."""
+    body = para(run("kept "), run("STRUCK", "<w:strike/>"))
+    parts = {"word/styles.xml": styles('<w:dstrike w:val="1"></w:dstrike>')}
+    md = parse_file(build_docx(tmp_path / "spec.docx", body, parts)).markdown
+    assert "kept ~~STRUCK~~" in md
 
 
 def test_struck_docx_runs_keep_their_markers(tmp_path):

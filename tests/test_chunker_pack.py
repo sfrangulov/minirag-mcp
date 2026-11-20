@@ -398,7 +398,8 @@ _EXACTLY_TWO = re.compile(r"(?<!~)~~(?!~)")
 
 def unmarked(text: str) -> str:
     """What a reader takes for current text: all but the `~~...~~` pairs, each of which
-    has to open on a word and close on one."""
+    has to open on a word and close on one. An escaped `\\~` is a literal character."""
+    text = text.replace("\\~", "x")
     assert "~~~" not in text, text
     found = [m.start() for m in _EXACTLY_TWO.finditer(text)]
     assert len(found) % 2 == 0, text
@@ -409,8 +410,8 @@ def unmarked(text: str) -> str:
 
 @pytest.mark.parametrize(("budget", "cut_into"), [(DEFAULT_TOKEN_BUDGET, 2), (40, 4)])
 def test_a_struck_run_cut_across_units_is_marked_in_every_one(budget, cut_into):
-    """markitdown marks a struck run once, at its ends; a unit cut from its middle held
-    deleted text with no marker at all, and read as current."""
+    """markitdown marks a struck run once, at its ends, so every unit cut from the run
+    has to carry markers of its own or its deleted text reads as current."""
     chunks = chunk_markdown(STRUCK_DOC, count_tokens=count, budget=budget)
     struck = [c for c in chunks if "Deleted" in c.text]
     assert len(struck) >= cut_into, "the run has to be cut to prove anything"
@@ -478,6 +479,19 @@ def test_a_cut_inside_nested_struck_runs_adds_one_marker():
     assert not any("~~~" in c.text for c in chunks), [c.text for c in chunks]
 
 
+def test_a_tilde_a_cut_leaves_beside_a_marker_is_escaped():
+    """`~~~` is no marker, and at the start of a line it opens a code fence when the
+    stored text is chunked again; `\\~` is a literal tilde that a marker can stand by."""
+    leading = "Plan. " + " ".join(f"~{i} days were planned for clause six." for i in range(20))
+    trailing = "\n".join(f"deleted line {i} costs about 5~" for i in range(20)) + "\nend"
+    for markdown in (f"~~{leading}~~", f"~~{trailing}~~"):
+        chunks = chunk_markdown(markdown, count_tokens=count, budget=40)
+        assert len(chunks) > 2
+        stored = join_parent([c.text for c in chunks])
+        for c in chunks + chunk_markdown(stored, count_tokens=count, budget=30):
+            assert not re.search(r"\d+ days|line", unmarked(c.text)), c.text
+
+
 def test_a_marker_without_a_partner_is_literal_and_never_balanced():
     """`a ~~ b` is a real document; so is an opener its paragraph or its table cell never
     closes, which a closer further on does not close either."""
@@ -500,7 +514,9 @@ def test_a_marker_without_a_partner_is_literal_and_never_balanced():
 
 
 def test_tildes_in_code_are_never_balanced():
-    """A `~~~` fence is code, and so is a code span: `~~` in either is literal."""
+    """`~~` in code is literal. The fence half guards `_split_fence`, which cuts a long
+    fence without balancing; it cannot show the CODE skip in `_paired`, because the pairs
+    of a whole fence close inside it."""
     fence = "~~~\nx = ~~start\n" + "\n".join(f"line_{i} = {i}" for i in range(400)) + "\nend~~\n~~~"
     spans = " ".join(f"Sentence {i} types `~~` to mark." for i in range(30))
     for markdown in (fence, spans):

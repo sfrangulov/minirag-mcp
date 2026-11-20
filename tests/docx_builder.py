@@ -1,8 +1,10 @@
-"""Minimal .docx builder for tests: a document.xml body and the two parts that find it."""
+"""Minimal .docx builder for tests: a document.xml body, the two parts that find it, and
+any other `word/` part mammoth reads by its default name, such as `word/styles.xml`."""
 
 from __future__ import annotations
 
 import zipfile
+from collections.abc import Mapping
 from pathlib import Path
 
 _CONTENT_TYPES = (
@@ -40,7 +42,17 @@ def table(*rows: tuple[str, ...]) -> str:
     return "<w:tbl>" + "".join(cells) + "</w:tbl>"
 
 
-def build_docx(path: Path, body: str) -> Path:
+def styles(*rprs: str) -> str:
+    """A `word/styles.xml` with one character style per `w:rPr` content."""
+    defined = "".join(
+        f'<w:style w:type="character" w:styleId="S{i}"><w:name w:val="S{i}"/>'
+        f"<w:rPr>{rpr}</w:rPr></w:style>"
+        for i, rpr in enumerate(rprs)
+    )
+    return f'<?xml version="1.0" encoding="UTF-8"?><w:styles xmlns:w="{_W}">{defined}</w:styles>'
+
+
+def build_docx(path: Path, body: str, parts: Mapping[str, str] | None = None) -> Path:
     document = (
         f'<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="{_W}">'
         f"<w:body>{body}</w:body></w:document>"
@@ -49,4 +61,6 @@ def build_docx(path: Path, body: str) -> Path:
         z.writestr("[Content_Types].xml", _CONTENT_TYPES)
         z.writestr("_rels/.rels", _RELS)
         z.writestr("word/document.xml", document)
+        for name, text in (parts or {}).items():
+            z.writestr(name, text)
     return path

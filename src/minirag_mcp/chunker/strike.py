@@ -16,9 +16,12 @@ from collections.abc import Sequence
 from typing import NamedTuple
 
 MARKER = "~~"
-# A delimiter run of tildes, or the backticks that open a code span: a code span
-# outranks every other inline construct, so a `~~` inside one is literal.
-_INLINE = re.compile(r"`+|~+")
+# A tilde a cut leaves beside a marker is written escaped: `~~~` is no marker, and at the
+# start of a line it opens a code fence when the stored text is chunked again.
+ESCAPE = "\\"
+# A backslash escape, a delimiter run of tildes, or the backticks that open a code span:
+# a code span outranks every other inline construct, so a `~~` inside one is literal.
+_INLINE = re.compile(r"\\.|`+|~+", re.S)
 _CELL_EDGE = re.compile(r"(?<!\\)\|")
 
 # (offset of a paired `~~`, +1 when it opens a run and -1 when it closes one)
@@ -28,16 +31,18 @@ Mark = tuple[int, int]
 def pairs(text: str) -> list[Mark]:
     """The `~~` markers of one paragraph that pair, in order.
 
-    GFM's rule without its punctuation clauses: exactly two tildes; a marker followed by
-    non-whitespace may open, one preceded by non-whitespace may close, and a closer
-    takes the nearest open one. A marker left without a partner is a literal `~~`, and
-    marks nothing.
+    GFM's rule without its punctuation clauses: exactly two tildes, none of them escaped;
+    a marker followed by non-whitespace may open, one preceded by non-whitespace may
+    close, and a closer takes the nearest open one. A marker left without a partner is a
+    literal `~~`, and marks nothing.
     """
     waiting: list[int] = []
     marks: list[Mark] = []
     at = 0
     while found := _INLINE.search(text, at):
         delimiter, at = found.group(), found.end()
+        if delimiter[0] == ESCAPE:
+            continue
         if delimiter[0] == "`":
             closing = re.compile(f"(?<!`){delimiter}(?!`)").search(text, at)
             at = closing.end() if closing else at
@@ -97,8 +102,12 @@ class Marked(NamedTuple):
         if reopen:
             own = own.lstrip()
         if closing:
-            own = own.rstrip() + MARKER
-        return Cut(MARKER if reopen else "", own, not closing)
+            own = own.rstrip()
+            if own.endswith("~") and not own.endswith(ESCAPE + "~"):
+                own = own[:-1] + ESCAPE + "~"
+            own += MARKER
+        lead = MARKER + ESCAPE if own.startswith("~") else MARKER
+        return Cut(lead if reopen else "", own, not closing)
 
     def uncuttable(self) -> frozenset[int]:
         """Offsets no cut may fall at: inside a marker, or between a marker and the text

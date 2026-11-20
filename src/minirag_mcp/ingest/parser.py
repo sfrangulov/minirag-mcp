@@ -435,6 +435,9 @@ def _utf8_hint(path: Path) -> StreamInfo | None:
 
 
 _DOUBLE_STRIKE = b"<w:dstrike"
+# An element written as a start and end tag needs both renamed: mammoth parses
+# `styles.xml`, `numbering.xml` and `comments.xml` with expat, which refuses a mismatch.
+_DOUBLE_STRIKE_END = b"</w:dstrike"
 
 
 def _docx_stream(path: Path) -> io.BytesIO | None:
@@ -460,6 +463,7 @@ def _docx_stream(path: Path) -> io.BytesIO | None:
                     data = source.read(info)
                     if info.filename in parts:
                         data = data.replace(_DOUBLE_STRIKE, b"<w:strike")
+                        data = data.replace(_DOUBLE_STRIKE_END, b"</w:strike")
                     copy.writestr(info, data)
     except (zipfile.BadZipFile, OSError):
         return None
