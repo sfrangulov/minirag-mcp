@@ -718,6 +718,12 @@ Rollback for this task: copy both backups back, then run the bootout and bootstr
 > of the reference index, and every index's `db` stays outside the cloud folder. The mirroring
 > script and the existing mirrors are left untouched as the rollback path. Paths and folder names
 > are in the private handover only.
+>
+> **Also (owner, 2026-11-20):** the local corpus is restructured first — one common local folder
+> with one subfolder per project, local-only material moved there, every move journaled
+> (old<TAB>new) so it can be undone — and each project index then reads BOTH its cloud project
+> folder and its local project subfolder (a project without a cloud folder reads its local one
+> only). The full checklist is bd minirag-mcp-g7q.13.2.
 
 **Files (outside the repository):** `$CONSTRAINTS_V2` (new) and `$MINIRAG_CONFIG` (new).
 
