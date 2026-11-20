@@ -57,6 +57,15 @@ class Connection:
 
     default: str | None
     allow: frozenset[str] | None
+    # Set by `only`: a server of its default index alone, which points a call naming another
+    # index, or a path under one, at the server of that index.
+    alone: bool = False
+
+    @classmethod
+    def only(cls, name: str) -> Connection:
+        """The connection of a server started for index `name` alone: one entry of an MCP
+        client's configuration per index (`minirag-mcp --index NAME`)."""
+        return cls(name, frozenset(), alone=True)
 
     def reachable(self, name: str) -> bool:
         return self.allow is None or name == self.default or name in self.allow
@@ -72,6 +81,14 @@ class IndexRefused(Exception):
 def _also(others: tuple[str, ...]) -> str:
     """The reachable indexes a refused call could use instead, as a closing sentence."""
     return f" Other reachable indexes: {', '.join(others)}." if others else ""
+
+
+def _own_entry(name: str) -> str:
+    """Where a server of another index alone sends a call for index `name`."""
+    return (
+        f"its own entry in the client's MCP configuration (`minirag-mcp --index {name}`): use "
+        "that server's tools, or tell the user to add that entry"
+    )
 
 
 def _refused(name: str, why: str, others: tuple[str, ...]) -> IndexRefused:
@@ -433,6 +450,11 @@ class IndexRegistry:
             whose = " (this connection's default)" if requested is None else ""
             raise IndexRefused(f"Unknown index {name!r}{whose}. Reachable indexes: {reachable}.")
         if not connection.reachable(name):
+            if connection.alone:
+                raise IndexRefused(
+                    f"This server serves only index {connection.default!r}. Index {name!r} is "
+                    f"served by {_own_entry(name)}."
+                )
             allowed = ",".join(sorted(connection.allow or ()))
             raise IndexRefused(
                 f"Index {name!r} is not allowed on this connection (allow={allowed}). "
@@ -494,13 +516,17 @@ class IndexRegistry:
         self, connection: Connection, entry: IndexEntry, error: OutsideRootsError
     ) -> IndexRefused:
         """A path outside the roots of `entry`, and the reachable index whose roots hold it:
-        the one a call that forgot `index` meant."""
+        the one a call that forgot `index` meant. A server of `entry` alone names the index
+        holding it, which only that index's own server reaches."""
         entries = self._snapshot()
         others = self._others(entries, connection, entry.name)
         roots = ", ".join(str(root) for root in entry.config.roots)
         why = f"{error.requested} is outside its roots ({roots})"
-        holder = next((n for n in others if within(error.path, entries[n].config.roots)), None)
-        if holder is not None:
+        candidates = [n for n in entries if n != entry.name] if connection.alone else others
+        holder = next((n for n in candidates if within(error.path, entries[n].config.roots)), None)
+        if holder is not None and connection.alone:
+            why += f" but under those of index {holder!r}, which is served by {_own_entry(holder)}"
+        elif holder is not None:
             why += f' but under those of index {holder!r}: pass index="{holder}" to reach it'
         else:
             why += (

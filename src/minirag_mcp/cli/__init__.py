@@ -1,4 +1,8 @@
-"""CLI over the same core as the MCP server. Flags beat env vars."""
+"""CLI over the same core as the MCP server. Flags beat env vars.
+
+A command uses the index the environment variables configure, or with `--index NAME` that
+index of indexes.toml. `--index NAME` without a command serves that index alone on stdio.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +10,8 @@ import json as jsonlib
 import os
 import sys
 from collections.abc import Callable
+from contextvars import ContextVar
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated
 
@@ -17,11 +23,13 @@ from minirag_mcp.config import Config, ConfigError, load_config
 from minirag_mcp.embedder import EmbedderUnavailableError
 from minirag_mcp.handle import OpenIndex, make_embedder
 from minirag_mcp.identity import REASON_SEPARATOR, EmbeddingScheme
+from minirag_mcp.indexes import default_config_path
 from minirag_mcp.ingest.ignore import IGNORE_FILE, excluded_by
 from minirag_mcp.ingest.pipeline import IngestResult, Pipeline
 from minirag_mcp.ingest.scanner import scan_roots
 from minirag_mcp.registry import (
     SINGLE_INDEX_NAME,
+    UNRESTRICTED,
     Connection,
     IndexEntry,
     IndexRefused,
@@ -32,6 +40,7 @@ from minirag_mcp.results import (
     DEFAULT_FIND_LIMIT,
     QueryError,
     ingest_reply,
+    list_indexes_payload,
     list_payload,
     registry_status,
     result_dict,
@@ -101,12 +110,111 @@ def _fail(msg: str) -> None:
     raise SystemExit(1)
 
 
+@dataclass(frozen=True)
+class Selection:
+    """The options read before or after the command: an index of indexes.toml, and which
+    indexes.toml."""
+
+    index: str | None = None
+    config: str | None = None
+
+
+_NOTHING_SELECTED = Selection()
+_SELECTION: ContextVar[Selection] = ContextVar("minirag_selection", default=_NOTHING_SELECTED)
+
+ENV_FLAGS_WITH_INDEX = (
+    "--index reads indexes.toml; --base-dir, --db-path, --cache-dir and --model-name "
+    "configure the environment-variable index and cannot be combined with it. Set them in "
+    "the index's [index.NAME] table."
+)
+CONFIG_WITHOUT_INDEX = (
+    "--config names the indexes.toml that --index reads; without --index this command uses "
+    "the index the environment variables configure"
+)
+
+# The `--` that puts a `find` term starting with a dash after it is the command's to read.
+app.meta.end_of_options_delimiter = ""
+
+
+@app.meta.default
+def main(
+    *tokens: Annotated[str, Parameter(show=False, allow_leading_hyphen=True)],
+    index: Annotated[
+        str | None,
+        Parameter(
+            name="--index",
+            help="An index of indexes.toml, which the command uses in place of the index the "
+            "environment variables configure. Without a command, serve that index alone over "
+            "MCP on stdio.",
+        ),
+    ] = None,
+    config: Annotated[
+        str | None,
+        Parameter(
+            name="--config",
+            help="The indexes.toml to read. Overrides MINIRAG_CONFIG and the default "
+            "~/.config/minirag/indexes.toml.",
+        ),
+    ] = None,
+) -> object:
+    selected = _SELECTION.set(Selection(index, config))
+    try:
+        if tokens:
+            return app(tokens)
+        if index is not None:
+            return _serve(index)
+        _fail("nothing to do: give a command, or --index NAME to serve that index on stdio")
+    finally:
+        _SELECTION.reset(selected)
+
+
+def _config_path() -> Path:
+    """--config, else MINIRAG_CONFIG, else where this platform keeps indexes.toml."""
+    config = _SELECTION.get().config
+    if config is None:
+        return default_config_path(os.environ)
+    return Path(config).expanduser().absolute()
+
+
+def _file_registry() -> IndexRegistry:
+    """The indexes of indexes.toml; exit 1 naming the file when it does not load."""
+    path, models = _config_path(), _make_model_factory()
+    try:
+        registry = IndexRegistry.from_file(path, os.environ, model_factory=models)
+        # As in `_single`, only a test's stand-in is handed in: the handles build and own
+        # every real embedder, so both shells refuse an index alike.
+        if any(_make_embedder(entry.config) is not None for entry in registry.entries):
+            registry = IndexRegistry.from_file(
+                path, os.environ, embedder_factory=_cli_embedder, model_factory=models
+            )
+    except ConfigError as e:
+        _fail(str(e))
+        raise AssertionError from e  # unreachable
+    return registry
+
+
+def _serve(name: str) -> None:
+    """The MCP server on stdio for index `name` of indexes.toml alone: what one entry of a
+    client's configuration starts. A file that does not load, or names no such index,
+    fails before it serves."""
+    from minirag_mcp.server import create_app  # fastmcp loads in a serving process only
+
+    registry = _file_registry()
+    try:
+        registry.resolve(UNRESTRICTED, name)
+    except IndexRefused as e:
+        _fail(str(e))
+    create_app(registry, connection=Connection.only(name), env=os.environ).run()
+
+
 def _load_cfg(
     base_dir: list[str] | None,
     db_path: str | None,
     cache_dir: str | None,
     model_name: str | None,
 ) -> Config:
+    if _SELECTION.get().config is not None:
+        _fail(CONFIG_WITHOUT_INDEX)
     return load_config(
         os.environ,
         base_dir_flags=base_dir or (),
@@ -129,6 +237,8 @@ def _single(cfg: Config) -> IndexRegistry:
     return IndexRegistry.single(cfg, embedder_factory=factory, model_factory=_make_model_factory())
 
 
+# Reaches every index. Without --index its default is the environment's, named default;
+# with it, --index names the index of indexes.toml a command uses.
 _CONNECTION = Connection(SINGLE_INDEX_NAME, None)
 
 
@@ -138,6 +248,10 @@ def _registry(
     cache_dir: str | None,
     model_name: str | None,
 ) -> IndexRegistry:
+    if _SELECTION.get().index is not None:
+        if any(flag is not None for flag in (base_dir, db_path, cache_dir, model_name)):
+            _fail(ENV_FLAGS_WITH_INDEX)
+        return _file_registry()
     try:
         return _single(_load_cfg(base_dir, db_path, cache_dir, model_name))
     except ConfigError as e:
@@ -147,7 +261,7 @@ def _registry(
 
 def _open_in(registry: IndexRegistry, use: Use) -> tuple[IndexEntry, OpenIndex]:
     try:
-        return registry.open(_CONNECTION, None, use)
+        return registry.open(_CONNECTION, _SELECTION.get().index, use)
     except IndexRefused as e:
         _fail(str(e))
         raise AssertionError from e  # unreachable
@@ -662,20 +776,48 @@ def status(
     json: JsonFlag = False,
 ):
     """Show index and configuration status."""
+    selection = _SELECTION.get()
     # Degraded mode, matching the server's `status` tool: a broken configuration is
     # exactly what you run `status` to diagnose, so it reports the error and exits 0.
-    # Every other command still fails loudly on the same ConfigError.
+    # Every other command still fails loudly on the same ConfigError. An indexes.toml that
+    # does not load fails it too: no configuration loaded before it to report beside it.
+    if selection.index is not None:
+        registry = _registry(base_dir, db_path, cache_dir, model_name)
+    else:
+        try:
+            registry = _single(_load_cfg(base_dir, db_path, cache_dir, model_name))
+        except ConfigError as e:
+            registry = IndexRegistry.single(None, error=str(e))
     try:
-        registry = _single(_load_cfg(base_dir, db_path, cache_dir, model_name))
-    except ConfigError as e:
-        registry = IndexRegistry.single(None, error=str(e))
-    try:
-        payload = registry_status(registry, _CONNECTION, None)
+        payload = registry_status(registry, _CONNECTION, selection.index)
     except IndexRefused as e:
         _fail(str(e))
         raise AssertionError from e  # unreachable
     human = "\n".join(f"{k}: {v}" for k, v in payload.items())
     _emit(payload, json, human)
+
+
+def _index_line(row: dict) -> str:
+    """One `indexes` row; an unavailable index says why in place of its counts."""
+    if "documentCount" in row:
+        found = f"{row['documentCount']} documents, {row['chunkCount']} chunks"
+    else:
+        found = row["stateReason"]
+    line = f"{row['name']} [{row['state']}] {found}, {row['model']}, {row['language']}"
+    return line + (f" — {row['description']}" if row["description"] else "")
+
+
+@app.command
+def indexes(*, json: JsonFlag = False) -> None:
+    """List the indexes of indexes.toml, as the MCP list_indexes tool does.
+
+    Each is opened to be reported, which may load its embedding model. A row is
+    "name [state] counts, model, language — description"; an index that cannot be opened
+    gives why in place of its counts, and --json also the reason a syncing or "rebuild
+    pending" index is not ready.
+    """
+    payload = list_indexes_payload(_file_registry(), UNRESTRICTED)
+    _emit(payload, json, "\n".join(_index_line(row) for row in payload["indexes"]))
 
 
 @app.command

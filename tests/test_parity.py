@@ -19,12 +19,14 @@ from fastmcp import Client
 import minirag_mcp.cli as cli
 import minirag_mcp.embedder as embedder_mod
 from conftest import FakeEmbedder, stamp_identity
+from index_helpers import file_registry
 from lookalike_texts import MINUTES, REGULATION_V1, REGULATION_V2
 from minirag_mcp import ocr, ocr_vision
 from minirag_mcp.config import default_db_path, load_config
 from minirag_mcp.embedder import E5_LARGE, Embedder
 from minirag_mcp.labels import Labeler
 from minirag_mcp.labels.model import ModelError
+from minirag_mcp.registry import UNRESTRICTED, Connection
 from minirag_mcp.server import create_app
 from minirag_mcp.store import DOCUMENT_TABLE, SIGNATURE_TABLE, Store
 
@@ -1111,3 +1113,126 @@ async def test_status_reports_undocumented_documents_the_same_way_in_both(
     assert code == 0
     _, st = await call_mcp(env, "status", {}, fake_embedder)
     assert "undocumentedSourceCount" not in st
+
+
+# --- file mode: indexes.toml, `--index` in the CLI and `index` in the server ----------
+
+
+def run_meta(tokens, capsys) -> tuple[int, str, str]:
+    try:
+        cli.app.meta(tokens, result_action="return_value", exit_on_error=False)
+        code = 0
+    except SystemExit as e:
+        code = e.code
+    captured = capsys.readouterr()
+    return code, captured.out, captured.err
+
+
+@pytest.fixture
+def file_mode(indexes_file, monkeypatch, fake_embedder):
+    """Both shells over `indexes_file`: the CLI through --config, the server through a
+    registry of the same file, each embedding with the fake."""
+    monkeypatch.setenv("HOME", indexes_file.env["HOME"])
+    monkeypatch.setattr(cli, "_make_embedder", lambda cfg: fake_embedder)
+
+    def server(connection: Connection = UNRESTRICTED):
+        registry = file_registry(indexes_file, lambda c, s: fake_embedder)
+        return create_app(registry, connection=connection)
+
+    return server
+
+
+async def _call(app, tool: str, args: dict) -> tuple[bool, object]:
+    async with Client(app) as c:
+        r = await c.call_tool(tool, args, raise_on_error=False)
+    return r.is_error, (r.content[0].text if r.is_error else r.data)
+
+
+async def test_a_named_index_answers_the_same_through_both(indexes_file, capsys, file_mode):
+    cfg = ["--config", str(indexes_file.path)]
+    assert run_meta([*cfg, "--index", "beta", "sync"], capsys)[0] == 0
+    is_error, mcp_payload = await _call(
+        file_mode(Connection("alpha", None)),
+        "query_documents",
+        {"query": "bananas", "index": "beta"},
+    )
+    code, out, _ = run_meta([*cfg, "--index", "beta", "query", "bananas", "--json"], capsys)
+    assert not is_error and code == 0
+    assert json.loads(out) == mcp_payload and mcp_payload["index"] == "beta"
+    assert mcp_payload["sources"]
+
+
+async def test_an_unknown_index_is_refused_the_same_way_by_both(indexes_file, capsys, file_mode):
+    cfg = ["--config", str(indexes_file.path)]
+    is_error, text = await _call(file_mode(), "query_documents", {"query": "x", "index": "delta"})
+    code, _, err = run_meta([*cfg, "--index", "delta", "query", "x"], capsys)
+    assert is_error and code == 1 and text.endswith(_last_error(err))
+    assert _last_error(err) == "Unknown index 'delta'. Reachable indexes: alpha, beta, gamma."
+
+
+async def test_list_indexes_matches_the_indexes_command(indexes_file, capsys, file_mode):
+    cfg = ["--config", str(indexes_file.path)]
+    assert run_meta([*cfg, "--index", "alpha", "sync"], capsys)[0] == 0
+    # A row names the model its index records, and opening beta and gamma to list them
+    # records the fake's: the first listing names their configured models.
+    assert run_meta([*cfg, "indexes"], capsys)[0] == 0
+    is_error, mcp_payload = await _call(file_mode(), "list_indexes", {})
+    code, out, _ = run_meta([*cfg, "indexes", "--json"], capsys)
+    assert not is_error and code == 0
+    assert json.loads(out) == mcp_payload
+    assert [r["documentCount"] for r in mcp_payload["indexes"]] == [1, 0, 0]
+
+
+async def test_status_of_a_named_index_is_identical_in_both_shells(indexes_file, capsys, file_mode):
+    cfg = ["--config", str(indexes_file.path)]
+    assert run_meta([*cfg, "--index", "gamma", "sync"], capsys)[0] == 0
+    is_error, st = await _call(file_mode(), "status", {"index": "gamma"})
+    code, out, _ = run_meta([*cfg, "--index", "gamma", "status", "--json"], capsys)
+    assert not is_error and code == 0
+    assert json.loads(out) == st and (st["index"], st["sourceCount"]) == ("gamma", 1)
+
+
+@pytest.mark.parametrize("held_by", ["another index", "no index"])
+async def test_a_path_outside_the_named_index_is_refused_the_same_way_by_both(
+    indexes_file, capsys, file_mode, held_by
+):
+    """In file mode the refusal names the index, points at the index whose roots hold the
+    file, and never names the environment's BASE_DIRS or a restart."""
+    cfg = ["--config", str(indexes_file.path)]
+    alpha = indexes_file.roots["alpha"]
+    path = (
+        indexes_file.roots["beta"] / "beta.md" if held_by == "another index" else indexes_file.path
+    )
+    is_error, text = await _call(
+        file_mode(), "read_file", {"filePath": str(path), "index": "alpha"}
+    )
+    code, _, err = run_meta([*cfg, "--index", "alpha", "read", str(path)], capsys)
+    assert is_error and code == 1 and text == _last_error(err)
+    assert text.startswith(f"Index 'alpha': {path} is outside its roots ({alpha})")
+    if held_by == "another index":
+        assert "under those of index 'beta': pass index=\"beta\" to reach it" in text
+    else:
+        assert (
+            f"a folder is reached by adding it to an index's roots in {indexes_file.path}" in text
+        )
+    assert text.endswith("Other reachable indexes: beta, gamma.")
+    assert "BASE_DIRS" not in text and "restart" not in text
+
+
+async def test_an_index_of_the_file_recorded_at_another_width_is_refused_alike_by_both(
+    indexes_file, capsys, monkeypatch
+):
+    """Without a stand-in each shell's handles build their own embedders, so the handle's
+    refusal reaches both, as in the environment mode."""
+    monkeypatch.setenv("HOME", indexes_file.env["HOME"])
+    registry = file_registry(indexes_file, None)
+    stamp_identity(registry.resolve(UNRESTRICTED, "beta").config, FakeEmbedder(E5_LARGE, dim=16))
+    is_error, text = await _call(
+        create_app(registry), "query_documents", {"query": "x", "index": "beta"}
+    )
+    tokens = ["--config", str(indexes_file.path), "--index", "beta", "query", "x"]
+    code, _, err = run_meta(tokens, capsys)
+    refusal = _last_error(err)
+    assert is_error and code == 1 and text == refusal
+    assert refusal.startswith("Index 'beta' is unavailable: ")
+    assert f"built with {E5_LARGE}, at 16 dimensions, but it makes 1024-dimensional" in refusal
