@@ -1,5 +1,9 @@
 # EnterpriseRAG-Bench stand — Implementation Plan
 
+> **Dropped 2026-11-20 (owner):** no further benchmarking on EnterpriseRAG-Bench. The stand's code
+> (`evals/enterpriserag/`) is removed from the repository; the numbers recorded in the v2 spec stay as the record of
+> what was measured. Retrieval decisions are measured on the owner's private Russian ruler only.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Measure minirag on EnterpriseRAG-Bench end to end (two `claude -p` arms, Codex-backed

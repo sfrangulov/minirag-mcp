@@ -347,6 +347,11 @@ git commit -m "docs: v2 pre-release section and reference sections" -m "Co-Autho
 
 ### Task 4: Joint check of the final pipeline on both stands; the English baseline re-taken
 
+> **Superseded 2026-11-20 (owner):** the English EnterpriseRAG-Bench stand is dropped and its code
+> removed. The English steps (Steps 1-2), the `baseline.json` re-take and every `evals/enterpriserag`
+> command below are not run; the joint check of the final pipeline runs on the owner's Russian ruler
+> only (the private part of this task and Task 12), and g7q.5's keyword weight is decided there.
+
 Spec section 6: before the re-index, one joint check of the final pipeline on both stands, and `evals/enterpriserag/baseline.json` re-taken after the retrieval changes (it predates 2ee521f's tie order and v2's model). Plan 1 Task 13 measured the chunk budgets before plan 2 changed OCR and sync, and plan 1 Task 12 left the baseline alone; this task checks what ships, on this branch with plans 1–3 merged.
 
 **Files:**

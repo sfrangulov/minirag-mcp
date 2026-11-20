@@ -1,5 +1,9 @@
 # EnterpriseRAG-Bench for minirag-mcp — design
 
+> **Dropped 2026-11-20 (owner):** no further benchmarking on EnterpriseRAG-Bench. The stand's code
+> (`evals/enterpriserag/`) is removed from the repository; the numbers recorded in the v2 spec stay as the record of
+> what was measured. Retrieval decisions are measured on the owner's private Russian ruler only.
+
 Date: 2026-11-18. Status: approved by the owner. Issue: `minirag-mcp-f95`.
 Related: `minirag-mcp-4we.11` (user-facing retrieval regression check, separate work),
 `minirag-mcp-4we.8` (reranker, shipped only if it measurably helps — this stand is how

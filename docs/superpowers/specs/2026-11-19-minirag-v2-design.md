@@ -369,12 +369,16 @@ on the owner's GPU). `find_mentions` (literal search) is unchanged.
 
 ### 6. Measurement gates
 
+> **Dropped 2026-11-20 (owner):** no further benchmarking on EnterpriseRAG-Bench. The stand's code
+> (`evals/enterpriserag/`) is removed from the repository; its numbers above stay as the record of
+> what was measured. Retrieval decisions are measured on the owner's private Russian ruler only.
+
 - Before the re-index: the chunk-budget measurement (section 3) and one joint check of the
-  final pipeline on both stands.
-- The Russian ruler and its scripts stay private; the English stand is in the repo. A
+  final pipeline on ~~both stands~~ the Russian ruler.
+- The Russian ruler and its scripts stay private; ~~the English stand is in the repo.~~ A
   retrieval change lands with its numbers in the issue.
-- `evals/enterpriserag/baseline.json` is re-taken after the retrieval changes (it predates
-  2ee521f's tie order).
+- ~~`evals/enterpriserag/baseline.json` is re-taken after the retrieval changes (it predates
+  2ee521f's tie order).~~
 
 ### 7. Release and migration
 
@@ -435,8 +439,8 @@ on the owner's GPU). `find_mentions` (literal search) is unchanged.
 
 ## Deferred
 
-- g7q.8 end-to-end benchmark run and README section (after v2).
-- g7q.10 English 5k dev tier (full-corpus checks through saved runs proved cheap enough).
+- ~~g7q.8 end-to-end benchmark run and README section (after v2).~~ Dropped 2026-11-20 (owner).
+- ~~g7q.10 English 5k dev tier (full-corpus checks through saved runs proved cheap enough).~~ Dropped 2026-11-20 (owner).
 - ~~Apple Vision as a macOS second reader for low-confidence Tesseract pages;~~ Kazakh OCR.
   Superseded (2026-11-20, plan 2 Task 11b; see section 5): the Vision second reader is built.
 - Whole-document vectors from a long-context model.
