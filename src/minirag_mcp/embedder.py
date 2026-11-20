@@ -7,6 +7,7 @@ import math
 import threading
 import time
 import warnings
+import weakref
 from collections.abc import Callable, Sequence
 from importlib.resources import files
 from pathlib import Path
@@ -113,6 +114,47 @@ def _untruncated_counter(model: TextEmbedding) -> Callable[[str], int]:
     # tokens are not, and the encoder does not attend to them either.
     counting.no_padding()
     return lambda text: len(counting.encode(text).ids)
+
+
+class _LoadedModels:
+    """The fastembed models loaded in this process, shared by every embedder of one model,
+    cache folder and thread count: several indexes of one model hold it in memory once.
+    A model is let go with the last embedder holding it."""
+
+    def __init__(self) -> None:
+        self._models: weakref.WeakValueDictionary[tuple, TextEmbedding] = (
+            weakref.WeakValueDictionary()
+        )
+        self._loading: dict[tuple, threading.Lock] = {}
+        self._lock = threading.Lock()
+
+    def get(self, key: tuple) -> TextEmbedding | None:
+        return self._models.get(key)
+
+    def load(self, key: tuple, build: Callable[[], TextEmbedding]) -> TextEmbedding:
+        """The model loaded under `key`, built by `build` when none is. Two embedders asking
+        at once wait for one load; other models load meanwhile."""
+        with self._lock:
+            loading = self._loading.setdefault(key, threading.Lock())
+        with loading:
+            model = self._models.get(key)
+            if model is None:
+                model = build()
+                self._models[key] = model
+            return model
+
+    def clear(self) -> None:
+        with self._lock:
+            self._models.clear()
+            self._loading.clear()
+
+
+_LOADED = _LoadedModels()
+
+
+def clear_loaded_models() -> None:
+    """Forget every loaded model, so the next embedding loads its own (tests)."""
+    _LOADED.clear()
 
 
 def _unit(vector: list[float]) -> list[float]:
@@ -334,13 +376,14 @@ class Embedder:
         return self._prefix_tokens
 
     def has_local_copy(self) -> bool:
-        """Whether the model runs in-process without a download: it is loaded, or the
-        folder fastembed finds for it in cache_dir holds its model files. Nothing is loaded.
+        """Whether the model runs in-process without a download: it is loaded in this
+        process, or the folder fastembed finds for it in cache_dir holds its model files.
+        Nothing is loaded.
 
         fastembed's lookup alone is not that: it finds a folder holding only tokenizer.json,
         which is what an endpoint leaves there, and building the model then fails.
         """
-        if self._model is not None:
+        if self._model is not None or _LOADED.get(self._loaded_key()) is not None:
             return True
         try:
             found = self._fastembed(local_files_only=True, lazy_load=True).model
@@ -359,23 +402,31 @@ class Embedder:
             **options,
         )
 
+    def _loaded_key(self) -> tuple:
+        # Not the endpoint: whether this embedder may download decides only how a model
+        # missing from memory is loaded, never which model it is.
+        return (self.model_name, str(self.cache_dir), self.threads)
+
     def _load(self) -> TextEmbedding:
         with self._load_lock:
             if self._model is None:
-                try:
-                    self.cache_dir.mkdir(parents=True, exist_ok=True)
-                    # With an endpoint this model only stands in for it, behind one search
-                    # or one sync, where a download of gigabytes must never start.
-                    self._model = self._fastembed(local_files_only=self.endpoint is not None)
-                except Exception as e:
-                    raise EmbedderUnavailableError(
-                        f"The embedding model {self.model_name!r} could not be loaded ({e}). "
-                        "Every search and ingest needs it, so each one fails this way until "
-                        "it loads; this is not a problem with the query. It is downloaded "
-                        f"once, into {self.cache_dir}: the server needs to reach huggingface.co "
-                        "for that, or CACHE_DIR has to point at a folder that already holds it."
-                    ) from e
+                self._model = _LOADED.load(self._loaded_key(), self._build)
             return self._model
+
+    def _build(self) -> TextEmbedding:
+        try:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            # With an endpoint this model only stands in for it, behind one search or one
+            # sync, where a download of gigabytes must never start.
+            return self._fastembed(local_files_only=self.endpoint is not None)
+        except Exception as e:
+            raise EmbedderUnavailableError(
+                f"The embedding model {self.model_name!r} could not be loaded ({e}). "
+                "Every search and ingest needs it, so each one fails this way until "
+                "it loads; this is not a problem with the query. It is downloaded "
+                f"once, into {self.cache_dir}: the server needs to reach huggingface.co "
+                "for that, or CACHE_DIR has to point at a folder that already holds it."
+            ) from e
 
     def _tokenizers(self) -> tuple[Tokenizer, Tokenizer]:
         """The model's tokenizer.json, read without the ONNX model: a counter that never

@@ -122,6 +122,15 @@ def indexes_file(tmp_path) -> IndexesFile:
 
 
 @pytest.fixture(autouse=True)
+def no_model_outlives_its_test() -> Iterator[None]:
+    """Embedders share the fastembed models loaded in this process; each test starts and ends
+    with none, so one test's stub is never another's model."""
+    embedder_mod.clear_loaded_models()
+    yield
+    embedder_mod.clear_loaded_models()
+
+
+@pytest.fixture(autouse=True)
 def tessdata_stays_offline(request, monkeypatch) -> Iterator[None]:
     """A fast test that reaches the download of Tesseract's data, which only an installed
     [ocr] extra makes possible, is refused it as if offline, and fails. A test that serves

@@ -1,3 +1,4 @@
+import gc
 import json
 import math
 import pickle
@@ -384,6 +385,65 @@ def test_without_an_endpoint_the_model_is_downloaded_on_first_use(tmp_path, stub
     assert stub_text_embedding.batches == [["query: alpha"]]
 
 
+def test_embedders_of_one_model_folder_and_threads_share_its_loaded_model(
+    tmp_path, stub_text_embedding
+):
+    first, second = Embedder(E5_LARGE, tmp_path), Embedder(E5_LARGE, tmp_path)
+    first.embed_query("alpha")
+    second.embed_documents(["beta"])
+    assert stub_text_embedding.model_names == [E5_LARGE]
+    assert stub_text_embedding.batches == [["query: alpha"], ["passage: beta"]]
+    others = [
+        Embedder(E5_LARGE, tmp_path, threads=2),
+        Embedder(E5_LARGE, tmp_path / "other"),
+        Embedder(MINILM, tmp_path),
+    ]
+    for emb in others:
+        emb.embed_query("gamma")
+    assert stub_text_embedding.model_names == [E5_LARGE, E5_LARGE, E5_LARGE, MINILM]
+    assert stub_text_embedding.threads == [None, 2, None, None]
+
+
+def test_a_fallback_runs_the_model_another_embedder_loaded(
+    tmp_path, dead_url, stub_text_embedding, tokenizer_file
+):
+    stub_text_embedding.on_disk = True
+    stub_text_embedding.put(tmp_path, E5_LARGE)
+    in_process = Embedder(E5_LARGE, tmp_path)
+    in_process.embed_query("loaded")
+    built = len(stub_text_embedding.constructions)
+    emb = dead(tmp_path, dead_url)
+    with pytest.warns(RuntimeWarning, match="unreachable"):
+        assert len(emb.embed_documents(["alpha"])) == 1
+    assert emb.has_local_copy() and emb.backend == "in-process (endpoint unreachable)"
+    assert len(stub_text_embedding.constructions) == built
+    assert stub_text_embedding.model_names == [E5_LARGE] and stub_text_embedding.downloads == []
+
+
+def test_a_model_loaded_from_another_cache_folder_is_no_local_copy(
+    tmp_path, dead_url, stub_text_embedding, tokenizer_file
+):
+    stub_text_embedding.on_disk = True
+    stub_text_embedding.put(tmp_path / "elsewhere", E5_LARGE)
+    in_process = Embedder(E5_LARGE, tmp_path / "elsewhere")
+    in_process.embed_query("loaded")
+    emb = dead(tmp_path / "here", dead_url)
+    assert not emb.has_local_copy()
+    with pytest.warns(RuntimeWarning, match="unreachable"):
+        with pytest.raises(EmbedderUnavailableError, match="no local copy"):
+            emb.embed_query("alpha")
+    assert stub_text_embedding.downloads == [] and stub_text_embedding.model_names == [E5_LARGE]
+
+
+def test_a_shared_model_is_let_go_with_its_last_embedder(tmp_path, stub_text_embedding):
+    emb = Embedder(E5_LARGE, tmp_path)
+    emb.embed_query("alpha")
+    del emb
+    gc.collect()
+    Embedder(E5_LARGE, tmp_path).embed_query("beta")
+    assert stub_text_embedding.model_names == [E5_LARGE, E5_LARGE]
+
+
 def test_the_endpoint_is_tried_again_after_the_interval(
     tmp_path, fake_llama, stub_text_embedding, tokenizer_file, monkeypatch
 ):
@@ -576,6 +636,8 @@ def test_an_in_process_embedder_survives_pickling_without_its_model(tmp_path, st
     emb = Embedder(E5_LARGE, tmp_path, threads=2)
     before = emb.embed_documents(["alpha"])
     clone = pickle.loads(pickle.dumps(emb))
+    # A worker unpickles it in a process of its own, where no model is loaded yet.
+    embedder_mod.clear_loaded_models()
     assert clone.embed_documents(["alpha"]) == before
     assert stub_text_embedding.threads == [2, 2]  # rebuilt, with the same threads
 
