@@ -72,10 +72,13 @@ class QueryError(ValueError):
 
 
 def embedding_status(embedder) -> dict:
-    """Which backend embeds, and while the endpoint is unreachable, why not it."""
+    """Which backend embeds, and while the endpoint is unreachable, why not it, and whether
+    the in-process model can stand in for it at all."""
     out = {"embeddingBackend": getattr(embedder, "backend", "in-process")}
     if warning := getattr(embedder, "warning", None):
         out["embeddingWarning"] = warning
+        if not embedder.has_local_copy():
+            out["embeddingFallback"] = f"no local copy in {embedder.cache_dir}"
     return out
 
 

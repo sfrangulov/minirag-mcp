@@ -560,7 +560,10 @@ def create_app(
 
         embeddingBackend is what embeds: "endpoint", "in-process", or
         "in-process (endpoint unreachable)", when embeddingWarning says why
-        and when the endpoint is tried again.
+        and when the endpoint is tried again. embeddingFallback, present only
+        then, says the model has no local copy in the cache folder: with an
+        endpoint configured it is never downloaded, so every search and
+        ingest fails until the endpoint is back.
 
         ftsLanguage is the stemmer keyword search uses (RAG_FTS_LANGUAGE).
         ftsWarning, present only when the keyword index could not be rebuilt

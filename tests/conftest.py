@@ -14,6 +14,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import urlsplit
 
 import pytest
@@ -104,6 +105,9 @@ class FakeEmbedder:
     def has_reference(self) -> bool:
         return True
 
+    def has_local_copy(self) -> bool:
+        return True
+
 
 @pytest.fixture
 def fake_embedder() -> FakeEmbedder:
@@ -159,30 +163,99 @@ def tokenizer_file(tmp_path, monkeypatch) -> TokenizerFile:
 
 
 class TextEmbeddingRecord:
-    """What reached fastembed: each model built, with its threads, and each batch embedded."""
+    """What reached fastembed: each model built, with its threads, each batch embedded,
+    each construction's cache options, and each download.
 
-    def __init__(self) -> None:
+    Unless `on_disk` is set, every cache holds the model. Set, the cache folder asked for
+    decides, as it does for fastembed 0.8 (measured): its lookup finds the model's snapshot
+    folder even when that holds only tokenizer.json, as an endpoint leaves it, and building
+    the model then fails; finding none, it downloads the model, or with `local_files_only`
+    raises. `lazy_load` looks the files up and builds nothing.
+    """
+
+    def __init__(self, everywhere: Path) -> None:
         self.model_names: list[str] = []
         self.threads: list[int | None] = []
         self.batches: list[list[str]] = []
+        self.on_disk = False
+        self.constructions: list[dict] = []
+        self.downloads: list[str] = []
+        self._everywhere = everywhere
+
+    @staticmethod
+    def _entry(model_name: str) -> dict:
+        models = embedder_mod.TextEmbedding.list_supported_models()
+        return next(m for m in models if m["model"] == model_name)
+
+    def folder(self, cache_dir, model_name: str) -> Path:
+        repo = self._entry(model_name)["sources"]["hf"]
+        return Path(cache_dir) / f"models--{repo.replace('/', '--')}" / "snapshots" / "0"
+
+    def put(self, cache_dir, model_name: str, *, tokenizer_only: bool = False) -> None:
+        """The model's files in `cache_dir` as a download leaves them, or its tokenizer.json
+        alone."""
+        entry = self._entry(model_name)
+        names = ["tokenizer.json"]
+        if not tokenizer_only:
+            names += [entry["model_file"], *entry["additional_files"]]
+        folder = self.folder(cache_dir, model_name)
+        for name in names:
+            (folder / name).parent.mkdir(parents=True, exist_ok=True)
+            (folder / name).write_bytes(b"stub")
 
 
 @pytest.fixture
-def stub_text_embedding(monkeypatch) -> TextEmbeddingRecord:
+def stub_text_embedding(monkeypatch, tmp_path_factory) -> TextEmbeddingRecord:
     """fastembed's `TextEmbedding` without an ONNX session. Its vectors are the ones
     `fake_llama` serves for the same text, so both backends agree, as the real ones do."""
     real = embedder_mod.TextEmbedding
-    record = TextEmbeddingRecord()
+    record = TextEmbeddingRecord(tmp_path_factory.mktemp("every-cache"))
 
     class Stub:
         list_supported_models = staticmethod(real.list_supported_models)
 
-        def __init__(self, model_name: str, cache_dir=None, threads=None, **kwargs) -> None:
+        def __init__(
+            self,
+            model_name: str,
+            cache_dir=None,
+            threads=None,
+            *,
+            local_files_only: bool = False,
+            lazy_load: bool = False,
+            **kwargs,
+        ) -> None:
+            record.constructions.append(
+                {
+                    "cache_dir": cache_dir,
+                    "local_files_only": local_files_only,
+                    "lazy_load": lazy_load,
+                }
+            )
+            if not record.on_disk:
+                cache_dir = record._everywhere
+                record.put(cache_dir, model_name)
+            folder = record.folder(cache_dir, model_name)
+            if not folder.is_dir():
+                if local_files_only:
+                    raise ValueError(f"Could not load model {model_name} from any source.")
+                record.downloads.append(cache_dir)
+                record.put(cache_dir, model_name)
+            entry = record._entry(model_name)
+            description = SimpleNamespace(
+                model_file=entry["model_file"], additional_files=list(entry["additional_files"])
+            )
+            self.model = SimpleNamespace(_model_dir=folder, model_description=description)
+            self.dim = int(entry["dim"])
+            if lazy_load:
+                return
+            model_file = folder / description.model_file
+            if not model_file.is_file():
+                raise RuntimeError(
+                    f"[ONNXRuntimeError] : 3 : NO_SUCHFILE : Load model from {model_file} "
+                    "failed. File doesn't exist"
+                )
             record.model_names.append(model_name)
             record.threads.append(threads)
-            self.dim = next(
-                int(m["dim"]) for m in real.list_supported_models() if m["model"] == model_name
-            )
 
         def embed(self, texts):
             record.batches.append(list(texts))

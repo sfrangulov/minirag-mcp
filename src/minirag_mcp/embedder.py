@@ -179,6 +179,7 @@ class Embedder:
         self._tokenizer_lock = threading.Lock()
         self._state_lock = threading.Lock()
         self._warning: str | None = None
+        self._unreachable: str | None = None
         self._failed_at = 0.0
         # When each backend's probe last matched; the endpoint's is dropped when it falls back.
         self._verified: dict[str, float] = {}
@@ -332,16 +333,40 @@ class Embedder:
             self._prefix_tokens = self.count_tokens(PASSAGE_PREFIX + "x") - self.count_tokens("x")
         return self._prefix_tokens
 
+    def has_local_copy(self) -> bool:
+        """Whether the model runs in-process without a download: it is loaded, or the
+        folder fastembed finds for it in cache_dir holds its model files. Nothing is loaded.
+
+        fastembed's lookup alone is not that: it finds a folder holding only tokenizer.json,
+        which is what an endpoint leaves there, and building the model then fails.
+        """
+        if self._model is not None:
+            return True
+        try:
+            found = self._fastembed(local_files_only=True, lazy_load=True).model
+            folder = Path(found._model_dir)
+            description = found.model_description
+            names = [description.model_file, *description.additional_files]
+        except Exception:
+            return False
+        return all((folder / name).is_file() for name in names)
+
+    def _fastembed(self, **options) -> TextEmbedding:
+        return TextEmbedding(
+            model_name=self.model_name,
+            cache_dir=str(self.cache_dir),
+            threads=self.threads,
+            **options,
+        )
+
     def _load(self) -> TextEmbedding:
         with self._load_lock:
             if self._model is None:
                 try:
                     self.cache_dir.mkdir(parents=True, exist_ok=True)
-                    self._model = TextEmbedding(
-                        model_name=self.model_name,
-                        cache_dir=str(self.cache_dir),
-                        threads=self.threads,
-                    )
+                    # With an endpoint this model only stands in for it, behind one search
+                    # or one sync, where a download of gigabytes must never start.
+                    self._model = self._fastembed(local_files_only=self.endpoint is not None)
                 except Exception as e:
                     raise EmbedderUnavailableError(
                         f"The embedding model {self.model_name!r} could not be loaded ({e}). "
@@ -503,15 +528,16 @@ class Embedder:
                 with self._state_lock:
                     self._warning = None
                 return vectors, None
+        if self.endpoint is not None and not self.has_local_copy():
+            raise EmbedderUnavailableError(self._no_local_copy(timed_out=note is not None))
         try:
             model = self._load()
         except EmbedderUnavailableError as e:
             if self.endpoint is None:
                 raise
-            failed = f"did not answer within {QUERY_TIMEOUT:g} s" if note else "is unreachable"
             raise EmbedderUnavailableError(
-                f"The embedding endpoint {self.endpoint.endpoint.url} {failed}, so "
-                f"{self.model_name} was to run in-process, and that failed too. {e}"
+                f"{self._not_used(timed_out=note is not None)}, so {self.model_name} was to "
+                f"run in-process, and that failed too. {e}"
             ) from e
         if check and not self._checked("in-process"):
             self._check_local(model)
@@ -525,6 +551,23 @@ class Embedder:
                 or time.monotonic() - self._failed_at >= ENDPOINT_RETRY_SECONDS
             )
 
+    def _not_used(self, *, timed_out: bool) -> str:
+        """Why the endpoint did not embed, as the start of a sentence."""
+        url = self.endpoint.endpoint.url
+        if timed_out:
+            return f"The embedding endpoint {url} did not answer within {QUERY_TIMEOUT:g} s"
+        return f"The embedding endpoint {url} is unreachable ({self._unreachable})"
+
+    def _no_local_copy(self, *, timed_out: bool) -> str:
+        return (
+            f"{self._not_used(timed_out=timed_out)}, and {self.model_name} has no local copy "
+            f"in {self.cache_dir} to run in-process instead. It was not downloaded: with an "
+            "endpoint configured, a download of the model never starts behind a search or a "
+            "sync. Nothing was embedded; this is not a problem with the query. Either bring "
+            f"the endpoint back, or download the model once into {self.cache_dir}, e.g. by "
+            "running minirag once with EMBED_URL and EMBED_ENDPOINT_MODEL unset."
+        )
+
     def _fall_back(self, error: EndpointError) -> None:
         url = self.endpoint.endpoint.url
         message = (
@@ -537,6 +580,7 @@ class Embedder:
             self._verified.pop("endpoint", None)
             self._probe_errors.pop("endpoint", None)
             self._warning = message
+            self._unreachable = str(error)
             self._failed_at = time.monotonic()
         # Python's default filter shows a given text once per process, so a long-running
         # server may not repeat it; `warning`, status and every reply still carry it.

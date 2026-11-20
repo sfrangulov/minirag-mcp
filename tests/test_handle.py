@@ -887,6 +887,35 @@ def test_a_known_mismatch_stays_known_when_a_read_cannot_check_in_time(
     assert h.get().embedder is embedder and embedder.probe_error is None
 
 
+@pytest.mark.parametrize(
+    "cached", ["nothing", "tokenizer only", "the model"], ids=lambda c: f"{c} cached"
+)
+def test_status_during_a_fallback_says_whether_the_model_can_run_in_process(
+    fake_llama, dead_url, tmp_path, tokenizer_file, stub_text_embedding, cached
+):
+    """The index is opened, its endpoint found down at open and fallen back from, and no
+    embedding asked for yet: nothing has tried to load the model."""
+    from minirag_mcp.results import status_payload
+
+    _served(tmp_path, fake_llama).ingest_pipeline().ingest_data("Budgets.", source="s")
+    cache = tmp_path / "models"
+    stub_text_embedding.on_disk = True
+    if cached != "nothing":
+        stub_text_embedding.put(cache, E5_LARGE, tokenizer_only=cached == "tokenizer only")
+    config = replace(
+        cfg(tmp_path, CACHE_DIR=str(cache)),
+        embed_endpoints={E5_LARGE: Endpoint(dead_url + "/v1/embeddings", "e5")},
+    )
+    with pytest.warns(RuntimeWarning, match="unreachable"):
+        st = status_payload(config, IndexHandle(config))
+    assert st["embeddingBackend"] == "in-process (endpoint unreachable)"
+    if cached == "the model":
+        assert "embeddingFallback" not in st
+    else:
+        assert st["embeddingFallback"] == f"no local copy in {cache}"
+    assert stub_text_embedding.model_names == [] and stub_text_embedding.downloads == []
+
+
 def _sync_job(h: IndexHandle) -> None:
     job = h.start_sync()
     h.sync.wait()

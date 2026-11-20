@@ -262,24 +262,126 @@ def test_a_fallback_warns_once_until_the_endpoint_is_back(
     assert stub_text_embedding.batches == [["passage: alpha"], ["query: beta"], ["query: delta"]]
 
 
+def _break_the_copy(record, cache_dir, monkeypatch) -> None:
+    """fastembed 0.8 over a cached model whose ONNX file is truncated, measured: its files
+    are there, and building the session raises onnxruntime's InvalidProtobuf."""
+    record.on_disk = True
+    record.put(cache_dir, E5_LARGE)
+
+    class Broken(embedder_mod.TextEmbedding):
+        def __init__(self, *args, lazy_load: bool = False, **kwargs):
+            super().__init__(*args, lazy_load=True, **kwargs)
+            if not lazy_load:
+                raise RuntimeError(
+                    "[ONNXRuntimeError] : 7 : INVALID_PROTOBUF : Load model from "
+                    "model.onnx failed:Protobuf parsing failed."
+                )
+
+    monkeypatch.setattr(embedder_mod, "TextEmbedding", Broken)
+
+
 def test_a_fallback_that_cannot_load_names_the_endpoint_too(
-    tmp_path, dead_url, tokenizer_file, monkeypatch
+    tmp_path, dead_url, stub_text_embedding, tokenizer_file, monkeypatch
 ):
-    real = embedder_mod.TextEmbedding
-
-    class Unloadable:
-        list_supported_models = staticmethod(real.list_supported_models)
-
-        def __init__(self, *args, **kwargs):
-            raise ValueError(f"Could not load model {E5_LARGE} from any source.")
-
-    monkeypatch.setattr(embedder_mod, "TextEmbedding", Unloadable)
+    _break_the_copy(stub_text_embedding, tmp_path, monkeypatch)
     emb = dead(tmp_path, dead_url)
     with pytest.warns(RuntimeWarning), pytest.raises(EmbedderUnavailableError) as raised:
         emb.embed_query("alpha")
     message = str(raised.value)
-    assert dead_url in message and "unreachable" in message
-    assert "from any source" in message and str(tmp_path) in message
+    assert dead_url in message and "is unreachable (cannot reach" in message
+    assert "INVALID_PROTOBUF" in message and str(tmp_path) in message
+    assert "no local copy" not in message
+
+
+def _refused_a_download(message: str, cache_dir) -> None:
+    assert f"no local copy in {cache_dir}" in message and "not downloaded" in message
+    assert "bring the endpoint back" in message
+    assert f"download the model once into {cache_dir}" in message and "EMBED_URL" in message
+
+
+# An endpoint's cache: the tokenizer.json it reads, which fastembed's lookup finds.
+CACHES = pytest.mark.parametrize("tokenizer_only", [False, True], ids=["empty", "tokenizer only"])
+
+
+def _uncached(record, cache_dir, tokenizer_only: bool) -> None:
+    record.on_disk = True
+    if tokenizer_only:
+        record.put(cache_dir, E5_LARGE, tokenizer_only=True)
+
+
+@CACHES
+@pytest.mark.parametrize(
+    "embed",
+    [lambda emb: emb.embed_query("alpha"), lambda emb: emb.embed_documents(["alpha"])],
+    ids=["query", "documents"],
+)
+def test_a_fallback_without_a_local_copy_refuses_loudly_and_downloads_nothing(
+    tmp_path, dead_url, stub_text_embedding, tokenizer_file, embed, tokenizer_only
+):
+    """A download of the whole model behind one search or one sync would take minutes, or
+    gigabytes, or fail after both offline."""
+    _uncached(stub_text_embedding, tmp_path, tokenizer_only)
+    emb = dead(tmp_path, dead_url)
+    with pytest.warns(RuntimeWarning, match="unreachable"):
+        with pytest.raises(EmbedderUnavailableError) as raised:
+            embed(emb)
+    message = str(raised.value)
+    assert dead_url in message and "is unreachable (cannot reach" in message
+    _refused_a_download(message, tmp_path)
+    with pytest.raises(EmbedderUnavailableError) as again:  # the endpoint is not due yet
+        embed(emb)
+    assert "is unreachable (cannot reach" in str(again.value)
+    _refused_a_download(str(again.value), tmp_path)
+    assert stub_text_embedding.downloads == [] and stub_text_embedding.model_names == []
+    assert all(c["local_files_only"] for c in stub_text_embedding.constructions)
+    assert emb.backend == "in-process (endpoint unreachable)"
+
+
+@CACHES
+def test_a_slow_query_without_a_local_copy_refuses_loudly_and_leaves_the_endpoint_in_use(
+    tmp_path, fake_llama, stub_text_embedding, tokenizer_file, monkeypatch, tokenizer_only
+):
+    _uncached(stub_text_embedding, tmp_path, tokenizer_only)
+    monkeypatch.setattr(embedder_mod, "QUERY_TIMEOUT", 0.2)
+    emb = armed(tmp_path, fake_llama)
+    emb.embed_query("checked")
+    fake_llama.delay = 1.0
+    with pytest.raises(EmbedderUnavailableError) as raised:
+        emb.embed_query("alpha")
+    message = str(raised.value)
+    assert fake_llama.url("/v1/embeddings") in message
+    assert "did not answer within 0.2 s" in message and "unreachable" not in message
+    _refused_a_download(message, tmp_path)
+    assert stub_text_embedding.downloads == [] and stub_text_embedding.model_names == []
+    assert all(c["local_files_only"] for c in stub_text_embedding.constructions)
+    assert emb.warning is None and emb.backend == "endpoint"
+    fake_llama.delay = 0.0
+    seen = len(fake_llama.requests)
+    emb.embed_query("beta")
+    assert inputs(fake_llama)[seen:] == [["query: beta"]]  # still checked, not re-probed
+
+
+def test_a_fallback_runs_a_local_copy_without_asking_for_a_download(
+    tmp_path, dead_url, stub_text_embedding, tokenizer_file
+):
+    stub_text_embedding.on_disk = True
+    stub_text_embedding.put(tmp_path, E5_LARGE)
+    emb = dead(tmp_path, dead_url)
+    with pytest.warns(RuntimeWarning, match="unreachable"):
+        assert len(emb.embed_documents(["alpha"])) == 1
+    assert stub_text_embedding.model_names == [E5_LARGE] and stub_text_embedding.downloads == []
+    built = [c for c in stub_text_embedding.constructions if not c["lazy_load"]]
+    assert built == [{"cache_dir": str(tmp_path), "local_files_only": True, "lazy_load": False}]
+    assert emb.backend == "in-process (endpoint unreachable)"
+
+
+def test_without_an_endpoint_the_model_is_downloaded_on_first_use(tmp_path, stub_text_embedding):
+    stub_text_embedding.on_disk = True
+    emb = Embedder(E5_LARGE, tmp_path)
+    emb.embed_query("alpha")
+    assert stub_text_embedding.downloads == [str(tmp_path)]
+    assert [c["local_files_only"] for c in stub_text_embedding.constructions] == [False]
+    assert stub_text_embedding.batches == [["query: alpha"]]
 
 
 def test_the_endpoint_is_tried_again_after_the_interval(
@@ -784,17 +886,9 @@ def test_without_a_fallback_a_query_too_slow_for_the_endpoint_is_an_error(
 
 
 def test_a_slow_query_that_cannot_run_in_process_does_not_call_the_endpoint_unreachable(
-    tmp_path, fake_llama, tokenizer_file, monkeypatch
+    tmp_path, fake_llama, stub_text_embedding, tokenizer_file, monkeypatch
 ):
-    real = embedder_mod.TextEmbedding
-
-    class Unloadable:
-        list_supported_models = staticmethod(real.list_supported_models)
-
-        def __init__(self, *args, **kwargs):
-            raise ValueError(f"Could not load model {E5_LARGE} from any source.")
-
-    monkeypatch.setattr(embedder_mod, "TextEmbedding", Unloadable)
+    _break_the_copy(stub_text_embedding, tmp_path, monkeypatch)
     monkeypatch.setattr(embedder_mod, "QUERY_TIMEOUT", 0.2)
     emb = e5(tmp_path, fake_llama)
     fake_llama.delay = 1.0
@@ -802,7 +896,7 @@ def test_a_slow_query_that_cannot_run_in_process_does_not_call_the_endpoint_unre
         emb.embed_query("alpha")
     message = str(raised.value)
     assert "did not answer within 0.2 s" in message and "unreachable" not in message
-    assert "from any source" in message and emb.warning is None
+    assert "INVALID_PROTOBUF" in message and emb.warning is None
 
 
 def test_a_check_given_a_timeout_waits_that_long_and_leaves_a_slow_endpoint_in_use(
@@ -847,3 +941,38 @@ def test_the_shipped_reference_probes_match_the_cached_models(monkeypatch):
     fresh = module.compute(platformdirs.user_cache_path("minirag-mcp") / "models")
     for model, vector in _shipped().items():
         assert embedder_mod.cosine(vector, fresh[model]) > 0.9999, model
+
+
+@pytest.mark.slow
+def test_a_local_copy_is_one_real_fastembed_can_build(tmp_path, dead_url):
+    """fastembed's own lookup finds a cache holding only the tokenizer.json an endpoint
+    reads, and building the model from it fails; the stub reproduces that, this pins it."""
+    import shutil
+
+    import platformdirs
+
+    cache = platformdirs.user_cache_path("minirag-mcp") / "models"
+    Embedder(MINILM, cache).embed_query("warm")  # downloads on the first run only
+    repo = cache / "models--qdrant--paraphrase-multilingual-MiniLM-L12-v2-onnx-Q"
+    sha = (repo / "refs" / "main").read_text().strip()
+    partial = tmp_path / "partial" / repo.name
+    (partial / "refs").mkdir(parents=True)
+    (partial / "refs" / "main").write_text(sha)
+    (partial / "snapshots" / sha).mkdir(parents=True)
+    shutil.copy(repo / "snapshots" / sha / "tokenizer.json", partial / "snapshots" / sha)
+
+    def through_dead(cache_dir):
+        endpoint = EmbeddingEndpoint(Endpoint(dead_url + "/v1/embeddings", "minilm"))
+        return Embedder(MINILM, cache_dir, endpoint=endpoint)
+
+    tokenizer_only = through_dead(tmp_path / "partial")
+    assert not tokenizer_only.has_local_copy()
+    assert not through_dead(tmp_path / "empty").has_local_copy()
+    with pytest.warns(RuntimeWarning, match="unreachable"):
+        with pytest.raises(EmbedderUnavailableError, match="no local copy"):
+            tokenizer_only.embed_query("alpha")
+    assert [p.name for p in (partial / "snapshots" / sha).iterdir()] == ["tokenizer.json"]
+    full = through_dead(cache)
+    assert full.has_local_copy()
+    with pytest.warns(RuntimeWarning, match="unreachable"):
+        assert len(full.embed_query("alpha")) == 384
