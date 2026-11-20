@@ -117,14 +117,14 @@ def test_two_racing_ingests_leave_the_signature_of_the_chunks_that_won(store, mo
     store.replace_source("/v1.md", doc("/v1.md", REGULATION_V1))
     a = doc("/x.md", MINUTES, stamp="2026-10-23T10:00:00+00:00")
     b = doc("/x.md", REGULATION_V2, stamp="2026-10-23T10:00:01+00:00")
-    real = store._put_signatures
+    real = store._chunk_stamps
 
-    def b_lands_in_between(entries):
-        monkeypatch.setattr(store, "_put_signatures", real)
+    def b_lands_in_between(sources):
+        monkeypatch.setattr(store, "_chunk_stamps", real)
         store.replace_source("/x.md", b)
-        return real(entries)
+        return real(sources)
 
-    monkeypatch.setattr(store, "_put_signatures", b_lands_in_between)
+    monkeypatch.setattr(store, "_chunk_stamps", b_lands_in_between)
     store.replace_source("/x.md", a)
 
     assert {c.text for c in store.all_chunks("/x.md")} == {r.text for r in b}

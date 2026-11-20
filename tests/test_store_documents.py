@@ -357,14 +357,14 @@ def test_two_racing_ingests_leave_the_row_of_the_chunks_that_won(store, monkeypa
     Its chunks are gone, so it must not replace B's."""
     a = [rec("/x.md", 0, "minutes of the meeting")]
     b = [rec("/x.md", 0, "the regulation", stamp=LATER)]
-    real = store._put_documents
+    real = store._chunk_stamps
 
-    def b_lands_in_between(entries):
-        monkeypatch.setattr(store, "_put_documents", real)
+    def b_lands_in_between(sources):
+        monkeypatch.setattr(store, "_chunk_stamps", real)
         store.replace_source("/x.md", b)
-        return real(entries)
+        return real(sources)
 
-    monkeypatch.setattr(store, "_put_documents", b_lands_in_between)
+    monkeypatch.setattr(store, "_chunk_stamps", b_lands_in_between)
     store.replace_source("/x.md", a)
 
     assert [r["text"] for r in rows(store)["/x.md"]] == ["the regulation"]

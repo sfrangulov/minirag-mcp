@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import statistics
 import warnings
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Container, Iterable, Iterator, Sequence
 from dataclasses import asdict, dataclass, replace
 from datetime import timedelta
 from functools import wraps
@@ -761,28 +761,91 @@ class Store:
         Two first ingests of one file racing each other still store it twice, since
         both see no rows to match; `list_sources` flags such a source as duplicated.
         """
-        clause = f"source = '{sql_str(source)}'"
         if not records:
+            clause = f"source = '{sql_str(source)}'"
             self._table.delete(clause)
             self._delete_signature(source)
             self._delete_documents([source])
             return
-        # An additive column this index could not gain reads as empty, and is written as
-        # nothing: the write must not fail on a column the table does not have.
+        self._replace_many([(source, records)], indexed={source})
+
+    @_refused_while_rebuilt
+    def replace_sources(
+        self, batch: Sequence[tuple[str, Sequence[ChunkRecord]]], *, indexed: Container[str]
+    ) -> None:
+        """Swap the chunks of every source in `batch` for its records, as `replace_source`
+        does for one: the sources in `indexed` in one merge, the rest in one append, so a
+        batch holding both kinds is two commits.
+
+        The caller vouches that a source outside `indexed` has no chunks. One that a
+        racing single-file ingest stored meanwhile ends up stored twice, which
+        `list_sources` flags as duplicated and the next sync reads again. Each source's
+        documents row and signature are written after the chunks, warning and never
+        raising, as `replace_source` writes them.
+
+        An entry without records, a source given twice, or a record filed under another
+        source is a ValueError, raised before anything is written.
+        """
+        self._replace_many(batch, indexed)
+
+    def _replace_many(
+        self, batch: Sequence[tuple[str, Sequence[ChunkRecord]]], indexed: Container[str]
+    ) -> None:
+        if not batch:
+            return
+        seen: set[str] = set()
+        for source, records in batch:
+            if not records:
+                raise ValueError(
+                    f"no chunks to write for {source}; replace_source(source, []) deletes one"
+                )
+            if source in seen:
+                raise ValueError(f"{source} is in one batch twice")
+            seen.add(source)
+            for r in records:
+                if r.source != source:
+                    raise ValueError(f"a chunk of {r.source} is batched as one of {source}")
+        # Built up front: both writes after the chunk write are gated on stamps read right
+        # after it, and a racing ingest landing between that read and them is overwritten.
+        documents = [self._document_row(source, records) for source, records in batch]
+        entries = [self._signature_entry(source, records) for source, records in batch]
+        replaced = [(source, records) for source, records in batch if source in indexed]
+        added = [(source, records) for source, records in batch if source not in indexed]
+        if replaced:
+            (
+                self._table.merge_insert(["id", "ingested_at"])
+                .when_matched_update_all()
+                .when_not_matched_insert_all()
+                .when_not_matched_by_source_delete(_in_clause(s for s, _ in replaced))
+                .execute(self._chunk_rows(r for _, records in replaced for r in records))
+            )
+        if added:
+            self._table.add(self._chunk_rows(r for _, records in added for r in records))
+        sources = [source for source, _ in batch]
+        try:
+            stamps = self._chunk_stamps(sources)
+        except Exception as e:
+            self._warn_documents(f"write the document row of {_named(sources)}", e)
+            self._warn_signature(f"write the look-alike signature of {_named(sources)}", e)
+            return
+        self._write_documents(documents, stamps=stamps)
+        try:
+            self._put_signatures(entries, stamps=stamps)
+        except Exception as e:
+            self._warn_signature(f"write the look-alike signature of {_named(sources)}", e)
+
+    def _chunk_rows(self, records: Iterable[ChunkRecord]) -> list[dict]:
+        """`records` as rows of the chunks table.
+
+        An additive column this index could not gain reads as empty, and is written as
+        nothing: the write must not fail on a column the table does not have.
+        """
         absent = [c for c in self.missing_columns if c in _ADDITIVE_COLUMNS]
         rows = [asdict(r) for r in records]
         for row in rows:
             for column in absent:
                 del row[column]
-        (
-            self._table.merge_insert(["id", "ingested_at"])
-            .when_matched_update_all()
-            .when_not_matched_insert_all()
-            .when_not_matched_by_source_delete(clause)
-            .execute(rows)
-        )
-        self._write_documents([self._document_row(source, records)])
-        self._sign(source, records)
+        return rows
 
     @_refused_while_rebuilt
     def add_sources(self, batch: Sequence[tuple[str, Sequence[ChunkRecord]]]) -> None:
@@ -792,19 +855,8 @@ class Store:
         `replace_source` it deletes nothing, and it writes no documents rows, which
         `backfill_documents` writes from the stored chunks afterwards.
         """
-        absent = [c for c in self.missing_columns if c in _ADDITIVE_COLUMNS]
-        rows = []
-        entries = []
-        for source, records in batch:
-            for r in records:
-                row = asdict(r)
-                for column in absent:
-                    del row[column]
-                rows.append(row)
-            ordered = sorted(records, key=lambda r: r.chunk_index)
-            entries.append((source, ordered[0].ingested_at, signature(join_document(ordered))))
-        self._table.add(rows)
-        self._put_signatures(entries)
+        self._table.add(self._chunk_rows(r for _, records in batch for r in records))
+        self._put_signatures([self._signature_entry(source, records) for source, records in batch])
 
     @_refused_while_rebuilt
     def move_source(self, old: str, new: str, *, mtime: float) -> int:
@@ -952,20 +1004,25 @@ class Store:
             stacklevel=4,
         )
 
-    def _sign(self, source: str, records: Sequence[ChunkRecord]) -> None:
+    def _signature_entry(
+        self, source: str, records: Sequence[ChunkRecord]
+    ) -> tuple[str, str, Signature]:
+        """The signature of `source`, computed from `records` in chunk order."""
         ordered = sorted(records, key=lambda r: r.chunk_index)
-        try:
-            self._put_signatures(
-                [(source, ordered[0].ingested_at, signature(join_document(ordered)))]
-            )
-        except Exception as e:
-            self._warn_signature(f"write the look-alike signature of {source}", e)
+        return source, ordered[0].ingested_at, signature(join_document(ordered))
 
-    def _put_signatures(self, entries: Sequence[tuple[str, str, Signature]]) -> list[str]:
-        """Write each signature whose source's chunks all still carry its stamp."""
+    def _put_signatures(
+        self,
+        entries: Sequence[tuple[str, str, Signature]],
+        *,
+        stamps: dict[str, set[str]] | None = None,
+    ) -> list[str]:
+        """Write each signature whose source's chunks all still carry its stamp, read here
+        unless the caller read `stamps` after its own chunk write."""
         if not entries:
             return []
-        stamps = self._chunk_stamps(source for source, _, _ in entries)
+        if stamps is None:
+            stamps = self._chunk_stamps(source for source, _, _ in entries)
         current = [e for e in entries if stamps.get(e[0]) == {e[1]}]
         if current:
             self._write_signatures(current)
@@ -1272,21 +1329,27 @@ class Store:
             "ingested_at": ordered[0].ingested_at,
         }
 
-    def _write_documents(self, rows: Sequence[dict]) -> None:
+    def _write_documents(
+        self, rows: Sequence[dict], *, stamps: dict[str, set[str]] | None = None
+    ) -> None:
         """`_put_documents`, warning instead of raising."""
         try:
-            self._put_documents(rows)
+            self._put_documents(rows, stamps=stamps)
         except Exception as e:
             self._warn_documents(
                 f"write the document row of {_named([r['source'] for r in rows])}", e
             )
 
-    def _put_documents(self, rows: Sequence[dict]) -> list[str]:
+    def _put_documents(
+        self, rows: Sequence[dict], *, stamps: dict[str, set[str]] | None = None
+    ) -> list[str]:
         """Write each row whose source's chunks all still carry its stamp, in one merge
-        that also deletes the other rows of those sources; the sources written."""
+        that also deletes the other rows of those sources; the sources written. The
+        stamps are read here unless the caller read `stamps` after its own chunk write."""
         if not rows:
             return []
-        stamps = self._chunk_stamps(row["source"] for row in rows)
+        if stamps is None:
+            stamps = self._chunk_stamps(row["source"] for row in rows)
         current = [row for row in rows if stamps.get(row["source"]) == {row["ingested_at"]}]
         if current:
             # Keyed like `replace_source`, so a row of the same source under another stamp,

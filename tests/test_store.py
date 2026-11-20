@@ -4,7 +4,16 @@ from dataclasses import asdict, replace
 import lancedb.db
 import pytest
 
-from minirag_mcp.store import ChunkRecord, DimensionMismatchError, Store
+from minirag_mcp.identity import staging_dir
+from minirag_mcp.lock import sync_lock
+from minirag_mcp.store import (
+    DOCUMENT_TABLE,
+    SIGNATURE_TABLE,
+    ChunkRecord,
+    DimensionMismatchError,
+    IndexBusyError,
+    Store,
+)
 from store_helpers import _older_table, _raise_commit_conflict, _row
 
 
@@ -418,6 +427,195 @@ def test_replacing_a_source_clears_chunks_a_racing_first_ingest_stored_twice(sto
     )
 
     assert sorted(c.text for c in store.all_chunks("/a.md")) == ["new 0", "new 1"]
+
+
+# --- many sources in one write -----------------------------------------------------
+
+LATER = "2026-08-08T00:00:00+00:00"
+
+
+def written(store) -> tuple[list[dict], list[dict], list[dict]]:
+    """Every row of the chunks, signatures and documents tables, in a fixed order."""
+    chunks = store._table.to_arrow().sort_by("id").to_pylist()
+    signatures = store._db.open_table(SIGNATURE_TABLE).to_arrow().sort_by("source").to_pylist()
+    documents = store._db.open_table(DOCUMENT_TABLE).to_arrow().sort_by("source").to_pylist()
+    return chunks, signatures, documents
+
+
+def test_replace_sources_writes_new_sources_in_one_commit(store):
+    v = store._table.version
+    store.replace_sources(
+        [
+            ("/a.md", [rec("/a.md", 0, "a")]),
+            ("/b.md", [rec("/b.md", 0, "b"), rec("/b.md", 1, "c")]),
+        ],
+        indexed=set(),
+    )
+    assert store._table.version == v + 1
+    assert sorted(s.source for s in store.list_sources()) == ["/a.md", "/b.md"]
+
+
+def test_replace_sources_drops_the_stale_chunks_of_an_indexed_source(store):
+    store.replace_source("/a.md", [rec("/a.md", i, f"old {i}") for i in range(5)])
+    store.replace_sources(
+        [
+            ("/a.md", [rec("/a.md", i, f"new {i}") for i in range(2)]),
+            ("/b.md", [rec("/b.md", 0, "b")]),
+        ],
+        indexed={"/a.md"},
+    )
+    assert [c.text for c in store.all_chunks("/a.md")] == ["new 0", "new 1"]
+    assert not store.get_source("/a.md").duplicated
+
+
+def test_replace_sources_appends_a_source_outside_indexed(store):
+    """The caller vouches that such a source has no chunks. One a racing single-file
+    ingest stored meanwhile ends up doubled, which `list_sources` flags."""
+    store.replace_source("/a.md", [rec("/a.md", 0, "raced")])
+    store.replace_sources(
+        [("/a.md", [replace(rec("/a.md", 0, "synced"), ingested_at=LATER)])], indexed=set()
+    )
+    assert sorted(c.text for c in store.all_chunks("/a.md")) == ["raced", "synced"]
+    assert store.get_source("/a.md").duplicated
+
+
+def test_replace_sources_writes_what_replace_source_writes(tmp_path):
+    old = [rec("/a.md", i, f"old {i}") for i in range(4)]
+    batch = [
+        (
+            "/a.md",
+            [replace(rec("/a.md", i, f"new {i}", title="A"), ingested_at=LATER) for i in (1, 0)],
+        ),
+        ("/b.md", [rec("/b.md", i, f"beta {i}", source_type="data") for i in range(3)]),
+        ("/c.pdf", [replace(rec("/c.pdf", 0, "gamma", ocr_engine="tesseract"), pages="2")]),
+    ]
+    one_each, batched = Store(tmp_path / "one", dim=8), Store(tmp_path / "batched", dim=8)
+    for store in (one_each, batched):
+        store.replace_source("/a.md", old)
+    for source, records in batch:
+        one_each.replace_source(source, records)
+    batched.replace_sources(batch, indexed={"/a.md"})
+
+    chunks, signatures, documents = written(batched)
+    assert [row["id"] for row in chunks] == [
+        "/a.md#0",
+        "/a.md#1",
+        "/b.md#0",
+        "/b.md#1",
+        "/b.md#2",
+        "/c.pdf#0",
+    ]
+    assert (
+        [row["source"] for row in signatures]
+        == [row["source"] for row in documents]
+        == ["/a.md", "/b.md", "/c.pdf"]
+    )
+    assert (chunks, signatures, documents) == written(one_each)
+
+
+def test_replace_sources_writes_one_document_row_per_source_in_one_call(store, monkeypatch):
+    calls = []
+    real = store._write_documents
+
+    def spy(rows, **kwargs):
+        calls.append([row["source"] for row in rows])
+        return real(rows, **kwargs)
+
+    monkeypatch.setattr(store, "_write_documents", spy)
+    store.replace_sources(
+        [
+            ("/a.md", [rec("/a.md", 0, "a")]),
+            ("/b.md", [rec("/b.md", 0, "b"), rec("/b.md", 1, "c")]),
+        ],
+        indexed=set(),
+    )
+    assert calls == [["/a.md", "/b.md"]]
+    assert [row["source"] for row in written(store)[2]] == ["/a.md", "/b.md"]
+
+
+def test_replace_sources_is_refused_while_a_rebuild_runs(store):
+    store.replace_source("/a.md", [rec("/a.md", 0, "a")])
+    staging_dir(store.db_path).mkdir()
+    with sync_lock(store.db_path):
+        with pytest.raises(IndexBusyError, match="is being rebuilt into"):
+            store.replace_sources(
+                [("/a.md", [rec("/a.md", 0, "new")]), ("/b.md", [rec("/b.md", 0, "b")])],
+                indexed={"/a.md"},
+            )
+    assert store.chunk_count() == 1
+    assert [c.text for c in store.all_chunks("/a.md")] == ["a"]
+
+
+def test_replace_sources_signs_every_source(store):
+    store.replace_source("/a.md", [rec("/a.md", 0, "old")])
+    store.replace_sources(
+        [
+            ("/a.md", [replace(rec("/a.md", 0, "the new text of a"), ingested_at=LATER)]),
+            ("/b.md", [rec("/b.md", 0, "the text of b")]),
+        ],
+        indexed={"/a.md"},
+    )
+    assert store.unsigned_sources() == []
+    assert [row["ingested_at"] for row in written(store)[1]] == [
+        LATER,
+        rec("/b.md", 0, "").ingested_at,
+    ]
+
+
+def test_replace_sources_writes_an_index_that_cannot_gain_the_page_column(tmp_path, monkeypatch):
+    db_path = tmp_path / "db"
+    table = _older_table(db_path, {"pages"}, [_row("/a.pdf", 0, "clause text")])
+    monkeypatch.setattr(type(table), "add_columns", _raise_commit_conflict)
+    with pytest.warns(RuntimeWarning, match="pages"):
+        store = Store(db_path, dim=8)
+    assert store.missing_columns == ("pages",)
+
+    store.replace_sources(
+        [
+            ("/a.pdf", [replace(rec("/a.pdf", 0, "clause rewritten"), pages="1")]),
+            ("/b.md", [replace(rec("/b.md", 0, "written anyway"), pages="")]),
+        ],
+        indexed={"/a.pdf"},
+    )
+    assert [c.text for c in store.all_chunks("/a.pdf")] == ["clause rewritten"]
+    assert [c.text for c in store.all_chunks("/b.md")] == ["written anyway"]
+
+
+@pytest.mark.parametrize(
+    "batch, why",
+    [
+        ([("/a.md", [rec("/a.md", 0, "a")]), ("/b.md", [])], "no chunks"),
+        ([("/a.md", [rec("/a.md", 0, "a"), rec("/b.md", 1, "b")])], "/b.md"),
+        ([("/a.md", [rec("/a.md", 0, "a")]), ("/a.md", [rec("/a.md", 1, "b")])], "twice"),
+    ],
+    ids=["no records", "a record of another source", "a source twice"],
+)
+def test_replace_sources_refuses_a_malformed_batch(store, batch, why):
+    with pytest.raises(ValueError, match=why):
+        store.replace_sources(batch, indexed=set())
+    assert store.chunk_count() == 0
+
+
+def test_replace_sources_warns_when_it_cannot_tell_which_chunks_it_wrote(store, monkeypatch):
+    """The stamps the chunks carry gate both the document rows and the signatures. Read
+    after the chunks are committed, a failure there must not fail the write."""
+    real = store._chunk_stamps
+
+    def fails_once(sources):
+        monkeypatch.setattr(store, "_chunk_stamps", real)
+        raise RuntimeError("Retryable commit conflict for version 9")
+
+    monkeypatch.setattr(store, "_chunk_stamps", fails_once)
+    with pytest.warns(RuntimeWarning) as caught:
+        store.replace_sources(
+            [("/a.md", [rec("/a.md", 0, "a")]), ("/b.md", [rec("/b.md", 0, "b")])], indexed=set()
+        )
+    assert sorted(s.source for s in store.list_sources()) == ["/a.md", "/b.md"]
+    assert [str(w.message).split(" in the index")[0] for w in caught] == [
+        "Could not write the document row of 2 documents",
+        "Could not write the look-alike signature of 2 documents",
+    ]
+    assert store.undocumented_sources() == store.unsigned_sources() == ["/a.md", "/b.md"]
 
 
 # --- page numbers ------------------------------------------------------------------
