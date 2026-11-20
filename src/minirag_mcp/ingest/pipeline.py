@@ -418,7 +418,15 @@ class Pipeline:
         # Refused rather than indexed: the next sync would take it out again, silently.
         if (
             not rules_checked
-            and (by := ignore.excluded_by(path, self.config.roots, self.config.exclude)) is not None
+            and (
+                by := ignore.excluded_by(
+                    path,
+                    self.config.roots,
+                    self.config.exclude,
+                    exclude_source=self.config.exclude_source,
+                )
+            )
+            is not None
         ):
             raise IgnoredFileError(f"{path} is excluded by {by}; remove its rule to index it")
         info = self._checked_stat(path)

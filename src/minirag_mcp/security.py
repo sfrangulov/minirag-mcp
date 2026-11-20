@@ -1,4 +1,4 @@
-"""Document-root containment and URL validation."""
+"""Document-root containment, URL validation and loopback host names."""
 
 from __future__ import annotations
 
@@ -23,6 +23,26 @@ _BLOCKED_KINDS = (
     ("private", "is_private"),
     ("reserved", "is_reserved"),
 )
+
+
+# Matched as names, never parsed as addresses: how `ipaddress` reads `::ffff:127.0.0.1`
+# varies by patch release (see `_blocked_kind`), and a name list has no such edge.
+LOOPBACK_NAMES = ("127.0.0.1", "localhost", "::1")
+
+
+def host_name(value: str) -> str:
+    """The host of `value`, a host or a `Host` header, without its port or IPv6 brackets,
+    in lowercase."""
+    name = value.strip().lower()
+    if name.startswith("["):
+        return name[1 : name.find("]")] if "]" in name else name
+    if name.count(":") == 1:
+        return name.split(":", 1)[0]
+    return name
+
+
+def is_loopback_name(value: str) -> bool:
+    return host_name(value) in LOOPBACK_NAMES
 
 
 class SecurityError(Exception):

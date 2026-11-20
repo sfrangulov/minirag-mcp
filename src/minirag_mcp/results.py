@@ -856,6 +856,7 @@ def list_payload(
     sort: str | None = None,
     label_source: LabelerSource | None = None,
     exclude: Sequence[str],
+    exclude_source: str,
 ) -> dict:
     """`list_files` and `minirag-mcp list`, as one implementation.
 
@@ -871,7 +872,8 @@ def list_payload(
         raise QueryError(f"sort must be 'date', got {sort!r}")
     label_filter, labeler = _parse_filter(store, labels, date_from, date_to, label_source)
     for scope in scopes:
-        if (by := ignore.scope_excluded_by(Path(scope), roots, exclude)) is not None:
+        by = ignore.scope_excluded_by(Path(scope), roots, exclude, exclude_source=exclude_source)
+        if by is not None:
             raise QueryError(f"{scope} is excluded by {by}; nothing under it is listed")
     blind: list[tuple[Path, str | None]] = []
     ignored: list[Path] = []

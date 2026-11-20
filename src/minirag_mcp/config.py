@@ -11,7 +11,7 @@ import platformdirs
 
 from minirag_mcp.embedder import E5_LARGE, MODEL_WINDOWS, default_budget, model_window
 from minirag_mcp.endpoints import Endpoint, EndpointError, read_api_key
-from minirag_mcp.ingest.ignore import check_patterns
+from minirag_mcp.ingest.ignore import EXCLUDE_VAR, check_patterns
 from minirag_mcp.ocr import DEFAULT_LANGUAGES, SECOND_READER_BELOW, tesseract_languages
 
 DEFAULT_MODEL = E5_LARGE
@@ -82,6 +82,7 @@ class Config:
     sync_workers: int | None = None
     max_table_rows: int | None = None
     exclude: tuple[str, ...] = ()
+    exclude_source: str = EXCLUDE_VAR  # where `exclude` was written, as refusals name it
 
 
 def default_db_path(roots: Sequence[Path]) -> Path:

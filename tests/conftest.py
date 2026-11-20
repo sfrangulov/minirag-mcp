@@ -25,6 +25,7 @@ from tokenizers.pre_tokenizers import Whitespace
 from tokenizers.processors import TemplateProcessing
 
 import minirag_mcp.embedder as embedder_mod
+from index_helpers import IndexesFile, make_indexes_file
 from minirag_mcp import ocr, ocr_vision, parallel, security
 from minirag_mcp.chunker import SCHEME_VERSION
 from minirag_mcp.config import Config
@@ -113,6 +114,11 @@ class FakeEmbedder:
 @pytest.fixture
 def fake_embedder() -> FakeEmbedder:
     return FakeEmbedder()
+
+
+@pytest.fixture
+def indexes_file(tmp_path) -> IndexesFile:
+    return make_indexes_file(tmp_path)
 
 
 @pytest.fixture(autouse=True)

@@ -30,6 +30,7 @@ from label_helpers import L, record
 from minirag_mcp.config import Config
 from minirag_mcp.embedder import E5_LARGE, Embedder
 from minirag_mcp.endpoints import EmbeddingEndpoint, Endpoint, RerankEndpoint
+from minirag_mcp.ingest.ignore import EXCLUDE_VAR
 from minirag_mcp.labels import LabelerSource
 from minirag_mcp.results import (
     QueryError,
@@ -327,7 +328,7 @@ def test_list_sorted_by_date_puts_undated_last(tmp_path, root, store, fake_embed
     index(store, fake_embedder, root, "c_new.md", {}, "2026-10-20")
     index(store, fake_embedder, root, "d_tie.md", {}, "2026-10-01")
 
-    payload = list_payload(store, [root], sort="date", exclude=())
+    payload = list_payload(store, [root], sort="date", exclude=(), exclude_source=EXCLUDE_VAR)
 
     assert [Path(f["source"]).name for f in payload["files"]] == [
         "c_new.md",
@@ -336,7 +337,7 @@ def test_list_sorted_by_date_puts_undated_last(tmp_path, root, store, fake_embed
         "a_undated.md",
     ]
     with pytest.raises(QueryError, match="sort"):
-        list_payload(store, [root], sort="size", exclude=())
+        list_payload(store, [root], sort="size", exclude=(), exclude_source=EXCLUDE_VAR)
 
 
 def test_a_filtered_listing_keeps_matches_and_counts_unread_files_as_unlabelled(
@@ -350,7 +351,12 @@ def test_a_filtered_listing_keeps_matches_and_counts_unread_files_as_unlabelled(
     (root / "new.md").write_text("never ingested")
 
     payload = list_payload(
-        store, [root], labels={"type": "minutes"}, label_source=label_source, exclude=()
+        store,
+        [root],
+        labels={"type": "minutes"},
+        label_source=label_source,
+        exclude=(),
+        exclude_source=EXCLUDE_VAR,
     )
 
     assert [f["source"] for f in payload["files"]] == [a]
@@ -422,7 +428,7 @@ def test_an_embedder_without_backend_flags_reads_as_in_process(tmp_path, root, s
 
 def test_a_listing_without_a_filter_has_exactly_the_old_keys(tmp_path, root, store, fake_embedder):
     index(store, fake_embedder, root, "a.md", {})
-    payload = list_payload(store, [root], exclude=())
+    payload = list_payload(store, [root], exclude=(), exclude_source=EXCLUDE_VAR)
     assert set(payload) == {"files", "unlistedFolders"}
     assert set(payload["files"][0]) == {
         "source",
@@ -454,7 +460,14 @@ def test_a_filter_on_an_index_without_label_columns_is_refused(
             label_source=label_source,
         )
     with pytest.raises(QueryError, match="write access"):
-        list_payload(old, [root], date_from="2026-10-01", label_source=label_source, exclude=())
+        list_payload(
+            old,
+            [root],
+            date_from="2026-10-01",
+            label_source=label_source,
+            exclude=(),
+            exclude_source=EXCLUDE_VAR,
+        )
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         assert run_query(old, fake_embedder, make_config(root, tmp_path), "x")["results"]

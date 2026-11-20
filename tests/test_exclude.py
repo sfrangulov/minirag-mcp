@@ -1,4 +1,5 @@
-"""RAG_EXCLUDE: gitignore patterns from minirag's configuration, applied to every root."""
+"""RAG_EXCLUDE and an indexes.toml's `exclude`: gitignore patterns from minirag's
+configuration, applied to every root."""
 
 from __future__ import annotations
 
@@ -9,6 +10,7 @@ from fastmcp import Client
 
 import minirag_mcp.cli as cli
 from minirag_mcp.config import ConfigError, load_config
+from minirag_mcp.indexes import load_server_config
 from minirag_mcp.ingest.ignore import IGNORE_FILE
 from minirag_mcp.ingest.scanner import scan_roots
 from minirag_mcp.server import create_app
@@ -200,3 +202,52 @@ def test_ingesting_a_folder_honours_the_patterns(root, env, capsys, monkeypatch)
     assert code == 0 and len(names) == 4 and not any("drafts" in n for n in names)
     code, _, err = run_cli(["ingest", str(root / "drafts"), *flags(env)], capsys)
     assert code == 1 and "is excluded by RAG_EXCLUDE pattern 'drafts/'" in err
+
+
+@pytest.fixture
+def toml_index(root, tmp_path, monkeypatch, fake_embedder):
+    """The index `docs` of an indexes.toml, which the CLI is made to load."""
+    path = tmp_path / "config" / "indexes.toml"
+    path.parent.mkdir()
+    path.write_text(
+        f'[index.docs]\nroots = ["{root}"]\ndb = "{tmp_path / "db"}"\nexclude = ["drafts/"]\n',
+        encoding="utf-8",
+    )
+    cfg = load_server_config(path, {"HOME": str(tmp_path)}).indexes["docs"]
+    monkeypatch.delenv("RAG_EXCLUDE", raising=False)
+    monkeypatch.setattr(cli, "_load_cfg", lambda *args: cfg)
+    monkeypatch.setattr(cli, "_make_embedder", lambda c: fake_embedder)
+    return path, cfg
+
+
+async def test_an_index_from_indexes_toml_names_its_exclude_key_in_both_shells(
+    root, toml_index, capsys, fake_embedder
+):
+    path, cfg = toml_index
+    drafts = root / "drafts"
+    async with Client(create_app(cfg, embedder=fake_embedder)) as c:
+        replies = [
+            await c.call_tool(tool, args, raise_on_error=False)
+            for tool, args in (
+                ("ingest_file", {"filePath": str(drafts / "d.md")}),
+                ("sync_start", {"path": str(drafts)}),
+                ("list_files", {"scope": str(drafts)}),
+            )
+        ]
+    errors = [r.content[0].text for r in replies if r.is_error]
+    for tokens in (
+        ["ingest", str(drafts / "d.md")],
+        ["ingest", str(drafts)],
+        ["sync", str(drafts)],
+        ["list", "--scope", str(drafts)],
+    ):
+        code, _, err = run_cli(tokens, capsys)
+        errors.append(err if code == 1 else f"exit {code}")
+    by = f"excluded by {path} [index.docs] exclude pattern 'drafts/'"
+    assert len(errors) == 7 and all(by in e and "RAG_EXCLUDE" not in e for e in errors)
+
+
+def test_the_list_note_credits_the_exclude_key_of_an_indexes_toml(root, toml_index, capsys):
+    path, _ = toml_index
+    code, _, err = run_cli(["list"], capsys)
+    assert code == 0 and f"excluded by .miniragignore or {path} [index.docs] exclude" in err

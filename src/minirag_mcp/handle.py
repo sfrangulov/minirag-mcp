@@ -595,6 +595,7 @@ class IndexHandle:
             scope,
             on_event,
             exclude=self.config.exclude,
+            exclude_source=self.config.exclude_source,
         )
         return counts, errors, None
 

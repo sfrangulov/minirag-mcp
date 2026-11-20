@@ -238,7 +238,13 @@ def ingest(
         for raw in paths:
             p = resolve_in_roots(raw, cfg.roots, require_absolute=False)
             blind: list[tuple[Path, str | None]] = []
-            if p.is_dir() and (by := excluded_by(p, cfg.roots, cfg.exclude)) is not None:
+            if (
+                p.is_dir()
+                and (
+                    by := excluded_by(p, cfg.roots, cfg.exclude, exclude_source=cfg.exclude_source)
+                )
+                is not None
+            ):
                 failures.append({"source": str(p), "error": f"{p} is excluded by {by}"})
                 continue
             if p.is_dir():
@@ -603,6 +609,7 @@ def list_cmd(
             cfg.roots,
             tuple(scope or ()),
             exclude=cfg.exclude,
+            exclude_source=cfg.exclude_source,
             labels=labels,
             date_from=date_from,
             date_to=date_to,
@@ -623,7 +630,7 @@ def list_cmd(
         print(f"warn: {folder['path']}: {folder['message']}", file=sys.stderr)
     if n := payload.get("ignored"):
         print(
-            f"note: {n} file(s) and folder(s) excluded by {IGNORE_FILE} or RAG_EXCLUDE",
+            f"note: {n} file(s) and folder(s) excluded by {IGNORE_FILE} or {cfg.exclude_source}",
             file=sys.stderr,
         )
     _warn_filter(payload)

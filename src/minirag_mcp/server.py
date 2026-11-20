@@ -113,7 +113,10 @@ def create_app(
         scope = None
         if path is not None:
             scope = resolve_in_roots(path, c.config.roots)
-            if (by := scope_excluded_by(scope, c.config.roots, c.config.exclude)) is not None:
+            by = scope_excluded_by(
+                scope, c.config.roots, c.config.exclude, exclude_source=c.config.exclude_source
+            )
+            if by is not None:
                 raise ToolError(f"{scope} is excluded by {by}; nothing under it can be synced")
         return {"jobId": h.start_sync(scope)}
 
@@ -512,6 +515,7 @@ def create_app(
             c.config.roots,
             _scopes(scope),
             exclude=c.config.exclude,
+            exclude_source=c.config.exclude_source,
             labels=labels,
             date_from=dateFrom,
             date_to=dateTo,
