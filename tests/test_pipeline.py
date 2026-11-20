@@ -3,6 +3,7 @@ from dataclasses import replace
 import pytest
 
 from conftest import FakeEmbedder
+from docx_builder import build_docx, para, run
 from minirag_mcp.config import load_config
 from minirag_mcp.ingest.parser import ParserError
 from minirag_mcp.ingest.pipeline import (
@@ -12,6 +13,7 @@ from minirag_mcp.ingest.pipeline import (
     UnsupportedFormatError,
     file_sha256,
 )
+from minirag_mcp.results import run_query
 from minirag_mcp.security import SecurityError
 from minirag_mcp.store import Store
 
@@ -525,3 +527,23 @@ def test_the_store_hook_runs_before_every_write(tmp_path, fake_embedder):
     p.ingest_data("one", source="s")
     p.ingest_data("two", source="s")
     assert held == [[], ["one"]] and p.before_store is hook
+
+
+def test_struck_docx_text_is_still_found_by_keyword_search(pipe):
+    """Struck-through text is kept, marked, because a deleted clause still records what
+    was removed."""
+    p, store, root = pipe
+    clauses = [f"Deleted clause {i} said the old rule." for i in range(60)]
+    clauses[30] = "Deleted clause OLDCLAUSE said the old rule."
+    struck = build_docx(
+        root / "spec.docx",
+        para(run("Current text stays. "), run(" ".join(clauses), "<w:strike/>")),
+    )
+    other = root / "other.md"
+    other.write_text("# Other\n\nNothing was deleted from this one.", encoding="utf-8")
+    p.ingest_file(struck)
+    p.ingest_file(other)
+    assert len(store.all_chunks(str(struck))) > 1, "the run has to be cut to prove anything"
+    payload = run_query(store, p.embedder, p.config, "OLDCLAUSE")
+    assert payload["sources"][0]["source"] == str(struck)
+    assert "OLDCLAUSE" in payload["results"][0]["text"]

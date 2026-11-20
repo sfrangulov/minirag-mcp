@@ -1,5 +1,7 @@
 """The token budget, table handling, and rebuilding a section from its units."""
 
+import re
+
 import pytest
 
 from conftest import FakeEmbedder
@@ -385,3 +387,125 @@ def test_a_transcript_whose_clock_goes_back_is_not_in_document_order():
     assert in_document_order(turns)
     assert not in_document_order(turns + "\n" + turns)
     assert in_document_order("# A\n\nText.\n\n# B\n\nMore.")
+
+
+# --- struck-through text: every unit reads `~~...~~` where the document did --------
+
+STRUCK = " ".join(f"Deleted clause {i} said the old rule." for i in range(16))
+STRUCK_DOC = f"Intro paragraph stays.\n\n~~{STRUCK}~~\n\nTail paragraph stays."
+_EXACTLY_TWO = re.compile(r"(?<!~)~~(?!~)")
+
+
+def unmarked(text: str) -> str:
+    """What a reader takes for current text: all but the `~~...~~` pairs, each of which
+    has to open on a word and close on one."""
+    assert "~~~" not in text, text
+    found = [m.start() for m in _EXACTLY_TWO.finditer(text)]
+    assert len(found) % 2 == 0, text
+    for opener, closer in zip(found[::2], found[1::2], strict=True):
+        assert not text[opener + 2].isspace() and not text[closer - 1].isspace(), text
+    return re.sub(r"~~.*?~~", "", text, flags=re.S)
+
+
+@pytest.mark.parametrize(("budget", "cut_into"), [(DEFAULT_TOKEN_BUDGET, 2), (40, 4)])
+def test_a_struck_run_cut_across_units_is_marked_in_every_one(budget, cut_into):
+    """markitdown marks a struck run once, at its ends; a unit cut from its middle held
+    deleted text with no marker at all, and read as current."""
+    chunks = chunk_markdown(STRUCK_DOC, count_tokens=count, budget=budget)
+    struck = [c for c in chunks if "Deleted" in c.text]
+    assert len(struck) >= cut_into, "the run has to be cut to prove anything"
+    for c in chunks:
+        assert "Deleted" not in unmarked(c.text), c.text
+    assert "Intro paragraph stays." in unmarked(chunks[0].text)
+    assert "Tail paragraph stays." in unmarked(chunks[-1].text)
+
+
+def test_the_markers_a_cut_adds_are_counted_against_the_budget():
+    for budget in range(30, DEFAULT_TOKEN_BUDGET + 1):
+        for c in chunk_markdown(STRUCK_DOC, count_tokens=count, budget=budget):
+            assert count(c.text) <= budget, (budget, c.text)
+
+
+def test_only_a_unit_whose_own_text_gained_a_closing_marker_is_not_verbatim():
+    """The re-opening marker is context, like a breadcrumb; the closing one is in the own
+    text, which is then not the document's as it stands."""
+    chunks = chunk_markdown(STRUCK_DOC, count_tokens=count, budget=40)
+    first, *middle, last = [c for c in chunks if "Deleted" in c.text]
+    assert middle, "the run has to be cut more than once to prove anything"
+    assert not first.verbatim and not any(c.verbatim for c in middle)
+    assert last.verbatim and last.text.startswith("~~") and not own(last).startswith("~~")
+    assert all(not own(c).startswith("~~") for c in middle)
+    for c in chunks:
+        if c.verbatim:
+            assert squeeze(own(c)) in squeeze(STRUCK_DOC), c.text
+
+
+def test_a_struck_cell_of_a_row_cut_to_fit_is_marked_in_every_piece():
+    cell = " ".join(f"old{i}" for i in range(80))
+    markdown = f"| Code | Text |\n| --- | --- |\n| A-1 | ~~{cell}~~ |"
+    pieces = [c for c in chunk_markdown(markdown, count_tokens=count, budget=40) if "old" in c.text]
+    assert len(pieces) > 2, "the row has to be cut to prove anything"
+    for c in pieces:
+        assert "old" not in unmarked(c.text), c.text
+
+
+def test_a_closing_marker_is_set_against_the_word_it_closes():
+    """A run crossing a hard line break: the line before the cut ends in spaces."""
+    lines = "  \n".join(f"deleted line {i} of the old text" for i in range(30))
+    chunks = chunk_markdown(f"~~{lines}~~", count_tokens=count, budget=40)
+    assert len(chunks) > 2
+    for c in chunks:
+        assert "deleted" not in unmarked(c.text), c.text
+
+
+def test_a_struck_word_cut_inside_itself_stays_marked():
+    """Cut a character at a time, a marker must not be split, nor parted from the
+    character it opens or closes on."""
+    word = "a" * 8 + "~~" + "b" * 30 + "~~"
+    for budget in range(10, 17):
+        chunks = chunk_markdown(word, count_tokens=len, budget=budget)
+        assert len(chunks) > 3
+        for c in chunks:
+            assert "b" not in unmarked(c.text), (budget, [c.text for c in chunks])
+
+
+def test_a_cut_inside_nested_struck_runs_adds_one_marker():
+    """`~~~~` is no marker at all, so nested runs close and re-open as one."""
+    inner = " ".join(f"Inner {i} was struck twice." for i in range(10))
+    outer = " ".join(f"Outer {i} was struck once." for i in range(10))
+    chunks = chunk_markdown(f"~~{outer} ~~{inner}~~ {outer}~~", count_tokens=count, budget=40)
+    assert len([c for c in chunks if "Inner" in c.text]) > 1
+    assert not any("~~~" in c.text for c in chunks), [c.text for c in chunks]
+
+
+def test_a_marker_without_a_partner_is_literal_and_never_balanced():
+    """`a ~~ b` is a real document; so is an opener its paragraph or its table cell never
+    closes, which a closer further on does not close either."""
+    filler = " ".join(f"word{i}" for i in range(60))
+    markdown = (
+        "# Rules\n\n"
+        + " ".join(f"Rule {i} reads a ~~ b for roughly equal." for i in range(20))
+        + "\n\n~~"
+        + " ".join(f"Opened {i} and never closed." for i in range(20))
+        + "\n\nThe next paragraph~~ closes nothing."
+        + f"\n\n| Old | Text | New |\n| --- | --- | --- |\n| ~~a | {filler} | b~~ |"
+        + "\n\n# End\n\nDone."
+    )
+    chunks = chunk_markdown(markdown, count_tokens=count, budget=40)
+    assert len(chunks) > 4
+    assert sum(len(_EXACTLY_TWO.findall(c.text)) for c in chunks) == len(
+        _EXACTLY_TWO.findall(markdown)
+    )
+    assert all(c.verbatim for c in chunks)
+
+
+def test_tildes_in_code_are_never_balanced():
+    """A `~~~` fence is code, and so is a code span: `~~` in either is literal."""
+    fence = "~~~\nx = ~~start\n" + "\n".join(f"line_{i} = {i}" for i in range(400)) + "\nend~~\n~~~"
+    spans = " ".join(f"Sentence {i} types `~~` to mark." for i in range(30))
+    for markdown in (fence, spans):
+        chunks = chunk_markdown(markdown, count_tokens=count, budget=40)
+        assert len(chunks) > 2
+        assert sum(len(_EXACTLY_TWO.findall(c.text)) for c in chunks) == len(
+            _EXACTLY_TWO.findall(markdown)
+        ), [c.text for c in chunks]
