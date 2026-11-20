@@ -7,6 +7,7 @@ import json
 import multiprocessing
 import os
 import signal
+import socket
 import subprocess
 import sys
 import sysconfig
@@ -511,16 +512,17 @@ ENTRY_POINTS = {
 }
 
 
-@pytest.mark.parametrize("served", ["environment", "--index"])
+@pytest.mark.parametrize("served", ["environment", "--index", "serve"])
 @pytest.mark.parametrize("entry", ENTRY_POINTS)
 def test_a_parallel_sync_under_each_entry_point_finishes_with_stdout_untouched(
     tmp_path, entry, served
 ):
     """Spawned workers run the parent's main script again, as `__mp_main__`, with the
     parent's argv. A script that starts the server unguarded starts one in every worker, on
-    the client's stdin and stdout, and the sync waits for those workers forever. The server
-    is the environment's, or with `--config X --index NAME` the one of that index, whose
-    arguments the workers get too."""
+    the client's stdin and stdout or on serve's port, and the sync waits for those workers
+    forever. The server is the environment's, with `--config X --index NAME` the one of
+    that index, or with `--config X serve` the HTTP server of every index, whose arguments
+    the workers get too."""
     kind, target = ENTRY_POINTS[entry]
     if kind == "path" and not Path(target).is_file():
         pytest.skip(f"{target} is not installed")
@@ -538,14 +540,19 @@ def test_a_parallel_sync_under_each_entry_point_finishes_with_stdout_untouched(
             "RAG_SYNC_WORKERS": "2",
         }
     else:
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
         config = tmp_path / "indexes.toml"
+        # A free port: a worker that started serve would listen there, never on 8765.
         config.write_text(
-            f"[server]\ncache_dir = {json.dumps(str(tmp_path / 'cache'))}\n\n"
+            f"[server]\ncache_dir = {json.dumps(str(tmp_path / 'cache'))}\nport = {port}\n\n"
             f"[index.docs]\nroots = [{json.dumps(str(root))}]\n"
             f"db = {json.dumps(str(tmp_path / 'db'))}\nsync_workers = 2\n",
             encoding="utf-8",
         )
-        env["ENTRY_ARGS"] = json.dumps(["--config", str(config), "--index", "docs"])
+        command = ["--index", "docs"] if served == "--index" else ["serve"]
+        env["ENTRY_ARGS"] = json.dumps(["--config", str(config), *command])
     out, err = tmp_path / "stdout", tmp_path / "stderr"
     with out.open("wb") as stdout, err.open("wb") as stderr:
         # stdin stays open, as a client's pipe does, so a server started in a worker waits.

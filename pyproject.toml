@@ -7,7 +7,15 @@ requires-python = ">=3.11"
 license = "MIT AND Apache-2.0"
 license-files = ["LICENSE", "LICENSES/*"]
 dependencies = [
-    "fastmcp>=3.4",
+    # 4.x moves to mcp 2.x and is untested here; the lock would keep CI on 3.x while an
+    # unconstrained `uvx minirag-mcp` resolved 4.x.
+    "fastmcp>=3.4,<4",
+    # fastmcp already pulls these in, but we import them directly: `serve` runs uvicorn
+    # itself, and its guards are Starlette middleware. uvicorn's bound is the floor of
+    # fastmcp 3.4.0's [server] extra, and Starlette's is mcp's, which fastmcp 3.4.0
+    # inherits, so declaring them can never move the resolution.
+    "uvicorn>=0.35",
+    "starlette>=0.27",
     "lancedb>=0.36",
     "fastembed>=0.8",
     "markitdown[pdf,docx,pptx,xlsx]>=0.1.7",

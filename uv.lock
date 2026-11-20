@@ -1419,7 +1419,9 @@ dependencies = [
     { name = "pdfminer-six" },
     { name = "platformdirs" },
     { name = "requests" },
+    { name = "starlette" },
     { name = "tokenizers" },
+    { name = "uvicorn" },
 ]
 
 [package.optional-dependencies]
@@ -1450,7 +1452,7 @@ requires-dist = [
     { name = "charset-normalizer", specifier = ">=3.0" },
     { name = "cyclopts", specifier = ">=4.0" },
     { name = "fastembed", specifier = ">=0.8" },
-    { name = "fastmcp", specifier = ">=3.4" },
+    { name = "fastmcp", specifier = ">=3.4,<4" },
     { name = "huggingface-hub", specifier = ">=0.20" },
     { name = "lancedb", specifier = ">=0.36" },
     { name = "llama-cpp-python", marker = "extra == 'classify'", specifier = ">=0.3.36" },
@@ -1466,8 +1468,10 @@ requires-dist = [
     { name = "pyobjc-framework-vision", marker = "sys_platform == 'darwin' and extra == 'ocr'", specifier = ">=13" },
     { name = "pypdfium2", marker = "extra == 'ocr'", specifier = ">=5" },
     { name = "requests", specifier = ">=2.32" },
+    { name = "starlette", specifier = ">=0.27" },
     { name = "tesserocr", marker = "extra == 'ocr'", specifier = ">=2.13" },
     { name = "tokenizers", specifier = ">=0.15" },
+    { name = "uvicorn", specifier = ">=0.35" },
 ]
 provides-extras = ["ocr", "classify"]
 

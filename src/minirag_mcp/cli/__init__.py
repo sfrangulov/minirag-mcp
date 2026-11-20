@@ -1,7 +1,8 @@
 """CLI over the same core as the MCP server. Flags beat env vars.
 
 A command uses the index the environment variables configure, or with `--index NAME` that
-index of indexes.toml. `--index NAME` without a command serves that index alone on stdio.
+index of indexes.toml. `--index NAME` without a command serves that index alone on stdio;
+`serve` serves every index of indexes.toml over HTTP.
 """
 
 from __future__ import annotations
@@ -827,6 +828,35 @@ def indexes(*, json: JsonFlag = False) -> None:
         )
     payload = list_indexes_payload(_file_registry(), UNRESTRICTED)
     _emit(payload, json, "\n".join(_index_line(row) for row in payload["indexes"]))
+
+
+@app.command
+def serve() -> None:
+    """Serve every index of indexes.toml over streamable HTTP on this machine.
+
+    A client connects to `http://127.0.0.1:8765/mcp/<index>`, which makes `<index>` its
+    default; `?allow=a,b` lets it name a and b too, and `/mcp` has no default. Every request
+    sends the token that the first start writes next to indexes.toml (or to [server]
+    token_file) as `Authorization: Bearer <token>`. SIGHUP reads indexes.toml again;
+    [server] changes take a restart.
+    """
+    if _SELECTION.get().index is not None:
+        _fail(
+            "`serve` serves every index of indexes.toml; --index selects the one another "
+            "command uses and cannot be combined with it"
+        )
+    from minirag_mcp.http_server import serve as serve_http  # fastmcp loads in a server only
+
+    path = _config_path()
+    if not path.exists():
+        _fail(
+            f"no indexes.toml at {path}; create one "
+            "(docs/launchd/local.minirag-mcp.plist shows how to run it)"
+        )
+    try:
+        serve_http(path, os.environ)
+    except ConfigError as e:
+        _fail(str(e))
 
 
 @app.command

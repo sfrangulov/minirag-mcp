@@ -173,6 +173,23 @@ def index_states(monkeypatch) -> dict[str, tuple[IndexState, str]]:
     return states
 
 
+@pytest.fixture
+async def site(indexes_file, fake_embedder, index_states):
+    """The app `serve` builds, over the indexes of `indexes_file` and with the token
+    `http_helpers.TOKEN`, served on a free loopback port: its base URL."""
+    # Imported here for the reason index_states gives.
+    from http_helpers import TOKEN, serving
+    from index_helpers import file_registry
+    from minirag_mcp.http_server import build_http_app
+    from minirag_mcp.security import LOOPBACK_NAMES
+    from minirag_mcp.server import create_app
+
+    registry = file_registry(indexes_file, lambda c, s: fake_embedder)
+    app = build_http_app(create_app(registry), token=TOKEN, allowed_hosts=LOOPBACK_NAMES)
+    async with serving(app) as base:
+        yield base
+
+
 @pytest.fixture(autouse=True)
 def no_model_outlives_its_test() -> Iterator[None]:
     """Embedders share the fastembed models loaded in this process; each test starts and ends

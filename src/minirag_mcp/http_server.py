@@ -1,0 +1,211 @@
+"""`minirag-mcp serve`: every index of indexes.toml over streamable HTTP on this machine.
+
+The server listens on a loopback address only (indexes.toml refuses any other), and every
+request must pass `LoopbackGuard`: a loopback Host, no Origin but a loopback one, and the
+bearer token of the token file. A web page the user visits can make the browser send
+requests to 127.0.0.1, and the Host and Origin rules turn away the DNS-rebinding and
+cross-site forms of that; the token turns away every local process that cannot read the
+token file.
+
+`/mcp/<index>` makes `<index>` the connection's default, `?allow=a,b` lets it name `a` and
+`b` besides, and `/mcp` has no default; the connection reaches each tool through the ASGI
+scope, under `CONNECTION_SCOPE_KEY`.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hmac
+import os
+import secrets
+import signal
+import sys
+from collections.abc import Collection, Mapping
+from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
+
+import uvicorn
+from fastmcp import FastMCP
+from starlette.applications import Starlette
+from starlette.datastructures import Headers
+from starlette.middleware import Middleware
+from starlette.responses import PlainTextResponse
+from starlette.types import ASGIApp, Receive, Scope, Send
+
+from minirag_mcp.config import ConfigError
+from minirag_mcp.registry import CONNECTION_SCOPE_KEY, Connection, IndexRegistry
+from minirag_mcp.security import LOOPBACK_NAMES, host_name
+from minirag_mcp.server import create_app
+
+MCP_PATH = "/mcp"
+NOT_FOUND = "Not Found: MCP is served at /mcp and /mcp/<index>"
+MISDIRECTED = "Misdirected Request: Host must be a loopback name"
+FOREIGN_ORIGIN = "Forbidden: Origin is not a loopback origin"
+UNAUTHORIZED = "Unauthorized: send Authorization: Bearer <the token in the server's token file>"
+# What a call that arrives outside any HTTP request may use: nothing.
+_CLOSED = Connection(None, frozenset())
+
+
+def read_token(path: Path) -> str:
+    """The token in `path`; ConfigError when other users may read the file, or it holds
+    none."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            mode = os.fstat(f.fileno()).st_mode
+            token = f.read().strip()
+    except (OSError, UnicodeDecodeError) as e:
+        why = e.strerror if isinstance(e, OSError) and e.strerror else e
+        raise ConfigError(f"{path}: cannot read the token: {why}") from e
+    # Windows reports no POSIX permission bits; the file's ACL guards it there.
+    if os.name == "posix" and mode & 0o077:
+        raise ConfigError(
+            f"{path}: other users may read this token file; make it yours alone: chmod 600 {path}"
+        )
+    if not token:
+        raise ConfigError(
+            f"{path}: the token file is empty; delete it, and the next start writes a new token"
+        )
+    return token
+
+
+def ensure_token(path: Path) -> str:
+    """The token in `path`, written there first when the file does not exist: readable by
+    this user alone, in a folder only this user may enter when it is created here."""
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        pass
+    except OSError as e:
+        raise ConfigError(f"{path}: cannot create the token file: {e.strerror or e}") from e
+    else:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(secrets.token_urlsafe(32) + "\n")
+    return read_token(path)
+
+
+def parse_connection(path: str, query_string: str) -> Connection | None:
+    """What a request to `path` with `query_string` may use; None for a path that is not
+    MCP's. The index the path names is not checked here: a call that uses it gets the
+    registry's refusal, which names the indexes there are."""
+    parts = path.split("/")
+    if parts[:2] != ["", "mcp"] or len(parts) > 3:
+        return None
+    default = parts[2] if len(parts) == 3 and parts[2] else None
+    # Blank values kept: a present but empty `allow=` allows no other index, not every one.
+    values = parse_qs(query_string, keep_blank_values=True).get("allow")
+    if values is None:
+        return Connection(default, None)
+    names = (name.strip() for value in values for name in value.split(","))
+    return Connection(default, frozenset(name for name in names if name))
+
+
+def _origin_host(origin: str) -> str | None:
+    try:
+        return urlsplit(origin).hostname
+    except ValueError:
+        return None
+
+
+class LoopbackGuard:
+    """Refuses an HTTP request from anywhere but this machine's own clients: one whose
+    Host is not a loopback name, whose Origin is another site's or opaque, or that lacks
+    the token."""
+
+    def __init__(self, app: ASGIApp, *, token: str, allowed_hosts: Collection[str]) -> None:
+        self.app = app
+        self._token = token.encode("utf-8")
+        self._hosts = frozenset(allowed_hosts)
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        headers = Headers(scope=scope)
+        if host_name(headers.get("host", "")) not in self._hosts:
+            refusal = PlainTextResponse(MISDIRECTED, status_code=421)
+        elif "origin" in headers and _origin_host(headers["origin"]) not in self._hosts:
+            refusal = PlainTextResponse(FOREIGN_ORIGIN, status_code=403)
+        elif not self._authorized(headers.get("authorization", "")):
+            refusal = PlainTextResponse(
+                UNAUTHORIZED, status_code=401, headers={"WWW-Authenticate": "Bearer"}
+            )
+        else:
+            await self.app(scope, receive, send)
+            return
+        await refusal(scope, receive, send)
+
+    def _authorized(self, authorization: str) -> bool:
+        scheme, _, credentials = authorization.partition(" ")
+        # Headers arrive decoded as latin-1, so encoding them back gives the bytes sent.
+        sent = credentials.strip().encode("latin-1")
+        return scheme.lower() == "bearer" and hmac.compare_digest(sent, self._token)
+
+
+class IndexPathMiddleware:
+    """Answers 404 for a path that is not MCP's, and hands MCP every other request at
+    `/mcp`, with the connection its URL asks for in the scope."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        connection = parse_connection(scope["path"], scope["query_string"].decode("latin-1"))
+        if connection is None:
+            await PlainTextResponse(NOT_FOUND, status_code=404)(scope, receive, send)
+            return
+        routed = dict(scope, path=MCP_PATH, raw_path=MCP_PATH.encode("ascii"))
+        routed[CONNECTION_SCOPE_KEY] = connection
+        await self.app(routed, receive, send)
+
+
+def build_http_app(mcp: FastMCP, *, token: str, allowed_hosts: Collection[str]) -> Starlette:
+    """`mcp` over streamable HTTP, behind the guard and the path middleware."""
+    return mcp.http_app(
+        path=MCP_PATH,
+        transport="http",
+        middleware=[
+            Middleware(LoopbackGuard, token=token, allowed_hosts=allowed_hosts),
+            Middleware(IndexPathMiddleware),
+        ],
+    )
+
+
+async def _run(server: uvicorn.Server, registry: IndexRegistry) -> None:
+    loop = asyncio.get_running_loop()
+    if hasattr(signal, "SIGHUP"):
+        # Not signal.signal: a reload takes the registry's locks, which a tool's thread may
+        # hold, and reads files that may sit on a slow mount; the loop must not wait on it.
+        loop.add_signal_handler(signal.SIGHUP, lambda: loop.run_in_executor(None, registry.reload))
+    await server.serve()
+
+
+def serve(config_path: Path, env: Mapping[str, str]) -> None:
+    """Serve every index `config_path` configures until SIGINT or SIGTERM. SIGHUP reads
+    the file again; an edit is also picked up by the next call. The address and the token
+    are read once, here: changing them takes a restart. ConfigError when the file does not
+    load or the token file is refused."""
+    registry = IndexRegistry.from_file(config_path, env)
+    settings = registry.server
+    token = ensure_token(settings.token_file)
+    allowed_hosts = {*LOOPBACK_NAMES, host_name(settings.host)}
+    mcp = create_app(registry, connection=_CLOSED, env=env)
+    app = build_http_app(mcp, token=token, allowed_hosts=allowed_hosts)
+    host = f"[{settings.host}]" if ":" in settings.host else settings.host
+    print(
+        f"minirag-mcp serve: http://{host}:{settings.port}/mcp/<index> for "
+        f"{', '.join(registry.names)}; token in {settings.token_file}",
+        file=sys.stderr,
+    )
+    config = uvicorn.Config(
+        app,
+        host=settings.host,
+        port=settings.port,
+        lifespan="on",
+        access_log=False,
+        timeout_graceful_shutdown=2,
+    )
+    asyncio.run(_run(uvicorn.Server(config), registry))
