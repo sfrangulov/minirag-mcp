@@ -265,7 +265,7 @@ def excluded_by(
     roots: Sequence[Path],
     exclude: Sequence[str] = (),
     *,
-    exclude_source: str = EXCLUDE_VAR,
+    exclude_source: str,
 ) -> Path | str | None:
     """What excludes a path the caller named, read strictly."""
     ignorer = Ignorer(roots, strict=True, exclude=exclude, exclude_source=exclude_source)
@@ -277,7 +277,7 @@ def scope_excluded_by(
     roots: Sequence[Path],
     exclude: Sequence[str] = (),
     *,
-    exclude_source: str = EXCLUDE_VAR,
+    exclude_source: str,
 ) -> Path | str | None:
     """What excludes a sync or listing scope, or None.
 

@@ -13,6 +13,7 @@ import os
 import re
 import sys
 import tomllib
+import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,7 +22,7 @@ import platformdirs
 
 from minirag_mcp.config import Config, ConfigError, load_config
 from minirag_mcp.endpoints import Endpoint
-from minirag_mcp.security import LOOPBACK_NAMES, is_loopback_name
+from minirag_mcp.security import LOOPBACK_NAMES, host_name, is_loopback_name
 
 CONFIG_ENV = "MINIRAG_CONFIG"
 DEFAULT_HOST = "127.0.0.1"
@@ -111,7 +112,8 @@ def default_config_path(env: Mapping[str, str] | None = None) -> Path:
     if named:
         return _expanded(named, env)
     if sys.platform == "win32":
-        return platformdirs.user_config_path("minirag") / "indexes.toml"
+        # appauthor=False: by default it nests a folder named after the author, minirag again.
+        return platformdirs.user_config_path("minirag", appauthor=False) / "indexes.toml"
     # Not platformdirs: on macOS it answers ~/Library/Application Support.
     base = env.get("XDG_CONFIG_HOME", "").strip()
     return Path(base or _home(env) / ".config") / "minirag" / "indexes.toml"
@@ -195,6 +197,11 @@ def _address(path: Path, server: dict) -> tuple[str, int]:
     host = server.get("host", DEFAULT_HOST)
     if not isinstance(host, str) or not host.strip():
         raise ConfigError(f"{path}: [server] host must be a host name, got {host!r}")
+    if host_name(host) != host.lower():
+        raise ConfigError(
+            f"{path}: [server] host {host!r} cannot be listened on as written: give the bare "
+            "name or address, without brackets, spaces or a port; the port goes in [server] port"
+        )
     port = server.get("port", DEFAULT_PORT)
     if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= _MAX_PORT:
         raise ConfigError(
@@ -244,6 +251,11 @@ def _embeddings(path: Path, value: object, shared: dict[str, str]) -> dict[str, 
     endpoints = {}
     for model, table in _table(path, "[embedding]", value).items():
         where = f'[embedding."{model}"]'
+        # load_config reads an empty MODEL_NAME as unset and would key the default model.
+        if not model.strip():
+            raise ConfigError(
+                f"{path}: {where} names no model: write the fastembed model id between the quotes"
+            )
         url, name = _endpoint(path, where, table)
         env = {"MODEL_NAME": model, "EMBED_URL": url, "EMBED_ENDPOINT_MODEL": name}
         if "ENDPOINT_API_KEY_FILE" in shared:
@@ -330,10 +342,27 @@ def _exclude(path: Path, where: str, value: object) -> str:
     return ";".join(value)
 
 
+def _directory_key(folder: Path) -> tuple:
+    """One key for one folder however it is spelled. The part that exists is the folder
+    itself, so a case-insensitive filesystem's `Docs` and `docs` are one. The part not made
+    yet is compared without case or Unicode composition, as such a filesystem will make it;
+    on a case-sensitive one that refuses two folders that would have been distinct, which is
+    loud, where two indexes writing one directory is not."""
+    tail: list[str] = []
+    for existing in (folder, *folder.parents):
+        try:
+            st = os.stat(existing)
+        except OSError:
+            tail.append(unicodedata.normalize("NFC", existing.name).casefold())
+            continue
+        return (st.st_dev, st.st_ino, *reversed(tail))
+    return (str(folder).casefold(),)
+
+
 def _refuse_shared_db(path: Path, configs: dict[str, Config]) -> None:
-    owners: dict[Path, str] = {}
+    owners: dict[tuple, str] = {}
     for name, config in configs.items():
-        other = owners.setdefault(config.db_path, name)
+        other = owners.setdefault(_directory_key(config.db_path), name)
         if other != name:
             raise ConfigError(
                 f"{path}: [index.{other}] and [index.{name}] would both write the index at "

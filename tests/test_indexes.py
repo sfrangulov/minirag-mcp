@@ -238,6 +238,23 @@ def test_two_indexes_sharing_an_index_directory_are_refused(tmp_path):
     assert "[index.a]" in msg and "[index.b]" in msg and ".minirag/v2" in msg
 
 
+def test_two_indexes_whose_roots_differ_only_in_case_are_refused(tmp_path):
+    (tmp_path / "docs").mkdir()
+    if not (tmp_path / "DOCS").exists():
+        pytest.skip("the temporary folder's filesystem tells case apart")
+    msg = refused(tmp_path, '[index.a]\nroots = ["~/docs"]\n[index.b]\nroots = ["~/Docs"]\n')
+    assert "[index.a]" in msg and "[index.b]" in msg and ".minirag/v2" in msg
+
+
+def test_an_index_directory_not_made_yet_is_compared_without_case(tmp_path):
+    msg = refused(
+        tmp_path,
+        '[index.a]\nroots = ["~/a"]\ndb = "~/idx/Work"\n'
+        '[index.b]\nroots = ["~/b"]\ndb = "~/idx/work"\n',
+    )
+    assert "[index.a]" in msg and "[index.b]" in msg
+
+
 def test_two_indexes_with_one_explicit_db_are_refused(tmp_path):
     msg = refused(
         tmp_path,
@@ -345,6 +362,12 @@ def test_an_endpoint_without_its_name_is_refused(tmp_path, table, body):
     assert table in msg and "name" in msg
 
 
+@pytest.mark.parametrize("model", ["", "  "])
+def test_an_embedding_table_without_a_model_id_is_refused(tmp_path, model):
+    msg = refused(tmp_path, f'[embedding."{model}"]\nurl = "{EMBED_URL}"\nname = "e5"\n{ONE_INDEX}')
+    assert f'[embedding."{model}"]' in msg and "model id" in msg
+
+
 def test_an_embedding_entry_that_is_not_a_table_is_refused(tmp_path):
     msg = refused(tmp_path, f'[embedding]\nurl = "{EMBED_URL}"\n{ONE_INDEX}')
     assert '[embedding."url"]' in msg
@@ -366,6 +389,14 @@ def test_a_non_loopback_host_is_refused(tmp_path, host):
 @pytest.mark.parametrize("host", ["127.0.0.1", "localhost", "::1"])
 def test_loopback_hosts_are_accepted(tmp_path, host):
     assert load(tmp_path, f'[server]\nhost = "{host}"\nport = 9000\n{ONE_INDEX}').host == host
+
+
+@pytest.mark.parametrize(
+    "host", ["127.0.0.1:9000", "[::1]", "[::1]:8765", " localhost ", "0.0.0.0:80"]
+)
+def test_a_host_that_cannot_be_bound_as_written_is_refused(tmp_path, host):
+    msg = refused(tmp_path, f'[server]\nhost = "{host}"\nallow_remote = true\n{ONE_INDEX}')
+    assert repr(host) in msg and "[server] port" in msg
 
 
 def test_allow_remote_lifts_the_host_check(tmp_path):
@@ -452,14 +483,21 @@ def test_macos_and_linux_use_dot_config_not_application_support(monkeypatch, tmp
     assert default_config_path({"MINIRAG_CONFIG": "  "}) == default_config_path({})
 
 
-def test_windows_uses_platformdirs(monkeypatch, tmp_path):
+def test_windows_uses_platformdirs_without_an_author_folder(monkeypatch, tmp_path):
+    from platformdirs import windows
+
+    local = tmp_path / "AppData" / "Local"
     monkeypatch.setattr(sys, "platform", "win32")
+    # platformdirs' own Windows rules, with only the folder lookup the OS answers stood in for.
+    monkeypatch.setattr(windows, "get_win_folder", lambda csidl: str(local))
     monkeypatch.setattr(
-        indexes.platformdirs, "user_config_path", lambda name: tmp_path / "AppData" / name
+        indexes.platformdirs,
+        "user_config_path",
+        lambda *args, **kwargs: windows.Windows(*args, **kwargs).user_config_path,
     )
     assert (
         default_config_path({"XDG_CONFIG_HOME": str(tmp_path / "x")})
-        == tmp_path / "AppData" / "minirag" / "indexes.toml"
+        == local / "minirag" / "indexes.toml"
     )
 
 

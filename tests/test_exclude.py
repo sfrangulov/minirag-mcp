@@ -251,3 +251,11 @@ def test_the_list_note_credits_the_exclude_key_of_an_indexes_toml(root, toml_ind
     path, _ = toml_index
     code, _, err = run_cli(["list"], capsys)
     assert code == 0 and f"excluded by .miniragignore or {path} [index.docs] exclude" in err
+
+
+@pytest.mark.parametrize("check", ["excluded_by", "scope_excluded_by"])
+def test_a_refusal_check_must_be_told_where_the_patterns_were_written(root, check):
+    from minirag_mcp.ingest import ignore
+
+    with pytest.raises(TypeError, match="exclude_source"):
+        getattr(ignore, check)(root / "drafts", [root], ("drafts/",))
