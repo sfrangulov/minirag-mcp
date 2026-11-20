@@ -142,6 +142,17 @@ def test_a_csv_counts_its_non_blank_lines(tmp_path):
     assert data_rows(csv, 100) == 4
 
 
+@pytest.mark.parametrize("end", ["\n", "\r\n", "\r"], ids=["lf", "crlf", "cr"])
+@pytest.mark.parametrize("encoding", ["utf-8", "utf-16"])
+def test_a_csv_line_ends_at_any_of_the_three_line_endings(tmp_path, end, encoding):
+    """Excel's "CSV (Macintosh)" ends its lines with CR alone; read as one line, its rows
+    would never reach the limit. A UTF-16 line ending holds a NUL beside its CR and LF."""
+    csv = tmp_path / "t.csv"
+    csv.write_bytes(end.join([*(f"{i},x" for i in range(100)), "", " "]).encode(encoding))
+    assert data_rows(csv, 1000) == 100
+    assert data_rows(csv, 10) == 11
+
+
 def test_what_is_not_a_readable_table_is_left_to_the_parse(tmp_path):
     (tmp_path / "zip.xlsx").write_bytes(b"not a zip at all")
     (tmp_path / "t.md").write_text("a\nb\n")

@@ -23,6 +23,7 @@ _ROW = re.compile(rb"<(?:[A-Za-z_][\w.-]*:)?row[\s/>]")
 _VALUE = re.compile(rb"<(?:[A-Za-z_][\w.-]*:)?(?:v|is)>")
 _END = re.compile(rb"</(?:[A-Za-z_][\w.-]*:)?sheetData>")
 _SHEET = re.compile(r"xl/worksheets/[^/]+\.xml")
+_BLANK = " \t\n\r\v\f\0"
 # What stops a file being read as a zip or as bytes, and so stops its parse too. A
 # ValueError is what zipfile raises for an entry name flagged UTF-8 that is not.
 _UNREADABLE = (
@@ -66,9 +67,12 @@ def over_limit(path: Path, limit: int | None) -> bool:
 
 def _csv_rows(path: Path, limit: int) -> int:
     rows = 0
-    with path.open("rb") as fh:
+    # Latin-1 maps every byte to one character, so any encoding reads, and the universal
+    # newlines end a line at CR, LF or CRLF alike. Only ASCII whitespace and NUL are blank:
+    # a UTF-16 line ending leaves a NUL on a line of its own.
+    with path.open(encoding="latin-1", newline=None) as fh:
         for line in fh:
-            if line.strip():
+            if line.strip(_BLANK):
                 rows += 1
                 if rows > limit:
                     break
