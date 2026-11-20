@@ -252,6 +252,31 @@ def test_a_budget_change_reingests_from_disk(corpus, models, parses):
     assert b.state() == (IndexState.READY, "")
 
 
+def test_a_reingest_reads_its_files_in_workers_and_writes_what_a_serial_one_writes(
+    tmp_path, models, inline_workers, monkeypatch
+):
+    # With the [ocr] extra installed, a parallel sync fetches Tesseract's data first.
+    monkeypatch.setattr(ocr_mod, "available", lambda: False)
+    root = tmp_path / "docs"
+    root.mkdir()
+    for i in range(10):
+        (root / f"{i}.md").write_text(f"# Doc {i}\n\n" + LONG.replace("Sentence", f"Doc {i}"))
+
+    def rebuilt(name: str, workers: int) -> list[dict]:
+        env = {"DB_PATH": str(tmp_path / name), "CACHE_DIR": str(tmp_path / "cache")}
+        built(root, models, CHUNK_TOKEN_BUDGET="32", RAG_SYNC_WORKERS="1", **env)
+        h = handle(root, models, MODEL_NAME=MINILM, RAG_SYNC_WORKERS=str(workers), **env)
+        counts, errors, info = h.run_sync(None)
+        assert (info.kind, counts["ingested"], errors) == ("reingest", 10, [])
+        rows = h.get().store._table.to_arrow().sort_by("id").to_pylist()
+        return [{k: v for k, v in r.items() if k != "ingested_at"} for r in rows]
+
+    serial = rebuilt("serial", 1)
+    assert inline_workers == [] and len(serial) > 10
+    assert rebuilt("parallel", 2) == serial
+    assert inline_workers == [2]
+
+
 def _words(text: str) -> list[str]:
     return text.split()
 
