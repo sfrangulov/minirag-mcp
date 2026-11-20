@@ -971,13 +971,16 @@ def test_splice_carries_a_paragraph_break_past_a_line_vision_merged_away():
     assert ocr.splice(tess, vision) == "a1 b1\n\nB2"
 
 
-@pytest.mark.parametrize("top,same", [(9, True), (10, False), (0, True)])
-def test_lines_overlap_by_more_than_half_the_smaller_height(top, same):
+@pytest.mark.parametrize(
+    "top,expected",
+    [(9, "vision"), (10, "tess\nvision"), (20, "tess\n\nvision"), (0, "vision")],
+)
+def test_lines_overlap_by_more_than_half_the_smaller_height(top, expected):
     """Vision's boxes are taller than the glyphs: a neighbour's box reaching a little
-    into a line is not that line."""
+    into a line is not that line, and comes out after it."""
     tess = [_tess((0, 0, 100, 20), "tess", True)]
     vision = [ocr.Line((50, top, 300, top + 40), "vision")]
-    assert ocr.splice(tess, vision) == ("vision" if same else "tess\n\nvision")
+    assert ocr.splice(tess, vision) == expected
 
 
 def test_splice_of_nothing_is_empty():
@@ -996,12 +999,52 @@ def test_splice_keeps_a_line_only_tesseract_read_on_a_tilted_page():
     assert ocr.splice(tess, vision) == "V0\nV1\nV2\nt3\nV4\nV5"
 
 
-def test_a_vision_line_no_tesseract_line_is_clearly_read_by_follows_the_page():
+def test_a_vision_line_that_reads_no_tesseract_line_comes_out_once_after_the_first_it_covers_most():
     """Tesseract missed line 2 and Vision line 1: Vision's line 2 covers half of each
-    Tesseract line beside it, and reads neither."""
+    Tesseract line beside it and a little of line 0, and reads none of them."""
     tess = [_tess(_tilted(k), f"t{k}", k == 0) for k in (0, 1, 3)]
     vision = [ocr.Line(_tilted(k), f"V{k}") for k in (0, 2)]
-    assert ocr.splice(tess, vision) == "V0\nt1\nt3\n\nV2"
+    assert ocr.splice(tess, vision) == "V0\nt1\nV2\nt3"
+
+
+def test_a_vision_line_across_two_cells_comes_out_after_the_one_it_covers_most():
+    """Tesseract read a table row as two cell lines, the value boxed lower than the label;
+    Vision read it as one line across both, covering under three quarters of either."""
+    tess = [
+        _tess((0, 0, 560, 30), "Expenses", True),
+        _tess((0, 100, 150, 130), "Rent"),
+        _tess((400, 112, 560, 142), "1 200"),
+        _tess((0, 200, 150, 230), "Total"),
+    ]
+    vision = [
+        ocr.Line((0, 0, 560, 31), "EXPENSES"),
+        ocr.Line((0, 104, 560, 126), "Rent 1 200"),
+        ocr.Line((0, 200, 150, 231), "TOTAL"),
+        ocr.Line((700, 400, 800, 430), "PAID"),
+    ]
+    assert ocr.splice(tess, vision) == "EXPENSES\nRent\nRent 1 200\n1 200\nTOTAL\n\nPAID"
+
+
+def test_two_table_rows_vision_read_across_their_cells_keep_their_order():
+    tess = [
+        _tess((0, 100, 150, 130), "Rent", True),
+        _tess((400, 112, 560, 142), "1 200"),
+        _tess((0, 200, 150, 230), "Heat"),
+        _tess((400, 188, 560, 218), "300"),
+    ]
+    vision = [
+        ocr.Line((0, 104, 560, 126), "Rent 1 200"),
+        ocr.Line((0, 196, 560, 220), "Heat 300"),
+    ]
+    assert ocr.splice(tess, vision) == "Rent\nRent 1 200\n1 200\nHeat\n300\nHeat 300"
+
+
+def test_vision_lines_after_one_tesseract_line_keep_visions_own_order():
+    """Tesseract missed a row Vision read as two cells, each box reaching a little into the
+    row above without sharing its line."""
+    tess = [_tess((0, 0, 300, 40), "above", True), _tess((0, 100, 300, 140), "below")]
+    vision = [ocr.Line((160, 30, 300, 70), "right"), ocr.Line((0, 30, 140, 70), "left")]
+    assert ocr.splice(tess, vision) == "above\nright\nleft\nbelow"
 
 
 def test_splice_loses_and_repeats_no_line_from_flat_pages_to_tilted_ones():

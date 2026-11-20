@@ -229,12 +229,23 @@ def splice(tess_lines: Sequence[Line], vision_lines: Sequence[Line]) -> str:
 
     A Tesseract line is replaced by the Vision lines that read it and are not used yet,
     left to right, so a Vision line across two Tesseract lines comes out once; one no
-    Vision line reads is kept. Vision lines that read no Tesseract line, text Tesseract
-    never found, follow the page as a paragraph of their own in the order Vision gave
-    them. Both readings are boxed on the upright page: left to right means nothing on a
-    sideways one.
+    Vision line reads is kept. A Vision line that reads none but overlaps some comes out
+    after the one of them it covers most of; those that overlap none, text Tesseract
+    never found, follow the page as a paragraph of their own. Either way, several in one
+    place come out in the order Vision gave them. Both readings are boxed on the upright
+    page: left to right means nothing on a sideways one.
     """
     reads = [_read_by(seen.box, tess_lines) for seen in vision_lines]
+    beside: dict[int, list[str]] = {}
+    rest: list[str] = []
+    for seen, lines in zip(vision_lines, reads, strict=True):
+        if lines:
+            continue
+        anchor = _beside(seen.box, tess_lines)
+        if anchor is None:
+            rest.append(seen.text)
+        else:
+            beside.setdefault(anchor, []).append(seen.text)
     used: set[int] = set()
     out: list[str] = []
     paragraph = False
@@ -242,6 +253,7 @@ def splice(tess_lines: Sequence[Line], vision_lines: Sequence[Line]) -> str:
         readings = [i for i, lines in enumerate(reads) if t in lines]
         fresh = sorted(set(readings) - used, key=lambda i: vision_lines[i].box[0])
         texts = [vision_lines[i].text for i in fresh] if readings else [line.text]
+        texts += beside.get(t, [])
         used.update(readings)
         paragraph = paragraph or line.starts_paragraph
         if texts:
@@ -249,10 +261,9 @@ def splice(tess_lines: Sequence[Line], vision_lines: Sequence[Line]) -> str:
                 out.append("")
             paragraph = False
             out.extend(texts)
-    rest = [seen for i, seen in enumerate(vision_lines) if i not in used]
     if rest and out:
         out.append("")
-    out.extend(seen.text for seen in rest)
+    out.extend(rest)
     return "\n".join(out)
 
 
@@ -266,10 +277,22 @@ def _read_by(box: Box, tess_lines: Sequence[Line]) -> set[int]:
     return {t for t in shared if _covered(tess_lines[t].box, box) >= _SPLICE_COVER}
 
 
+def _beside(box: Box, tess_lines: Sequence[Line]) -> int | None:
+    """The Tesseract line a Vision line boxed `box` that reads none goes out after: of
+    those it overlaps, the one it covers most of, the first of equals; None if it overlaps
+    none. A table row Tesseract read as two cell lines and Vision as one line across both
+    covers under `_SPLICE_COVER` of each, and belongs beside that row."""
+    overlapped = [t for t, line in enumerate(tess_lines) if _overlaps(line.box, box)]
+    return max(overlapped, key=lambda t: _covered(tess_lines[t].box, box), default=None)
+
+
 def _covered(a: Box, b: Box) -> float:
-    """The share of `a`'s height `b` covers; `a` is one `b` shares a line with, so it has
-    a height."""
+    """The share of `a`'s height `b` covers; `a` is one `b` overlaps, so it has a height."""
     return (min(a[3], b[3]) - max(a[1], b[1])) / (a[3] - a[1])
+
+
+def _overlaps(a: Box, b: Box) -> bool:
+    return min(a[2], b[2]) > max(a[0], b[0]) and min(a[3], b[3]) > max(a[1], b[1])
 
 
 def _same_line(a: Box, b: Box) -> bool:
