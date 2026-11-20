@@ -236,8 +236,19 @@ and `list_indexes` say which backend is live.
   today (prototype: `evals/enterpriserag/common.py: apply_embedding_endpoint`). Vectors are
   unit-normalized on arrival. Measured: llama.cpp f16 e5 vs fastembed, cosine >= 0.99999, so an
   index built by one backend is served by the other and the backend is not part of the
-  embedding scheme. Unreachable endpoint: fall back to in-process fastembed for the same
-  model, loudly (status flag + a warning in results), never to a different model.
+  embedding scheme. ~~Unreachable endpoint: fall back to in-process fastembed for the same
+  model, loudly (status flag + a warning in results), never to a different model.~~
+  **Superseded (2026-11-20, plan 2; deliberate departures, ruling C21 and `58d9139`):**
+  unreachable endpoint: fall back to in-process fastembed for the same model, loudly (status
+  flag + a warning in results), never to a different model, with two exceptions. Sync
+  workers never fall back: an unreachable endpoint fails the file a worker reads, and 3
+  consecutive endpoint failures stop the sync with one error (`embedding: endpoint
+  unreachable, N files not synced`), whose files the next sync reads; N workers each loading
+  e5 (~3.3 GB) would exhaust memory. A sync that runs in one process (fewer than 8 files to
+  read, or `RAG_SYNC_WORKERS=1`), ingest calls and queries keep the fallback. And with an
+  endpoint configured, the fallback never downloads the model: it runs from a copy already
+  in `cache_dir`, and without one the call fails, naming the endpoint, why it was not used
+  and the cache folder, instead of fetching up to 2.2 GB behind one search or sync.
   **The served model is verified**, since a router preset pointing at another model of the
   same dimension would mix vectors silently: `index.json` records the vector of a fixed probe
   text at build time; on open (and when the endpoint comes back) the probe is embedded through
@@ -389,7 +400,11 @@ on the owner's GPU). `find_mentions` (literal search) is unchanged.
 - A bearer token is required even on loopback.
 - `/mcp` without an index is allowed but has no default.
 - Reranking top 30 by default; document bonus weight 0.5; keyword weight 0.6.
-- Endpoints fall back to in-process models loudly rather than failing searches.
+- ~~Endpoints fall back to in-process models loudly rather than failing searches.~~
+  Superseded (2026-11-20, plan 2; see section 2): endpoints fall back to in-process models
+  loudly rather than failing searches when the model is already on disk; with an endpoint
+  configured the fallback never downloads it, so without a local copy the search fails with
+  the way out. Sync workers never fall back.
 - v2 indexes default to `<first root>/.minirag/v2/`.
 - Rebuilds keep one previous copy (disk cost: one index).
 - ~~Struck-through text is dropped in v2 without a ruler measurement (correctness).~~

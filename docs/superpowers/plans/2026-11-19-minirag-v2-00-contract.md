@@ -28,7 +28,7 @@ Plans, executed in this order (each leaves `uv run pytest -q`, `ruff check src t
 | `handle.py` | 1.5, 1.9-1.11 | `make_embedder(config, scheme, *, threads=None)`, `configured_scheme(config)`, `EmbedderFactory`, `OpenIndex(config, store, embedder, pipeline, labels, identity, reranker)`, `IndexHandle(config, *, embedder_factory, model_factory)` with `get()`, `state()`, `.sync`, `run_sync(scope, on_event)`, `ensure_probe()`, `notes()`; `IndexUnavailableError` |
 | `rebuild.py` | 1.11 | `rebuild(current, make, on_event)` |
 | `store.py` | 1.7, 1.8, 1.11; 2.5 | `documents` table; `_document_row`, `_write_documents`, `_delete_documents`, `backfill_documents`; `search(..., document_weight, reranker, rerank_top)`; `copy_reembedded`; `IndexBusyError`; `replace_sources(batch, *, indexed)` (plan 2) |
-| `ingest/pipeline.py` | 1.3, 1.10, 1.11; 2.4 | `Pipeline(store, embedder, config, labels=None, *, before_store=None)`, `.before_store`, `reingest_stored`; `PreparedDocument` (with `embedding_warning`), `prepare`, `prepare_file`, `records`, `store_prepared` (plan 2) |
+| `ingest/pipeline.py` | 1.3, 1.10, 1.11; 2.4 | `Pipeline(store, embedder, config, labels=None, *, before_store=None)`, `.before_store`, `reingest_stored`; `PreparedDocument` (no `embedding_warning`: workers never fall back, ruling C10), `prepare`, `prepare_file`, `records`, `store_prepared` (plan 2) |
 | `sync.py` | 1.3, 1.7, 1.9, 1.11; 2.9 | `_run_sync_unlocked(pipeline, store, roots, max_file_size, scope, on_event)`, `SyncManager(db_path, run)`, `.running`, `SyncJob.rebuild` |
 | `results.py` | 1.3-1.9; 3.4 | `embedding_status`, `embedder_notes`, `ingest_reply(r, notes)`, `rerank_status`, `documents_status`, `status_payload(config, handle)` (plan 1); `with_index`, `index_status`, `registry_status`, `list_indexes_payload` (plan 3) |
 | `labels/endpoint_model.py` | 1.6 | `EndpointChoiceModel`, `endpoint_model_factory`; `LabelerSource.backend` |
@@ -63,6 +63,8 @@ Plans, executed in this order (each leaves `uv run pytest -q`, `ruff check src t
   A scoped sync on a pending index is refused (only the unscoped rebuild writes there).
   Workers never fall back in-process: an unreachable endpoint fails the file, and 3
   consecutive failures stop dispatch with one loud error; the serial path keeps the fallback.
+  `parallel.prepare_files` yields each file as it finishes, not in input order (2026-11-20,
+  ruling I1).
 - **Status and result flags.** Plan 1's `status_payload(config, handle)` is the per-index
   status (`indexState`, `indexGeneration`, `embedding`, `embeddingBackend`, `reranker`,
   `chunkBudget`, `rebuildReasons`, `indexError`, labels `backend`); plan 3's `index_status`
