@@ -472,3 +472,118 @@ def test_real_engine_reads_rendered_pdf_page(tmp_path):
     cfg = load_config({}, cwd=tmp_path)
     texts = ocr.ocr_pdf(p, cfg, [0])
     assert "555" in texts[0]
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("rus+eng", "rus+eng"),
+        ("eng", "eng"),
+        (" ENG + rus ", "eng+rus"),
+        ("eslav", "rus+eng"),
+        ("en", "eng"),
+    ],
+)
+def test_tesseract_languages(value, expected):
+    assert ocr.tesseract_languages(value) == expected
+
+
+@pytest.mark.parametrize("value", ["", "ch", "deu", "rus+", "rus+rus", "osd"])
+def test_tesseract_languages_refuses(value):
+    with pytest.raises(ValueError, match=r"rus.*eng.*eslav"):
+        ocr.tesseract_languages(value)
+
+
+class _TessdataServer:
+    def __init__(self):
+        self.files: dict[str, bytes] = {}
+        self.hits: list[str] = []
+
+
+@pytest.fixture
+def tessdata_server(monkeypatch):
+    import hashlib
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    state = _TessdataServer()
+    for name in ("eng", "osd", "rus"):
+        state.files[f"/{ocr.TESSDATA_COMMIT}/{name}.traineddata"] = f"{name} data".encode()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            state.hits.append(self.path)
+            body = state.files.get(self.path)
+            if body is None:
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    port = server.server_address[1]
+    monkeypatch.setattr(
+        ocr, "_TESSDATA_URL", f"http://127.0.0.1:{port}/{{commit}}/{{name}}.traineddata"
+    )
+    monkeypatch.setattr(
+        ocr,
+        "TESSDATA_SHA256",
+        {n: hashlib.sha256(f"{n} data".encode()).hexdigest() for n in ("eng", "osd", "rus")},
+    )
+    yield state
+    server.shutdown()
+    server.server_close()
+
+
+def test_tessdata_is_fetched_once_from_the_pinned_commit(tmp_path, tessdata_server):
+    d = ocr.ensure_tessdata(tmp_path, "rus+eng")
+    assert d == ocr.tessdata_dir(tmp_path) and d.parent == tmp_path / "ocr"
+    assert sorted(p.name for p in d.iterdir()) == [
+        "eng.traineddata",
+        "osd.traineddata",
+        "rus.traineddata",
+    ]
+    assert len(tessdata_server.hits) == 3
+    assert all(h.startswith(f"/{ocr.TESSDATA_COMMIT}/") for h in tessdata_server.hits)
+    ocr.ensure_tessdata(tmp_path, "rus+eng")
+    assert len(tessdata_server.hits) == 3
+
+
+def test_only_the_languages_asked_for_and_osd_are_fetched(tmp_path, tessdata_server):
+    ocr.ensure_tessdata(tmp_path, "eng")
+    assert sorted(h.rsplit("/", 1)[1] for h in tessdata_server.hits) == [
+        "eng.traineddata",
+        "osd.traineddata",
+    ]
+
+
+def test_a_download_with_the_wrong_digest_is_discarded(tmp_path, tessdata_server):
+    tessdata_server.files[f"/{ocr.TESSDATA_COMMIT}/rus.traineddata"] = b"tampered"
+    with pytest.raises(ocr.OcrError, match=r"rus\.traineddata.*sha256"):
+        ocr.ensure_tessdata(tmp_path, "rus")
+    leftovers = [
+        p.name for p in ocr.tessdata_dir(tmp_path).iterdir() if p.name.startswith(("rus", ".rus"))
+    ]
+    assert leftovers == []
+
+
+def test_a_cached_file_with_the_wrong_digest_is_refused(tmp_path, tessdata_server):
+    d = ocr.tessdata_dir(tmp_path)
+    d.mkdir(parents=True)
+    (d / "osd.traineddata").write_bytes(b"x")
+    with pytest.raises(ocr.OcrError, match="delete it to download it again"):
+        ocr.ensure_tessdata(tmp_path, "eng")
+
+
+def test_an_unreachable_host_is_a_loud_ocr_error(tmp_path, monkeypatch, dead_url):
+    monkeypatch.setattr(ocr, "_TESSDATA_URL", dead_url + "/{commit}/{name}.traineddata")
+    with pytest.raises(
+        ocr.OcrError, match=r"could not download (eng|osd)\.traineddata .*127\.0\.0\.1"
+    ):
+        ocr.ensure_tessdata(tmp_path, "eng")

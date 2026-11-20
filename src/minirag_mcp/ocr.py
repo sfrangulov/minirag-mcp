@@ -7,12 +7,16 @@ run without the extra installed.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import logging
+import os
+import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import requests
 from pdfminer.high_level import extract_pages
 from pdfminer.layout import LTTextContainer
 
@@ -265,3 +269,103 @@ def ocr_image(path: Path, config: Config) -> str:
         raise OcrError(f"could not decode image {path}")
     logger.info("ocr: %s -> %d frame(s)", path, len(frames))
     return "\n\n".join(text for f in frames if (text := _recognize(_orient(f, path), config, path)))
+
+
+TESSDATA_COMMIT = "87416418657359cb625c412a48b6e1d6d41c29bd"  # tessdata_fast main, 2024-08-01
+TESSDATA_SHA256 = {
+    "eng": "7d4322bd2a7749724879683fc3912cb542f19906c83bcc1a52132556427170b2",
+    "osd": "9cf5d576fcc47564f11265841e5ca839001e7e6f38ff7f7aacf46d15a96b00ff",
+    "rus": "e16e5e036cce1d9ec2b00063cf8b54472625b9e14d893a169e2b0dedeb4df225",
+}
+_TESSDATA_URL = (
+    "https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/{commit}/{name}.traineddata"
+)
+DEFAULT_LANGUAGES = "rus+eng"
+LANGUAGE_ALIASES = {"eslav": "rus+eng", "en": "eng"}
+
+
+def tesseract_languages(value: str) -> str:
+    text = value.strip().lower()
+    if text in LANGUAGE_ALIASES:
+        return LANGUAGE_ALIASES[text]
+    parts = [part.strip() for part in text.split("+")]
+    known = [name for name in TESSDATA_SHA256 if name != "osd"]
+    if any(part not in known for part in parts) or len(set(parts)) != len(parts):
+        raise ValueError(
+            f"{value!r} is not a language set OCR can read: use rus, eng or both joined "
+            "by '+' (rus+eng), or the 1.x names eslav, en"
+        )
+    return "+".join(parts)
+
+
+def tessdata_dir(cache_dir: Path) -> Path:
+    return cache_dir / "ocr" / f"tessdata_fast-{TESSDATA_COMMIT[:12]}"
+
+
+# sha256 of each cached traineddata file this process has verified, keyed by what would
+# change if the file did, so repeated OCR jobs do not rehash ~10 MB each time.
+_tessdata_digests: dict[tuple[str, int, int], str] = {}
+
+
+def _file_sha256(path: Path) -> str:
+    st = path.stat()
+    key = (str(path.resolve()), st.st_size, st.st_mtime_ns)
+    if key not in _tessdata_digests:
+        digest = hashlib.sha256()
+        with path.open("rb") as fh:
+            for block in iter(lambda: fh.read(1 << 20), b""):
+                digest.update(block)
+        _tessdata_digests[key] = digest.hexdigest()
+    return _tessdata_digests[key]
+
+
+def _download_tessdata(name: str, target: Path) -> None:
+    url = _TESSDATA_URL.format(commit=TESSDATA_COMMIT, name=name)
+    expected = TESSDATA_SHA256[name]
+    # Several sync workers may fetch at once; the replace is what keeps any of them
+    # from reading a partial file.
+    tmp = tempfile.NamedTemporaryFile(dir=target.parent, prefix=f".{name}.", delete=False)
+    tmp_path = Path(tmp.name)
+    try:
+        with tmp:
+            digest = hashlib.sha256()
+            try:
+                with requests.get(url, stream=True, timeout=60) as resp:
+                    resp.raise_for_status()
+                    for block in resp.iter_content(1 << 20):
+                        digest.update(block)
+                        tmp.write(block)
+            except requests.RequestException as e:
+                raise OcrError(
+                    f"could not download {name}.traineddata from {url}: {e}; "
+                    "OCR needs it once, then works offline"
+                ) from e
+        if digest.hexdigest() != expected:
+            raise OcrError(
+                f"{url} has sha256 {digest.hexdigest()}, expected {expected}; "
+                "the download was discarded"
+            )
+        os.replace(tmp_path, target)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def ensure_tessdata(cache_dir: Path, languages: str) -> Path:
+    directory = tessdata_dir(cache_dir)
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        for name in [*languages.split("+"), "osd"]:
+            path = directory / f"{name}.traineddata"
+            if path.exists():
+                actual = _file_sha256(path)
+                if actual != TESSDATA_SHA256[name]:
+                    raise OcrError(
+                        f"{path} has sha256 {actual}, expected {TESSDATA_SHA256[name]}; "
+                        "delete it to download it again"
+                    )
+            else:
+                _download_tessdata(name, path)
+    except OSError as e:
+        raise OcrError(f"could not prepare Tesseract data in {directory}: {e}") from e
+    return directory
