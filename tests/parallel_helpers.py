@@ -37,7 +37,7 @@ class Preparer:
         self.hold_on = hold_on
         self.release = release
 
-    def prepare_file(self, path: Path, *, rules_checked: bool) -> str:
+    def prepare_file(self, path: Path, *, rules_checked: bool, rows_checked: bool) -> str:
         if self.shout:
             print("LEAK-print")
             os.write(1, b"LEAK-fd\n")

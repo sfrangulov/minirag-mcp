@@ -79,6 +79,7 @@ class Config:
     classify_endpoint: Endpoint | None = None
     index_name: str | None = None
     sync_workers: int | None = None
+    max_table_rows: int | None = None
 
 
 def default_db_path(roots: Sequence[Path]) -> Path:
@@ -223,6 +224,11 @@ def load_config(
         _int(env, "RAG_SYNC_WORKERS", 1, 1, 256) if sync_workers_raw is not None else None
     )
 
+    max_table_rows_raw = env.get("RAG_MAX_TABLE_ROWS")
+    max_table_rows = (
+        _int(env, "RAG_MAX_TABLE_ROWS", 1, 1) if max_table_rows_raw is not None else None
+    )
+
     model_name = model_name_flag or env.get("MODEL_NAME") or DEFAULT_MODEL
 
     key_raw = env.get("ENDPOINT_API_KEY_FILE", "").strip()
@@ -271,4 +277,5 @@ def load_config(
         rerank_endpoint=_endpoint(env, "RERANK_URL", "RERANK_MODEL", api_key),
         classify_endpoint=_endpoint(env, "CLASSIFY_URL", "CLASSIFY_MODEL", api_key),
         sync_workers=sync_workers,
+        max_table_rows=max_table_rows,
     )

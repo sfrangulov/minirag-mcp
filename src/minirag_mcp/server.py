@@ -124,9 +124,9 @@ def create_app(
 
         Returns state ('pending' | 'running' | 'succeeded' | 'failed'),
         counts (scanned/ingested/skipped/moved/deleted/relabelled/signed/
-        ignored/unreadable/failed), and any per-file errors. Only the latest job is
-        retained — an old jobId, or any jobId from before a server restart, raises an
-        error.
+        ignored/unreadable/largeTables/failed), and any per-file errors. Only
+        the latest job is retained — an old jobId, or any jobId from before a
+        server restart, raises an error.
 
         relabelled counts documents whose labels were rewritten from their
         stored text, with nothing re-embedded: classify.toml changed, a move
@@ -156,6 +156,12 @@ def create_app(
         reading again a PDF that was read with OCR before page numbers were
         stored); each one appears in errors saying it was kept as it is, but
         it is not a failure and does not make the job fail.
+
+        largeTables counts the .xlsx and .csv files the sync would have read
+        but left out for holding more data rows than RAG_MAX_TABLE_ROWS; each
+        appears in errors as "skipped: ...", and is not a failure. One already
+        indexed is deleted from the index and counted under deleted. Only new
+        and changed files are counted, so an unchanged one stays as indexed.
 
         A folder the scan could not see into (a missing root, one without read
         permission, an empty folder where a root was mounted) also appears in
@@ -190,7 +196,8 @@ def create_app(
         and the in-process model embedded instead: same vectors, slower.
 
         Refused while the index needs a rebuild (status: indexState "rebuild
-        pending"), until an unscoped sync_start rebuilds it.
+        pending"), until an unscoped sync_start rebuilds it, and for a file
+        above MAX_FILE_SIZE or a table above RAG_MAX_TABLE_ROWS data rows.
         """
         h = live()
         pipeline = h.ingest_pipeline()
@@ -585,6 +592,9 @@ def create_app(
 
         ignoreFiles, present when a root has a .miniragignore: each file with
         its number of rules, or the error that stops scanning under its root.
+
+        maxTableRows, present only when RAG_MAX_TABLE_ROWS is set, is the
+        number of data rows above which an .xlsx or .csv is not indexed.
 
         ocr names the OCR engine this install can use, or is "unavailable"
         when the optional extra is missing — scanned PDFs and images cannot

@@ -373,6 +373,8 @@ def status_payload(config: Config, handle: IndexHandle) -> dict:
         **ocr_status(config),
         **ignore_status(config.roots),
     }
+    if config.max_table_rows is not None:
+        out["maxTableRows"] = config.max_table_rows
     state, why = handle.state()
     out["indexState"] = state.value
     if state is IndexState.UNAVAILABLE:

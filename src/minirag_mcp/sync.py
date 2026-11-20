@@ -59,6 +59,7 @@ class SyncJob:
             "signed": 0,
             "ignored": 0,
             "unreadable": 0,
+            "largeTables": 0,
             "failed": 0,
         }
     )
@@ -192,13 +193,15 @@ def _run_sync_unlocked(
         blind=blind,
         ignored=ignored,
         record_pages="pages" not in store.missing_columns,
+        max_table_rows=pipeline.config.max_table_rows,
     )
     counts = {
         "scanned": len(diff.to_ingest)
         + len(diff.moved)
         + len(diff.unchanged)
         + len(diff.oversized)
-        + len(diff.kept_scans),
+        + len(diff.kept_scans)
+        + len(diff.large_tables),
         "ingested": 0,
         "skipped": len(diff.unchanged),
         "moved": 0,
@@ -207,6 +210,7 @@ def _run_sync_unlocked(
         "signed": 0,
         "ignored": sum(1 for p in ignored if scope is None or is_under(str(p), str(scope))),
         "unreadable": len(diff.unreadable) + len(diff.kept_scans),
+        "largeTables": len(diff.large_tables),
         "failed": 0,
     }
     errors: list[dict] = []
@@ -219,6 +223,17 @@ def _run_sync_unlocked(
     for path in diff.oversized:
         counts["failed"] += 1
         errors.append({"source": str(path), "error": f"exceeds MAX_FILE_SIZE ({max_file_size})"})
+
+    # Not failures: the limit is the owner's choice, made so that these stay out.
+    limit = pipeline.config.max_table_rows
+    for path in diff.large_tables:
+        errors.append(
+            {
+                "source": str(path),
+                "error": f"skipped: more than {limit} data rows exceeds RAG_MAX_TABLE_ROWS "
+                f"({limit})",
+            }
+        )
 
     # Not counted as failures: the run did everything it could, and an install that
     # deliberately omits the extra would otherwise exit 1 on every sync forever.
@@ -250,7 +265,7 @@ def _run_sync_unlocked(
 
     def ingest(path: Path) -> bool:
         try:
-            pipeline.ingest_file(path, rules_checked=True)
+            pipeline.ingest_file(path, rules_checked=True, rows_checked=True)
         except Exception as e:  # per-file failures never abort the job
             failed(str(path), str(e))
             return False

@@ -333,6 +333,26 @@ def test_a_reingest_keeps_what_the_disk_cannot_give_back(
     assert store.get_source(str(broken)).file_hash == pipeline_mod.file_sha256(broken)
 
 
+@pytest.mark.parametrize(
+    "change",
+    [{}, {"MODEL_NAME": MINILM, "CHUNK_TOKEN_BUDGET": "32"}],
+    ids=["reembed", "reingest"],
+)
+def test_a_rebuild_does_not_keep_a_table_that_grew_over_the_limit(corpus, models, change):
+    """A sync takes such a table out; a rebuild restoring its old text would put it back."""
+    table = corpus / "t.csv"
+    table.write_text("".join(f"{i},v{i}\n" for i in range(3)))
+    built(corpus, models, RAG_MAX_TABLE_ROWS="5")
+    table.write_text("".join(f"{i},v{i}\n" for i in range(9)))
+    h = handle(corpus, models, RAG_MAX_TABLE_ROWS="5", **change)
+
+    counts, errors, info = h.run_sync(None)
+
+    assert (info.restored, counts["largeTables"], counts["failed"]) == (0, 1, 0)
+    assert h.get().store.get_source(str(table)) is None
+    assert [e["source"] for e in errors] == [str(table)]
+
+
 def test_a_reingest_keeps_the_files_of_a_root_it_cannot_see(tmp_path, models):
     docs, drive = tmp_path / "docs", tmp_path / "drive"
     docs.mkdir()

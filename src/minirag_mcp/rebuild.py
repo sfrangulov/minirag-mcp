@@ -145,7 +145,8 @@ def _restore(
 
     Kept: what was ingested from data or a URL, and a file this installation could not
     read again, or whose folder it could not see into. Not kept: a file gone from disk, or
-    excluded by a rule, or moved, which `compute_diff` decides as for any sync.
+    excluded by a rule, or moved, or a changed table over RAG_MAX_TABLE_ROWS, which
+    `compute_diff` decides as for any sync.
 
     Also stored again: a file read with OCR before, which an installation without OCR read
     again from its text layer alone. A PDF with any text layer reads without error then,
@@ -163,6 +164,7 @@ def _restore(
         roots=config.roots,
         blind=blind,
         ignored=ignored,
+        max_table_rows=config.max_table_rows,
     )
     gone = set(diff.to_delete) | {m.source for m in diff.moved}
     rebuilt = {info.source: info for info in pipeline.store.list_sources()}

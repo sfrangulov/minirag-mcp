@@ -14,7 +14,7 @@ from pathlib import Path
 from minirag_mcp import ocr
 from minirag_mcp.chunker import SCHEME_VERSION, Chunk, chunk_markdown, estimate_tokens
 from minirag_mcp.config import Config
-from minirag_mcp.ingest import ignore, pages
+from minirag_mcp.ingest import ignore, pages, tables
 from minirag_mcp.ingest import parser as _parser
 from minirag_mcp.ingest.ignore import IgnoredFileError
 from minirag_mcp.ingest.parser import (
@@ -38,6 +38,10 @@ class UnsupportedFormatError(Exception):
 
 
 class FileTooLargeError(Exception):
+    pass
+
+
+class TableTooLargeError(Exception):
     pass
 
 
@@ -401,16 +405,25 @@ class Pipeline:
             )
         return info
 
-    def prepare_file(self, path: Path, *, rules_checked: bool = False) -> PreparedDocument:
+    def prepare_file(
+        self, path: Path, *, rules_checked: bool = False, rows_checked: bool = False
+    ) -> PreparedDocument:
         """Read, parse and prepare one file. Reads neither the store nor the labels.
 
         `rules_checked` is a sync's: its scan already held the file to the rules, and
         a rule file edited mid-sync must not turn files it scanned into failures.
+        `rows_checked` is a sync's too: its diff held the tables it reads to
+        RAG_MAX_TABLE_ROWS, and counting again would read each of them twice.
         """
         # Refused rather than indexed: the next sync would take it out again, silently.
         if not rules_checked and (by := ignore.excluded_by(path, self.config.roots)) is not None:
             raise IgnoredFileError(f"{path} is excluded by {by}; remove its rule to index it")
         info = self._checked_stat(path)
+        limit = self.config.max_table_rows
+        if not rows_checked and tables.over_limit(path, limit):
+            raise TableTooLargeError(
+                f"{path} has more than {limit} data rows; RAG_MAX_TABLE_ROWS is {limit}"
+            )
         doc = parse_file(path, self.config)
         return self.prepare(
             doc.markdown,
@@ -426,9 +439,12 @@ class Pipeline:
             page_starts=doc.page_starts,
         )
 
-    def ingest_file(self, path: Path, *, rules_checked: bool = False) -> IngestResult:
-        """Prepare and store one file; `rules_checked` is as `prepare_file` takes it."""
-        doc = self.prepare_file(path, rules_checked=rules_checked)
+    def ingest_file(
+        self, path: Path, *, rules_checked: bool = False, rows_checked: bool = False
+    ) -> IngestResult:
+        """Prepare and store one file; `rules_checked` and `rows_checked` are as
+        `prepare_file` takes them."""
+        doc = self.prepare_file(path, rules_checked=rules_checked, rows_checked=rows_checked)
         with self.job():
             return self.store_prepared(doc)
 

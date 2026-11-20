@@ -47,6 +47,11 @@ values.report = { description = "Report. Findings and figures." }
 BROKEN_DOCX = b"PK\x03\x04" + bytes(40)
 
 
+def write_table(path: Path, rows: int) -> Path:
+    path.write_text("".join(f"{i},value {i}\n" for i in range(rows)), encoding="utf-8")
+    return path
+
+
 def write_doc(path: Path, parts: int) -> Path:
     """One chunk per part at the default budget."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -86,6 +91,8 @@ def test_parallel_and_serial_sync_write_identical_indexes(tmp_path, model_factor
     model_factory.default = {"report": 1.0}
     shrink = write_doc(root / "alpha" / "shrink.md", 6)
     write_doc(root / "keep.md", 1)
+    write_table(root / "keep.csv", 5)
+    grow = write_table(root / "grow.csv", 5)
 
     def handle(name: str, workers: int):
         env = {
@@ -93,6 +100,7 @@ def test_parallel_and_serial_sync_write_identical_indexes(tmp_path, model_factor
             "DB_PATH": str(tmp_path / name),
             "CACHE_DIR": str(tmp_path / "cache"),
             "RAG_SYNC_WORKERS": str(workers),
+            "RAG_MAX_TABLE_ROWS": "5",
         }
         cfg = load_config(env, cwd=root)
         h = IndexHandle(cfg, embedder_factory=lambda s: FakeEmbedder(), model_factory=model_factory)
@@ -113,6 +121,8 @@ def test_parallel_and_serial_sync_write_identical_indexes(tmp_path, model_factor
         write_doc(root / ("alpha" if i % 2 else "") / f"new{i}.md", 2 + i % 3) for i in range(10)
     ]
     (root / "broken.docx").write_bytes(BROKEN_DOCX)
+    write_table(grow, 6)
+    write_table(root / "alpha" / "big.csv", 40)
     round2_sources = {str(shrink), *(str(p) for p in new)}
     counts_a, errors_a = run_sync(handle_a)
 
@@ -130,6 +140,8 @@ def test_parallel_and_serial_sync_write_identical_indexes(tmp_path, model_factor
     emb = FakeEmbedder()
     assert spy_workers == [2]
     assert counts_a == counts_b and counts_b["failed"] == 1 and counts_b["signed"] == 0
+    assert (counts_b["largeTables"], counts_b["deleted"]) == (2, 1)
+    assert store_b.get_source(str(grow)) is None and store_b.get_source(str(root / "keep.csv"))
     assert sorted(errors_a, key=str) == sorted(errors_b, key=str)
     rows_a, rows_b = all_rows(store_a), all_rows(store_b)
     assert Counter(r["id"] for r in rows_b) == Counter(r["id"] for r in rows_a)

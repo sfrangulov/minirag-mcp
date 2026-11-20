@@ -144,7 +144,9 @@ WORKER_DIED = (
 
 
 class Preparer(Protocol):
-    def prepare_file(self, path: Path, *, rules_checked: bool) -> PreparedDocument: ...
+    def prepare_file(
+        self, path: Path, *, rules_checked: bool, rows_checked: bool
+    ) -> PreparedDocument: ...
 
 
 class Prepared(NamedTuple):
@@ -173,7 +175,8 @@ def worker_pipeline(config: Config, embedder, threads: int | None) -> Pipeline:
 def prepare_one(preparer: Preparer, path: Path) -> Prepared:
     """`path` prepared as a sync's worker prepares it; a failure is its error."""
     try:
-        return Prepared(path, preparer.prepare_file(path, rules_checked=True), None)
+        document = preparer.prepare_file(path, rules_checked=True, rows_checked=True)
+        return Prepared(path, document, None)
     except EndpointError as e:
         return Prepared(path, None, str(e), endpoint_failed=True)
     except Exception as e:

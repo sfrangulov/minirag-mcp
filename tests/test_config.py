@@ -84,6 +84,8 @@ def test_flags_beat_env(tmp_path):
         ({"RAG_GROUPING": "bogus"}, "RAG_GROUPING"),
         ({"RAG_MAX_DISTANCE": "-1"}, "RAG_MAX_DISTANCE"),
         ({"RAG_MAX_FILES": "0"}, "RAG_MAX_FILES"),
+        ({"RAG_MAX_TABLE_ROWS": "0"}, "RAG_MAX_TABLE_ROWS"),
+        ({"RAG_MAX_TABLE_ROWS": "5k"}, "RAG_MAX_TABLE_ROWS"),
         ({"ALLOW_PRIVATE_URLS": "maybe"}, "ALLOW_PRIVATE_URLS"),
         ({"ALLOW_PRIVATE_URLS": "2"}, "ALLOW_PRIVATE_URLS"),
     ],
@@ -116,6 +118,12 @@ def test_search_tuning_env(tmp_path):
         0.5,
         2,
     )
+
+
+def test_a_table_row_limit_is_off_unless_set(tmp_path):
+    assert load_config({}, cwd=tmp_path).max_table_rows is None
+    assert load_config({"RAG_MAX_TABLE_ROWS": "5000"}, cwd=tmp_path).max_table_rows == 5000
+    assert load_config({"RAG_MAX_TABLE_ROWS": "1"}, cwd=tmp_path).max_table_rows == 1
 
 
 def test_config_is_frozen(tmp_path):

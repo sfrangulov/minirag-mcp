@@ -9,7 +9,7 @@ from pathlib import Path
 
 from minirag_mcp import ocr
 from minirag_mcp.chunker import SCHEME_VERSION
-from minirag_mcp.ingest import ignore
+from minirag_mcp.ingest import ignore, tables
 from minirag_mcp.ingest.pages import predates_pages
 from minirag_mcp.ingest.parser import IMAGE_EXTENSIONS, SUPPORTED_EXTENSIONS, supported_extensions
 from minirag_mcp.ingest.pipeline import file_sha256
@@ -57,6 +57,9 @@ class SyncDiff:
     # install lacks: read again they would lose their scanned pages and pass for
     # current, so they are kept as they are.
     kept_scans: list[Path] = field(default_factory=list)
+    # Tables to be read that hold more data rows than the limit: not read, and the
+    # indexed ones among them are in `to_delete`.
+    large_tables: list[Path] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -296,6 +299,7 @@ def compute_diff(
     blind: Sequence[tuple[Path, str | None]] = (),
     ignored: Sequence[Path] = (),
     record_pages: bool = True,
+    max_table_rows: int | None = None,
 ) -> SyncDiff:
     """Compute sync diff: files to ingest, delete, and unchanged status.
 
@@ -330,17 +334,23 @@ def compute_diff(
     A source whose chunks two racing first ingests stored twice is re-ingested even
     though its bytes match.
 
+    A table it would read (`tables.TABLE_EXTENSIONS`) holding more than `max_table_rows`
+    data rows is in `large_tables` instead, and an indexed one also in `to_delete`, as a
+    file a new ignore rule excludes is: by policy it is no longer indexable. Only what
+    would be read is counted, so an unchanged or moved table costs nothing and stays.
+
     Args:
         entries: Scanned disk files.
         indexed: Files currently in the index (SourceInfo from Store).
         max_file_size: Files larger than this are marked oversized (not ingested).
+        max_table_rows: The data-row limit for tables, or None for none.
         scope: If provided, limit processing to files under this path.
         roots: The roots `entries` was scanned from.
         blind: Folders the scan could not see into, as `scan_roots` reports them.
 
     Returns:
-        SyncDiff with to_ingest, to_delete, unchanged, oversized, unreadable, held
-        and moved.
+        SyncDiff with to_ingest, to_delete, unchanged, oversized, unreadable, held,
+        moved, kept_scans and large_tables.
     """
     indexed_files = {
         s.source: s for s in indexed if s.source_type == "file" and _in_scope(s.source, scope)
@@ -403,6 +413,11 @@ def compute_diff(
     paired_paths = {m.path for m in moved}
     to_delete = [s for s in to_delete if s not in paired_sources]
     to_ingest = [p for p in to_ingest if p not in paired_paths]
+    large_tables = [p for p in to_ingest if tables.over_limit(p, max_table_rows)]
+    if large_tables:
+        large = set(large_tables)
+        to_ingest = [p for p in to_ingest if p not in large]
+        to_delete += [str(p) for p in large_tables if str(p) in indexed_files]
     kept: dict[Path, list[str]] = {path: [] for path, _ in blind}
     for src, folder in sorted(hidden.items()):
         if src not in paired_sources:
@@ -434,6 +449,7 @@ def compute_diff(
         held=held,
         moved=moved,
         kept_scans=kept_scans,
+        large_tables=large_tables,
     )
 
 
