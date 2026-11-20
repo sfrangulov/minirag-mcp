@@ -87,7 +87,7 @@ anything user-visible must appear identically through both.
 
 ```
 src/minirag_mcp/
-  server.py      FastMCP app, 12 tools          cli/          11 subcommands
+  server.py      FastMCP app, 13 tools          cli/          13 subcommands
                           \                    /
                            pipeline / store / embedder        <- the core
   ingest/parser.py    markitdown: file, HTML, URL -> Markdown + title
@@ -103,13 +103,31 @@ src/minirag_mcp/
   security.py         document-root containment, URL host rules
   sync.py             one background job, per-file failures never abort it
   labels/             taxonomy, dates, facet resolution, in-process choice model, filters
+  indexes.py          indexes.toml -> one Config per index
+  registry.py         index registry over IndexHandles, connection rules, refusals, reload
+  http_server.py      serve: token, Host/Origin guard, /mcp/<index>
+  handle.py           opens one index by its recorded scheme; the one place embedders are built
+  identity.py         index.json, 1.x detection, index state, atomic swap
+  rebuild.py          re-embed or re-ingest into <db>.next, then swap
+  endpoints.py        llama.cpp embeddings and rerank clients
+  parallel.py         sync's worker processes and batched writes
 ```
+
+Two ways to run the server, both over the registry. `minirag-mcp serve` is streamable
+HTTP for every index in `indexes.toml` (`/mcp/<index>`), what the LaunchAgent template
+in `docs/launchd/` runs. `minirag-mcp --index NAME` with no command is a stdio server
+for that one index, which is how Claude Desktop uses v2: one entry per index. A reload
+happens when `indexes.toml` is edited (its content hash changes) or on SIGHUP; a
+`touch` alone does not reload. Host, port and token are read once and apply only after
+a restart. A process runs one sync worker pool at a time.
 
 Retrieval is hybrid: a vector query and an FTS query run separately and are fused by
 weighted Reciprocal Rank Fusion in `store.search`. `RAG_HYBRID_WEIGHT` is the keyword
 side's share. LanceDB's own `LinearCombinationReranker` was tried and rejected — it
 mixes `1 - L2_distance` with raw BM25, whose scales are incomparable, so an exact-term
 hit can never outrank a strong vector match at any weight. Do not reintroduce it.
+Fusion also adds a whole-document BM25 bonus (`RAG_DOCUMENT_WEIGHT`) and, when an
+endpoint is configured, a cross-encoder reranks the top `RAG_RERANK_TOP` fused chunks.
 
 ## Conventions & Patterns
 
