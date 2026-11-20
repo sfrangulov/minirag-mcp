@@ -106,17 +106,26 @@ def _expanded(value: str, env: Mapping[str, str]) -> Path:
 
 
 def default_config_path(env: Mapping[str, str] | None = None) -> Path:
-    """MINIRAG_CONFIG when set, else where this platform keeps a user's indexes.toml."""
+    """MINIRAG_CONFIG when set, else where this platform keeps a user's indexes.toml.
+
+    A relative MINIRAG_CONFIG is a ConfigError: the token file next to it, and every
+    reload, would follow the working directory, which is / under launchd. A relative
+    XDG_CONFIG_HOME is ignored, as the XDG spec says."""
     env = os.environ if env is None else env
     named = env.get(CONFIG_ENV, "").strip()
     if named:
-        return _expanded(named, env)
+        path = _expanded(named, env)
+        if not path.is_absolute():
+            raise ConfigError(f"{CONFIG_ENV} must be an absolute path, got {named!r}")
+        return path
     if sys.platform == "win32":
         # appauthor=False: by default it nests a folder named after the author, minirag again.
         return platformdirs.user_config_path("minirag", appauthor=False) / "indexes.toml"
     # Not platformdirs: on macOS it answers ~/Library/Application Support.
-    base = env.get("XDG_CONFIG_HOME", "").strip()
-    return Path(base or _home(env) / ".config") / "minirag" / "indexes.toml"
+    base = Path(env.get("XDG_CONFIG_HOME", "").strip())
+    if not base.is_absolute():
+        base = _home(env) / ".config"
+    return base / "minirag" / "indexes.toml"
 
 
 def load_server_config(path: Path, env: Mapping[str, str]) -> ServerConfig:

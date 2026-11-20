@@ -176,9 +176,13 @@ def main(
 def _config_path() -> Path:
     """--config, else MINIRAG_CONFIG, else where this platform keeps indexes.toml."""
     config = _SELECTION.get().config
-    if config is None:
+    if config is not None:
+        return Path(config).expanduser().absolute()
+    try:
         return default_config_path(os.environ)
-    return Path(config).expanduser().absolute()
+    except ConfigError as e:
+        _fail(str(e))
+        raise AssertionError from e  # unreachable
 
 
 def _file_registry() -> IndexRegistry:

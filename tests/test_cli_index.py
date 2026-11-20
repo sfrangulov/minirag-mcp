@@ -10,6 +10,7 @@ import pytest
 from fastmcp import Client, FastMCP
 
 import minirag_mcp.cli as cli
+import minirag_mcp.http_server as http_server
 from index_helpers import run_meta
 from minirag_mcp.__main__ import main
 from minirag_mcp.embedder import MINILM
@@ -57,6 +58,22 @@ def test_minirag_config_selects_the_file(home, capsys, monkeypatch):
     payload = json.loads(out)
     assert code == 0, err
     assert (payload["index"], payload["roots"]) == ("beta", [str(home.roots["beta"])])
+
+
+@pytest.mark.parametrize("command", [["indexes"], ["--index", "beta", "status"], ["serve"]])
+def test_a_relative_minirag_config_fails_the_command_naming_the_variable(
+    home, capsys, monkeypatch, command
+):
+    # `serve` given a file it can read serves until it is killed.
+    def served(path, env):
+        raise AssertionError(f"served {path}")
+
+    monkeypatch.setattr(http_server, "serve", served)
+    monkeypatch.chdir(home.path.parent)
+    monkeypatch.setenv("MINIRAG_CONFIG", home.path.name)
+    code, out, err = run_meta(command, capsys)
+    assert (code, out) == (1, "")
+    assert err == f"error: MINIRAG_CONFIG must be an absolute path, got {home.path.name!r}\n"
 
 
 def test_an_unknown_index_is_refused_naming_the_configured_ones(home, capsys):

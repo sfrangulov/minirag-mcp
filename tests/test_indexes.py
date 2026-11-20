@@ -483,6 +483,29 @@ def test_macos_and_linux_use_dot_config_not_application_support(monkeypatch, tmp
     assert default_config_path({"MINIRAG_CONFIG": "  "}) == default_config_path({})
 
 
+@pytest.mark.parametrize("platform", ["darwin", "linux", "win32"])
+@pytest.mark.parametrize("value", ["indexes.toml", "config/indexes.toml", "~other/x.toml"])
+def test_a_relative_minirag_config_is_refused_naming_the_variable(monkeypatch, platform, value):
+    """Relative to the working directory, which is / under launchd: the token file and
+    every reload would follow wherever the process was started."""
+    monkeypatch.setattr(sys, "platform", platform)
+    with pytest.raises(ConfigError) as refused:
+        default_config_path({"MINIRAG_CONFIG": value})
+    assert str(refused.value) == f"MINIRAG_CONFIG must be an absolute path, got {value!r}"
+
+
+@pytest.mark.parametrize("platform", ["darwin", "linux"])
+def test_a_relative_xdg_config_home_is_ignored_as_the_xdg_spec_says(
+    monkeypatch, tmp_path, platform
+):
+    monkeypatch.setattr(sys, "platform", platform)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert (
+        default_config_path({"XDG_CONFIG_HOME": "relative/config"})
+        == tmp_path / ".config" / "minirag" / "indexes.toml"
+    )
+
+
 def test_windows_uses_platformdirs_without_an_author_folder(monkeypatch, tmp_path):
     from platformdirs import windows
 
