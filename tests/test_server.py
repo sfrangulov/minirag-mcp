@@ -200,7 +200,9 @@ async def test_list_files_reports_the_ocr_engine(app, monkeypatch):
     from minirag_mcp import ocr
 
     monkeypatch.setattr(ocr, "available", lambda: True)
-    monkeypatch.setattr(ocr, "ocr_image", lambda path, config: "recognized invoice text")
+    monkeypatch.setattr(
+        ocr, "ocr_image", lambda path, config: ("recognized invoice text", ocr.ENGINE_TESSERACT)
+    )
     mcp, root = app
     scan = root / "scan.png"
     scan.write_bytes(b"png bytes irrelevant, ocr is faked")
@@ -216,7 +218,9 @@ async def test_list_files_reports_an_indexed_source_this_install_cannot_read(app
     """An image indexed by an install with the extra, listed from one without it: sync
     keeps it and `status` still counts its chunks, so the listing has to show it too."""
     monkeypatch.setattr(ocr, "available", lambda: True)
-    monkeypatch.setattr(ocr, "ocr_image", lambda path, config: "recognized invoice text")
+    monkeypatch.setattr(
+        ocr, "ocr_image", lambda path, config: ("recognized invoice text", ocr.ENGINE_TESSERACT)
+    )
     mcp, root = app
     scan = root / "scan.png"
     scan.write_bytes(b"png bytes irrelevant, ocr is faked")

@@ -135,7 +135,9 @@ def test_sync_ingests_images_via_ocr(env, monkeypatch):
 
     cfg, store, pipeline, root, h = env
     monkeypatch.setattr(ocr, "available", lambda: True)
-    monkeypatch.setattr(ocr, "ocr_image", lambda path, config: "scanned text body")
+    monkeypatch.setattr(
+        ocr, "ocr_image", lambda path, config: ("scanned text body", ocr.ENGINE_TESSERACT)
+    )
     (root / "note.md").write_text("# plain note\n\nbody")
     (root / "scan.jpg").write_bytes(b"...")
     counts, errors = sync(h)
@@ -155,7 +157,9 @@ def test_sync_keeps_indexed_images_when_the_ocr_extra_is_gone(env, monkeypatch):
 
     cfg, store, pipeline, root, h = env
     monkeypatch.setattr(ocr, "available", lambda: True)
-    monkeypatch.setattr(ocr, "ocr_image", lambda path, config: "scanned text body")
+    monkeypatch.setattr(
+        ocr, "ocr_image", lambda path, config: ("scanned text body", ocr.ENGINE_TESSERACT)
+    )
     (root / "note.md").write_text("# plain note\n\nbody")
     (root / "scan.jpg").write_bytes(b"...")
     counts, _ = sync(h)
@@ -176,7 +180,9 @@ def test_sync_reports_the_sources_it_kept_but_cannot_read(env, monkeypatch):
 
     cfg, store, pipeline, root, h = env
     monkeypatch.setattr(ocr, "available", lambda: True)
-    monkeypatch.setattr(ocr, "ocr_image", lambda path, config: "scanned text body")
+    monkeypatch.setattr(
+        ocr, "ocr_image", lambda path, config: ("scanned text body", ocr.ENGINE_TESSERACT)
+    )
     (root / "note.md").write_text("# plain note\n\nbody")
     (root / "scan.jpg").write_bytes(b"...")
     sync(h)

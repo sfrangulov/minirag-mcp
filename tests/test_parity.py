@@ -20,7 +20,7 @@ import minirag_mcp.cli as cli
 import minirag_mcp.embedder as embedder_mod
 from conftest import FakeEmbedder
 from lookalike_texts import MINUTES, REGULATION_V1, REGULATION_V2
-from minirag_mcp import ocr
+from minirag_mcp import ocr, ocr_vision
 from minirag_mcp.config import default_db_path, load_config
 from minirag_mcp.embedder import Embedder
 from minirag_mcp.labels import Labeler
@@ -279,6 +279,31 @@ async def test_an_empty_query_is_refused_by_both(
     code, _, err = run_cli(["query", "   ", *_flags(env)], capsys)
     assert is_error and "query must not be empty" in text
     assert code == 1 and "query must not be empty" in err
+
+
+@pytest.mark.parametrize(
+    "tesseract,macos,bindings,expected",
+    [
+        (True, True, True, "vision"),
+        (True, True, False, "unavailable"),
+        (True, False, False, None),
+        (False, True, True, None),
+    ],
+)
+async def test_status_names_the_second_reader_the_same_in_both_shells(
+    root, tmp_path, capsys, monkeypatch, fake_embedder, tesseract, macos, bindings, expected
+):
+    """Present only where Apple Vision could be: on macOS, and only beside an OCR engine
+    for it to second."""
+    monkeypatch.setattr(cli, "_make_embedder", lambda cfg: fake_embedder)
+    monkeypatch.setattr(ocr, "available", lambda: tesseract)
+    monkeypatch.setattr(ocr_vision, "supported", lambda: macos)
+    monkeypatch.setattr(ocr_vision, "available", lambda: macos and bindings)
+    env = {"BASE_DIR": str(root), "DB_PATH": str(tmp_path / "db")}
+    is_error, st = await call_mcp(env, "status", {}, fake_embedder)
+    code, out, _ = run_cli(["status", *_flags(env), "--json"], capsys)
+    assert not is_error and code == 0 and json.loads(out) == st
+    assert st.get("ocrSecondReader", None) == expected
 
 
 async def test_an_unusable_db_path_is_an_index_error_in_both_status_reports(

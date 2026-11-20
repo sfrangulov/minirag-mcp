@@ -351,7 +351,12 @@ on the owner's GPU). `find_mentions` (literal search) is unchanged.
   `PSM.AUTO_OSD`, PDF pages rendered at 300 dpi with `SetSourceResolution(300)`. The text is
   taken in Tesseract's own reading order; `assemble_lines`, which interleaves the columns of
   two-column pages for every engine (g7q.14), is no longer on this path. `ocr_engine` becomes
-  `tesseract`. `RAG_OCR_LANG` maps to Tesseract language codes.
+  `tesseract`. `RAG_OCR_LANG` maps to Tesseract language codes. On macOS, Apple Vision re-reads
+  the pages Tesseract reads with a mean word confidence under 85 and the two readings are
+  spliced (`ocr_engine` `tesseract+vision`, `RAG_OCR_SECOND_READER_BELOW=0` turns it off),
+  measured in plan 2 Task 11 with aggregate numbers only: line CER 0.20 -> 0.10 and word
+  recall 0.63 -> 0.73 on hand-transcribed regions of low-confidence pages. Its pyobjc adds
+  about 31 MB to the extra on macOS.
 - **Parser noise** (g7q.12) — ~~struck-through `.docx` text is dropped at parse time (deleted
   requirements are searchable as current today: a correctness fix).~~ **Superseded (owner,
   2026-11-19):** struck-through text is still text — it records what was removed — so it is
@@ -432,6 +437,7 @@ on the owner's GPU). `find_mentions` (literal search) is unchanged.
 
 - g7q.8 end-to-end benchmark run and README section (after v2).
 - g7q.10 English 5k dev tier (full-corpus checks through saved runs proved cheap enough).
-- Apple Vision as a macOS second reader for low-confidence Tesseract pages; Kazakh OCR.
+- ~~Apple Vision as a macOS second reader for low-confidence Tesseract pages;~~ Kazakh OCR.
+  Superseded (2026-11-20, plan 2 Task 11b; see section 5): the Vision second reader is built.
 - Whole-document vectors from a long-context model.
 - Gold for the 107 real agent queries on the Russian ruler.

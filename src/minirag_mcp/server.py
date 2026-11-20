@@ -588,7 +588,10 @@ def create_app(
 
         ocr names the OCR engine this install can use, or is "unavailable"
         when the optional extra is missing — scanned PDFs and images cannot
-        be indexed then, and ocrHint says what to install.
+        be indexed then, and ocrHint says what to install. ocrSecondReader,
+        present on macOS beside an engine, is "vision" when Apple Vision
+        re-reads the pages Tesseract is unsure of (ocrEngine
+        "tesseract+vision"), or "unavailable" when its bindings are missing.
 
         labels, present only when the corpus has a classify.toml: its facets,
         value descriptions and document counts, unlabelled and uncertain

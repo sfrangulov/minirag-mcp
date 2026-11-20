@@ -143,6 +143,18 @@ def test_ocr_min_chars_zero_allowed_and_negative_rejected(tmp_path):
         load_config({"RAG_OCR_MIN_CHARS_PER_PAGE": "-1"}, cwd=tmp_path)
 
 
+@pytest.mark.parametrize("value,expected", [(None, 85), ("0", 0), ("70", 70), ("100", 100)])
+def test_the_second_readers_threshold_is_a_mean_word_confidence(tmp_path, value, expected):
+    env = {} if value is None else {"RAG_OCR_SECOND_READER_BELOW": value}
+    assert load_config(env, cwd=tmp_path).ocr_second_reader_below == expected
+
+
+@pytest.mark.parametrize("value", ["-1", "101", "0.85", "high"])
+def test_a_second_reader_threshold_outside_0_to_100_is_rejected(tmp_path, value):
+    with pytest.raises(ConfigError, match="RAG_OCR_SECOND_READER_BELOW"):
+        load_config({"RAG_OCR_SECOND_READER_BELOW": value}, cwd=tmp_path)
+
+
 @pytest.mark.parametrize("value", ["ch", "", "  "])
 def test_ocr_lang_outside_the_pinned_languages_is_rejected(tmp_path, value):
     with pytest.raises(ConfigError, match=r"RAG_OCR_LANG.*rus.*eng"):

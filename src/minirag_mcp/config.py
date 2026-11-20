@@ -11,7 +11,7 @@ import platformdirs
 
 from minirag_mcp.embedder import E5_LARGE, MODEL_WINDOWS, default_budget, model_window
 from minirag_mcp.endpoints import Endpoint, EndpointError, read_api_key
-from minirag_mcp.ocr import DEFAULT_LANGUAGES, tesseract_languages
+from minirag_mcp.ocr import DEFAULT_LANGUAGES, SECOND_READER_BELOW, tesseract_languages
 
 DEFAULT_MODEL = E5_LARGE
 DEFAULT_DOCUMENT_WEIGHT = 0.5
@@ -43,6 +43,8 @@ FTS_LANGUAGES = (
     "Tamil",
     "Turkish",
 )
+# A mean word confidence in percent, as RAG_OCR_SECOND_READER_BELOW takes it.
+DEFAULT_SECOND_READER_BELOW = round(SECOND_READER_BELOW * 100)
 _TRUE = frozenset({"1", "true", "yes", "on"})
 _FALSE = frozenset({"0", "false", "no", "off", ""})  # an empty value reads as "not set"
 
@@ -66,6 +68,7 @@ class Config:
     allow_private_urls: bool
     ocr_lang: str = DEFAULT_LANGUAGES
     ocr_min_chars_per_page: int = 25
+    ocr_second_reader_below: int = DEFAULT_SECOND_READER_BELOW  # 0 turns the reader off
     fts_language: str = DEFAULT_FTS_LANGUAGE
     document_weight: float = DEFAULT_DOCUMENT_WEIGHT
     rerank_top: int = DEFAULT_RERANK_TOP
@@ -258,6 +261,9 @@ def load_config(
         allow_private_urls=_bool(env, "ALLOW_PRIVATE_URLS"),
         ocr_lang=ocr_lang,
         ocr_min_chars_per_page=_int(env, "RAG_OCR_MIN_CHARS_PER_PAGE", 25, 0),
+        ocr_second_reader_below=_int(
+            env, "RAG_OCR_SECOND_READER_BELOW", DEFAULT_SECOND_READER_BELOW, 0, 100
+        ),
         fts_language=fts_language,
         document_weight=_float(env, "RAG_DOCUMENT_WEIGHT", DEFAULT_DOCUMENT_WEIGHT, 0.0, 1.0),
         rerank_top=_int(env, "RAG_RERANK_TOP", DEFAULT_RERANK_TOP, 1, MAX_RERANK_TOP),

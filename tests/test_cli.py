@@ -142,7 +142,9 @@ def test_list_reports_the_ocr_engine_in_json_and_in_the_human_listing(corpus, ca
     from minirag_mcp import ocr
 
     monkeypatch.setattr(ocr, "available", lambda: True)
-    monkeypatch.setattr(ocr, "ocr_image", lambda path, config: "recognized invoice text")
+    monkeypatch.setattr(
+        ocr, "ocr_image", lambda path, config: ("recognized invoice text", ocr.ENGINE_TESSERACT)
+    )
     scan = corpus / "scan.png"
     scan.write_bytes(b"png bytes irrelevant, ocr is faked")
     run(["ingest", str(scan), "--base-dir", str(corpus)])
@@ -167,7 +169,9 @@ def test_list_reports_an_indexed_source_this_install_cannot_read(corpus, capsys,
     """The CLI half of the same fact the MCP `list_files` state reports
     (tests/test_server.py): a retained source the install cannot scan is still listed."""
     monkeypatch.setattr(ocr, "available", lambda: True)
-    monkeypatch.setattr(ocr, "ocr_image", lambda path, config: "recognized invoice text")
+    monkeypatch.setattr(
+        ocr, "ocr_image", lambda path, config: ("recognized invoice text", ocr.ENGINE_TESSERACT)
+    )
     scan = corpus / "scan.png"
     scan.write_bytes(b"png bytes irrelevant, ocr is faked")
     run(["ingest", str(scan), "--base-dir", str(corpus)])

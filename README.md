@@ -359,12 +359,13 @@ all. The optional `[ocr]` extra reads those pages locally, on the CPU
 into documents.
 
 It is an extra rather than a dependency because a corpus of Markdown and Office
-documents has no use for it, though it is small: about 9 MB installed on macOS,
-35 MB on Linux and 60 MB on Windows. The wheels bundle libtesseract 5.5.4 for
-macOS 15 or later, Linux and Windows; on an older macOS there is no wheel, so the
-install builds tesserocr from source, and that needs a system Tesseract first
-(`brew install tesseract`). Install it by asking for the extra instead of the bare
-package:
+documents has no use for it, though it is small: about 40 MB installed on macOS
+(9 MB Tesseract plus 31 MB of pyobjc for the Vision second reader, half of that the
+test helpers pyobjc-core installs with itself), 35 MB on Linux and 60 MB on Windows.
+The wheels bundle libtesseract 5.5.4 for macOS 15 or later, Linux and Windows; on an
+older macOS there is no wheel, so the install builds tesserocr from source, and that
+needs a system Tesseract first (`brew install tesseract`). Install it by asking for
+the extra instead of the bare package:
 
 ```bash
 uv tool install 'minirag-mcp[ocr]'
@@ -399,6 +400,16 @@ What the extra changes:
   being interleaved line by line. A page scanned sideways or upside down is turned
   upright by Tesseract's orientation detection, which needs a page's worth of text
   to decide: a three-line slip upside down can still come out as noise.
+- **On macOS, Apple Vision re-reads the pages Tesseract is unsure of.** A page
+  whose mean word confidence from Tesseract is under 85 is read again by Apple
+  Vision, and the two readings are spliced: Tesseract's lines in Tesseract's
+  order, each one Vision read replaced by Vision's reading, and what only Vision
+  found after the page. On hand-checked regions of such pages this halved the
+  character error rate. The same corpus can therefore index slightly different
+  text on macOS than on Linux or Windows: a document with a page read this way
+  has the `ocrEngine` `tesseract+vision`, and `RAG_OCR_SECOND_READER_BELOW=0`
+  turns the second reader off. A page Vision fails on keeps Tesseract's text
+  and logs a warning naming the file and page.
 - **Image files become documents.** `.png` `.jpg` `.jpeg` `.tiff` `.tif` `.bmp`
   `.webp` join the scan whitelist, titled from the filename by the same rules as
   everything else. A multi-page TIFF — what a scanner or a fax gateway writes —
@@ -416,13 +427,15 @@ What the extra changes:
   certificate, a title page) is kept as it is, exactly as before.
 
 How a document entered the index is visible in both shells: `list_files` reports
-an `ocrEngine` field per source (`"tesseract"`, or `""` for text extracted
-normally), and `minirag-mcp list` prints `[ocr:tesseract]` after the line for such
-a file.
+an `ocrEngine` field per source (`"tesseract"`, `"tesseract+vision"` when Apple
+Vision re-read a page, or `""` for text extracted normally), and `minirag-mcp list`
+prints `[ocr:tesseract]` after the line for such a file.
 
 Whether this install can OCR at all is a `status` field in both shells: `ocr`
 names the engine (`"tesseract"`) or reads `"unavailable"`, and when it is
-unavailable a second key, `ocrHint`, carries the install command.
+unavailable a second key, `ocrHint`, carries the install command. On macOS,
+`ocrSecondReader` says whether Apple Vision is there to re-read (`"vision"`) or
+its bindings are missing (`"unavailable"`).
 
 **OCR text is not authoritative over the source scan.** Measured on real scans
 against 83 hand-checked lines, Tesseract read all 83, with a character error rate
@@ -1304,6 +1317,7 @@ merges with them.
 | `RAG_FTS_LANGUAGE` | `English` | Stemmer for keyword (BM25) search: one of Arabic, Danish, Dutch, English, Finnish, French, German, Greek, Hungarian, Italian, Norwegian, Portuguese, Romanian, Russian, Spanish, Swedish, Tamil, Turkish (any case). The English stemmer leaves other alphabets untouched, so on a Russian corpus «договор» and «договорами» are different words; with `Russian` they are one, and English words stop being stemmed. Changing it rebuilds the keyword index the next time the index is opened, with no re-embedding (under a second for 165,000 chunks); `status` reports `ftsLanguage`, and `ftsWarning` if that rebuild could not be written. Two processes opening one index with different values rebuild it back and forth. On a 60-question test over 800 real Russian documents, `Russian` raised top-5 hits from 38 to 44. |
 | `RAG_OCR_LANG` | `rus+eng` | Recognition languages for the `[ocr]` extra, in Tesseract's spelling: `rus`, `eng`, or both joined by `+`. Only these are pinned and downloaded, so any other value is an error that names the accepted ones. The 1.x values still work: `eslav` means `rus+eng` and `en` means `eng`. See [OCR](#ocr-for-scanned-documents). |
 | `RAG_OCR_MIN_CHARS_PER_PAGE` | `25` | A PDF page whose text layer holds fewer characters than this is treated as a scan and sent to OCR. `0` disables the check, so no page is ever OCRed and a PDF is only ever taken as converted. See [OCR](#ocr-for-scanned-documents). |
+| `RAG_OCR_SECOND_READER_BELOW` | `85` | macOS only: a page Tesseract reads with a mean word confidence under this, in percent, is read again by Apple Vision and the two readings spliced. An integer from 0 to 100; `0` turns the second reader off, so a corpus indexes the same text on every platform. See [OCR](#ocr-for-scanned-documents). |
 | `RAG_INSTRUCTIONS_APPEND` | unset | Extra text appended as a final paragraph to the instructions the server hands the client at connect time — for what the server can't know about your corpus, best phrased as a situation the model can recognise, e.g. `"When a question names a document code such as QP-7.2, search before answering"`. Appended, never merged, and it shares the same 2048-character client budget. See [Search by Default](#search-by-default). |
 | `ALLOW_PRIVATE_URLS` | unset (off) | Let `ingest_url` fetch hosts that resolve to loopback, link-local, private, reserved, or unspecified addresses. Off by default — see [Security and Operation](#security-and-operation). Accepts `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off`; anything else is a configuration error. |
 

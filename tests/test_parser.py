@@ -384,13 +384,30 @@ def test_parse_file_image_routes_through_ocr(tmp_path, monkeypatch):
     from minirag_mcp.ingest import parser
 
     monkeypatch.setattr(ocr, "available", lambda: True)
-    monkeypatch.setattr(ocr, "ocr_image", lambda path, config: "recognized scan text")
+    monkeypatch.setattr(
+        ocr, "ocr_image", lambda path, config: ("recognized scan text", ocr.ENGINE_TESSERACT)
+    )
     img = tmp_path / "Договор_поставки_2026.png"
     img.write_bytes(b"png bytes irrelevant, ocr is faked")
     doc = parser.parse_file(img, load_config({}, cwd=tmp_path))
     assert doc.markdown == "recognized scan text"
     assert doc.ocr_engine == "tesseract"
     assert doc.title == "Договор поставки 2026"
+
+
+def test_an_image_carries_the_engines_that_read_it(tmp_path, monkeypatch):
+    from minirag_mcp import ocr
+    from minirag_mcp.config import load_config
+    from minirag_mcp.ingest import parser
+
+    monkeypatch.setattr(ocr, "available", lambda: True)
+    monkeypatch.setattr(
+        ocr, "ocr_image", lambda path, config: ("spliced text", ocr.ENGINE_TESSERACT_VISION)
+    )
+    img = tmp_path / "scan.png"
+    img.write_bytes(b"png bytes irrelevant, ocr is faked")
+    doc = parser.parse_file(img, load_config({}, cwd=tmp_path))
+    assert (doc.markdown, doc.ocr_engine) == ("spliced text", "tesseract+vision")
 
 
 def test_parse_file_image_without_ocr_raises_hint(tmp_path, monkeypatch):
@@ -414,7 +431,7 @@ def test_parse_file_image_title_strips_leftover_extension(tmp_path, monkeypatch)
     from minirag_mcp.ingest import parser
 
     monkeypatch.setattr(ocr, "available", lambda: True)
-    monkeypatch.setattr(ocr, "ocr_image", lambda path, config: "text")
+    monkeypatch.setattr(ocr, "ocr_image", lambda path, config: ("text", ocr.ENGINE_TESSERACT))
     img = tmp_path / "scan.png.png"
     img.write_bytes(b"...")
     doc = parser.parse_file(img, load_config({}, cwd=tmp_path))
@@ -429,7 +446,7 @@ def test_parse_file_image_title_normalizes_underscores(tmp_path, monkeypatch):
     from minirag_mcp.ingest import parser
 
     monkeypatch.setattr(ocr, "available", lambda: True)
-    monkeypatch.setattr(ocr, "ocr_image", lambda path, config: "text")
+    monkeypatch.setattr(ocr, "ocr_image", lambda path, config: ("text", ocr.ENGINE_TESSERACT))
     img = tmp_path / "IMG_20260807_123456.png"
     img.write_bytes(b"...")
     doc = parser.parse_file(img, load_config({}, cwd=tmp_path))
@@ -471,7 +488,9 @@ def test_pdf_scanned_pages_get_ocr(tmp_path, monkeypatch):
 
     monkeypatch.setattr(ocr, "available", lambda: True)
     monkeypatch.setattr(
-        ocr, "ocr_pdf", lambda path, config, pages: {i: f"OCR PAGE {i}" for i in pages}
+        ocr,
+        "ocr_pdf",
+        lambda path, config, pages: ({i: f"OCR PAGE {i}" for i in pages}, ocr.ENGINE_TESSERACT),
     )
     doc = parser.parse_file(_pdf(tmp_path, [LONG, "", ""]), load_config({}, cwd=tmp_path))
     assert doc.ocr_engine == "tesseract"
@@ -479,6 +498,25 @@ def test_pdf_scanned_pages_get_ocr(tmp_path, monkeypatch):
     # their order among themselves.
     body = doc.markdown
     assert body.index("long enough") < body.index("OCR PAGE 1") < body.index("OCR PAGE 2")
+
+
+def test_a_pdf_carries_the_engines_that_read_its_scanned_pages(tmp_path, monkeypatch):
+    from minirag_mcp import ocr
+    from minirag_mcp.config import load_config
+    from minirag_mcp.ingest import parser
+
+    monkeypatch.setattr(ocr, "available", lambda: True)
+    monkeypatch.setattr(
+        ocr,
+        "ocr_pdf",
+        lambda path, config, pages: (
+            {i: f"OCR PAGE {i}" for i in pages},
+            ocr.ENGINE_TESSERACT_VISION,
+        ),
+    )
+    doc = parser.parse_file(_pdf(tmp_path, [LONG, ""]), load_config({}, cwd=tmp_path))
+    assert doc.ocr_engine == "tesseract+vision"
+    assert "OCR PAGE 1" in doc.markdown
 
 
 def test_pdf_ocr_text_is_appended_after_the_converted_document(tmp_path, monkeypatch):
@@ -491,7 +529,9 @@ def test_pdf_ocr_text_is_appended_after_the_converted_document(tmp_path, monkeyp
 
     monkeypatch.setattr(ocr, "available", lambda: True)
     monkeypatch.setattr(
-        ocr, "ocr_pdf", lambda path, config, pages: {i: f"OCR PAGE {i}" for i in pages}
+        ocr,
+        "ocr_pdf",
+        lambda path, config, pages: ({i: f"OCR PAGE {i}" for i in pages}, ocr.ENGINE_TESSERACT),
     )
     doc = parser.parse_file(_pdf(tmp_path, ["", LONG]), load_config({}, cwd=tmp_path))
     assert doc.ocr_engine == "tesseract"
@@ -508,7 +548,9 @@ def test_pdf_page_with_a_short_text_layer_still_goes_to_ocr(tmp_path, monkeypatc
 
     monkeypatch.setattr(ocr, "available", lambda: True)
     monkeypatch.setattr(
-        ocr, "ocr_pdf", lambda path, config, pages: {i: f"OCR PAGE {i}" for i in pages}
+        ocr,
+        "ocr_pdf",
+        lambda path, config, pages: ({i: f"OCR PAGE {i}" for i in pages}, ocr.ENGINE_TESSERACT),
     )
     doc = parser.parse_file(_pdf(tmp_path, [LONG, SHORT]), load_config({}, cwd=tmp_path))
     assert doc.ocr_engine == "tesseract"
@@ -604,7 +646,9 @@ def test_pdf_fully_scanned_ocr_returns_nothing_raises(tmp_path, monkeypatch):
     from minirag_mcp.ingest import parser
 
     monkeypatch.setattr(ocr, "available", lambda: True)
-    monkeypatch.setattr(ocr, "ocr_pdf", lambda path, config, pages: {i: "" for i in pages})
+    monkeypatch.setattr(
+        ocr, "ocr_pdf", lambda path, config, pages: ({i: "" for i in pages}, ocr.ENGINE_TESSERACT)
+    )
     with pytest.raises(parser.ParserError, match=r"OCR produced no text"):
         parser.parse_file(_pdf(tmp_path, ["", ""]), load_config({}, cwd=tmp_path))
 
@@ -617,7 +661,9 @@ def test_pdf_mixed_ocr_returns_nothing_keeps_text_page(tmp_path, monkeypatch):
     from minirag_mcp.ingest import parser
 
     monkeypatch.setattr(ocr, "available", lambda: True)
-    monkeypatch.setattr(ocr, "ocr_pdf", lambda path, config, pages: {i: "" for i in pages})
+    monkeypatch.setattr(
+        ocr, "ocr_pdf", lambda path, config, pages: ({i: "" for i in pages}, ocr.ENGINE_TESSERACT)
+    )
     doc = parser.parse_file(_pdf(tmp_path, [LONG, ""]), load_config({}, cwd=tmp_path))
     assert doc.ocr_engine == ""
     assert "long enough" in doc.markdown
@@ -634,7 +680,9 @@ def test_pdf_markitdown_content_survives_when_pdfminer_diverges(tmp_path, monkey
 
     monkeypatch.setattr(ocr, "available", lambda: True)
     monkeypatch.setattr(ocr, "pdf_page_texts", lambda path: [""])
-    monkeypatch.setattr(ocr, "ocr_pdf", lambda path, config, pages: {i: "" for i in pages})
+    monkeypatch.setattr(
+        ocr, "ocr_pdf", lambda path, config, pages: ({i: "" for i in pages}, ocr.ENGINE_TESSERACT)
+    )
     doc = parser.parse_file(_pdf(tmp_path, [LONG]), load_config({}, cwd=tmp_path))
     assert "long enough" in doc.markdown
     assert doc.ocr_engine == ""

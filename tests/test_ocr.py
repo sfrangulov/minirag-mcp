@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 import threading
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from PIL import Image, ImageDraw, ImageFont
 
-from minirag_mcp import ocr
+from minirag_mcp import ocr, ocr_vision
 from minirag_mcp.config import load_config
+from minirag_mcp.ingest.pipeline import Pipeline
+from minirag_mcp.store import Store
 from pdf_builder import build_pdf
 
 
@@ -93,6 +97,86 @@ def test_ocr_image_broken_pil_install_raises_ocr_error(tmp_path, monkeypatch):
         ocr.ocr_image(tmp_path / "missing.png", cfg)
 
 
+RIL = SimpleNamespace(BLOCK=0, PARA=1, TEXTLINE=2, WORD=3, SYMBOL=4)  # tesserocr's values
+
+
+@dataclass
+class _Line:
+    box: tuple[int, int, int, int]
+    text: str | None  # None: a line the iterator has no text for
+    block: bool = False
+    para: bool = False
+    orientation: int = 0
+
+
+@dataclass
+class _Reading:
+    """What the fake engine makes of one image, in the shapes tesserocr hands back."""
+
+    text: str  # GetUTF8Text()
+    confidence: int  # MeanTextConf(): an int, 0 with no words
+    lines: list[_Line] = field(default_factory=list)
+
+
+def _reading(text: str, confidence: int | None = None, *, orientation: int = 0) -> _Reading:
+    """The page that reads as `text`: one block, a paragraph after each blank line, lines
+    stacked 50 px apart. 91 confident, or 0 with no words, as Tesseract reports."""
+    lines: list[_Line] = []
+    para = True
+    for row in text.splitlines():
+        if not row.strip():
+            para = True
+            continue
+        top = 10 + 50 * len(lines)
+        box = (10, top, 10 + 20 * len(row), top + 30)
+        lines.append(_Line(box, row, block=not lines, para=para, orientation=orientation))
+        para = False
+    if confidence is None:
+        confidence = 91 if lines else 0
+    return _Reading(text, confidence, lines)
+
+
+class _FakeIterator:
+    """A ResultIterator walked line by line. An empty page's iterator still exists: it
+    has no box, no orientation worth reading, and raises for its text."""
+
+    def __init__(self, lines: list[_Line]):
+        self._lines = lines
+        self._at = 0
+
+    def _line(self, level: int) -> _Line | None:
+        assert level == RIL.TEXTLINE, "the fake models iteration by line only"
+        return self._lines[self._at] if self._lines else None
+
+    def BoundingBox(self, level):
+        line = self._line(level)
+        return None if line is None else line.box
+
+    def GetUTF8Text(self, level):
+        line = self._line(level)
+        if line is None or line.text is None:
+            raise RuntimeError("No text returned")
+        return line.text + "\n"
+
+    def IsAtBeginningOf(self, level):
+        if not self._lines:
+            return False
+        line = self._lines[self._at]
+        return {RIL.BLOCK: line.block, RIL.PARA: line.para or line.block, RIL.TEXTLINE: True}[level]
+
+    def Orientation(self):
+        if not self._lines:
+            return (0, 0, 2, 434553094144.0)  # what the real one returns on an empty page
+        return (self._lines[self._at].orientation, 0, 2, 0.0)
+
+    def Next(self, level):
+        self._line(level)
+        if self._at + 1 >= len(self._lines):
+            return False
+        self._at += 1
+        return True
+
+
 class _FakeTessApi:
     """One PyTessBaseAPI handle: it holds the last image it was given, as the real one
     does, so two callers interleaving on one handle would read each other's page."""
@@ -100,6 +184,7 @@ class _FakeTessApi:
     def __init__(self, tess: _FakeTesserocr):
         self._tess = tess
         self._image = None
+        self._read: _Reading | None = None
         self.calls: list[str] = []
         self.resolutions: list[int] = []
         self.images: list[Image.Image] = []
@@ -111,6 +196,7 @@ class _FakeTessApi:
         # getting a handle of their own.
         if not self._tess.busy.acquire(blocking=False):
             raise AssertionError("SetImage while another recognition is in progress")
+        self._read = None  # a new image clears the last one's results
         time.sleep(self._tess.hold)
         self._image = image
 
@@ -121,20 +207,37 @@ class _FakeTessApi:
     def GetUTF8Text(self):
         self.calls.append("GetUTF8Text")
         try:
-            return self._tess.reply(self._image)
+            reply = self._tess.reply(self._image)
+            self._read = reply if isinstance(reply, _Reading) else _reading(reply)
+            return self._read.text
         finally:
             self._tess.busy.release()
+
+    def _results(self) -> _Reading:
+        if self._read is None:
+            raise AssertionError("results read without a recognition of the current image")
+        return self._read
+
+    def MeanTextConf(self):
+        self.calls.append("MeanTextConf")
+        time.sleep(self._tess.hold)  # room for another caller's SetImage to clear it
+        return self._results().confidence
+
+    def GetIterator(self):
+        self.calls.append("GetIterator")
+        return _FakeIterator(self._results().lines)
 
 
 class _FakeTesserocr:
     """Just enough tesserocr to drive ocr.py without the extra installed."""
 
     PSM = SimpleNamespace(AUTO_OSD=1)
+    RIL = RIL
 
     def __init__(self):
         self.created: list[dict] = []
         self.apis: list[_FakeTessApi] = []
-        self.texts: list[str] = []
+        self.texts: list[str | _Reading] = []
         self.reply = lambda image: self.texts.pop(0)
         self.init_error: Exception | None = None
         self.init_delay = 0.0
@@ -210,7 +313,7 @@ def test_engine_init_failure_is_a_loud_ocr_error(fake_tess, cfg):
 def test_recognize_keeps_tesseracts_own_order(fake_tess, cfg, tmp_path):
     fake_tess.texts = ["Left 1\nLeft 2\n\nRight 1\nRight 2\n"]
     out = ocr._recognize(Image.new("L", (8, 8), 255), cfg, tmp_path / "p.png", dpi=None)
-    assert out == "Left 1\nLeft 2\n\nRight 1\nRight 2"
+    assert out.text == "Left 1\nLeft 2\n\nRight 1\nRight 2"
 
 
 def test_engine_failure_names_the_file(fake_tess, cfg, tmp_path):
@@ -224,19 +327,21 @@ def test_engine_failure_names_the_file(fake_tess, cfg, tmp_path):
 
 def test_two_recognitions_at_once_never_share_the_engine(fake_tess, cfg, tmp_path):
     """An MCP `ingest_file` during an in-process sync: both reach the one cached
-    handle, which has no lock of its own."""
+    handle, which has no lock of its own. A page's confidence and lines are read off
+    the handle after its text, so they belong in the same turn."""
     ocr._engine(cfg)
     fake_tess.hold = 0.05
-    fake_tess.reply = lambda image: f"page {image.width}"
+    fake_tess.reply = lambda image: _reading(f"page {image.width}", image.width)
     start = threading.Barrier(2)
-    results: dict[int, str] = {}
+    results: dict[int, tuple] = {}
     errors: list[BaseException] = []
 
     def read(width: int) -> None:
         start.wait()
         try:
             page = Image.new("L", (width, 8), 255)
-            results[width] = ocr._recognize(page, cfg, tmp_path / f"{width}.png", dpi=None)
+            got = ocr._recognize(page, cfg, tmp_path / f"{width}.png", dpi=None)
+            results[width] = (got.text, got.confidence, [line.text for line in got.lines])
         except BaseException as e:
             errors.append(e)
 
@@ -246,7 +351,7 @@ def test_two_recognitions_at_once_never_share_the_engine(fake_tess, cfg, tmp_pat
     for t in threads:
         t.join()
     assert errors == []
-    assert results == {10: "page 10", 20: "page 20"}
+    assert results == {10: ("page 10", 0.1, ["page 10"]), 20: ("page 20", 0.2, ["page 20"])}
     assert len(fake_tess.created) == 1
 
 
@@ -257,7 +362,7 @@ def test_every_frame_of_a_multi_page_tiff_is_read(fake_tess, cfg, tmp_path):
     tiff = tmp_path / "fax.tiff"
     frames[0].save(tiff, save_all=True, append_images=frames[1:])
     fake_tess.reply = lambda image: f"w{image.width}"
-    assert ocr.ocr_image(tiff, cfg) == "w100\n\nw101\n\nw102"
+    assert ocr.ocr_image(tiff, cfg) == ("w100\n\nw101\n\nw102", ocr.ENGINE_TESSERACT)
 
 
 def test_an_image_file_keeps_its_recorded_dpi(fake_tess, cfg, tmp_path):
@@ -353,7 +458,7 @@ def test_ocr_image_reads_a_non_ascii_path(fake_tess, cfg, tmp_path):
     fake_tess.reply = lambda image: f"{image.width}x{image.height}"
     img = tmp_path / "Скан договора.png"
     Image.new("L", (30, 12), 255).save(img)
-    assert ocr.ocr_image(img, cfg) == "30x12"
+    assert ocr.ocr_image(img, cfg) == ("30x12", ocr.ENGINE_TESSERACT)
 
 
 def test_a_jpeg_is_not_recompressed_on_its_way_to_tesseract(fake_tess, cfg, tmp_path):
@@ -447,9 +552,12 @@ def test_pdf_pages_render_at_300_dpi_and_say_so(fake_tess, monkeypatch, cfg, tmp
     page = _FakePage()
     _install_pdfium(monkeypatch, _FakePdfium(doc=_FakeDoc([page])))
     fake_tess.texts = ["page text"]
-    assert ocr.ocr_pdf(_pdf(tmp_path, "scan.pdf"), cfg, [0]) == {0: "page text"}
+    assert ocr.ocr_pdf(_pdf(tmp_path, "scan.pdf"), cfg, [0]) == (
+        {0: "page text"},
+        ocr.ENGINE_TESSERACT,
+    )
     assert page.scales == [300 / 72] and fake_tess.api.resolutions == [300]
-    assert fake_tess.api.calls == ["SetImage", "SetSourceResolution", "GetUTF8Text"]
+    assert fake_tess.api.calls[:3] == ["SetImage", "SetSourceResolution", "GetUTF8Text"]
 
 
 def test_ocr_pdf_unopenable_file_raises_ocr_error(tmp_path, monkeypatch, cfg):
@@ -481,6 +589,342 @@ def test_ocr_pdf_unrenderable_page_raises_ocr_error(tmp_path, monkeypatch, cfg):
     assert doc.closed
 
 
+# --- what Tesseract reports besides the text --------------------------------------------
+
+
+def _image(size: tuple[int, int] = (400, 200)) -> Image.Image:
+    return Image.new("L", size, 255)
+
+
+def test_recognize_reports_confidence_lines_paragraph_starts_and_turns(fake_tess, cfg, tmp_path):
+    """GetUTF8Text leaves a blank line before every paragraph, not only before a block,
+    so a paragraph start is what a line has to carry for the text to be rebuilt."""
+    fake_tess.texts = [
+        _Reading(
+            "Title\n\nFirst line\nSecond line\n\nNew paragraph\n",
+            70,
+            [
+                _Line((10, 10, 200, 40), "Title", block=True, para=True, orientation=3),
+                _Line((10, 80, 300, 110), "First line", block=True, para=True, orientation=3),
+                _Line((10, 120, 300, 150), "Second line", orientation=3),
+                _Line((10, 160, 300, 190), "New paragraph", para=True, orientation=3),
+            ],
+        )
+    ]
+    got = ocr._recognize(_image(), cfg, tmp_path / "p.png", dpi=None)
+    assert got.text == "Title\n\nFirst line\nSecond line\n\nNew paragraph"
+    assert got.confidence == 0.7
+    assert got.lines == (
+        ocr.Line((10, 10, 200, 40), "Title", starts_paragraph=True),
+        ocr.Line((10, 80, 300, 110), "First line", starts_paragraph=True),
+        ocr.Line((10, 120, 300, 150), "Second line"),
+        ocr.Line((10, 160, 300, 190), "New paragraph", starts_paragraph=True),
+    )
+    assert got.turns == 3
+
+
+def test_turns_are_the_orientation_most_blocks_report(fake_tess, cfg, tmp_path):
+    fake_tess.texts = [
+        _Reading(
+            "a\nb\nc\nd\n",
+            80,
+            [
+                _Line((0, 0, 9, 9), "a", block=True, orientation=1),
+                _Line((0, 10, 9, 19), "b", orientation=0),
+                _Line((0, 20, 9, 29), "c", block=True, orientation=3),
+                _Line((0, 30, 9, 39), "d", block=True, orientation=3),
+            ],
+        )
+    ]
+    assert ocr._recognize(_image(), cfg, tmp_path / "p.png", dpi=None).turns == 3
+
+
+def test_an_empty_page_has_no_lines_and_no_confidence(fake_tess, cfg, tmp_path):
+    """The real iterator of an empty page exists and raises "No text returned"."""
+    fake_tess.texts = [""]
+    got = ocr._recognize(_image(), cfg, tmp_path / "p.png", dpi=None)
+    assert (got.text, got.confidence, got.lines, got.turns) == ("", 0.0, (), 0)
+
+
+def test_a_line_the_iterator_has_no_text_for_is_left_out(fake_tess, cfg, tmp_path):
+    fake_tess.texts = [
+        _Reading(
+            "kept\nalso kept\n",
+            88,
+            [
+                _Line((0, 0, 90, 30), "kept", block=True, para=True),
+                _Line((0, 40, 90, 70), None, block=True, para=True, orientation=2),
+                _Line((0, 80, 90, 110), "also kept", block=True, para=True),
+            ],
+        )
+    ]
+    got = ocr._recognize(_image(), cfg, tmp_path / "p.png", dpi=None)
+    assert [line.text for line in got.lines] == ["kept", "also kept"]
+    assert got.turns == 0
+
+
+# --- Apple Vision re-reads the pages Tesseract is unsure of ------------------------------
+
+
+class _FakeVision:
+    """`ocr_vision.read_lines`, answering with lines in the page's own frame as it does."""
+
+    def __init__(self):
+        self.calls: list[tuple[tuple[int, int], int, list[str]]] = []
+        self.lines: list[ocr.Line] = []
+        self.errors: list[Exception | None] = []
+
+    def read_lines(self, image, turns, languages):
+        self.calls.append((image.size, turns, languages))
+        if self.errors and (error := self.errors.pop(0)) is not None:
+            raise error
+        return list(self.lines)
+
+
+@pytest.fixture
+def vision(monkeypatch):
+    fake = _FakeVision()
+    monkeypatch.setattr(ocr_vision, "available", lambda: True)
+    monkeypatch.setattr(ocr_vision, "read_lines", fake.read_lines)
+    return fake
+
+
+_UNSURE = _Reading(
+    "Dogovor postavki\nnomer 7OO\n",
+    70,
+    [
+        _Line((10, 10, 300, 40), "Dogovor postavki", block=True, para=True),
+        _Line((10, 60, 300, 90), "nomer 7OO"),
+    ],
+)
+_VISION_READS = [
+    ocr.Line((9, 8, 302, 42), "Договор поставки"),
+    ocr.Line((8, 58, 305, 92), "nomer 700"),
+]
+
+
+def _read_one_page(how: str, monkeypatch, cfg, tmp_path, size=(400, 120)) -> tuple[str, str]:
+    if how == "image":
+        path = tmp_path / "scan.png"
+        _image(size).save(path)
+        return ocr.ocr_image(path, cfg)
+    _install_pdfium(monkeypatch, _FakePdfium(doc=_FakeDoc([_FakePage()])))
+    texts, engine = ocr.ocr_pdf(_pdf(tmp_path, "scan.pdf"), cfg, [0])
+    return texts[0], engine
+
+
+@pytest.mark.parametrize("how", ["image", "pdf"])
+def test_a_page_under_the_threshold_is_spliced_with_visions_reading(
+    fake_tess, vision, monkeypatch, cfg, tmp_path, how
+):
+    fake_tess.texts = [_UNSURE]
+    vision.lines = _VISION_READS
+    text, engine = _read_one_page(how, monkeypatch, cfg, tmp_path)
+    assert text == "Договор поставки\nnomer 700"
+    assert engine == ocr.ENGINE_TESSERACT_VISION == "tesseract+vision"
+    size = (400, 120) if how == "image" else (8, 8)
+    assert vision.calls == [(size, 0, ["ru-RU", "en-US"])]
+
+
+@pytest.mark.parametrize("how", ["image", "pdf"])
+@pytest.mark.parametrize("confidence", [85, 90])
+def test_a_page_at_or_above_the_threshold_keeps_tesseracts_own_text(
+    fake_tess, vision, monkeypatch, cfg, tmp_path, how, confidence
+):
+    fake_tess.texts = [_reading("  Dogovor   postavki\nnomer 7OO\n\n", confidence)]
+    vision.lines = _VISION_READS
+    text, engine = _read_one_page(how, monkeypatch, cfg, tmp_path)
+    assert (text, engine) == ("Dogovor   postavki\nnomer 7OO", ocr.ENGINE_TESSERACT)
+    assert vision.calls == []
+
+
+@pytest.mark.parametrize("how", ["image", "pdf"])
+def test_without_vision_an_unsure_page_keeps_tesseracts_text(
+    fake_tess, vision, monkeypatch, cfg, tmp_path, how
+):
+    monkeypatch.setattr(ocr_vision, "available", lambda: False)
+    fake_tess.texts = [_UNSURE]
+    vision.lines = _VISION_READS
+    text, engine = _read_one_page(how, monkeypatch, cfg, tmp_path)
+    assert (text, engine) == ("Dogovor postavki\nnomer 7OO", ocr.ENGINE_TESSERACT)
+    assert vision.calls == []
+
+
+def test_a_page_tesseract_found_no_words_on_is_read_by_vision(
+    fake_tess, vision, monkeypatch, cfg, tmp_path
+):
+    fake_tess.texts = [""]
+    vision.lines = [ocr.Line((50, 50, 150, 80), "Печать")]
+    assert _read_one_page("image", monkeypatch, cfg, tmp_path) == (
+        "Печать",
+        ocr.ENGINE_TESSERACT_VISION,
+    )
+
+
+@pytest.mark.parametrize(
+    "setting,confidence,reread", [("0", 0, False), ("95", 90, True), ("60", 70, False)]
+)
+def test_the_threshold_is_the_configured_one_and_zero_turns_the_reader_off(
+    fake_tess, vision, monkeypatch, tmp_path, setting, confidence, reread
+):
+    cfg = load_config({"RAG_OCR_SECOND_READER_BELOW": setting}, cwd=tmp_path)
+    fake_tess.texts = [_reading("" if confidence == 0 else "Dogovor", confidence)]
+    vision.lines = [ocr.Line((10, 10, 100, 40), "Договор")]
+    _, engine = _read_one_page("image", monkeypatch, cfg, tmp_path)
+    assert (bool(vision.calls), engine == ocr.ENGINE_TESSERACT_VISION) == (reread, reread)
+
+
+def test_a_failing_second_reader_keeps_tesseracts_text_and_says_so(
+    fake_tess, vision, fake_embedder, caplog, tmp_path
+):
+    """The file is never lost to the second reader; the warning is what tells the owner
+    that a page they would have had re-read was not."""
+    fake_tess.texts = [_UNSURE]
+    vision.errors = [RuntimeError("Vision refused the page")]
+    scan = tmp_path / "invoice.png"
+    _image().save(scan)
+    cfg = load_config({"BASE_DIR": str(tmp_path)}, cwd=tmp_path)
+    store = Store(tmp_path / ".minirag" / "v2", dim=fake_embedder.dim)
+    with caplog.at_level(logging.WARNING, logger="minirag_mcp.ocr"):
+        result = Pipeline(store, fake_embedder, cfg).ingest_file(scan)
+    assert result.chunk_count >= 1
+    assert store.get_source(str(scan)).ocr_engine == ocr.ENGINE_TESSERACT
+    rows = store._table.search().where(f"source = '{scan}'").limit(10_000).to_list()
+    assert "nomer 7OO" in " ".join(r["text"] for r in rows)
+    ours = [r for r in caplog.records if r.name == "minirag_mcp.ocr"]
+    [warning] = [r for r in ours if r.levelno == logging.WARNING]
+    assert "invoice.png" in warning.getMessage() and "page 0" in warning.getMessage()
+    assert "Vision refused the page" in warning.getMessage()
+
+
+def test_one_spliced_page_marks_the_document_and_a_failed_one_does_not(
+    fake_tess, vision, monkeypatch, cfg, tmp_path
+):
+    sure = _reading("Page one reads clean", 93)
+    _install_pdfium(monkeypatch, _FakePdfium(doc=_FakeDoc([_FakePage() for _ in range(3)])))
+    fake_tess.texts = [sure, _UNSURE, _UNSURE]
+    vision.lines = _VISION_READS
+    vision.errors = [RuntimeError("Vision refused the page"), None]
+    texts, engine = ocr.ocr_pdf(_pdf(tmp_path, "scan.pdf"), cfg, [0, 1, 2])
+    assert texts == {
+        0: "Page one reads clean",
+        1: "Dogovor postavki\nnomer 7OO",
+        2: "Договор поставки\nnomer 700",
+    }
+    assert engine == ocr.ENGINE_TESSERACT_VISION
+    assert len(vision.calls) == 2
+
+    fake_tess.texts = [sure, _UNSURE]
+    vision.errors = [RuntimeError("Vision refused the page")]
+    _, engine = ocr.ocr_pdf(_pdf(tmp_path, "scan.pdf"), cfg, [0, 1])
+    assert engine == ocr.ENGINE_TESSERACT
+
+
+def test_a_turned_page_is_spliced_upright(fake_tess, vision, monkeypatch, cfg, tmp_path):
+    """Both readers give boxes in the frame of the page as scanned, here turned a
+    quarter. Rows and left-to-right only mean anything upright: on the sideways page,
+    Vision's tall line boxes reach across into the next line and sort by the wrong axis."""
+    w, h = 300, 1000  # the scanned page; upright it is 1000 x 300
+
+    def scanned(box):  # an upright box on the page as scanned, one turn short of upright
+        x0, y0, x1, y1 = box
+        return (w - y1, x0, w - y0, x1)
+
+    upright_tess = [(100, 100, 900, 140), (100, 150, 900, 190), (100, 200, 900, 240)]
+    fake_tess.texts = [
+        _Reading(
+            "one\ntwo\nthree\n",
+            60,
+            [
+                _Line(scanned(box), text, block=i == 0, para=i == 0, orientation=1)
+                for i, (box, text) in enumerate(
+                    zip(upright_tess, ["one", "two", "three"], strict=True)
+                )
+            ],
+        )
+    ]
+    upright_vision = [(100, 95, 900, 141), (100, 138, 900, 202), (100, 195, 900, 247)]
+    vision.lines = [
+        ocr.Line(scanned(box), text)
+        for box, text in zip(upright_vision, ["ONE", "TWO", "THREE"], strict=True)
+    ]
+    path = tmp_path / "sideways.png"
+    _image((w, h)).save(path)
+    assert ocr.ocr_image(path, cfg) == ("ONE\nTWO\nTHREE", ocr.ENGINE_TESSERACT_VISION)
+    assert vision.calls == [((w, h), 1, ["ru-RU", "en-US"])]
+
+
+# --- splice: Tesseract's lines and order, Vision's reading of them ----------------------
+
+
+def _tess(box, text, para=False):
+    return ocr.Line(box, text, starts_paragraph=para)
+
+
+def test_splice_keeps_a_line_vision_does_not_overlap():
+    tess = [_tess((0, 0, 100, 20), "alpha", True), _tess((0, 30, 100, 50), "beta")]
+    vision = [ocr.Line((0, 29, 100, 51), "BETA")]
+    assert ocr.splice(tess, vision) == "alpha\nBETA"
+
+
+def test_splice_appends_what_only_vision_found_after_the_page_in_row_order():
+    tess = [_tess((0, 0, 100, 20), "alpha", True)]
+    vision = [
+        ocr.Line((0, 0, 100, 21), "ALPHA"),
+        ocr.Line((0, 200, 90, 220), "below"),
+        ocr.Line((150, 100, 300, 120), "right"),
+        ocr.Line((0, 102, 140, 118), "left"),
+    ]
+    assert ocr.splice(tess, vision) == "ALPHA\n\nleft\nright\nbelow"
+
+
+def test_splice_emits_one_vision_line_over_two_tesseract_lines_once():
+    tess = [_tess((0, 0, 100, 20), "top half", True), _tess((0, 25, 100, 45), "bottom half")]
+    vision = [ocr.Line((0, 2, 100, 43), "one line")]
+    assert ocr.splice(tess, vision) == "one line"
+
+
+def test_splice_replaces_a_line_by_every_vision_line_over_it_left_to_right():
+    tess = [_tess((0, 0, 300, 20), "a wide row", True), _tess((0, 40, 300, 60), "next")]
+    vision = [ocr.Line((160, 0, 300, 20), "right cell"), ocr.Line((0, 0, 150, 20), "left cell")]
+    assert ocr.splice(tess, vision) == "left cell\nright cell\nnext"
+
+
+def test_splice_keeps_tesseracts_paragraph_breaks():
+    tess = [
+        _tess((0, 0, 100, 20), "a1", True),
+        _tess((0, 30, 100, 50), "a2"),
+        _tess((0, 70, 100, 90), "b1", True),
+        _tess((0, 100, 100, 120), "b2"),
+    ]
+    vision = [ocr.Line((0, y0 - 1, 100, y1 + 1), f"V{y0}") for y0, y1 in [(0, 20), (30, 50)]]
+    vision += [ocr.Line((0, 70, 100, 90), "B1")]
+    assert ocr.splice(tess, vision) == "V0\nV30\n\nB1\nb2"
+
+
+def test_splice_carries_a_paragraph_break_past_a_line_vision_merged_away():
+    tess = [
+        _tess((0, 0, 100, 20), "a1", True),
+        _tess((0, 25, 100, 45), "b1", True),
+        _tess((0, 60, 100, 80), "b2"),
+    ]
+    vision = [ocr.Line((0, 2, 100, 43), "a1 b1"), ocr.Line((0, 60, 100, 80), "B2")]
+    assert ocr.splice(tess, vision) == "a1 b1\n\nB2"
+
+
+@pytest.mark.parametrize("top,same", [(9, True), (10, False), (0, True)])
+def test_lines_overlap_by_more_than_half_the_smaller_height(top, same):
+    """Vision's boxes are taller than the glyphs: a neighbour's box reaching a little
+    into a line is not that line."""
+    tess = [_tess((0, 0, 100, 20), "tess", True)]
+    vision = [ocr.Line((50, top, 300, top + 40), "vision")]
+    assert ocr.splice(tess, vision) == ("vision" if same else "tess\n\nvision")
+
+
+def test_splice_of_nothing_is_empty():
+    assert ocr.splice([], []) == ""
+
+
 def _font(size: int = 44) -> ImageFont.FreeTypeFont:
     return ImageFont.load_default(size=size)
 
@@ -501,7 +945,7 @@ def test_real_engine_reads_both_pages_of_a_two_frame_tiff(tmp_path):
     frames = [_page([marker] * 3, (1600, 500)) for marker in ("FIRST PAGE 111", "SECOND PAGE 222")]
     p = tmp_path / "scan.tiff"
     frames[0].save(p, save_all=True, append_images=frames[1:], dpi=(300, 300))
-    text = ocr.ocr_image(p, load_config({}, cwd=tmp_path))
+    text, _ = ocr.ocr_image(p, load_config({}, cwd=tmp_path))
     assert "111" in text and "222" in text
     assert text.index("111") < text.index("222")
 
@@ -511,7 +955,7 @@ def test_real_engine_reads_both_pages_of_a_two_frame_tiff(tmp_path):
 def test_real_engine_reads_a_generated_page(tmp_path):
     p = tmp_path / "scan.png"
     _page(["INVOICE 12345 TOTAL 999"], (1600, 400)).save(p, dpi=(300, 300))
-    text = ocr.ocr_image(p, load_config({}, cwd=tmp_path))
+    text, _ = ocr.ocr_image(p, load_config({}, cwd=tmp_path))
     assert "12345" in text and "999" in text
 
 
@@ -526,7 +970,7 @@ def test_real_engine_reads_a_rotated_page(tmp_path, angle):
     ]
     p = tmp_path / "rotated.png"
     _page(lines, (2480, 1400)).rotate(angle, expand=True).save(p, dpi=(300, 300))
-    text = ocr.ocr_image(p, load_config({}, cwd=tmp_path))
+    text, _ = ocr.ocr_image(p, load_config({}, cwd=tmp_path))
     assert "700" in text and "711" in text
 
 
@@ -536,7 +980,7 @@ def test_real_engine_reads_rendered_pdf_page(tmp_path):
     """Pins the pypdfium2 render -> to_pil -> _recognize path in ocr_pdf, which the
     image-file tests never touch."""
     p = _write(tmp_path, ["OCR PDF CHECK 555 " * 5])
-    texts = ocr.ocr_pdf(p, load_config({}, cwd=tmp_path), [0])
+    texts, _ = ocr.ocr_pdf(p, load_config({}, cwd=tmp_path), [0])
     assert "555" in texts[0]
 
 
@@ -551,9 +995,36 @@ def test_real_engine_keeps_the_columns_of_a_two_column_page_apart(tmp_path):
         draw.text((1340, y), f"Right side entry {500 + i} goes on", fill=0, font=_font())
     p = tmp_path / "two-columns.png"
     page.save(p, dpi=(300, 300))
-    text = ocr.ocr_image(p, load_config({}, cwd=tmp_path))
+    text, _ = ocr.ocr_image(p, load_config({}, cwd=tmp_path))
     assert all(f"{100 + i}" in text and f"{500 + i}" in text for i in range(10))
     assert text.index("109") < text.index("500")
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not ocr.available(), reason="needs the [ocr] extra")
+@pytest.mark.parametrize("quarter_turns", [0, 1, 2, 3])
+def test_real_engine_reports_the_turns_that_make_a_page_upright(tmp_path, quarter_turns):
+    """The page below is turned counter-clockwise; turning it back takes the rest of a
+    full turn. Its line boxes stay in the frame of the page as handed over."""
+    lines = [
+        f"The quick brown fox number {700 + i} jumps over the lazy dog again" for i in range(12)
+    ]
+    page = _page(lines, (2480, 1400)).rotate(90 * quarter_turns, expand=True)
+    got = ocr._recognize(page, load_config({}, cwd=tmp_path), tmp_path / "p.png", dpi=300)
+    assert got.turns == (4 - quarter_turns) % 4
+    assert got.confidence > 0.85
+    assert len(got.lines) == 12 and got.lines[0].starts_paragraph
+    assert "700" in got.lines[0].text and "711" in got.lines[-1].text
+    wide = [x1 - x0 > y1 - y0 for x0, y0, x1, y1 in (line.box for line in got.lines)]
+    assert wide == [quarter_turns % 2 == 0] * 12
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not ocr.available(), reason="needs the [ocr] extra")
+def test_real_engine_reports_an_empty_page_as_no_lines_and_no_confidence(tmp_path):
+    page = Image.new("L", (800, 600), 255)
+    got = ocr._recognize(page, load_config({}, cwd=tmp_path), tmp_path / "p.png", dpi=300)
+    assert (got.text, got.confidence, got.lines, got.turns) == ("", 0.0, (), 0)
 
 
 @pytest.mark.parametrize(

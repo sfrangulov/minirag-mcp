@@ -505,7 +505,12 @@ def test_other_formats_carry_no_page_starts(tmp_path):
 def fake_ocr(monkeypatch):
     monkeypatch.setattr(ocr, "available", lambda: True)
     monkeypatch.setattr(
-        ocr, "ocr_pdf", lambda path, config, todo: {i: f"Recognized page index {i}" for i in todo}
+        ocr,
+        "ocr_pdf",
+        lambda path, config, todo: (
+            {i: f"Recognized page index {i}" for i in todo},
+            ocr.ENGINE_TESSERACT,
+        ),
     )
 
 

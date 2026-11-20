@@ -127,7 +127,7 @@ def test_ingest_file_carries_ocr_engine(pipe, monkeypatch):
         for i in range(20)
     )
     monkeypatch.setattr(ocr, "available", lambda: True)
-    monkeypatch.setattr(ocr, "ocr_image", lambda path, config: scanned)
+    monkeypatch.setattr(ocr, "ocr_image", lambda path, config: (scanned, ocr.ENGINE_TESSERACT))
     img = root / "scan.png"
     img.write_bytes(b"...")
     result = p.ingest_file(img)

@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from minirag_mcp import __version__, literal, ocr
+from minirag_mcp import __version__, literal, ocr, ocr_vision
 from minirag_mcp.chunker import SCHEME_VERSION, shared_lines
 from minirag_mcp.config import Config
 from minirag_mcp.endpoints import RerankEndpoint
@@ -320,11 +320,18 @@ def ocr_status() -> dict:
     the index, so the server reports it alongside the fields that do not need one.
     """
     if ocr.available():
-        return {"ocr": ocr.ENGINE_TESSERACT}
+        return {"ocr": ocr.ENGINE_TESSERACT, **_second_reader_status()}
     return {
         "ocr": "unavailable",
         "ocrHint": f"scanned PDFs and images cannot be indexed; {ocr.INSTALL_HINT}",
     }
+
+
+def _second_reader_status() -> dict:
+    """Apple Vision, on the platform that has it: whether its bindings are installed."""
+    if not ocr_vision.supported():
+        return {}
+    return {"ocrSecondReader": "vision" if ocr_vision.available() else "unavailable"}
 
 
 def identity_status(opened: OpenIndex, state: IndexState, why: str) -> dict:

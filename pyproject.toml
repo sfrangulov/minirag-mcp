@@ -52,6 +52,14 @@ ocr = [
     # is above the 4.18 that pdfplumber 0.11.9, markitdown's floor, would accept.
     "pypdfium2>=5",
     "pillow>=10.3",
+    # Apple Vision, the second reader of the pages Tesseract is unsure of, on macOS only.
+    "pyobjc-framework-Vision>=13; sys_platform == 'darwin'",
+    # pyobjc-framework-Vision already pulls these in, but we import them directly: the
+    # region each request reads is a Quartz rectangle, and every call drains its own
+    # autorelease pool. Both bounds are Vision 13's own floors, so declaring them can
+    # never move the resolution.
+    "pyobjc-framework-Quartz>=13; sys_platform == 'darwin'",
+    "pyobjc-core>=13; sys_platform == 'darwin'",
 ]
 classify = [
     "llama-cpp-python>=0.3.36",

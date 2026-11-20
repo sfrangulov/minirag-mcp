@@ -2,6 +2,7 @@
 
 The only module that touches tesserocr / pypdfium2, and both are imported lazily
 inside functions: the core package must import and run without the extra installed.
+Apple Vision, the second reader on macOS, is `ocr_vision`, under the same rule.
 """
 
 from __future__ import annotations
@@ -12,13 +13,17 @@ import logging
 import os
 import tempfile
 import threading
+from collections import Counter
 from collections.abc import Iterator, Sequence
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import requests
 from pdfminer.high_level import extract_pages
 from pdfminer.layout import LTTextContainer
+
+from minirag_mcp import ocr_vision
 
 if TYPE_CHECKING:
     from PIL import Image
@@ -29,7 +34,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 ENGINE_TESSERACT = "tesseract"
+# A document Apple Vision re-read at least one page of.
+ENGINE_TESSERACT_VISION = "tesseract+vision"
 DPI = 300
+# A page Tesseract reads with a lower mean word confidence is read again by Apple Vision
+# where it exists. RAG_OCR_SECOND_READER_BELOW overrides it, in percent.
+SECOND_READER_BELOW = 0.85
+
+Box = tuple[float, float, float, float]  # left, top, right, bottom; pixels from the top left
 
 INSTALL_HINT = (
     "install the OCR extra: uv tool install 'minirag-mcp[ocr]' (or pip install 'minirag-mcp[ocr]')"
@@ -38,6 +50,26 @@ INSTALL_HINT = (
 
 class OcrError(Exception):
     """OCR was needed and failed or is unavailable. Always loud, never a no-op."""
+
+
+@dataclass(frozen=True)
+class Line:
+    """One line of a page as a reader saw it. `starts_paragraph` marks where Tesseract's
+    own text leaves a blank line: before every paragraph, not only every block."""
+
+    box: Box
+    text: str
+    starts_paragraph: bool = False
+
+
+@dataclass(frozen=True)
+class Recognized:
+    """A page as Tesseract read it, its boxes in the frame of the image it was given."""
+
+    text: str
+    confidence: float  # mean word confidence, 0 to 1; 0 when no word was found
+    lines: tuple[Line, ...]
+    turns: int  # counter-clockwise quarter-turns that make the page upright
 
 
 def available() -> bool:
@@ -96,31 +128,162 @@ def _engine(config: Config) -> tuple[PyTessBaseAPI, threading.Lock]:
         return _engines[key]
 
 
-def _recognize(image: Image.Image, config: Config, path: Path, *, dpi: int | None) -> str:
-    """The page's text in Tesseract's own reading order: block by block, so the columns
-    of a two-column page stay apart.
+def _recognize(image: Image.Image, config: Config, path: Path, *, dpi: int | None) -> Recognized:
+    """The page in Tesseract's own reading order: block by block, so the columns of a
+    two-column page stay apart.
 
     With `dpi` None no resolution is set here. tesserocr hands a frame without a format
     to Tesseract as BMP, and Pillow writes 96 dpi into every BMP it saves.
     """
     api, lock = _engine(config)
-    # The handle is not thread-safe, and SetImage resets the source resolution, so the
-    # three calls only ever run together. Never call DetectOrientationScript on this
-    # handle: on one initialised without `osd` as its language it aborts the process
-    # (std::out_of_range, observed 2026-11-19); AUTO_OSD orients the page instead.
+    # The handle is not thread-safe, and SetImage resets the source resolution and the
+    # last page's results, so everything read off it happens in one turn. Never call
+    # DetectOrientationScript on this handle: on one initialised without `osd` as its
+    # language it aborts the process (std::out_of_range, observed 2026-11-19); AUTO_OSD
+    # orients the page instead.
     with lock:
         try:
             api.SetImage(image)
             if dpi is not None:
                 api.SetSourceResolution(dpi)
             text = api.GetUTF8Text()
+            lines, orientations = _layout(api)
+            confidence = api.MeanTextConf() / 100 if lines else 0.0
         except Exception as e:
             raise OcrError(f"OCR engine failed on {path}: {e}") from e
-    return text.strip()
+    turns = Counter(orientations).most_common(1)[0][0] if orientations else 0
+    return Recognized(text.strip(), confidence, tuple(lines), turns)
 
 
-def ocr_pdf(path: Path, config: Config, pages: Sequence[int]) -> dict[int, str]:
-    """OCR the given zero-based pages of a PDF, rendered at `DPI`."""
+def _layout(api: PyTessBaseAPI) -> tuple[list[Line], list[int]]:
+    """Tesseract's lines, and the orientation of each block that holds one.
+
+    An empty page still has an iterator, and it raises for its text ("No text returned"),
+    as it may for a block with no text in it.
+    """
+    from tesserocr import RIL
+
+    lines: list[Line] = []
+    orientations: list[int] = []
+    iterator = api.GetIterator()
+    if iterator is None:
+        return lines, orientations
+    while True:
+        box = iterator.BoundingBox(RIL.TEXTLINE)
+        try:
+            text = iterator.GetUTF8Text(RIL.TEXTLINE).strip()
+        except RuntimeError:
+            text = ""
+        if box is not None and text:
+            if iterator.IsAtBeginningOf(RIL.BLOCK):
+                orientations.append(int(iterator.Orientation()[0]))
+            lines.append(Line(tuple(box), text, bool(iterator.IsAtBeginningOf(RIL.PARA))))
+        if not iterator.Next(RIL.TEXTLINE):
+            return lines, orientations
+
+
+def _read(
+    image: Image.Image, config: Config, path: Path, *, dpi: int | None, page: int
+) -> tuple[str, bool]:
+    """The page's text, and whether Apple Vision's reading went into it.
+
+    A page Tesseract is unsure of is read again by Vision where Vision exists, and the
+    two readings are spliced. A page Vision fails on keeps Tesseract's text: the file
+    never fails because of the second reader, and the warning is how that shows.
+    """
+    recognized = _recognize(image, config, path, dpi=dpi)
+    if recognized.confidence >= config.ocr_second_reader_below / 100 or not ocr_vision.available():
+        return recognized.text, False
+    try:
+        languages = ocr_vision.languages(config.ocr_lang)
+        seen = ocr_vision.read_lines(image, recognized.turns, languages)
+    except Exception as e:
+        logger.warning(
+            "ocr: Apple Vision failed on page %d of %s, which keeps Tesseract's text: %s",
+            page,
+            path,
+            e,
+        )
+        return recognized.text, False
+
+    def upright(line: Line) -> Line:
+        return replace(line, box=_upright_box(line.box, recognized.turns, image.size))
+
+    return splice([upright(line) for line in recognized.lines], [upright(s) for s in seen]), True
+
+
+def splice(tess_lines: Sequence[Line], vision_lines: Sequence[Line]) -> str:
+    """Tesseract's lines in Tesseract's order, each as Vision read it.
+
+    A Tesseract line Vision overlaps is replaced by the Vision lines over it not used
+    yet, left to right, so a Vision line across two Tesseract lines comes out once; one
+    Vision has nothing over is kept. Vision lines over no Tesseract line, text Tesseract
+    never found, follow the page as a paragraph of their own, row by row. Both readings
+    are boxed on the upright page: rows and left to right mean nothing on a sideways one.
+    """
+    used: set[int] = set()
+    out: list[str] = []
+    paragraph = False
+    for line in tess_lines:
+        over = [i for i, seen in enumerate(vision_lines) if _same_line(line.box, seen.box)]
+        fresh = sorted(set(over) - used, key=lambda i: vision_lines[i].box[0])
+        texts = [vision_lines[i].text for i in fresh] if over else [line.text]
+        used.update(over)
+        paragraph = paragraph or line.starts_paragraph
+        if texts:
+            if paragraph and out:
+                out.append("")
+            paragraph = False
+            out.extend(texts)
+    rest = [seen for i, seen in enumerate(vision_lines) if i not in used]
+    if rest and out:
+        out.append("")
+    out.extend(seen.text for seen in _rows(rest))
+    return "\n".join(out)
+
+
+def _same_line(a: Box, b: Box) -> bool:
+    """Whether two boxes hold one line: they meet across, and down they share more than
+    half the shorter one's height. Vision's boxes are taller than the glyphs, so a
+    neighbour's box reaching a little into a line is not that line."""
+    across = min(a[2], b[2]) - max(a[0], b[0])
+    down = min(a[3], b[3]) - max(a[1], b[1])
+    return across > 0 and down > min(a[3] - a[1], b[3] - b[1]) / 2
+
+
+def _rows(lines: Sequence[Line]) -> list[Line]:
+    """`lines` top to bottom and, within a row, left to right. A line joins a row when
+    its middle lies within the height of the row's first line."""
+
+    def middle(line: Line) -> float:
+        return (line.box[1] + line.box[3]) / 2
+
+    rows: list[list[Line]] = []
+    for line in sorted(lines, key=middle):
+        if rows and rows[-1][0].box[1] <= middle(line) <= rows[-1][0].box[3]:
+            rows[-1].append(line)
+        else:
+            rows.append([line])
+    return [line for row in rows for line in sorted(row, key=lambda line: line.box[0])]
+
+
+def _upright_box(box: Box, turns: int, size: tuple[int, int]) -> Box:
+    """`box` on a page of `size` once the page is turned `turns` quarter-turns
+    counter-clockwise, as `Image.rotate(90 * turns, expand=True)` turns it."""
+    width, height = size
+    x0, y0, x1, y1 = box
+    if turns == 1:
+        return (y0, width - x1, y1, width - x0)
+    if turns == 2:
+        return (width - x1, height - y1, width - x0, height - y0)
+    if turns == 3:
+        return (height - y1, x0, height - y0, x1)
+    return box
+
+
+def ocr_pdf(path: Path, config: Config, pages: Sequence[int]) -> tuple[dict[int, str], str]:
+    """OCR the given zero-based pages of a PDF, rendered at `DPI`: the text of each, and
+    the engine that read them."""
     _require_available()
     try:
         import pypdfium2 as pdfium
@@ -128,6 +291,7 @@ def ocr_pdf(path: Path, config: Config, pages: Sequence[int]) -> dict[int, str]:
         raise _import_error_as_ocr_error(e) from e
 
     out: dict[int, str] = {}
+    spliced = False
     try:
         doc = pdfium.PdfDocument(str(path))
     except Exception as e:
@@ -144,23 +308,28 @@ def ocr_pdf(path: Path, config: Config, pages: Sequence[int]) -> dict[int, str]:
                 image = page.render(scale=DPI / 72).to_pil()
             except Exception as e:
                 raise OcrError(f"could not render page {index} of {path} for OCR: {e}") from e
-            out[index] = _recognize(image, config, path, dpi=DPI)
+            out[index], second = _read(image, config, path, dpi=DPI, page=index)
+            spliced = spliced or second
             logger.info("ocr: %s page %d -> %d chars", path, index, len(out[index]))
     finally:
         doc.close()
-    return out
+    return out, ENGINE_TESSERACT_VISION if spliced else ENGINE_TESSERACT
 
 
-def ocr_image(path: Path, config: Config) -> str:
+def ocr_image(path: Path, config: Config) -> tuple[str, str]:
+    """The text of every frame of an image file, and the engine that read them."""
     _require_available()
     texts = []
     frames = 0
+    spliced = False
     for frame, dpi in _decoded_frames(path):
+        text, second = _read(frame, config, path, dpi=dpi, page=frames)
         frames += 1
-        if text := _recognize(frame, config, path, dpi=dpi):
+        spliced = spliced or second
+        if text:
             texts.append(text)
     logger.info("ocr: %s -> %d frame(s)", path, frames)
-    return "\n\n".join(texts)
+    return "\n\n".join(texts), ENGINE_TESSERACT_VISION if spliced else ENGINE_TESSERACT
 
 
 def _decoded_frames(path: Path) -> Iterator[tuple[Image.Image, int | None]]:

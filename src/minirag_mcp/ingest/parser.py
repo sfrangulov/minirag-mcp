@@ -487,13 +487,13 @@ def parse_file(path: Path, config: Config | None = None) -> ParsedDoc:
         if config is None:
             raise ParserError(f"OCR for {path} needs a Config (internal error)")
         try:
-            text = ocr.ocr_image(path, config)
+            text, engine = ocr.ocr_image(path, config)
         except ocr.OcrError as e:
             raise ParserError(str(e)) from e
         # Not `_file_title`: it prefers an authored ATX heading to the filename, and a
         # recognized page has none — a `# ` line in OCR output is scanner noise.
         title = _stem_title(_strip_extension_suffix(path.stem))
-        return ParsedDoc(markdown=text, title=title, ocr_engine=ocr.ENGINE_TESSERACT)
+        return ParsedDoc(markdown=text, title=title, ocr_engine=engine)
     try:
         result = _convert_file(path)
     except Exception as e:  # markitdown may raise lib-specific errors too
@@ -553,7 +553,7 @@ def _pdf_with_ocr_fallback(
             )
         return markdown, "", starts  # partial text beats refusal
     try:
-        recognized = ocr.ocr_pdf(path, config, needs)
+        recognized, engine = ocr.ocr_pdf(path, config, needs)
     except ocr.OcrError as e:
         raise ParserError(str(e)) from e
     # markitdown's markdown does not reliably mark page boundaries to splice into: a
@@ -576,7 +576,7 @@ def _pdf_with_ocr_fallback(
     if converted := markdown.strip():
         parts.insert(0, (converted, pages.stripped(markdown, starts)))
     merged, merged_starts = pages.joined(parts)
-    return merged, ocr.ENGINE_TESSERACT, merged_starts
+    return merged, engine, merged_starts
 
 
 def parse_html(html: str, title: str | None = None) -> ParsedDoc:

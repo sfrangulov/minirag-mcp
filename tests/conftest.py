@@ -25,7 +25,7 @@ from tokenizers.pre_tokenizers import Whitespace
 from tokenizers.processors import TemplateProcessing
 
 import minirag_mcp.embedder as embedder_mod
-from minirag_mcp import ocr, parallel, security
+from minirag_mcp import ocr, ocr_vision, parallel, security
 from minirag_mcp.chunker import SCHEME_VERSION
 from minirag_mcp.config import Config
 from minirag_mcp.identity import (
@@ -136,6 +136,26 @@ def tessdata_stays_offline(request, monkeypatch) -> Iterator[None]:
     yield
     if reached:
         pytest.fail(f"reached the download of Tesseract's data ({', '.join(reached)})")
+
+
+@pytest.fixture(autouse=True)
+def vision_stays_out(request, monkeypatch) -> Iterator[None]:
+    """A fast test that reaches Apple Vision, which only macOS with the [ocr] extra makes
+    possible, fails: the fast suite reads the same on every platform. A test of the second
+    reader puts its own `ocr_vision.read_lines` in place."""
+    if request.node.get_closest_marker("slow"):
+        yield
+        return
+    reached: list[str] = []
+
+    def guarded(image, turns, languages):
+        reached.append(f"{image.width}x{image.height}")
+        raise RuntimeError("the fast suite never runs Apple Vision")
+
+    monkeypatch.setattr(ocr_vision, "read_lines", guarded)
+    yield
+    if reached:
+        pytest.fail(f"reached Apple Vision ({', '.join(reached)})")
 
 
 def stamp_identity(config: Config, embedder) -> IndexIdentity:
