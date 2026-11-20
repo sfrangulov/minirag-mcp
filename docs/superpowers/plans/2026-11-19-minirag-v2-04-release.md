@@ -241,6 +241,18 @@ git commit -m "build(release): pre-release parts for bump-my-version" -m "Co-Aut
 > make no power-loss durability claims (macOS fsync is not F_FULLFSYNC). The owner granted full
 > rights on 2026-11-19: steps that wait for the owner's go-ahead proceed without waiting.
 
+> **Added 2026-11-20 (owner):** the README gets its own section on setting up llama-server
+> from scratch, at least for macOS (Apple silicon, Metal): installing llama.cpp (Homebrew),
+> getting the three GGUFs (multilingual-e5-large for embeddings, bge-reranker-v2-m3 for
+> reranking, the classify model pinned in `classify.toml`), a router preset file with one
+> section per model (embedding / rerank with `pooling = rank` / classify with >= 8192 tokens
+> per slot) and `--models-max`, an API key file, running it under launchd, checking each route
+> with `curl` (`/v1/embeddings`, `/v1/rerank`, `/props`), and pointing minirag at it
+> (`indexes.toml` `[embedding."<id>"]`, `[rerank]`, `[classify]`, and the env-var equivalents).
+> Every command in the section is run on this Mac against a throwaway router on a spare port
+> (never the owner's live router), and the section says which steps were verified where. No
+> machine paths of the owner's in the text. bd minirag-mcp-g7q.15.
+
 **Files:**
 - Modify: `README.md` (banner below the badges; new `## v2 (pre-release)` before `## Requirements`; Configuration, MCP Tools, CLI and Chunking sections; fixes from the sweep)
 
