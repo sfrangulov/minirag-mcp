@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
+import json
 import multiprocessing
+import os
+import signal
+import subprocess
+import sys
+import sysconfig
 from collections import Counter
 from pathlib import Path
 
@@ -421,3 +428,60 @@ def test_endpoint_failures_stop_dispatch_only_when_consecutive(
     counts, errors = sync(h)
     assert inline_workers == [2] and (counts["ingested"], counts["failed"]) == (4, 4)
     assert not any("endpoint unreachable" in e["error"] for e in errors)
+
+
+HARNESS = Path(__file__).resolve().parent / "entry_point_harness.py"
+# How a client starts minirag: the Desktop bundle's script, the console script, `python -m`.
+ENTRY_POINTS = {
+    "bundle": ("path", str(Path(__file__).resolve().parent.parent / "mcpb" / "server" / "main.py")),
+    "console script": ("path", str(Path(sysconfig.get_path("scripts")) / "minirag-mcp")),
+    "python -m": ("module", "minirag_mcp"),
+}
+
+
+@pytest.mark.parametrize("entry", ENTRY_POINTS)
+def test_a_parallel_sync_under_each_entry_point_finishes_with_stdout_untouched(tmp_path, entry):
+    """Spawned workers run the parent's main script again, as `__mp_main__`, with the
+    parent's argv. A script that starts the server unguarded starts one in every worker, on
+    the client's stdin and stdout, and the sync waits for those workers forever."""
+    kind, target = ENTRY_POINTS[entry]
+    if kind == "path" and not Path(target).is_file():
+        pytest.skip(f"{target} is not installed")
+    root = tmp_path / "docs"
+    root.mkdir()
+    for i in range(8):
+        (root / f"{i}.md").write_text(f"# Doc {i}\n\nBody of document {i}.", encoding="utf-8")
+    env = {k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "TMPDIR", "SYSTEMROOT")}
+    env |= {
+        "BASE_DIR": str(root),
+        "DB_PATH": str(tmp_path / "db"),
+        "CACHE_DIR": str(tmp_path / "cache"),
+        "RAG_SYNC_WORKERS": "2",
+        "ENTRY_KIND": kind,
+        "ENTRY": target,
+    }
+    out, err = tmp_path / "stdout", tmp_path / "stderr"
+    with out.open("wb") as stdout, err.open("wb") as stderr:
+        # stdin stays open, as a client's pipe does, so a server started in a worker waits.
+        proc = subprocess.Popen(
+            [sys.executable, str(HARNESS)],
+            stdin=subprocess.PIPE,
+            stdout=stdout,
+            stderr=stderr,
+            env=env,
+            start_new_session=True,
+        )
+        try:
+            proc.wait(timeout=120)
+        except subprocess.TimeoutExpired:
+            pytest.fail(f"the sync under the {entry} did not finish:\n{err.read_text()}")
+        finally:
+            proc.stdin.close()
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
+    assert proc.returncode == 0, err.read_text()
+    report = json.loads(err.read_text().splitlines()[-1])
+    assert report["pools"] == [2] and report["errors"] == []
+    assert report["counts"]["ingested"] == 8
+    assert out.read_bytes() == b""
