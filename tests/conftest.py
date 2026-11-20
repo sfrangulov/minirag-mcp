@@ -25,7 +25,7 @@ from tokenizers.pre_tokenizers import Whitespace
 from tokenizers.processors import TemplateProcessing
 
 import minirag_mcp.embedder as embedder_mod
-from minirag_mcp import parallel, security
+from minirag_mcp import ocr, parallel, security
 from minirag_mcp.chunker import SCHEME_VERSION
 from minirag_mcp.config import Config
 from minirag_mcp.identity import (
@@ -113,6 +113,29 @@ class FakeEmbedder:
 @pytest.fixture
 def fake_embedder() -> FakeEmbedder:
     return FakeEmbedder()
+
+
+@pytest.fixture(autouse=True)
+def tessdata_stays_offline(request, monkeypatch) -> Iterator[None]:
+    """A fast test that reaches the download of Tesseract's data, which only an installed
+    [ocr] extra makes possible, is refused it as if offline, and fails. A test that serves
+    the data itself points `ocr._TESSDATA_URL` elsewhere first."""
+    if request.node.get_closest_marker("slow"):
+        yield
+        return
+    pinned, download = ocr._TESSDATA_URL, ocr._download_tessdata
+    reached: list[str] = []
+
+    def guarded(name: str, target: Path) -> None:
+        if ocr._TESSDATA_URL != pinned:
+            return download(name, target)
+        reached.append(name)
+        raise ocr.OcrError(f"{name}.traineddata: the fast suite never downloads it")
+
+    monkeypatch.setattr(ocr, "_download_tessdata", guarded)
+    yield
+    if reached:
+        pytest.fail(f"reached the download of Tesseract's data ({', '.join(reached)})")
 
 
 def stamp_identity(config: Config, embedder) -> IndexIdentity:

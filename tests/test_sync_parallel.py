@@ -71,10 +71,15 @@ def documents(store) -> list[dict]:
     return [{k: v for k, v in r.items() if k != "ingested_at"} for r in rows]
 
 
+@pytest.fixture(autouse=True)
+def without_ocr(monkeypatch):
+    """With the [ocr] extra installed, the parent fetches Tesseract's data before a parallel
+    sync. The tests of that fetch make OCR available again."""
+    monkeypatch.setattr(ocr, "available", lambda: False)
+
+
 def test_parallel_and_serial_sync_write_identical_indexes(tmp_path, model_factory, monkeypatch):
     monkeypatch.setattr(parallel, "BATCH_ROWS", 7)
-    # The parent fetches Tesseract's data before a parallel sync when the extra is there.
-    monkeypatch.setattr(ocr, "available", lambda: False)
     root = tmp_path / "docs"
     (root / ".minirag").mkdir(parents=True)
     (root / ".minirag" / "classify.toml").write_text(TAXONOMY, encoding="utf-8")
@@ -158,6 +163,7 @@ def corpus(tmp_path: Path, embedder, files: int, *, workers: int = 2):
     env = {
         "BASE_DIR": str(root),
         "DB_PATH": str(tmp_path / "db"),
+        "CACHE_DIR": str(tmp_path / "cache"),
         "RAG_SYNC_WORKERS": str(workers),
     }
     cfg = load_config(env, cwd=root)

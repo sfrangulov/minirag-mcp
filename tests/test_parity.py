@@ -20,6 +20,7 @@ import minirag_mcp.cli as cli
 import minirag_mcp.embedder as embedder_mod
 from conftest import FakeEmbedder
 from lookalike_texts import MINUTES, REGULATION_V1, REGULATION_V2
+from minirag_mcp import ocr
 from minirag_mcp.config import default_db_path, load_config
 from minirag_mcp.embedder import Embedder
 from minirag_mcp.labels import Labeler
@@ -243,11 +244,18 @@ async def test_a_parallel_sync_counts_the_same_through_both_shells(
     root, tmp_path, capsys, monkeypatch, fake_embedder, inline_workers
 ):
     monkeypatch.setattr(cli, "_make_embedder", lambda cfg: fake_embedder)
+    # With the [ocr] extra installed, a parallel sync fetches Tesseract's data first.
+    monkeypatch.setattr(ocr, "available", lambda: False)
     for i in range(7):
         (root / f"doc{i}.md").write_text(f"# Doc {i}\n\nBody of document {i}.")
     monkeypatch.setenv("RAG_SYNC_WORKERS", "2")
     envs = {
-        shell: {"BASE_DIR": str(root), "DB_PATH": str(tmp_path / shell), "RAG_SYNC_WORKERS": "2"}
+        shell: {
+            "BASE_DIR": str(root),
+            "DB_PATH": str(tmp_path / shell),
+            "CACHE_DIR": str(tmp_path / "cache"),
+            "RAG_SYNC_WORKERS": "2",
+        }
         for shell in ("cli", "mcp")
     }
 
