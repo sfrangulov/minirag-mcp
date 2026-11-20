@@ -723,7 +723,10 @@ Rollback for this task: copy both backups back, then run the bootout and bootstr
 > with one subfolder per project, local-only material moved there (no move journal: the indexes
 > are rebuilt anyway, owner 2026-11-20) — and each project index then reads BOTH its cloud project
 > folder and its local project subfolder (a project without a cloud folder reads its local one
-> only). The full checklist is bd minirag-mcp-g7q.13.2.
+> only). The full checklist is bd minirag-mcp-g7q.13.2. Names: hyphens only, the main client's
+> project indexes carry the client prefix. Right after the restructuring the owner's mirroring
+> script must not run again: bd minirag-mcp-g7q.13.4 removes it from the owner's notes-vault
+> instructions at once and deletes it a few days after v2 is confirmed.
 
 **Files (outside the repository):** `$CONSTRAINTS_V2` (new) and `$MINIRAG_CONFIG` (new).
 
