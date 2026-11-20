@@ -288,8 +288,9 @@ def create_app(
         scope no indexed document is under — `notice` says which.
 
         `embeddingBackend` says what embedded the query: "endpoint",
-        "in-process", or "in-process (endpoint unreachable)". `warnings`,
-        present only when there is something to say, explains the last:
+        "in-process", "in-process (endpoint unreachable)", or "in-process
+        (endpoint timed out)" when this query alone was. `warnings`,
+        present only when there is something to say, explains the last two:
         the results are the same, only slower to come.
 
         Results are in reranked order when a reranker is configured:

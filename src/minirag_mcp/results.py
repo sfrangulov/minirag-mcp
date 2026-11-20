@@ -499,9 +499,12 @@ def run_query(
     scopes = tuple(scopes)
     label_filter, labeler = _parse_filter(store, labels, date_from, date_to, label_source)
     recorder = _Recorder(reranker) if reranker is not None else None
+    # Per call: another query may share the embedder meanwhile.
+    embed = getattr(embedder, "embed_query_noted", None)
+    vector, embed_note = embed(query) if embed else (embedder.embed_query(query), None)
     results = store.search(
         query,
-        embedder.embed_query(query),
+        vector,
         top_k=min(top_k, MAX_TOP_K),
         hybrid_weight=config.hybrid_weight,
         document_weight=config.document_weight,
@@ -513,15 +516,18 @@ def run_query(
         reranker=recorder,
         rerank_top=config.rerank_top,
     )
+    # Read after the query was embedded: that embedding is what may have fallen back.
+    backend = getattr(embedder, "backend", "in-process")
     payload = {
         "results": [result_dict(r) for r in results],
         "sources": aggregate_sources(results, config.roots),
         "parents": parent_map(results),
-        # Read after the query was embedded: that embedding is what may have fallen back.
-        "embeddingBackend": getattr(embedder, "backend", "in-process"),
+        "embeddingBackend": "in-process (endpoint timed out)" if embed_note else backend,
         "reranked": any(r.rerank_score is not None for r in results),
     }
     notes = embedder_notes(embedder)
+    if embed_note:
+        notes.append(embed_note)
     if recorder is not None and recorder.error:
         notes.append(f"Reranking was skipped ({recorder.error}); results are in first-stage order.")
     if notes:

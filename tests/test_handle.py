@@ -843,6 +843,47 @@ def test_an_index_is_available_again_once_its_endpoint_is_back(
     run_query(h.get().store, h.get().embedder, h.config, "budgets")
 
 
+def test_a_read_checks_a_slow_endpoint_for_the_query_timeout_only(
+    fake_llama, tmp_path, tokenizer_file, stub_text_embedding, monkeypatch
+):
+    """A check that timed out is made again before the endpoint's next use, so a read
+    neither waits the endpoint's own timeout nor sends embeddings in-process. A write
+    still waits that timeout."""
+    _served(tmp_path, fake_llama).ingest_pipeline().ingest_data("Budgets.", source="s")
+    monkeypatch.setattr(handle_mod, "QUERY_TIMEOUT", 0.2)
+    h = _served(tmp_path, fake_llama)
+    fake_llama.delay = 1.0
+    started = time.monotonic()
+    embedder = h.get().embedder
+    assert time.monotonic() - started < 0.8
+    assert embedder.warning is None and embedder.backend == "endpoint"
+    started = time.monotonic()
+    h.ingest_pipeline()
+    assert time.monotonic() - started >= 0.9
+    assert embedder.warning is None
+
+
+def test_a_known_mismatch_stays_known_when_a_read_cannot_check_in_time(
+    fake_llama, tmp_path, tokenizer_file, stub_text_embedding, monkeypatch
+):
+    h = _served(tmp_path, fake_llama)
+    h.ingest_pipeline().ingest_data("Budgets.", source="s")
+    embedder = h.get().embedder
+    fake_llama.vector_salt = "bge-m3"
+    with pytest.raises(IndexUnavailableError, match=E5_LARGE):
+        h.ingest_pipeline()
+    fake_llama.vector_salt = ""
+    monkeypatch.setattr(handle_mod, "QUERY_TIMEOUT", 0.2)
+    fake_llama.delay = 1.0
+    started = time.monotonic()
+    with pytest.raises(IndexUnavailableError, match=E5_LARGE):
+        h.get()
+    assert time.monotonic() - started < 0.8
+    assert embedder.warning is None
+    fake_llama.delay = 0.0
+    assert h.get().embedder is embedder and embedder.probe_error is None
+
+
 def test_a_rebuild_by_another_process_makes_the_index_syncing(tmp_path, fake_embedder):
     h = handle(tmp_path, fake_embedder)
     h.get()

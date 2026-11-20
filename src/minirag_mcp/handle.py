@@ -25,6 +25,7 @@ from pathlib import Path
 from minirag_mcp.chunker import SCHEME_VERSION
 from minirag_mcp.config import Config
 from minirag_mcp.embedder import (
+    QUERY_TIMEOUT,
     Embedder,
     EmbedderUnavailableError,
     ProbeMismatchError,
@@ -330,7 +331,7 @@ class IndexHandle:
                 if self._current is current:
                     self._current = self._reopen(current, {})
                 current = self._current
-        self._refuse_mismatch(current.index.embedder)
+        self._refuse_mismatch(current.index.embedder, timeout=QUERY_TIMEOUT)
         return current
 
     def _reopen(self, current: _Opened | None, keep: Mapping[EmbeddingScheme, object]) -> _Opened:
@@ -357,13 +358,14 @@ class IndexHandle:
         return opened
 
     @staticmethod
-    def _refuse_mismatch(embedder, *, now: bool = False) -> None:
+    def _refuse_mismatch(embedder, *, now: bool = False, timeout: float | None = None) -> None:
         """An endpoint that stopped serving the index's model keeps the index unavailable
-        until a check passes again. `now` checks it even when no mismatch is known."""
+        until a check passes again. `now` checks it even when no mismatch is known; a check
+        that outlasts `timeout` passes nothing."""
         if not now and embedder.probe_error is None:
             return
         try:
-            embedder.verify()
+            embedder.verify(timeout=timeout)
         except EmbedderUnavailableError:
             pass
         if embedder.probe_error is not None:
@@ -422,7 +424,7 @@ class IndexHandle:
     def _verify_at_open(embedder) -> None:
         """An endpoint serving another model than the index records is unavailable at open."""
         try:
-            embedder.verify()
+            embedder.verify(timeout=QUERY_TIMEOUT)
         except ProbeMismatchError as e:
             raise IndexUnavailableError(str(e)) from e
 

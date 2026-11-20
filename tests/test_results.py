@@ -24,10 +24,12 @@ from pathlib import Path
 
 import pytest
 
+import minirag_mcp.embedder as embedder_mod
 from conftest import FakeEmbedder, FakeModelFactory
 from label_helpers import L, record
 from minirag_mcp.config import Config
-from minirag_mcp.endpoints import Endpoint, RerankEndpoint
+from minirag_mcp.embedder import E5_LARGE, Embedder
+from minirag_mcp.endpoints import EmbeddingEndpoint, Endpoint, RerankEndpoint
 from minirag_mcp.labels import LabelerSource
 from minirag_mcp.results import (
     QueryError,
@@ -381,6 +383,28 @@ def test_a_query_reads_the_backend_after_embedding(tmp_path, root, store, fake_e
     payload = run_query(store, FallsBack(), make_config(root, tmp_path), "budget review")
     assert payload["embeddingBackend"] == "in-process (endpoint unreachable)"
     assert payload["warnings"] == ["W"]
+
+
+def test_only_the_reply_to_a_query_embedded_in_process_says_so(
+    tmp_path, root, fake_llama, stub_text_embedding, tokenizer_file, monkeypatch
+):
+    """Per reply, not from the shared embedder: another query may run meanwhile."""
+    monkeypatch.setattr(embedder_mod, "QUERY_TIMEOUT", 0.2)
+    fake_llama.dim = 1024
+    url = fake_llama.url("/v1/embeddings")
+    embedder = Embedder(E5_LARGE, tmp_path, endpoint=EmbeddingEndpoint(Endpoint(url, "e5")))
+    store = Store(tmp_path / "db", dim=1024)
+    index(store, embedder, root, "a.md", {})
+    config = make_config(root, tmp_path)
+    fake_llama.delay = 1.0
+    slow = run_query(store, embedder, config, "budget review")
+    fake_llama.delay = 0.0
+    fast = run_query(store, embedder, config, "budget review")
+    assert slow["embeddingBackend"] == "in-process (endpoint timed out)"
+    [note] = slow["warnings"]
+    assert url in note and "in-process" in note
+    assert slow["results"] and slow["results"][0]["source"] == fast["results"][0]["source"]
+    assert fast["embeddingBackend"] == "endpoint" and "warnings" not in fast
 
 
 def test_an_embedder_without_backend_flags_reads_as_in_process(tmp_path, root, store):

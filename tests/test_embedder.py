@@ -3,6 +3,7 @@ import math
 import pickle
 import re
 import threading
+import time
 from importlib.resources import files
 
 import pytest
@@ -649,19 +650,130 @@ def test_a_mismatch_of_the_fallback_is_forgotten_once_the_endpoint_serves_again(
     emb.embed_documents(["beta"])
 
 
-def test_a_hung_endpoint_holds_a_query_for_the_query_timeout_only(
+def test_a_document_batch_waits_the_endpoints_own_timeout_then_falls_back(
     tmp_path, fake_llama, stub_text_embedding, tokenizer_file, monkeypatch
 ):
-    """A document batch may take long; a query waits seconds, then falls back."""
-    monkeypatch.setattr(embedder_mod, "QUERY_TIMEOUT", 0.2, raising=False)
+    """A document batch may take long, so QUERY_TIMEOUT does not hold it; past the
+    endpoint's own timeout it falls back like any other failure."""
+    monkeypatch.setattr(embedder_mod, "QUERY_TIMEOUT", 0.2)
     fake_llama.delay = 1.0
-    emb = e5(tmp_path, fake_llama)
+    patient = e5(tmp_path, fake_llama)
+    patient.embed_documents(["alpha"])
+    assert patient.backend == "endpoint"
+    endpoint = EmbeddingEndpoint(Endpoint(fake_llama.url("/v1/embeddings"), "e5", timeout=0.2))
+    impatient = Embedder(E5_LARGE, tmp_path, endpoint=endpoint)
     with pytest.warns(RuntimeWarning, match="unreachable"):
+        impatient.embed_documents(["alpha"])
+    assert impatient.backend == "in-process (endpoint unreachable)"
+    assert stub_text_embedding.batches == [["passage: alpha"]]
+
+
+def test_a_query_the_endpoint_answers_too_slowly_leaves_it_to_the_documents(
+    tmp_path, fake_llama, stub_text_embedding, tokenizer_file, monkeypatch
+):
+    """One embedder serves queries and a running sync's batches alike: a query that waited
+    out QUERY_TIMEOUT must not send the sync to the in-process model."""
+    monkeypatch.setattr(embedder_mod, "QUERY_TIMEOUT", 0.2)
+    emb = e5(tmp_path, fake_llama)
+    fake_llama.delay = 1.0
+    emb.embed_query("beta")
+    fake_llama.delay = 0.0
+    emb.embed_documents(["alpha"])
+    emb.embed_query("gamma")
+    assert inputs(fake_llama) == [["query: beta"], ["passage: alpha"], ["query: gamma"]]
+    assert stub_text_embedding.batches == [["query: beta"]]
+    assert emb.warning is None and emb.backend == "endpoint"
+
+
+def test_a_probe_check_too_slow_for_a_query_leaves_the_endpoint_to_the_documents(
+    tmp_path, fake_llama, stub_text_embedding, tokenizer_file, monkeypatch
+):
+    monkeypatch.setattr(embedder_mod, "QUERY_TIMEOUT", 0.2)
+    emb = armed(tmp_path, fake_llama)
+    fake_llama.delay = 1.0
+    emb.embed_query("beta")
+    fake_llama.delay = 0.0
+    emb.embed_documents(["alpha"])
+    probe = ["passage: " + PROBE_TEXT]
+    assert inputs(fake_llama) == [probe, probe, ["passage: alpha"]]
+    assert stub_text_embedding.batches == [probe, ["query: beta"]]
+    assert emb.warning is None and emb.backend == "endpoint" and emb.probe_error is None
+
+
+def test_a_query_to_an_endpoint_that_is_down_still_falls_back(
+    tmp_path, dead_url, stub_text_embedding, tokenizer_file
+):
+    """Only slowness is the query's own: an endpoint that refuses is down for the
+    documents too."""
+    emb = dead(tmp_path, dead_url)
+    with pytest.warns(RuntimeWarning, match="unreachable"):
+        _, note = emb.embed_query_noted("beta")
+    assert note is None and emb.backend == "in-process (endpoint unreachable)"
+
+
+def test_only_the_query_embedded_in_process_carries_a_note(
+    tmp_path, fake_llama, stub_text_embedding, tokenizer_file, monkeypatch
+):
+    monkeypatch.setattr(embedder_mod, "QUERY_TIMEOUT", 0.2)
+    emb = e5(tmp_path, fake_llama)
+    fake_llama.delay = 1.0
+    slow, note = emb.embed_query_noted("beta")
+    fake_llama.delay = 0.0
+    fast, none = emb.embed_query_noted("beta")
+    assert none is None and emb.embed_query("beta") == fast
+    assert slow == pytest.approx(fast)
+    assert fake_llama.url("/v1/embeddings") in note and "within 0.2 s" in note
+    assert "in-process" in note and E5_LARGE in note and "stays in use" in note
+
+
+def test_without_a_fallback_a_query_too_slow_for_the_endpoint_is_an_error(
+    tmp_path, fake_llama, stub_text_embedding, tokenizer_file, monkeypatch
+):
+    monkeypatch.setattr(embedder_mod, "QUERY_TIMEOUT", 0.2)
+    emb = e5(tmp_path, fake_llama, allow_fallback=False)
+    fake_llama.delay = 1.0
+    with pytest.raises(EndpointError) as raised:
         emb.embed_query("beta")
-    assert emb.backend == "in-process (endpoint unreachable)"
-    documents = e5(tmp_path, fake_llama)
-    documents.embed_documents(["alpha"])
-    assert documents.backend == "endpoint"
+    assert raised.value.timed_out and stub_text_embedding.model_names == []
+
+
+def test_a_slow_query_that_cannot_run_in_process_does_not_call_the_endpoint_unreachable(
+    tmp_path, fake_llama, tokenizer_file, monkeypatch
+):
+    real = embedder_mod.TextEmbedding
+
+    class Unloadable:
+        list_supported_models = staticmethod(real.list_supported_models)
+
+        def __init__(self, *args, **kwargs):
+            raise ValueError(f"Could not load model {E5_LARGE} from any source.")
+
+    monkeypatch.setattr(embedder_mod, "TextEmbedding", Unloadable)
+    monkeypatch.setattr(embedder_mod, "QUERY_TIMEOUT", 0.2)
+    emb = e5(tmp_path, fake_llama)
+    fake_llama.delay = 1.0
+    with pytest.raises(EmbedderUnavailableError) as raised:
+        emb.embed_query("alpha")
+    message = str(raised.value)
+    assert "did not answer within 0.2 s" in message and "unreachable" not in message
+    assert "from any source" in message and emb.warning is None
+
+
+def test_a_check_given_a_timeout_waits_that_long_and_leaves_a_slow_endpoint_in_use(
+    tmp_path, fake_llama, stub_text_embedding, tokenizer_file
+):
+    """It proves nothing either way, so the endpoint is checked again before its next use."""
+    emb = armed(tmp_path, fake_llama)
+    fake_llama.delay = 1.0
+    started = time.monotonic()
+    emb.verify(timeout=0.2)
+    assert time.monotonic() - started < 0.8
+    assert emb.warning is None and emb.backend == "endpoint"
+    fake_llama.delay = 0.0
+    emb.embed_documents(["alpha"])
+    probe = ["passage: " + PROBE_TEXT]
+    assert inputs(fake_llama) == [probe, probe, ["passage: alpha"]]
+    assert stub_text_embedding.model_names == []
 
 
 def _shipped() -> dict[str, list[float]]:

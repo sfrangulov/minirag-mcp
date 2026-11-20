@@ -35,8 +35,8 @@ QUERY_PREFIX = "query: "
 # Also how long a passing check of the endpoint stands: a router restarted with its preset
 # pointing at another model of the same width answers without ever failing.
 ENDPOINT_RETRY_SECONDS = 60.0
-# A query waits this long for the endpoint, then falls back; a document batch waits the
-# endpoint's own timeout.
+# A query waits this long for the endpoint, then is embedded in-process alone; a document
+# batch waits the endpoint's own timeout.
 QUERY_TIMEOUT = 10.0
 
 
@@ -130,9 +130,10 @@ class Embedder:
 
     Both backends see the same text: the model's prefixes, and for the endpoint a cut to
     the window where fastembed would truncate. An unreachable endpoint falls back to the
-    in-process model, loudly, and is tried again every ENDPOINT_RETRY_SECONDS. With a
-    probe expected, each backend is checked before its first embedding, and the endpoint
-    again once ENDPOINT_RETRY_SECONDS have passed since its last check.
+    in-process model, loudly, and is tried again every ENDPOINT_RETRY_SECONDS; a query it
+    does not answer within QUERY_TIMEOUT is embedded in-process alone. With a probe
+    expected, each backend is checked before its first embedding, and the endpoint again
+    once ENDPOINT_RETRY_SECONDS have passed since its last check.
     """
 
     # What a pickled copy carries. A loaded model, the tokenizers, the locks, the HTTP
@@ -240,7 +241,7 @@ class Embedder:
 
     def probe_vector(self) -> list[float]:
         """PROBE_TEXT embedded as a document, prefix included, by the live backend."""
-        return self._embed([self._probe_text()], query=False, check=False)[0]
+        return self._embed([self._probe_text()], query=False, check=False)[0][0]
 
     def reference_error(self, vector: Sequence[float]) -> str | None:
         """Why `vector`, this embedder's live probe, is not the model's reference probe;
@@ -261,15 +262,18 @@ class Embedder:
     def has_reference(self) -> bool:
         return self.model_name in REFERENCE_PROBES
 
-    def verify(self) -> None:
+    def verify(self, *, timeout: float | None = None) -> None:
         """Check a configured, reachable endpoint against the expected probe now. An
         unreachable one falls back as an embed would, and the fallback checks itself; the
-        model is never loaded."""
+        model is never loaded. A check that outlasts `timeout` changes nothing, so the
+        endpoint is checked again before its next use."""
         if self.endpoint is None or self._expected is None or not self._endpoint_due():
             return
         try:
-            self._check_endpoint()
+            self._check_endpoint(timeout)
         except EndpointError as e:
+            if timeout is not None and e.timed_out:
+                return
             if self.allow_fallback:
                 self._fall_back(e)
 
@@ -453,15 +457,24 @@ class Embedder:
             return []
         if self.prefixes == "e5":
             texts = [PASSAGE_PREFIX + t for t in texts]
-        return self._embed(list(texts), query=False)
+        return self._embed(list(texts), query=False)[0]
 
     def embed_query(self, text: str) -> list[float]:
+        return self.embed_query_noted(text)[0]
+
+    def embed_query_noted(self, text: str) -> tuple[list[float], str | None]:
+        """The query's vector, and a note when the endpoint did not answer within
+        QUERY_TIMEOUT, so that this query alone was embedded in-process."""
         if self.prefixes == "e5":
             text = QUERY_PREFIX + text
-        return self._embed([text], query=True)[0]
+        [vector], note = self._embed([text], query=True)
+        return vector, note
 
-    def _embed(self, texts: list[str], *, query: bool, check: bool = True) -> list[list[float]]:
+    def _embed(
+        self, texts: list[str], *, query: bool, check: bool = True
+    ) -> tuple[list[list[float]], str | None]:
         check = check and self._expected is not None
+        note = None
         if self.endpoint is not None and self._endpoint_due():
             fitted = [self._fit_window(t) for t in texts]
             timeout = QUERY_TIMEOUT if query else None
@@ -472,25 +485,36 @@ class Embedder:
             except EndpointError as e:
                 if not self.allow_fallback:
                     raise
-                self._fall_back(e)
+                # This embedder also serves a sync's document batches, and a router busy
+                # with them answers a query late: a slow query must not move them in-process.
+                if query and e.timed_out:
+                    note = (
+                        f"The embedding endpoint {self.endpoint.endpoint.url} did not answer "
+                        f"within {QUERY_TIMEOUT:g} s, so this query was embedded in-process "
+                        f"with {self.model_name}, the same model: same vectors, slower. The "
+                        "endpoint stays in use."
+                    )
+                else:
+                    self._fall_back(e)
             else:
                 self._check_width(vectors)
                 with self._state_lock:
                     self._warning = None
-                return vectors
+                return vectors, None
         try:
             model = self._load()
         except EmbedderUnavailableError as e:
             if self.endpoint is None:
                 raise
+            failed = f"did not answer within {QUERY_TIMEOUT:g} s" if note else "is unreachable"
             raise EmbedderUnavailableError(
-                f"The embedding endpoint {self.endpoint.endpoint.url} is unreachable, so "
+                f"The embedding endpoint {self.endpoint.endpoint.url} {failed}, so "
                 f"{self.model_name} was to run in-process, and that failed too. {e}"
             ) from e
         if check and not self._checked("in-process"):
             self._check_local(model)
         raw = model.query_embed(texts) if query else model.embed(texts)
-        return [_unit([float(x) for x in v]) for v in raw]
+        return [_unit([float(x) for x in v]) for v in raw], note
 
     def _endpoint_due(self) -> bool:
         with self._state_lock:

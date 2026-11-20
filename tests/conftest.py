@@ -95,7 +95,7 @@ class FakeEmbedder:
     def expect_probe(self, probe: Sequence[float]) -> None:
         self.expected_probe = tuple(probe)
 
-    def verify(self) -> None:
+    def verify(self, *, timeout: float | None = None) -> None:
         pass
 
     def reference_error(self, vector: Sequence[float]) -> str | None:

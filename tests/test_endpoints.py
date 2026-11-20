@@ -45,8 +45,9 @@ def test_no_texts_make_no_request(fake_llama):
 
 
 def test_an_unreachable_endpoint_names_the_url(dead_url):
-    with pytest.raises(EndpointError, match=re.escape(dead_url)):
+    with pytest.raises(EndpointError, match=re.escape(dead_url)) as raised:
         EmbeddingEndpoint(Endpoint(dead_url + "/v1/embeddings", "e5")).embed(["a"])
+    assert raised.value.timed_out is False
 
 
 def test_an_http_error_carries_status_and_body(fake_llama):
@@ -120,8 +121,9 @@ def test_a_silent_endpoint_times_out_naming_the_url():
         silent.bind(("127.0.0.1", 0))
         silent.listen(1)
         url = f"http://127.0.0.1:{silent.getsockname()[1]}/v1/embeddings"
-        with pytest.raises(EndpointError, match=re.escape(url)):
+        with pytest.raises(EndpointError, match=re.escape(url)) as raised:
             EmbeddingEndpoint(Endpoint(url, "e5", timeout=0.3)).embed(["a"])
+    assert raised.value.timed_out is True
 
 
 def test_an_embeddings_reply_without_data_is_an_endpoint_error(fake_llama):
