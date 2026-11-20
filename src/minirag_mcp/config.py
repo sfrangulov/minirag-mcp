@@ -11,6 +11,7 @@ import platformdirs
 
 from minirag_mcp.embedder import E5_LARGE, MODEL_WINDOWS, default_budget, model_window
 from minirag_mcp.endpoints import Endpoint, EndpointError, read_api_key
+from minirag_mcp.ocr import DEFAULT_LANGUAGES, tesseract_languages
 
 DEFAULT_MODEL = E5_LARGE
 DEFAULT_DOCUMENT_WEIGHT = 0.5
@@ -63,7 +64,7 @@ class Config:
     max_distance: float | None
     max_files: int | None
     allow_private_urls: bool
-    ocr_lang: str = "eslav"
+    ocr_lang: str = DEFAULT_LANGUAGES
     ocr_min_chars_per_page: int = 25
     fts_language: str = DEFAULT_FTS_LANGUAGE
     document_weight: float = DEFAULT_DOCUMENT_WEIGHT
@@ -201,9 +202,10 @@ def load_config(
     max_files_raw = env.get("RAG_MAX_FILES")
     max_files = _int(env, "RAG_MAX_FILES", 1, 1) if max_files_raw is not None else None
 
-    ocr_lang = env.get("RAG_OCR_LANG", "eslav").strip()
-    if not ocr_lang:
-        raise ConfigError("RAG_OCR_LANG must be a non-empty language code, e.g. 'eslav'")
+    try:
+        ocr_lang = tesseract_languages(env.get("RAG_OCR_LANG", DEFAULT_LANGUAGES))
+    except ValueError as e:
+        raise ConfigError(f"RAG_OCR_LANG: {e}") from e
 
     fts_raw = env.get("RAG_FTS_LANGUAGE", DEFAULT_FTS_LANGUAGE).strip()
     fts_language = next((lang for lang in FTS_LANGUAGES if lang.lower() == fts_raw.lower()), None)

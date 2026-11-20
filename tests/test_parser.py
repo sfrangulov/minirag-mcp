@@ -389,7 +389,7 @@ def test_parse_file_image_routes_through_ocr(tmp_path, monkeypatch):
     img.write_bytes(b"png bytes irrelevant, ocr is faked")
     doc = parser.parse_file(img, load_config({}, cwd=tmp_path))
     assert doc.markdown == "recognized scan text"
-    assert doc.ocr_engine == "rapidocr"
+    assert doc.ocr_engine == "tesseract"
     assert doc.title == "Договор поставки 2026"
 
 
@@ -474,7 +474,7 @@ def test_pdf_scanned_pages_get_ocr(tmp_path, monkeypatch):
         ocr, "ocr_pdf", lambda path, config, pages: {i: f"OCR PAGE {i}" for i in pages}
     )
     doc = parser.parse_file(_pdf(tmp_path, [LONG, "", ""]), load_config({}, cwd=tmp_path))
-    assert doc.ocr_engine == "rapidocr"
+    assert doc.ocr_engine == "tesseract"
     # Recognized text follows the whole converted document, and the OCR'd pages keep
     # their order among themselves.
     body = doc.markdown
@@ -494,7 +494,7 @@ def test_pdf_ocr_text_is_appended_after_the_converted_document(tmp_path, monkeyp
         ocr, "ocr_pdf", lambda path, config, pages: {i: f"OCR PAGE {i}" for i in pages}
     )
     doc = parser.parse_file(_pdf(tmp_path, ["", LONG]), load_config({}, cwd=tmp_path))
-    assert doc.ocr_engine == "rapidocr"
+    assert doc.ocr_engine == "tesseract"
     body = doc.markdown
     assert body.index("long enough") < body.index("OCR PAGE 0")
 
@@ -511,7 +511,7 @@ def test_pdf_page_with_a_short_text_layer_still_goes_to_ocr(tmp_path, monkeypatc
         ocr, "ocr_pdf", lambda path, config, pages: {i: f"OCR PAGE {i}" for i in pages}
     )
     doc = parser.parse_file(_pdf(tmp_path, [LONG, SHORT]), load_config({}, cwd=tmp_path))
-    assert doc.ocr_engine == "rapidocr"
+    assert doc.ocr_engine == "tesseract"
     assert "OCR PAGE 1" in doc.markdown and "OCR PAGE 0" not in doc.markdown
 
 
@@ -598,7 +598,7 @@ def test_pdf_without_config_behaves_as_before(tmp_path):
 
 def test_pdf_fully_scanned_ocr_returns_nothing_raises(tmp_path, monkeypatch):
     """The blank-page guard: OCR ran over every page and still found nothing, which
-    must be a loud failure rather than an empty document tagged ocr_engine=rapidocr."""
+    must be a loud failure rather than an empty document tagged ocr_engine=tesseract."""
     from minirag_mcp import ocr
     from minirag_mcp.config import load_config
     from minirag_mcp.ingest import parser
@@ -611,7 +611,7 @@ def test_pdf_fully_scanned_ocr_returns_nothing_raises(tmp_path, monkeypatch):
 
 def test_pdf_mixed_ocr_returns_nothing_keeps_text_page(tmp_path, monkeypatch):
     """OCR adding nothing must not erase a text page that already carried content,
-    and must not claim ocr_engine=rapidocr for a result OCR did not contribute to."""
+    and must not claim ocr_engine=tesseract for a result OCR did not contribute to."""
     from minirag_mcp import ocr
     from minirag_mcp.config import load_config
     from minirag_mcp.ingest import parser

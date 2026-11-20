@@ -1,8 +1,7 @@
 """Optional OCR engine (the [ocr] extra): scanned PDFs and images -> text.
 
-The only module that touches rapidocr / pypdfium2 / rapid_orientation, and all
-three are imported lazily inside functions: the core package must import and
-run without the extra installed.
+The only module that touches tesserocr / pypdfium2, and both are imported lazily
+inside functions: the core package must import and run without the extra installed.
 """
 
 from __future__ import annotations
@@ -12,7 +11,8 @@ import importlib.util
 import logging
 import os
 import tempfile
-from collections.abc import Sequence
+import threading
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -21,11 +21,15 @@ from pdfminer.high_level import extract_pages
 from pdfminer.layout import LTTextContainer
 
 if TYPE_CHECKING:
+    from PIL import Image
+    from tesserocr import PyTessBaseAPI
+
     from minirag_mcp.config import Config
 
 logger = logging.getLogger(__name__)
 
-ENGINE_RAPIDOCR = "rapidocr"
+ENGINE_TESSERACT = "tesseract"
+DPI = 300
 
 INSTALL_HINT = (
     "install the OCR extra: uv tool install 'minirag-mcp[ocr]' (or pip install 'minirag-mcp[ocr]')"
@@ -37,7 +41,7 @@ class OcrError(Exception):
 
 
 def available() -> bool:
-    return all(importlib.util.find_spec(mod) is not None for mod in ("rapidocr", "pypdfium2"))
+    return all(importlib.util.find_spec(mod) is not None for mod in ("tesserocr", "pypdfium2"))
 
 
 def pdf_page_texts(path: Path) -> list[str]:
@@ -49,47 +53,10 @@ def pdf_page_texts(path: Path) -> list[str]:
     return texts
 
 
-_engines: dict[tuple[str, str], object] = {}
-# pypdfium2 scale for 300 dpi; recognition crops keep this resolution because
-# the engine params below raise its silent 2000 px input cap.
-_RENDER_SCALE = 300 / 72
-
-
-def assemble_lines(boxes: list, txts: list, source: Path | str) -> str:
-    """Reading order for flat OCR line boxes: rows by y-overlap, then x.
-
-    RapidOCR returns detection quads in image order, not reading order. Two
-    boxes share a row when their vertical centers sit within half the median
-    box height of each other — a threshold that tolerates slight skew without
-    merging adjacent lines.
-
-    `source` is carried only to name the file if the engine breaks its own
-    contract and hands back one list longer than the other.
-    """
-    if not txts:
-        return ""
-    try:
-        pairs = list(zip(boxes, txts, strict=True))
-    except ValueError as e:
-        raise OcrError(
-            f"OCR of {source} returned {len(boxes)} box(es) for {len(txts)} text(s)"
-        ) from e
-    items = []
-    for box, txt in pairs:
-        ys = [pt[1] for pt in box]
-        xs = [pt[0] for pt in box]
-        items.append(((min(ys) + max(ys)) / 2, min(xs), max(ys) - min(ys), txt))
-    items.sort()
-    heights = sorted(h for _, _, h, _ in items)
-    row_tol = max(heights[len(heights) // 2] / 2, 1.0)
-    rows: list[list[tuple[float, str]]] = []
-    row_y = None
-    for cy, x, _, txt in items:
-        if row_y is None or cy - row_y > row_tol:
-            rows.append([])
-            row_y = cy
-        rows[-1].append((x, txt))
-    return "\n".join(" ".join(t for _, t in sorted(row)) for row in rows)
+# A handle holds its language models (tens of MB each); one per language set and data
+# directory, each with the lock its callers share.
+_engines: dict[tuple[str, str], tuple[PyTessBaseAPI, threading.Lock]] = {}
+_engines_lock = threading.Lock()
 
 
 def _require_available() -> None:
@@ -108,110 +75,48 @@ def _import_error_as_ocr_error(e: ImportError) -> OcrError:
     )
 
 
-def _engine(config: Config):
-    """One cached RapidOCR per (lang, cache_dir); models download on first use."""
-    key = (config.ocr_lang, str(config.cache_dir))
-    engine = _engines.get(key)
-    if engine is None:
+def _engine(config: Config) -> tuple[PyTessBaseAPI, threading.Lock]:
+    """The cached Tesseract handle for `config.ocr_lang`; its data downloads on first use."""
+    key = (config.ocr_lang, str(tessdata_dir(config.cache_dir)))
+    with _engines_lock:
+        if key not in _engines:
+            try:
+                import tesserocr
+            except ImportError as e:
+                raise _import_error_as_ocr_error(e) from e
+
+            data = ensure_tessdata(config.cache_dir, config.ocr_lang)
+            try:
+                api = tesserocr.PyTessBaseAPI(
+                    path=str(data), lang=config.ocr_lang, psm=tesserocr.PSM.AUTO_OSD
+                )
+            except Exception as e:
+                raise OcrError(f"OCR engine failed to initialize: {e}") from e
+            _engines[key] = (api, threading.Lock())
+        return _engines[key]
+
+
+def _recognize(image: Image.Image, config: Config, path: Path, *, dpi: int | None) -> str:
+    """The page's text in Tesseract's own reading order: block by block, so the columns
+    of a two-column page stay apart. `dpi` None lets Tesseract estimate it."""
+    api, lock = _engine(config)
+    # The handle is not thread-safe, and SetImage resets the source resolution, so the
+    # three calls only ever run together. Never call DetectOrientationScript on this
+    # handle: on one initialised without `osd` as its language it aborts the process
+    # (std::out_of_range, observed 2026-11-19); AUTO_OSD orients the page instead.
+    with lock:
         try:
-            from rapidocr import LangRec, ModelType, OCRVersion, RapidOCR
-        except ImportError as e:
-            raise _import_error_as_ocr_error(e) from e
-
-        try:
-            lang = LangRec(config.ocr_lang)
-        except ValueError as e:
-            valid = ", ".join(m.value for m in LangRec)
-            raise OcrError(
-                f"RAG_OCR_LANG={config.ocr_lang!r} is not a rapidocr language; one of: {valid}"
-            ) from e
-        try:
-            engine = RapidOCR(
-                params={
-                    "Global.model_root_dir": str(config.cache_dir / "ocr"),
-                    # Raised from the default 2000: recognition crops are cut
-                    # from this image, and 300-dpi pages must not be resampled.
-                    "Global.max_side_len": 4000,
-                    # Detection alone runs on a bounded copy — without this it
-                    # would process the full 300-dpi bitmap at ~3x the cost.
-                    "Det.limit_type": "max",
-                    "Det.limit_side_len": 1600,
-                    "Rec.ocr_version": OCRVersion.PPOCRV5,
-                    "Rec.lang_type": lang,
-                    "Rec.model_type": ModelType.MOBILE,
-                }
-            )
-        except Exception as e:  # model download / init failure must be loud
-            raise OcrError(f"OCR engine failed to initialize: {e}") from e
-        _engines[key] = engine
-    return engine
-
-
-def _orient(img, path: Path):
-    """Rotate a sideways/upside-down page upright, when the classifier says so.
-
-    rapid-orientation returns only a label ('0'/'90'/'180'/'270'), no
-    confidence, so the only gate is a non-zero label. Optional: skipped
-    silently when the package is missing (it ships with the extra).
-
-    `path` is carried only to name the file in a failure.
-    """
-    if importlib.util.find_spec("rapid_orientation") is None:
-        return img
-    try:
-        import numpy as np
-    except ImportError as e:
-        raise _import_error_as_ocr_error(e) from e
-
-    engine = _orientation_engine()
-    try:
-        label, _elapse = engine(img)
-    except Exception as e:
-        raise OcrError(f"orientation detection failed on {path}: {e}") from e
-    try:
-        quarter_turns = int(label) // 90
-    except (TypeError, ValueError) as e:
-        raise OcrError(
-            f"the orientation classifier returned {label!r}, not an angle, for {path}"
-        ) from e
-    if quarter_turns:
-        # np.rot90 is counterclockwise; the slow rotation test pins this sign.
-        img = np.rot90(img, k=quarter_turns).copy()
-    return img
-
-
-_orientation: list[object] = []
-
-
-def _orientation_engine():
-    if not _orientation:
-        try:
-            from rapid_orientation import RapidOrientation
-        except ImportError as e:
-            raise _import_error_as_ocr_error(e) from e
-
-        try:
-            _orientation.append(RapidOrientation())
-        except Exception as e:  # model download / init failure must be loud
-            raise OcrError(
-                f"the OCR orientation model failed to initialize: {e}; {INSTALL_HINT}"
-            ) from e
-    return _orientation[0]
-
-
-def _recognize(img, config: Config, path: Path) -> str:
-    engine = _engine(config)
-    try:
-        result = engine(img)
-    except Exception as e:
-        raise OcrError(f"OCR engine failed on {path}: {e}") from e
-    if result.txts is None:
-        return ""
-    return assemble_lines(list(result.boxes), list(result.txts), path)
+            api.SetImage(image)
+            if dpi is not None:
+                api.SetSourceResolution(dpi)
+            text = api.GetUTF8Text()
+        except Exception as e:
+            raise OcrError(f"OCR engine failed on {path}: {e}") from e
+    return text.strip()
 
 
 def ocr_pdf(path: Path, config: Config, pages: Sequence[int]) -> dict[int, str]:
-    """OCR the given zero-based pages of a PDF, rendered at 300 dpi."""
+    """OCR the given zero-based pages of a PDF, rendered at `DPI`."""
     _require_available()
     try:
         import pypdfium2 as pdfium
@@ -232,10 +137,10 @@ def ocr_pdf(path: Path, config: Config, pages: Sequence[int]) -> dict[int, str]:
                 # opening the same file is a second parser and can count differently.
                 raise OcrError(f"{path} has no page {index} to render for OCR: {e}") from e
             try:
-                bitmap = page.render(scale=_RENDER_SCALE).to_numpy()
+                image = page.render(scale=DPI / 72).to_pil()
             except Exception as e:
                 raise OcrError(f"could not render page {index} of {path} for OCR: {e}") from e
-            out[index] = _recognize(_orient(bitmap, path), config, path)
+            out[index] = _recognize(image, config, path, dpi=DPI)
             logger.info("ocr: %s page %d -> %d chars", path, index, len(out[index]))
     finally:
         doc.close()
@@ -244,31 +149,59 @@ def ocr_pdf(path: Path, config: Config, pages: Sequence[int]) -> dict[int, str]:
 
 def ocr_image(path: Path, config: Config) -> str:
     _require_available()
+    texts = []
+    frames = 0
+    for frame, dpi in _decoded_frames(path):
+        frames += 1
+        if text := _recognize(frame, config, path, dpi=dpi):
+            texts.append(text)
+    logger.info("ocr: %s -> %d frame(s)", path, frames)
+    return "\n\n".join(texts)
+
+
+def _decoded_frames(path: Path) -> Iterator[tuple[Image.Image, int | None]]:
+    """Every frame of an image file, decoded, with the dpi it records.
+
+    Every frame, not the first: multi-page TIFF is ordinary scanner and fax output, and
+    a 20-page scan would otherwise index as page 1 and report success.
+    """
     try:
-        import cv2
-        import numpy as np
+        from PIL import Image, ImageSequence
     except ImportError as e:
         raise _import_error_as_ocr_error(e) from e
 
-    # np.fromfile + imdecodemulti instead of cv2.imread / cv2.imreadmulti: the imread
-    # family cannot open non-ASCII paths on Windows, and this corpus's filenames are
-    # Russian. imdecodemulti over imdecode because imdecode returns the first frame
-    # only, and multi-page TIFF is ordinary scanner and fax output here — a 20-page
-    # scan would index as page 1 and report success.
     try:
-        data = np.fromfile(str(path), dtype=np.uint8)
-        ok, frames = cv2.imdecodemulti(data, cv2.IMREAD_COLOR)
+        with Image.open(path) as image:
+            for frame in ImageSequence.Iterator(image):
+                yield _on_white(frame), _recorded_dpi(frame)
     except Exception as e:
-        # Reading and decoding share one guard because both must leave this module as
-        # OcrError; the message covers both because an OSError from the read (missing
-        # file, no permission) is not a statement about the image's encoding. cv2
-        # reports a corrupt file either way: `ok=False` for some, its own exception
-        # type for others.
+        # Opening reads only the header; the pixels decode in `_on_white`. Both, and the
+        # read itself (missing file, no permission), must leave this module as OcrError.
         raise OcrError(f"could not read or decode image {path}: {e}") from e
-    if not ok or not frames:
-        raise OcrError(f"could not decode image {path}")
-    logger.info("ocr: %s -> %d frame(s)", path, len(frames))
-    return "\n\n".join(text for f in frames if (text := _recognize(_orient(f, path), config, path)))
+
+
+def _on_white(frame: Image.Image) -> Image.Image:
+    from PIL import Image
+
+    # A copy, even of a frame that needs no conversion: tesserocr hands Tesseract an
+    # image re-encoded in its own format, which recompresses a JPEG or WebP frame
+    # lossily. A copy has no format and goes as a lossless BMP.
+    if frame.mode in ("1", "L", "RGB"):
+        return frame.copy()
+    # Dropping the alpha channel of black text on a transparent background (an exported
+    # diagram, a screenshot) leaves a black page.
+    page = Image.new("RGBA", frame.size, (255, 255, 255, 255))
+    page.alpha_composite(frame.convert("RGBA"))
+    return page.convert("RGB")
+
+
+def _recorded_dpi(frame: Image.Image) -> int | None:
+    """The frame's own dpi, or None below Tesseract's credible minimum of 70."""
+    try:
+        dpi = round(float(frame.info["dpi"][0]))
+    except (KeyError, IndexError, TypeError, ValueError, OverflowError):
+        return None
+    return dpi if dpi >= 70 else None
 
 
 TESSDATA_COMMIT = "87416418657359cb625c412a48b6e1d6d41c29bd"  # tessdata_fast main, 2024-08-01

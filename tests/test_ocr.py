@@ -1,12 +1,18 @@
-"""OCR module tests. Fast tests never import rapidocr; slow ones need the extra."""
+"""OCR module tests. Fast tests run on a fake tesserocr; slow ones need the extra."""
 
 from __future__ import annotations
 
+import sys
+import threading
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from PIL import Image, ImageDraw, ImageFont
 
 from minirag_mcp import ocr
+from minirag_mcp.config import load_config
 from pdf_builder import build_pdf
 
 
@@ -20,6 +26,13 @@ def test_available_is_bool():
     assert isinstance(ocr.available(), bool)
 
 
+def test_available_needs_tesserocr(monkeypatch):
+    monkeypatch.setattr(
+        ocr.importlib.util, "find_spec", lambda name: None if name == "tesserocr" else object()
+    )
+    assert ocr.available() is False
+
+
 def test_pdf_page_texts_counts_text_and_blank_pages(tmp_path):
     p = _write(tmp_path, ["first page with plenty of text", "", "third page"])
     texts = ocr.pdf_page_texts(p)
@@ -29,38 +42,10 @@ def test_pdf_page_texts_counts_text_and_blank_pages(tmp_path):
     assert "third" in texts[2]
 
 
-def test_assemble_lines_reading_order():
-    # Three boxes: two on one visual line (given out of x-order), one below.
-    # Box format mirrors RapidOCR: 4 points, [x, y] each.
-    boxes = [
-        [[300, 10], [400, 10], [400, 30], [300, 30]],  # line 1, right
-        [[10, 12], [200, 12], [200, 32], [10, 32]],  # line 1, left
-        [[10, 100], [200, 100], [200, 120], [10, 120]],  # line 2
-    ]
-    txts = ["right", "left", "below"]
-    assert ocr.assemble_lines(boxes, txts, Path("/docs/scan.png")) == "left right\nbelow"
-
-
-def test_assemble_lines_empty():
-    assert ocr.assemble_lines([], [], Path("/docs/scan.png")) == ""
-
-
-def test_assemble_lines_mismatched_engine_output_raises_ocr_error():
-    """One box short of its text is an engine-contract violation, and `strict=True`
-    reports it as a bare ValueError with no file and no counts in it."""
-    boxes = [[[0, 0], [10, 0], [10, 10], [0, 10]]]
-    with pytest.raises(ocr.OcrError) as e:
-        ocr.assemble_lines(boxes, ["a", "b"], Path("/docs/scan.png"))
-    assert "scan.png" in str(e.value)
-    assert "1" in str(e.value) and "2" in str(e.value)
-
-
 def test_ocr_image_without_extra_raises_loudly(tmp_path, monkeypatch):
     monkeypatch.setattr(ocr, "available", lambda: False)
     img = tmp_path / "scan.png"
     img.write_bytes(b"not really a png")
-    from minirag_mcp.config import load_config
-
     cfg = load_config({}, cwd=tmp_path)
     with pytest.raises(ocr.OcrError, match=r"minirag-mcp\[ocr\]"):
         ocr.ocr_image(img, cfg)
@@ -83,11 +68,10 @@ def _break_import(monkeypatch, name: str) -> None:
     monkeypatch.setattr(builtins, "__import__", fake_import)
 
 
-def test_engine_broken_rapidocr_install_raises_ocr_error(tmp_path, monkeypatch):
+def test_engine_broken_tesserocr_install_raises_ocr_error(tmp_path, monkeypatch):
     monkeypatch.setattr(ocr, "available", lambda: True)
-    _break_import(monkeypatch, "rapidocr")
-    from minirag_mcp.config import load_config
-
+    monkeypatch.setattr(ocr, "_engines", {})
+    _break_import(monkeypatch, "tesserocr")
     cfg = load_config({}, cwd=tmp_path)
     with pytest.raises(ocr.OcrError, match=r"failed to import.*minirag-mcp\[ocr\]"):
         ocr._engine(cfg)
@@ -96,142 +80,278 @@ def test_engine_broken_rapidocr_install_raises_ocr_error(tmp_path, monkeypatch):
 def test_ocr_pdf_broken_pypdfium2_install_raises_ocr_error(tmp_path, monkeypatch):
     monkeypatch.setattr(ocr, "available", lambda: True)
     _break_import(monkeypatch, "pypdfium2")
-    from minirag_mcp.config import load_config
-
     cfg = load_config({}, cwd=tmp_path)
     with pytest.raises(ocr.OcrError, match=r"failed to import.*minirag-mcp\[ocr\]"):
         ocr.ocr_pdf(tmp_path / "missing.pdf", cfg, [0])
 
 
-def test_ocr_image_broken_cv2_install_raises_ocr_error(tmp_path, monkeypatch):
+def test_ocr_image_broken_pil_install_raises_ocr_error(tmp_path, monkeypatch):
     monkeypatch.setattr(ocr, "available", lambda: True)
-    _break_import(monkeypatch, "cv2")
-    from minirag_mcp.config import load_config
-
+    _break_import(monkeypatch, "PIL")
     cfg = load_config({}, cwd=tmp_path)
     with pytest.raises(ocr.OcrError, match=r"failed to import.*minirag-mcp\[ocr\]"):
         ocr.ocr_image(tmp_path / "missing.png", cfg)
 
 
-def test_orient_broken_numpy_install_raises_ocr_error(monkeypatch):
-    monkeypatch.setattr(ocr.importlib.util, "find_spec", lambda name: object())
-    monkeypatch.setattr(ocr, "_orientation", [])
-    _break_import(monkeypatch, "numpy")
-    with pytest.raises(ocr.OcrError, match=r"failed to import.*minirag-mcp\[ocr\]"):
-        ocr._orient(object(), Path("/docs/scan.png"))
+class _FakeTessApi:
+    """One PyTessBaseAPI handle: it holds the last image it was given, as the real one
+    does, so two callers interleaving on one handle would read each other's page."""
+
+    def __init__(self, tess: _FakeTesserocr):
+        self._tess = tess
+        self._image = None
+        self.calls: list[str] = []
+        self.resolutions: list[int] = []
+        self.images: list[Image.Image] = []
+
+    def SetImage(self, image):
+        self.calls.append("SetImage")
+        self.images.append(image)
+        # One flag for every handle, so a test cannot pass by two callers each
+        # getting a handle of their own.
+        if not self._tess.busy.acquire(blocking=False):
+            raise AssertionError("SetImage while another recognition is in progress")
+        time.sleep(self._tess.hold)
+        self._image = image
+
+    def SetSourceResolution(self, dpi):
+        self.calls.append("SetSourceResolution")
+        self.resolutions.append(dpi)
+
+    def GetUTF8Text(self):
+        self.calls.append("GetUTF8Text")
+        try:
+            return self._tess.reply(self._image)
+        finally:
+            self._tess.busy.release()
 
 
-def test_orient_broken_rapid_orientation_install_raises_ocr_error(monkeypatch):
-    monkeypatch.setattr(ocr.importlib.util, "find_spec", lambda name: object())
-    monkeypatch.setattr(ocr, "_orientation", [])
-    _break_import(monkeypatch, "rapid_orientation")
-    with pytest.raises(ocr.OcrError, match=r"failed to import.*minirag-mcp\[ocr\]"):
-        ocr._orient(object(), Path("/docs/scan.png"))
+class _FakeTesserocr:
+    """Just enough tesserocr to drive ocr.py without the extra installed."""
+
+    PSM = SimpleNamespace(AUTO_OSD=1)
+
+    def __init__(self):
+        self.created: list[dict] = []
+        self.apis: list[_FakeTessApi] = []
+        self.texts: list[str] = []
+        self.reply = lambda image: self.texts.pop(0)
+        self.init_error: Exception | None = None
+        self.init_delay = 0.0
+        self.hold = 0.0
+        self.busy = threading.Lock()
+
+    def PyTessBaseAPI(self, **kw):
+        self.created.append(kw)
+        time.sleep(self.init_delay)
+        if self.init_error is not None:
+            raise self.init_error
+        api = _FakeTessApi(self)
+        self.apis.append(api)
+        return api
+
+    @property
+    def api(self) -> _FakeTessApi:
+        assert len(self.apis) == 1, f"expected one engine, {len(self.apis)} were built"
+        return self.apis[0]
 
 
-class _FakeCv2:
-    """Just enough cv2 to run ocr_image's decode step without the extra installed.
-
-    Pins only that every decoded frame reaches the recognizer, in order. That the
-    decoder really returns every frame of a multi-page TIFF is the separate claim, and
-    only the slow test below — real cv2, real file — can make it.
-    """
-
-    IMREAD_COLOR = 1
-
-    def __init__(self, frames):
-        self._frames = frames
-
-    def imdecodemulti(self, buf, flags):
-        return bool(self._frames), list(self._frames)
+@pytest.fixture
+def fake_tess(monkeypatch, tmp_path):
+    fake = _FakeTesserocr()
+    monkeypatch.setitem(sys.modules, "tesserocr", fake)
+    monkeypatch.setattr(ocr, "available", lambda: True)
+    monkeypatch.setattr(ocr, "ensure_tessdata", lambda cache_dir, langs: tmp_path / "td")
+    monkeypatch.setattr(ocr, "_engines", {})
+    return fake
 
 
-def test_ocr_image_recognizes_every_frame_of_a_multi_page_image(tmp_path, monkeypatch):
+@pytest.fixture
+def cfg(tmp_path):
+    return load_config({}, cwd=tmp_path)
+
+
+def test_the_engine_reads_with_auto_osd_and_the_configured_languages(fake_tess, tmp_path):
+    ocr._engine(load_config({"RAG_OCR_LANG": "eslav"}, cwd=tmp_path))
+    assert fake_tess.created == [{"path": str(tmp_path / "td"), "lang": "rus+eng", "psm": 1}]
+
+
+def test_one_engine_per_language_set(fake_tess, tmp_path):
+    both = load_config({}, cwd=tmp_path)
+    assert ocr._engine(both) is ocr._engine(both)
+    ocr._engine(load_config({"RAG_OCR_LANG": "eng"}, cwd=tmp_path))
+    assert [kw["lang"] for kw in fake_tess.created] == ["rus+eng", "eng"]
+
+
+def test_two_first_uses_at_once_build_one_engine(fake_tess, cfg):
+    fake_tess.init_delay = 0.05
+    start = threading.Barrier(2)
+    engines = []
+
+    def build():
+        start.wait()
+        engines.append(ocr._engine(cfg))
+
+    threads = [threading.Thread(target=build) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(fake_tess.created) == 1
+    assert engines[0] is engines[1]
+
+
+def test_engine_init_failure_is_a_loud_ocr_error(fake_tess, cfg):
+    fake_tess.init_error = RuntimeError("Failed to init API, possibly an invalid tessdata path")
+    with pytest.raises(ocr.OcrError, match=r"failed to initialize.*invalid tessdata path"):
+        ocr._engine(cfg)
+
+
+def test_recognize_keeps_tesseracts_own_order(fake_tess, cfg, tmp_path):
+    fake_tess.texts = ["Left 1\nLeft 2\n\nRight 1\nRight 2\n"]
+    out = ocr._recognize(Image.new("L", (8, 8), 255), cfg, tmp_path / "p.png", dpi=None)
+    assert out == "Left 1\nLeft 2\n\nRight 1\nRight 2"
+
+
+def test_engine_failure_names_the_file(fake_tess, cfg, tmp_path):
+    def abort(image):
+        raise RuntimeError("tesseract aborted")
+
+    fake_tess.reply = abort
+    with pytest.raises(ocr.OcrError, match=r"scan\.png.*tesseract aborted"):
+        ocr._recognize(Image.new("L", (8, 8), 255), cfg, tmp_path / "scan.png", dpi=None)
+
+
+def test_two_recognitions_at_once_never_share_the_engine(fake_tess, cfg, tmp_path):
+    """An MCP `ingest_file` during an in-process sync: both reach the one cached
+    handle, which has no lock of its own."""
+    ocr._engine(cfg)
+    fake_tess.hold = 0.05
+    fake_tess.reply = lambda image: f"page {image.width}"
+    start = threading.Barrier(2)
+    results: dict[int, str] = {}
+    errors: list[BaseException] = []
+
+    def read(width: int) -> None:
+        start.wait()
+        try:
+            page = Image.new("L", (width, 8), 255)
+            results[width] = ocr._recognize(page, cfg, tmp_path / f"{width}.png", dpi=None)
+        except BaseException as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=read, args=(width,)) for width in (10, 20)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == []
+    assert results == {10: "page 10", 20: "page 20"}
+    assert len(fake_tess.created) == 1
+
+
+def test_every_frame_of_a_multi_page_tiff_is_read(fake_tess, cfg, tmp_path):
     """Multi-page TIFF is standard scanner and fax output. Reading frame 1 and calling
     the document done would index page 1 of a 20-page scan as the whole of it."""
-    import sys
-
-    from minirag_mcp.config import load_config
-
-    monkeypatch.setattr(ocr, "available", lambda: True)
-    monkeypatch.setitem(sys.modules, "cv2", _FakeCv2(["page-a", "page-b", "page-c"]))
-    monkeypatch.setattr(ocr, "_recognize", lambda img, config, path: f"text of {img}")
-    # Orientation is pinned by the slow rotation test; here it would only reject the
-    # stand-in frames, and only on a machine that happens to have the extra installed.
-    monkeypatch.setattr(ocr, "_orient", lambda img, path: img)
-    img = tmp_path / "fax.tiff"
-    img.write_bytes(b"pretend tiff bytes; the decoder is faked")
-    text = ocr.ocr_image(img, load_config({}, cwd=tmp_path))
-    assert text == "text of page-a\n\ntext of page-b\n\ntext of page-c"
+    frames = [Image.new("L", (width, 10), 255) for width in (100, 101, 102)]
+    tiff = tmp_path / "fax.tiff"
+    frames[0].save(tiff, save_all=True, append_images=frames[1:])
+    fake_tess.reply = lambda image: f"w{image.width}"
+    assert ocr.ocr_image(tiff, cfg) == "w100\n\nw101\n\nw102"
 
 
-def test_ocr_image_undecodable_bytes_still_raise(tmp_path, monkeypatch):
-    import sys
+def test_an_image_file_keeps_its_recorded_dpi(fake_tess, cfg, tmp_path):
+    fake_tess.reply = lambda image: "text"
+    with_dpi = tmp_path / "200dpi.png"
+    Image.new("L", (8, 8), 255).save(with_dpi, dpi=(200, 200))
+    ocr.ocr_image(with_dpi, cfg)
+    assert fake_tess.api.resolutions == [200]
 
-    from minirag_mcp.config import load_config
+    fake_tess.api.resolutions.clear()
+    without = tmp_path / "no-dpi.png"
+    Image.new("L", (8, 8), 255).save(without)
+    ocr.ocr_image(without, cfg)
+    assert fake_tess.api.resolutions == []
 
-    monkeypatch.setattr(ocr, "available", lambda: True)
-    monkeypatch.setitem(sys.modules, "cv2", _FakeCv2([]))
+
+def test_an_image_with_transparency_is_read_on_white(fake_tess, cfg, tmp_path):
+    """An exported diagram or a screenshot: black text on a transparent background
+    reads as a black page when the alpha channel is simply dropped."""
+    fake_tess.reply = lambda image: "text"
+    rgba = Image.new("RGBA", (20, 20), (0, 0, 0, 0))
+    rgba.putpixel((5, 5), (0, 0, 0, 255))
+    png = tmp_path / "diagram.png"
+    rgba.save(png)
+    palette = Image.new("P", (20, 20), 0)
+    palette.putpalette([0, 0, 0] * 256)
+    palette.putpixel((5, 5), 1)
+    gif = tmp_path / "diagram.gif"
+    palette.save(gif, transparency=0)
+
+    ocr.ocr_image(png, cfg)
+    ocr.ocr_image(gif, cfg)
+    for seen in fake_tess.api.images:
+        assert seen.mode == "RGB"
+        assert seen.getpixel((0, 0)) == (255, 255, 255)
+        assert seen.getpixel((5, 5)) == (0, 0, 0)
+
+
+def test_ocr_image_reads_a_non_ascii_path(fake_tess, cfg, tmp_path):
+    fake_tess.reply = lambda image: f"{image.width}x{image.height}"
+    img = tmp_path / "Скан договора.png"
+    Image.new("L", (30, 12), 255).save(img)
+    assert ocr.ocr_image(img, cfg) == "30x12"
+
+
+def test_a_jpeg_is_not_recompressed_on_its_way_to_tesseract(fake_tess, cfg, tmp_path):
+    """tesserocr serializes an image in the image's own format, so a frame still
+    carrying "JPEG" would be re-encoded lossily before it is read."""
+    fake_tess.reply = lambda image: "text"
+    photo = tmp_path / "photo.jpg"
+    Image.new("RGB", (16, 16), "white").save(photo)
+    ocr.ocr_image(photo, cfg)
+    assert [image.format for image in fake_tess.api.images] == [None]
+
+
+def test_ocr_image_undecodable_bytes_raise(fake_tess, cfg, tmp_path):
     img = tmp_path / "broken.png"
     img.write_bytes(b"not an image")
-    with pytest.raises(ocr.OcrError, match="could not decode"):
-        ocr.ocr_image(img, load_config({}, cwd=tmp_path))
+    with pytest.raises(ocr.OcrError, match=r"could not read or decode.*broken\.png"):
+        ocr.ocr_image(img, cfg)
 
 
-def test_ocr_image_unreadable_file_says_reading_failed(tmp_path, monkeypatch):
+def test_ocr_image_truncated_file_is_a_decode_error_not_an_engine_one(fake_tess, cfg, tmp_path):
+    """The header opens and the pixels do not: a cut-off scan is a damaged file."""
+    whole = tmp_path / "whole.png"
+    Image.effect_noise((200, 200), 64).save(whole)
+    img = tmp_path / "cut.png"
+    img.write_bytes(whole.read_bytes()[:2000])
+    with pytest.raises(ocr.OcrError, match=r"could not read or decode.*cut\.png"):
+        ocr.ocr_image(img, cfg)
+
+
+def test_ocr_image_unreadable_file_says_reading_failed(fake_tess, cfg, tmp_path):
     """Reading the bytes and decoding them share one guard, so a missing file or a
     permission error was reported as an image that could not be decoded."""
-    import sys
-
-    from minirag_mcp.config import load_config
-
-    monkeypatch.setattr(ocr, "available", lambda: True)
-    monkeypatch.setitem(sys.modules, "cv2", _FakeCv2(["page-a"]))
     with pytest.raises(ocr.OcrError, match=r"could not read.*gone\.png"):
-        ocr.ocr_image(tmp_path / "gone.png", load_config({}, cwd=tmp_path))
-
-
-class _CrashingCv2:
-    """A decoder that raises instead of returning `ok=False`. cv2 does both."""
-
-    IMREAD_COLOR = 1
-
-    def imdecodemulti(self, buf, flags):
-        raise ValueError("cv2 error: unsupported depth")
-
-
-def test_ocr_image_decoder_crash_raises_ocr_error(tmp_path, monkeypatch):
-    import sys
-
-    from minirag_mcp.config import load_config
-
-    monkeypatch.setattr(ocr, "available", lambda: True)
-    monkeypatch.setitem(sys.modules, "cv2", _CrashingCv2())
-    img = tmp_path / "corrupt.tiff"
-    img.write_bytes(b"truncated scanner output")
-    with pytest.raises(ocr.OcrError, match=r"corrupt\.tiff.*unsupported depth"):
-        ocr.ocr_image(img, load_config({}, cwd=tmp_path))
+        ocr.ocr_image(tmp_path / "gone.png", cfg)
 
 
 class _FakeBitmap:
-    def __init__(self, array):
-        self._array = array
-
-    def to_numpy(self):
-        return self._array
+    def to_pil(self):
+        return Image.new("RGB", (8, 8), "white")
 
 
 class _FakePage:
-    def __init__(self, error: Exception | None = None, bitmap=None):
+    def __init__(self, error: Exception | None = None):
         self._error = error
-        self._bitmap = bitmap
+        self.scales: list[float] = []
 
     def render(self, scale):
+        self.scales.append(scale)
         if self._error is not None:
             raise self._error
-        if self._bitmap is None:
-            raise AssertionError("this page was given neither an error nor a bitmap")
-        return _FakeBitmap(self._bitmap)
+        return _FakeBitmap()
 
 
 class _FakeDoc:
@@ -260,8 +380,6 @@ class _FakePdfium:
 
 
 def _install_pdfium(monkeypatch, fake: _FakePdfium) -> None:
-    import sys
-
     monkeypatch.setattr(ocr, "available", lambda: True)
     monkeypatch.setitem(sys.modules, "pypdfium2", fake)
 
@@ -272,206 +390,117 @@ def _pdf(tmp_path: Path, name: str) -> Path:
     return p
 
 
-def test_ocr_pdf_unopenable_file_raises_ocr_error(tmp_path, monkeypatch):
+def test_pdf_pages_render_at_300_dpi_and_say_so(fake_tess, monkeypatch, cfg, tmp_path):
+    page = _FakePage()
+    _install_pdfium(monkeypatch, _FakePdfium(doc=_FakeDoc([page])))
+    fake_tess.texts = ["page text"]
+    assert ocr.ocr_pdf(_pdf(tmp_path, "scan.pdf"), cfg, [0]) == {0: "page text"}
+    assert page.scales == [300 / 72] and fake_tess.api.resolutions == [300]
+    assert fake_tess.api.calls == ["SetImage", "SetSourceResolution", "GetUTF8Text"]
+
+
+def test_ocr_pdf_unopenable_file_raises_ocr_error(tmp_path, monkeypatch, cfg):
     """An encrypted or malformed PDF markitdown already handled: pypdfium2 raises its own
     exception type, which left the module unnamed, uncontextualised and not an OcrError."""
-    from minirag_mcp.config import load_config
-
     _install_pdfium(monkeypatch, _FakePdfium(open_error=RuntimeError("password required")))
     p = _pdf(tmp_path, "encrypted.pdf")
     with pytest.raises(ocr.OcrError, match=r"encrypted\.pdf.*password required"):
-        ocr.ocr_pdf(p, load_config({}, cwd=tmp_path), [0])
+        ocr.ocr_pdf(p, cfg, [0])
 
 
-def test_ocr_pdf_page_the_renderer_does_not_have_raises_ocr_error(tmp_path, monkeypatch):
+def test_ocr_pdf_page_the_renderer_does_not_have_raises_ocr_error(tmp_path, monkeypatch, cfg):
     """pdfminer counts the pages OCR routing asks for and pypdfium2 supplies them. When
     the two disagree on page count, `doc[index]` raised a bare IndexError."""
-    from minirag_mcp.config import load_config
-
     doc = _FakeDoc([_FakePage()])
     _install_pdfium(monkeypatch, _FakePdfium(doc=doc))
     p = _pdf(tmp_path, "short.pdf")
     with pytest.raises(ocr.OcrError, match=r"short\.pdf.*list index out of range"):
-        ocr.ocr_pdf(p, load_config({}, cwd=tmp_path), [3])
+        ocr.ocr_pdf(p, cfg, [3])
     assert doc.closed, "the document must still be closed when a page lookup fails"
 
 
-def test_ocr_pdf_orientation_failure_raises_ocr_error(tmp_path, monkeypatch):
-    """The same escape on the PDF path, which reaches `_orient` through the renderer."""
-    from minirag_mcp.config import load_config
-
-    cfg = load_config({}, cwd=tmp_path)
-    doc = _FakeDoc([_FakePage(bitmap="rendered page")])
-    _install_pdfium(monkeypatch, _FakePdfium(doc=doc))
-    _install_orientation(monkeypatch, _crashing_orientation)
-    p = _pdf(tmp_path, "tilted.pdf")
-    with pytest.raises(ocr.OcrError, match=r"tilted\.pdf.*orientation model download failed"):
-        ocr.ocr_pdf(p, cfg, [0])
-    assert doc.closed
-
-
-def test_ocr_pdf_unrenderable_page_raises_ocr_error(tmp_path, monkeypatch):
-    from minirag_mcp.config import load_config
-
+def test_ocr_pdf_unrenderable_page_raises_ocr_error(tmp_path, monkeypatch, cfg):
     doc = _FakeDoc([_FakePage(RuntimeError("bitmap allocation failed"))])
     _install_pdfium(monkeypatch, _FakePdfium(doc=doc))
     p = _pdf(tmp_path, "unrenderable.pdf")
     with pytest.raises(ocr.OcrError, match=r"unrenderable\.pdf.*bitmap allocation failed"):
-        ocr.ocr_pdf(p, load_config({}, cwd=tmp_path), [0])
+        ocr.ocr_pdf(p, cfg, [0])
     assert doc.closed
 
 
-class _CrashingOrientationModule:
-    """rapid_orientation whose model init fails — an offline first use, a bad cache."""
-
-    @staticmethod
-    def RapidOrientation():
-        raise RuntimeError("failed to download the orientation model")
+def _font(size: int = 44) -> ImageFont.FreeTypeFont:
+    return ImageFont.load_default(size=size)
 
 
-def _install_orientation(monkeypatch, engine) -> None:
-    """Make `_orient` believe the optional orientation package is installed.
-
-    find_spec gates the whole step: without the extra it returns None and `_orient`
-    hands the image straight back, so a fake engine would never be reached.
-    """
-    monkeypatch.setattr(ocr.importlib.util, "find_spec", lambda name: object())
-    monkeypatch.setattr(ocr, "_orientation", [engine])
-
-
-def _crashing_orientation(img):
-    raise RuntimeError("orientation model download failed")
-
-
-def test_orient_engine_init_failure_raises_ocr_error_with_the_install_hint(monkeypatch):
-    import sys
-
-    monkeypatch.setattr(ocr.importlib.util, "find_spec", lambda name: object())
-    monkeypatch.setattr(ocr, "_orientation", [])
-    monkeypatch.setitem(sys.modules, "rapid_orientation", _CrashingOrientationModule())
-    with pytest.raises(ocr.OcrError, match=r"orientation.*download.*minirag-mcp\[ocr\]"):
-        ocr._orient(object(), Path("/docs/scan.png"))
-
-
-def test_orient_unreadable_label_raises_ocr_error(monkeypatch):
-    """The classifier's contract is an angle in a string; anything else is an engine
-    fault, and `int()` reported it as a bare ValueError naming neither engine nor file."""
-    _install_orientation(monkeypatch, lambda img: ("sideways", 0.01))
-    with pytest.raises(ocr.OcrError, match=r"sideways.*scan\.png"):
-        ocr._orient(object(), Path("/docs/scan.png"))
-
-
-def test_ocr_image_orientation_failure_raises_ocr_error(tmp_path, monkeypatch):
-    """A failing orientation engine left the module as a raw RuntimeError, which
-    `parse_file` never converts: no file name, no install hint, no ParserError."""
-    import sys
-
-    from minirag_mcp.config import load_config
-
-    cfg = load_config({}, cwd=tmp_path)
-    monkeypatch.setattr(ocr, "available", lambda: True)
-    monkeypatch.setitem(sys.modules, "cv2", _FakeCv2(["page-a"]))
-    _install_orientation(monkeypatch, _crashing_orientation)
-    img = tmp_path / "tilted.png"
-    img.write_bytes(b"pretend png bytes; the decoder is faked")
-    with pytest.raises(ocr.OcrError, match=r"tilted\.png.*orientation model download failed"):
-        ocr.ocr_image(img, cfg)
-
-
-def test_recognize_engine_failure_names_the_file(tmp_path, monkeypatch):
-    from minirag_mcp.config import load_config
-
-    def crash(img):
-        raise RuntimeError("onnxruntime session failed")
-
-    monkeypatch.setattr(ocr, "_engine", lambda config: crash)
-    with pytest.raises(ocr.OcrError, match=r"scan\.png.*onnxruntime session failed"):
-        ocr._recognize(object(), load_config({}, cwd=tmp_path), tmp_path / "scan.png")
+def _page(lines: list[str], size: tuple[int, int], *, x: int = 150) -> Image.Image:
+    page = Image.new("L", size, 255)
+    draw = ImageDraw.Draw(page)
+    for i, line in enumerate(lines):
+        draw.text((x, 150 + 100 * i), line, fill=0, font=_font())
+    return page
 
 
 @pytest.mark.slow
+@pytest.mark.skipif(not ocr.available(), reason="needs the [ocr] extra")
 def test_real_engine_reads_both_pages_of_a_two_frame_tiff(tmp_path):
-    """The claim the fake above cannot make: cv2 really hands back both frames of a
+    """The claim the fake above cannot make: Pillow really hands back both frames of a
     two-page TIFF written the way a scanner writes one, and both reach the index."""
-    pytest.importorskip("rapidocr")
-    import cv2
-    import numpy as np
-
-    from minirag_mcp.config import load_config
-
-    frames = []
-    for marker in ("FIRST PAGE 111", "SECOND PAGE 222"):
-        page = np.full((300, 1200, 3), 255, dtype=np.uint8)
-        for y in (80, 160, 240):
-            cv2.putText(page, marker, (30, y), cv2.FONT_HERSHEY_SIMPLEX, 1.6, 0, 3)
-        frames.append(page)
+    frames = [_page([marker] * 3, (1600, 500)) for marker in ("FIRST PAGE 111", "SECOND PAGE 222")]
     p = tmp_path / "scan.tiff"
-    assert cv2.imwritemulti(str(p), frames), "failed to write a two-frame TIFF"
+    frames[0].save(p, save_all=True, append_images=frames[1:], dpi=(300, 300))
     text = ocr.ocr_image(p, load_config({}, cwd=tmp_path))
     assert "111" in text and "222" in text
+    assert text.index("111") < text.index("222")
 
 
 @pytest.mark.slow
-def test_real_engine_reads_generated_cyrillic_page(tmp_path):
-    pytest.importorskip("rapidocr")
-    import cv2
-    import numpy as np
-
-    from minirag_mcp.config import load_config
-
-    img = np.full((200, 900, 3), 255, dtype=np.uint8)
-    # Latin marker text: cv2's built-in Hershey fonts cannot draw Cyrillic,
-    # and this test pins the pipeline, not the language model (the eslav
-    # model reads Latin too).
-    cv2.putText(img, "INVOICE 12345 TOTAL 999", (30, 120), cv2.FONT_HERSHEY_SIMPLEX, 2, 0, 4)
+@pytest.mark.skipif(not ocr.available(), reason="needs the [ocr] extra")
+def test_real_engine_reads_a_generated_page(tmp_path):
     p = tmp_path / "scan.png"
-    cv2.imwrite(str(p), img)
-    cfg = load_config({}, cwd=tmp_path)
-    text = ocr.ocr_image(p, cfg)
+    _page(["INVOICE 12345 TOTAL 999"], (1600, 400)).save(p, dpi=(300, 300))
+    text = ocr.ocr_image(p, load_config({}, cwd=tmp_path))
     assert "12345" in text and "999" in text
 
 
 @pytest.mark.slow
-def test_real_engine_fixes_rotated_page(tmp_path):
-    """Pins the np.rot90 sign in _orient: a 90-degree page must still read."""
-    pytest.importorskip("rapidocr")
-    pytest.importorskip("rapid_orientation")
-    import cv2
-    import numpy as np
-
-    from minirag_mcp.config import load_config
-
-    img = np.full((300, 1200, 3), 255, dtype=np.uint8)
-    for y in (80, 160, 240):
-        cv2.putText(img, "ROTATION CHECK 777", (30, y), cv2.FONT_HERSHEY_SIMPLEX, 1.6, 0, 3)
-    rotated = np.rot90(img, k=1)
-    p = tmp_path / "rot.png"
-    cv2.imwrite(str(p), rotated)
-    cfg = load_config({}, cwd=tmp_path)
-    assert "777" in ocr.ocr_image(p, cfg)
+@pytest.mark.skipif(not ocr.available(), reason="needs the [ocr] extra")
+@pytest.mark.parametrize("angle", [90, 180])
+def test_real_engine_reads_a_rotated_page(tmp_path, angle):
+    """Orientation is Tesseract's own OSD, which needs enough text to decide: a slip of
+    three short lines turned 180 degrees reads as noise."""
+    lines = [
+        f"The quick brown fox number {700 + i} jumps over the lazy dog again" for i in range(12)
+    ]
+    p = tmp_path / "rotated.png"
+    _page(lines, (2480, 1400)).rotate(angle, expand=True).save(p, dpi=(300, 300))
+    text = ocr.ocr_image(p, load_config({}, cwd=tmp_path))
+    assert "700" in text and "711" in text
 
 
 @pytest.mark.slow
+@pytest.mark.skipif(not ocr.available(), reason="needs the [ocr] extra")
 def test_real_engine_reads_rendered_pdf_page(tmp_path):
-    """Pins the pypdfium2 render -> _orient -> _recognize path in ocr_pdf.
-
-    The ocr_image tests above never touch pypdfium2, so a channel-order or
-    shape mismatch in PdfBitmap.to_numpy() would go uncaught without this.
-
-    The marker is repeated to span most of the page width: a single short
-    line on an otherwise blank 612x792pt page (rendered at 300 dpi, ~2550px
-    wide) falls under RapidOCR's default detection confidence threshold —
-    confirmed by direct engine probing, not a bug in this module's render
-    path (the identical pixels crop correctly when isolated). A wider line
-    is closer to a real scanned page's text density and detects reliably.
-    """
-    pytest.importorskip("rapidocr")
-    from minirag_mcp.config import load_config
-
+    """Pins the pypdfium2 render -> to_pil -> _recognize path in ocr_pdf, which the
+    image-file tests never touch."""
     p = _write(tmp_path, ["OCR PDF CHECK 555 " * 5])
-    cfg = load_config({}, cwd=tmp_path)
-    texts = ocr.ocr_pdf(p, cfg, [0])
+    texts = ocr.ocr_pdf(p, load_config({}, cwd=tmp_path), [0])
     assert "555" in texts[0]
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not ocr.available(), reason="needs the [ocr] extra")
+def test_real_engine_keeps_the_columns_of_a_two_column_page_apart(tmp_path):
+    page = Image.new("L", (2480, 1400), 255)
+    draw = ImageDraw.Draw(page)
+    for i in range(10):
+        y = 150 + 100 * i
+        draw.text((150, y), f"Left column line {100 + i} reads here", fill=0, font=_font())
+        draw.text((1340, y), f"Right side entry {500 + i} goes on", fill=0, font=_font())
+    p = tmp_path / "two-columns.png"
+    page.save(p, dpi=(300, 300))
+    text = ocr.ocr_image(p, load_config({}, cwd=tmp_path))
+    assert all(f"{100 + i}" in text and f"{500 + i}" in text for i in range(10))
+    assert text.index("109") < text.index("500")
 
 
 @pytest.mark.parametrize(

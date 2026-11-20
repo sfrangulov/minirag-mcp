@@ -208,7 +208,7 @@ async def test_list_files_reports_the_ocr_engine(app, monkeypatch):
         await c.call_tool("ingest_file", {"filePath": str(scan)})
         await c.call_tool("ingest_file", {"filePath": str(root / "auth.md")})
         by_source = {f["source"]: f for f in (await c.call_tool("list_files", {})).data["files"]}
-    assert by_source[str(scan)]["ocrEngine"] == "rapidocr"
+    assert by_source[str(scan)]["ocrEngine"] == "tesseract"
     assert by_source[str(root / "auth.md")]["ocrEngine"] == ""
 
 
@@ -374,7 +374,7 @@ async def test_status_names_the_ocr_engine_when_the_extra_is_installed(app, monk
     monkeypatch.setattr(ocr, "available", lambda: True)
     async with Client(mcp) as c:
         st = (await c.call_tool("status", {})).data
-    assert st["ocr"] == ocr.ENGINE_RAPIDOCR
+    assert st["ocr"] == ocr.ENGINE_TESSERACT
     assert "ocrHint" not in st
 
 

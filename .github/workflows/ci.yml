@@ -62,5 +62,6 @@ jobs:
         with:
           path: ${{ github.workspace }}/.model-cache
           key: fastembed-${{ runner.os }}-${{ hashFiles('src/minirag_mcp/config.py') }}
-      - run: uv sync
+      # The fast job stays without the extra; this is where the real Tesseract runs.
+      - run: uv sync --extra ocr
       - run: uv run pytest -q -m slow

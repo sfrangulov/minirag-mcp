@@ -150,7 +150,7 @@ def test_list_reports_the_ocr_engine_in_json_and_in_the_human_listing(corpus, ca
 
     run(["list", "--base-dir", str(corpus), "--json"])
     by_source = {f["source"]: f for f in json.loads(capsys.readouterr().out)["files"]}
-    assert by_source[str(scan)]["ocrEngine"] == "rapidocr"
+    assert by_source[str(scan)]["ocrEngine"] == "tesseract"
     assert by_source[str(corpus / "a.md")]["ocrEngine"] == ""
 
     run(["list", "--base-dir", str(corpus)])
@@ -159,7 +159,7 @@ def test_list_reports_the_ocr_engine_in_json_and_in_the_human_listing(corpus, ca
         for ln in capsys.readouterr().out.split("\n")
         if "] " in ln
     }
-    assert lines[str(scan)].endswith(" [ocr:rapidocr]")
+    assert lines[str(scan)].endswith(" [ocr:tesseract]")
     assert "[ocr:" not in lines[str(corpus / "a.md")]
 
 
@@ -500,7 +500,7 @@ def test_cli_status_names_the_ocr_engine_when_the_extra_is_installed(corpus, cap
     monkeypatch.setattr(ocr, "available", lambda: True)
     run(["status", "--base-dir", str(corpus), "--json"])
     payload = json.loads(capsys.readouterr().out)
-    assert payload["ocr"] == ocr.ENGINE_RAPIDOCR
+    assert payload["ocr"] == ocr.ENGINE_TESSERACT
     assert "ocrHint" not in payload
 
 

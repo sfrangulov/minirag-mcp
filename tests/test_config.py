@@ -126,13 +126,14 @@ def test_config_is_frozen(tmp_path):
 
 def test_ocr_defaults(tmp_path):
     cfg = load_config({}, cwd=tmp_path)
-    assert cfg.ocr_lang == "eslav"
+    assert cfg.ocr_lang == "rus+eng"
     assert cfg.ocr_min_chars_per_page == 25
 
 
-def test_ocr_lang_override(tmp_path):
-    cfg = load_config({"RAG_OCR_LANG": "cyrillic"}, cwd=tmp_path)
-    assert cfg.ocr_lang == "cyrillic"
+@pytest.mark.parametrize("value,expected", [("eslav", "rus+eng"), ("eng", "eng")])
+def test_ocr_lang_takes_tesseract_spelling_and_the_1x_names(tmp_path, value, expected):
+    cfg = load_config({"RAG_OCR_LANG": value}, cwd=tmp_path)
+    assert cfg.ocr_lang == expected
 
 
 def test_ocr_min_chars_zero_allowed_and_negative_rejected(tmp_path):
@@ -142,9 +143,10 @@ def test_ocr_min_chars_zero_allowed_and_negative_rejected(tmp_path):
         load_config({"RAG_OCR_MIN_CHARS_PER_PAGE": "-1"}, cwd=tmp_path)
 
 
-def test_ocr_lang_blank_rejected(tmp_path):
-    with pytest.raises(ConfigError):
-        load_config({"RAG_OCR_LANG": "  "}, cwd=tmp_path)
+@pytest.mark.parametrize("value", ["ch", "", "  "])
+def test_ocr_lang_outside_the_pinned_languages_is_rejected(tmp_path, value):
+    with pytest.raises(ConfigError, match=r"RAG_OCR_LANG.*rus.*eng"):
+        load_config({"RAG_OCR_LANG": value}, cwd=tmp_path)
 
 
 def test_the_budget_ceiling_is_the_models_window(tmp_path):

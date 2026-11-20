@@ -317,7 +317,7 @@ def ocr_status() -> dict:
     the index, so the server reports it alongside the fields that do not need one.
     """
     if ocr.available():
-        return {"ocr": ocr.ENGINE_RAPIDOCR}
+        return {"ocr": ocr.ENGINE_TESSERACT}
     return {
         "ocr": "unavailable",
         "ocrHint": f"scanned PDFs and images cannot be indexed; {ocr.INSTALL_HINT}",

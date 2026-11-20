@@ -90,10 +90,10 @@ def test_ingest_file_carries_ocr_engine(pipe, monkeypatch):
     result = p.ingest_file(img)
     assert result.chunk_count >= 2
     info = store.get_source(str(img))
-    assert info.ocr_engine == ocr.ENGINE_RAPIDOCR
+    assert info.ocr_engine == ocr.ENGINE_TESSERACT
     rows = store._table.search().where(f"source = '{img}'").limit(10_000).to_list()
     assert len(rows) == result.chunk_count
-    assert [r["ocr_engine"] for r in rows] == [ocr.ENGINE_RAPIDOCR] * len(rows)
+    assert [r["ocr_engine"] for r in rows] == [ocr.ENGINE_TESSERACT] * len(rows)
 
 
 def test_ingest_file_image_without_ocr_names_the_missing_extra(pipe, monkeypatch):

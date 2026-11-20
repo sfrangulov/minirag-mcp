@@ -493,7 +493,7 @@ def parse_file(path: Path, config: Config | None = None) -> ParsedDoc:
         # Not `_file_title`: it prefers an authored ATX heading to the filename, and a
         # recognized page has none — a `# ` line in OCR output is scanner noise.
         title = _stem_title(_strip_extension_suffix(path.stem))
-        return ParsedDoc(markdown=text, title=title, ocr_engine=ocr.ENGINE_RAPIDOCR)
+        return ParsedDoc(markdown=text, title=title, ocr_engine=ocr.ENGINE_TESSERACT)
     try:
         result = _convert_file(path)
     except Exception as e:  # markitdown may raise lib-specific errors too
@@ -576,7 +576,7 @@ def _pdf_with_ocr_fallback(
     if converted := markdown.strip():
         parts.insert(0, (converted, pages.stripped(markdown, starts)))
     merged, merged_starts = pages.joined(parts)
-    return merged, ocr.ENGINE_RAPIDOCR, merged_starts
+    return merged, ocr.ENGINE_TESSERACT, merged_starts
 
 
 def parse_html(html: str, title: str | None = None) -> ParsedDoc:

@@ -354,12 +354,17 @@ Hidden files and folders, Office lock files (`~$…`), `node_modules`,
 A scanned PDF is a picture of a page. `markitdown` finds no text in it, so the
 document reaches the index empty — which is to say it does not reach the index at
 all. The optional `[ocr]` extra reads those pages locally, on the CPU
-([RapidOCR](https://github.com/RapidAI/RapidOCR) on the same ONNX runtime the
-embedding model already uses), and turns standalone image files into documents.
+([Tesseract](https://github.com/tesseract-ocr/tesseract), through
+[tesserocr](https://github.com/sirfz/tesserocr)), and turns standalone image files
+into documents.
 
-It is an extra rather than a dependency because it adds roughly 160 MB of wheels
-that a corpus of Markdown and Office documents has no use for. Install it by
-asking for the extra instead of the bare package:
+It is an extra rather than a dependency because a corpus of Markdown and Office
+documents has no use for it, though it is small: about 9 MB installed on macOS,
+35 MB on Linux and 60 MB on Windows. The wheels bundle libtesseract 5.5.4 for
+macOS 15 or later, Linux and Windows; on an older macOS there is no wheel, so the
+install builds tesserocr from source, and that needs a system Tesseract first
+(`brew install tesseract`). Install it by asking for the extra instead of the bare
+package:
 
 ```bash
 uv tool install 'minirag-mcp[ocr]'
@@ -373,9 +378,11 @@ uvx --from 'minirag-mcp[ocr]' minirag-mcp
 
 As an argument list, that is `["--from", "minirag-mcp[ocr]", "minirag-mcp"]`.
 
-The recognition models are downloaded once, into `CACHE_DIR` next to the embedding
-model, and every recognition after that is offline. A download that fails is a
-loud per-file error, not an empty document.
+Tesseract's models for the `RAG_OCR_LANG` languages, plus `osd` for page
+orientation — 18.5 MB of `tessdata_fast` for the default `rus+eng` — are downloaded
+once, into `CACHE_DIR/ocr` next to the embedding model, pinned to one commit and
+checked against their sha256; every recognition after that is offline. A download
+that fails or does not match is a loud per-file error, not an empty document.
 
 What the extra changes:
 
@@ -387,15 +394,21 @@ What the extra changes:
   document rather than woven back into page order — that keeps the text pages'
   own tables and headings intact instead of flattening the whole file into raw
   per-page text the moment one page needs OCR.
+- **Text comes in Tesseract's own reading order**, block by block, so the two
+  columns of a two-column page — a bilingual contract, say — stay apart instead of
+  being interleaved line by line. A page scanned sideways or upside down is turned
+  upright by Tesseract's orientation detection, which needs a page's worth of text
+  to decide: a three-line slip upside down can still come out as noise.
 - **Image files become documents.** `.png` `.jpg` `.jpeg` `.tiff` `.tif` `.bmp`
   `.webp` join the scan whitelist, titled from the filename by the same rules as
   everything else. A multi-page TIFF — what a scanner or a fax gateway writes —
-  is read as all of its pages, not just the first. These extensions are
-  recognized **only when the extra is installed**: without it images are not
-  scanned at all, since most images under a documents folder are illustrations,
-  and their absence is silence rather than an error. Images already indexed are
-  kept rather than deleted when the extra is not there: `sync` counts them as
-  `unreadable` and names each one, and the listing gives them the state
+  is read as all of its pages, not just the first, and an image with transparency
+  — an exported diagram, a screenshot — is read as if printed on white. These
+  extensions are recognized **only when the extra is installed**: without it
+  images are not scanned at all, since most images under a documents folder are
+  illustrations, and their absence is silence rather than an error. Images already
+  indexed are kept rather than deleted when the extra is not there: `sync` counts
+  them as `unreadable` and names each one, and the listing gives them the state
   `unreadable` instead of dropping them.
 - **Without the extra, a scanned PDF fails loudly** — naming the install command
   — instead of being indexed as an empty document. `sync` counts it as one failed
@@ -403,21 +416,20 @@ What the extra changes:
   certificate, a title page) is kept as it is, exactly as before.
 
 How a document entered the index is visible in both shells: `list_files` reports
-an `ocrEngine` field per source (`"rapidocr"`, or `""` for text extracted
-normally), and `minirag-mcp list` prints `[ocr:rapidocr]` after the line for such
+an `ocrEngine` field per source (`"tesseract"`, or `""` for text extracted
+normally), and `minirag-mcp list` prints `[ocr:tesseract]` after the line for such
 a file.
 
 Whether this install can OCR at all is a `status` field in both shells: `ocr`
-names the engine (`"rapidocr"`) or reads `"unavailable"`, and when it is
+names the engine (`"tesseract"`) or reads `"unavailable"`, and when it is
 unavailable a second key, `ocrHint`, carries the install command.
 
-**OCR text is not authoritative over the source scan.** Measured on a real
-Russian scanned invoice against a checklist of 27 verbatim-searchable facts —
-names, tax ids, amounts, dates — this tier recovered 21. The six misses are
-recognition errors in low-contrast regions: `р`→`о` and `ц`→`и` confusions inside
-company names, Cyrillic `Б` read as Latin `6` or `E` inside codes, one dropped
-product name and one dropped total. Search over a scan finds the document; the
-document is what you read, and the scan is what settles a disputed figure.
+**OCR text is not authoritative over the source scan.** Measured on real scans
+against 83 hand-checked lines, Tesseract read all 83, with a character error rate
+of 0.001, where RapidOCR, the engine of 1.x, dropped 12 of them, one a contract sum.
+Tesseract's weakest page was a poor fax scan, where it recovered 81% of the words.
+Search over a scan finds the document; the document is what you read, and the scan
+is what settles a disputed figure.
 
 ## Document labels (optional)
 
@@ -1289,7 +1301,7 @@ merges with them.
 | `RAG_MAX_DISTANCE` | unset | See [Search Tuning](#search-tuning). |
 | `RAG_MAX_FILES` | unset | See [Search Tuning](#search-tuning). |
 | `RAG_FTS_LANGUAGE` | `English` | Stemmer for keyword (BM25) search: one of Arabic, Danish, Dutch, English, Finnish, French, German, Greek, Hungarian, Italian, Norwegian, Portuguese, Romanian, Russian, Spanish, Swedish, Tamil, Turkish (any case). The English stemmer leaves other alphabets untouched, so on a Russian corpus «договор» and «договорами» are different words; with `Russian` they are one, and English words stop being stemmed. Changing it rebuilds the keyword index the next time the index is opened, with no re-embedding (under a second for 165,000 chunks); `status` reports `ftsLanguage`, and `ftsWarning` if that rebuild could not be written. Two processes opening one index with different values rebuild it back and forth. On a 60-question test over 800 real Russian documents, `Russian` raised top-5 hits from 38 to 44. |
-| `RAG_OCR_LANG` | `eslav` | Recognition language for the `[ocr]` extra, as a `rapidocr` language id. The default is East Slavic because the stock `ch`/`en` model silently drops Cyrillic altogether, so a Cyrillic-capable model has to be the default rather than an opt-in. An unknown value is an error that names the valid ids. See [OCR](#ocr-for-scanned-documents). |
+| `RAG_OCR_LANG` | `rus+eng` | Recognition languages for the `[ocr]` extra, in Tesseract's spelling: `rus`, `eng`, or both joined by `+`. Only these are pinned and downloaded, so any other value is an error that names the accepted ones. The 1.x values still work: `eslav` means `rus+eng` and `en` means `eng`. See [OCR](#ocr-for-scanned-documents). |
 | `RAG_OCR_MIN_CHARS_PER_PAGE` | `25` | A PDF page whose text layer holds fewer characters than this is treated as a scan and sent to OCR. `0` disables the check, so no page is ever OCRed and a PDF is only ever taken as converted. See [OCR](#ocr-for-scanned-documents). |
 | `RAG_INSTRUCTIONS_APPEND` | unset | Extra text appended as a final paragraph to the instructions the server hands the client at connect time — for what the server can't know about your corpus, best phrased as a situation the model can recognise, e.g. `"When a question names a document code such as QP-7.2, search before answering"`. Appended, never merged, and it shares the same 2048-character client budget. See [Search by Default](#search-by-default). |
 | `ALLOW_PRIVATE_URLS` | unset (off) | Let `ingest_url` fetch hosts that resolve to loopback, link-local, private, reserved, or unspecified addresses. Off by default — see [Security and Operation](#security-and-operation). Accepts `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off`; anything else is a configuration error. |
