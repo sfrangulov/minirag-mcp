@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import functools
 import threading
 import uuid
 from collections.abc import Callable, Sequence
@@ -9,14 +11,27 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
-from minirag_mcp import ocr
-from minirag_mcp.config import Config
+from minirag_mcp import ocr, parallel
+from minirag_mcp.identity import RebuildInfo, acquire_sync_lock
 from minirag_mcp.ingest.ignore import IgnoredFileError, scope_excluded_by
 from minirag_mcp.ingest.pipeline import Pipeline
 from minirag_mcp.ingest.scanner import compute_diff, scan_roots
-from minirag_mcp.lock import SyncLock, sync_lock
 from minirag_mcp.scope import is_under
-from minirag_mcp.store import Store
+from minirag_mcp.store import IndexBusyError, Store
+
+# Endpoint failures in a row after which a parallel sync stops handing out files: every
+# file needs the endpoint, and each failure can have waited out its whole timeout.
+ENDPOINT_FAILURES_TO_STOP = 3
+
+# Told what a rebuild rebuilds and why when it starts, before its counts are known.
+OnRebuild = Callable[[RebuildInfo], None]
+# Told each progress line a sync reports, as the CLI prints them.
+OnEvent = Callable[[str], None]
+# One sync of the index, or of `scope` inside it: its counts, its per-file errors, and the
+# rebuild it made, if any. Run with the sync lock already held.
+SyncRun = Callable[
+    [Path | None, OnRebuild, OnEvent], tuple[dict[str, int], list[dict], RebuildInfo | None]
+]
 
 
 class SyncBusyError(Exception):
@@ -48,11 +63,21 @@ class SyncJob:
             "signed": 0,
             "ignored": 0,
             "unreadable": 0,
+            "largeTables": 0,
             "failed": 0,
         }
     )
     errors: list[dict] = field(default_factory=list)
     error: str | None = None
+    # Set when a rebuild starts, its counts None until the job has finished.
+    rebuild: RebuildInfo | None = None
+    # What the job waits for while it waits at the worker-pool gate of this process.
+    waiting: str | None = None
+
+    @property
+    def running(self) -> bool:
+        """Whether the job is pending or running."""
+        return self.state in ("pending", "running")
 
     def to_dict(self) -> dict:
         return {
@@ -63,33 +88,85 @@ class SyncJob:
             "counts": dict(self.counts),
             "errors": list(self.errors),
             "error": self.error,
+            "rebuild": self.rebuild.to_dict() if self.rebuild else None,
+            "waiting": self.waiting,
         }
 
 
-def run_sync(
+def _ingest_in_workers(
     pipeline: Pipeline,
     store: Store,
-    roots: Sequence[Path],
-    max_file_size: int,
-    scope: Path | None = None,
-    on_event: Callable[[str], None] | None = None,
-) -> tuple[dict[str, int], list[dict]]:
-    """Scan `roots`, diff against the store, ingest/delete accordingly.
+    paths: Sequence[Path],
+    workers: int,
+    indexed: set[str],
+    ingested: Callable[[str], None],
+    failed: Callable[[str, str], None],
+    emit: Callable[[str], None],
+) -> int:
+    """Prepare `paths` in `workers` processes and store them from this one, in batches,
+    labelled in the caller's labelling job. How many were never prepared because the
+    embedding endpoint stopped answering.
 
-    Holds the cross-process sync lock (see `minirag_mcp.lock`) for the whole
-    run and raises `SyncLockBusy` if another process is already syncing this
-    index. `SyncManager` does not come through here — it takes the same lock
-    itself, earlier, and calls `_run_sync_unlocked`.
-
-    `scope`, if given, is resolved to its canonical form (`Path.resolve()`)
-    before use, matching `Config.roots` (which are always resolved). Without
-    this, a non-canonical scope (e.g. an unresolved `/tmp` on macOS, where
-    the real path is `/private/tmp`) silently matches zero files: the diff
-    comes back empty, the job "succeeds" with all-zero counts, and no error
-    is ever raised.
+    `indexed` gains each source as it is stored, so that a later batch holding it again
+    replaces its chunks instead of appending a second copy.
     """
-    with sync_lock(store.db_path):
-        return _run_sync_unlocked(pipeline, store, roots, max_file_size, scope, on_event)
+    config = pipeline.config
+    # Once, before any worker starts: the batches are written with `replace_sources`, which
+    # this hook does not precede. On a fresh index it records the probe and arms the
+    # embedder, and each worker's copy of the embedder carries that.
+    if pipeline.before_store is not None:
+        pipeline.before_store()
+    if ocr.available():
+        # Fetched here so that the workers do not race each other to download it. Each file
+        # that needs it then fails with its own message.
+        with contextlib.suppress(ocr.OcrError):
+            ocr.ensure_tessdata(config.cache_dir, config.ocr_lang)
+    make = functools.partial(
+        parallel.worker_pipeline, config, pipeline.embedder, parallel.worker_threads(workers)
+    )
+    writer = parallel.BatchWriter(store, indexed=indexed)
+    # The sources added since the writer last reported: those a refused write drops.
+    held: list[str] = []
+
+    def write(call: Callable[..., list[parallel.Written]], *args) -> None:
+        try:
+            results = call(*args)
+        except IndexBusyError as e:
+            for source in held:
+                failed(source, str(e))
+            held.clear()
+            return
+        if results:
+            held.clear()
+        for source, error in results:
+            if error is None:
+                indexed.add(source)
+                ingested(source)
+            else:
+                failed(source, error)
+
+    read = in_a_row = not_read = 0
+    with contextlib.closing(
+        parallel.prepare_files(make, paths, workers=workers, on_event=emit)
+    ) as prepared:
+        for result in prepared:
+            read += 1
+            in_a_row = in_a_row + 1 if result.endpoint_failed else 0
+            if result.error is not None:
+                failed(str(result.path), result.error)
+                if in_a_row >= ENDPOINT_FAILURES_TO_STOP:
+                    not_read = len(paths) - read
+                    break
+                continue
+            try:
+                records, _ = pipeline.records(result.document)
+            except Exception as e:
+                failed(str(result.path), str(e))
+                continue
+            held.append(result.document.source)
+            write(writer.add, result.document.source, records)
+    write(writer.flush)
+    return not_read
 
 
 def _run_sync_unlocked(
@@ -99,10 +176,28 @@ def _run_sync_unlocked(
     max_file_size: int,
     scope: Path | None,
     on_event: Callable[[str], None] | None,
+    large_tables: list[Path] | None = None,
+    *,
+    exclude: Sequence[str],
+    exclude_source: str,
 ) -> tuple[dict[str, int], list[dict]]:
-    """The body of `run_sync`. The caller must already hold the sync lock."""
+    """Scan `roots`, diff against the store, ingest and delete accordingly. The caller holds
+    the sync lock (`acquire_sync_lock`) and has checked the index is not `rebuild pending`:
+    `IndexHandle.run_sync` and the rebuild do both.
+
+    When `large_tables` is given, it collects the tables left out for RAG_MAX_TABLE_ROWS.
+
+    `scope`, if given, is resolved to its canonical form before use, matching
+    `Config.roots` (which are always resolved). Without this, a non-canonical scope (an
+    unresolved `/tmp` on macOS, whose real path is `/private/tmp`) silently matches zero
+    files: the diff comes back empty and the job "succeeds" with all-zero counts.
+    """
     scope = scope.resolve() if scope is not None else None
-    if scope is not None and (by := scope_excluded_by(scope, roots)) is not None:
+    if (
+        scope is not None
+        and (by := scope_excluded_by(scope, roots, exclude, exclude_source=exclude_source))
+        is not None
+    ):
         # A silent no-op otherwise: every count zero, exit 0, nothing synced.
         raise IgnoredFileError(f"{scope} is excluded by {by}; nothing under it can be synced")
 
@@ -112,23 +207,28 @@ def _run_sync_unlocked(
 
     blind: list[tuple[Path, str | None]] = []
     ignored: list[Path] = []
-    entries = scan_roots(list(roots), blind=blind, ignored=ignored)
+    entries = scan_roots(list(roots), blind=blind, ignored=ignored, exclude=exclude)
+    listing = store.list_sources()
     diff = compute_diff(
         entries,
-        store.list_sources(),
+        listing,
         max_file_size=max_file_size,
         scope=scope,
         roots=roots,
         blind=blind,
         ignored=ignored,
         record_pages="pages" not in store.missing_columns,
+        max_table_rows=pipeline.config.max_table_rows,
     )
+    if large_tables is not None:
+        large_tables.extend(diff.large_tables)
     counts = {
         "scanned": len(diff.to_ingest)
         + len(diff.moved)
         + len(diff.unchanged)
         + len(diff.oversized)
-        + len(diff.kept_scans),
+        + len(diff.kept_scans)
+        + len(diff.large_tables),
         "ingested": 0,
         "skipped": len(diff.unchanged),
         "moved": 0,
@@ -137,6 +237,7 @@ def _run_sync_unlocked(
         "signed": 0,
         "ignored": sum(1 for p in ignored if scope is None or is_under(str(p), str(scope))),
         "unreadable": len(diff.unreadable) + len(diff.kept_scans),
+        "largeTables": len(diff.large_tables),
         "failed": 0,
     }
     errors: list[dict] = []
@@ -149,6 +250,17 @@ def _run_sync_unlocked(
     for path in diff.oversized:
         counts["failed"] += 1
         errors.append({"source": str(path), "error": f"exceeds MAX_FILE_SIZE ({max_file_size})"})
+
+    # Not failures: the limit is the owner's choice, made so that these stay out.
+    limit = pipeline.config.max_table_rows
+    for path in diff.large_tables:
+        errors.append(
+            {
+                "source": str(path),
+                "error": f"skipped: more than {limit} data rows exceeds RAG_MAX_TABLE_ROWS "
+                f"({limit})",
+            }
+        )
 
     # Not counted as failures: the run did everything it could, and an install that
     # deliberately omits the extra would otherwise exit 1 on every sync forever.
@@ -169,16 +281,22 @@ def _run_sync_unlocked(
             }
         )
 
+    def failed(source: str, error: str) -> None:
+        counts["failed"] += 1
+        errors.append({"source": source, "error": error})
+        emit(f"failed {source}: {error}")
+
+    def ingested(source: str) -> None:
+        counts["ingested"] += 1
+        emit(f"ingested {source}")
+
     def ingest(path: Path) -> bool:
         try:
-            pipeline.ingest_file(path, rules_checked=True)
+            pipeline.ingest_file(path, rules_checked=True, rows_checked=True)
         except Exception as e:  # per-file failures never abort the job
-            counts["failed"] += 1
-            errors.append({"source": str(path), "error": str(e)})
-            emit(f"failed {path}: {e}")
+            failed(str(path), str(e))
             return False
-        counts["ingested"] += 1
-        emit(f"ingested {path}")
+        ingested(str(path))
         return True
 
     # One labelling job for the whole run, so the model is loaded at most once and the
@@ -202,8 +320,30 @@ def _run_sync_unlocked(
                 counts["deleted"] += 1
                 emit(f"deleted {move.source}")
 
-        for path in diff.to_ingest:
-            ingest(path)
+        workers = parallel.worker_count(
+            pipeline.config.sync_workers,
+            len(diff.to_ingest),
+            default=parallel.default_workers(
+                parallel.physical_cores(),
+                parallel.total_memory(),
+                parallel.worker_footprint(pipeline.embedder),
+            ),
+        )
+        if workers == 1:
+            for path in diff.to_ingest:
+                ingest(path)
+        else:
+            indexed = {info.source for info in listing}
+            not_read = _ingest_in_workers(
+                pipeline, store, diff.to_ingest, workers, indexed, ingested, failed, emit
+            )
+            if not_read:
+                # Not one error per file: they were never read, and the next sync reads
+                # them, their hashes unchanged.
+                counts["failed"] += not_read
+                stopped = f"embedding: endpoint unreachable, {not_read} files not synced"
+                errors.append({"source": str(store.db_path), "error": stopped})
+                emit(stopped)
 
         for source in diff.to_delete:
             store.delete_source(source)
@@ -226,6 +366,10 @@ def _run_sync_unlocked(
     )
     counts["signed"] += signed
     errors.extend(sign_errors)
+    # Likewise for document rows, and before `update_indices`, which folds the rows it
+    # writes into the documents index.
+    _, document_errors = store.backfill_documents((str(scope),) if scope else (), on_event=on_event)
+    errors.extend(document_errors)
 
     # Also on a run that changed nothing: an index written before this existed is
     # brought up to date by its next sync.
@@ -238,17 +382,32 @@ def _run_sync_unlocked(
         taxonomy = str(pipeline.labels.path) if pipeline.labels else ""
         errors.extend({"source": taxonomy, "error": f"labels: {p}"} for p in report.problems)
 
+    # Not a failure: while the endpoint is unreachable, the in-process model embeds.
+    if warning := getattr(pipeline.embedder, "warning", None):
+        errors.append({"source": str(store.db_path), "error": f"embedding: {warning}"})
+
     return counts, errors
 
 
 class SyncManager:
-    def __init__(self, pipeline: Pipeline, store: Store, config: Config):
-        self._pipeline = pipeline
-        self._store = store
-        self._config = config
+    def __init__(self, db_path: Path, run: SyncRun):
+        """Runs `run` as one background job at a time, holding the sync lock of `db_path`."""
+        self._db_path = db_path
+        self._run = run
         self._lock = threading.Lock()
         self._job: SyncJob | None = None
         self._thread: threading.Thread | None = None
+
+    @property
+    def running(self) -> bool:
+        """Whether this manager's latest job is pending or running."""
+        job = self._job
+        return job is not None and job.running
+
+    @property
+    def latest_job(self) -> SyncJob | None:
+        """The latest job's record, finished or not; None before the first."""
+        return self._job
 
     def start(self, scope: Path | None = None) -> str:
         """Start a background sync, or raise if one is already running.
@@ -256,7 +415,6 @@ class SyncManager:
         `SyncBusyError` if this process is already running one, `SyncLockBusy`
         if a different process is.
         """
-        lock = SyncLock(self._store.db_path)
         with self._lock:
             # Order matters twice over. The in-process guard runs first, so a second
             # job started while this one is still non-terminal is rejected as
@@ -276,7 +434,7 @@ class SyncManager:
             # already doomed, and since only the latest job's record is kept, that
             # failure is easy to miss entirely. Here, contention is an immediate
             # error on sync_start — a ToolError the client can act on.
-            lock.acquire()
+            lock = acquire_sync_lock(self._db_path)
             job = SyncJob(job_id=uuid.uuid4().hex)
             self._job = job  # newer job replaces any finished record
 
@@ -303,22 +461,23 @@ class SyncManager:
             # reported failed rather than left reading 'running', which would hold
             # the in-process guard shut for the lifetime of the process.
             terminal = "failed"
+
+            def rebuilding(info: RebuildInfo) -> None:
+                job.rebuild = info
+
+            def reported(event: str) -> None:
+                job.waiting = event if event == parallel.POOL_WAIT else None
+
             try:
-                counts, errors = _run_sync_unlocked(
-                    self._pipeline,
-                    self._store,
-                    self._config.roots,
-                    self._config.max_file_size,
-                    scope,
-                    None,
-                )
+                counts, errors, rebuilt = self._run(scope, rebuilding, reported)
             except Exception as e:  # catastrophic failure (scan error, DB down, ...)
                 job.error = str(e)
             else:
-                job.counts, job.errors = counts, errors
+                job.counts, job.errors, job.rebuild = counts, errors, rebuilt
                 terminal = "succeeded"
             finally:
                 job.finished_at = _now()
+                job.waiting = None
                 try:
                     # Released on the worker thread, not the one that acquired it.
                     # flock belongs to the open file description, so the handoff is

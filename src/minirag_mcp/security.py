@@ -1,8 +1,9 @@
-"""Document-root containment and URL validation."""
+"""Document-root containment, URL validation and loopback host names."""
 
 from __future__ import annotations
 
 import ipaddress
+import re
 import socket
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -25,8 +26,44 @@ _BLOCKED_KINDS = (
 )
 
 
+# Matched as names, never parsed as addresses: how `ipaddress` reads `::ffff:127.0.0.1`
+# varies by patch release (see `_blocked_kind`), and a name list has no such edge.
+LOOPBACK_NAMES = ("127.0.0.1", "localhost", "::1")
+# What may follow a host: nothing, or a port.
+_PORT = re.compile(r"(?::[0-9]+)?")
+
+
+def host_name(value: str) -> str:
+    """The host of `value`, a host or a `Host` header, without its port or IPv6 brackets,
+    in lowercase; "" when anything but a port follows the host, so that no trailing text
+    can ride on a loopback name."""
+    name = value.strip().lower()
+    if name.startswith("["):
+        end = name.find("]")
+        if end < 0 or not _PORT.fullmatch(name, end + 1):
+            return ""
+        return name[1:end]
+    if name.count(":") == 1:
+        host, port = name.split(":")
+        return host if _PORT.fullmatch(f":{port}") else ""
+    return name
+
+
+def is_loopback_name(value: str) -> bool:
+    return host_name(value) in LOOPBACK_NAMES
+
+
 class SecurityError(Exception):
     pass
+
+
+class OutsideRootsError(SecurityError):
+    """A path outside every root it was checked against; `path` is where it resolves to."""
+
+    def __init__(self, message: str, *, requested: str, path: Path) -> None:
+        super().__init__(message)
+        self.requested = requested
+        self.path = path
 
 
 class URLResolutionError(Exception):
@@ -43,15 +80,24 @@ def resolve_in_roots(
             "query_documents or list_files result is one."
         )
     real = p.resolve()  # follows symlinks; the check below sees the true target
-    real_roots = [root.resolve() for root in roots]
-    for real_root in real_roots:
-        if real == real_root or real_root in real.parents:
-            return real
-    raise SecurityError(
+    if within(real, roots):
+        return real
+    raise OutsideRootsError(
         f"Path outside configured document roots: {path_str}. This server reads only "
-        f"under {', '.join(map(str, real_roots))}; a file elsewhere is out of reach until "
-        "its folder is added to BASE_DIRS and the server restarted."
+        f"under {', '.join(str(root.resolve()) for root in roots)}; a file elsewhere is out "
+        "of reach until its folder is added to BASE_DIRS and the server restarted.",
+        requested=path_str,
+        path=real,
     )
+
+
+def within(real: Path, roots: Sequence[Path]) -> bool:
+    """Whether the resolved path `real` is one of `roots` or under one."""
+    for root in roots:
+        real_root = root.resolve()
+        if real == real_root or real_root in real.parents:
+            return True
+    return False
 
 
 def _blocked_kind(ip: IPAddress) -> str | None:

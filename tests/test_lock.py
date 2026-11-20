@@ -13,6 +13,7 @@ deadlock. Spawn costs a fresh interpreter per child and buys determinism.
 from __future__ import annotations
 
 import errno
+import fcntl
 import json
 import multiprocessing
 import os
@@ -24,7 +25,7 @@ import pytest
 
 from minirag_mcp.config import load_config
 from minirag_mcp.ingest.pipeline import Pipeline
-from minirag_mcp.lock import LOCK_FILENAME, SyncLock, SyncLockBusy, sync_lock
+from minirag_mcp.lock import LOCK_FILENAME, SyncLock, SyncLockBusy, is_held, sync_lock
 from minirag_mcp.store import Store
 
 MP = multiprocessing.get_context("spawn")
@@ -77,7 +78,7 @@ class Holder:
 
 @pytest.fixture
 def db_path(tmp_path) -> Path:
-    p = tmp_path / ".minirag" / "lancedb"
+    p = tmp_path / ".minirag" / "v2"
     p.mkdir(parents=True)
     return p
 
@@ -117,9 +118,21 @@ def test_second_process_is_refused_and_told_who_holds_it(holder):
 
     msg = str(excinfo.value)
     assert str(holder.proc.pid) in msg, msg
-    assert "syncing this index" in msg and "different DB_PATH" in msg, msg
+    assert "Another sync of this index" in msg and "different DB_PATH" in msg, msg
     assert excinfo.value.pid == holder.proc.pid
     assert excinfo.value.path == holder.lock_file
+
+
+def test_a_second_sync_in_this_process_is_not_called_another_process(tmp_path):
+    """A reload replaces an index's handle while its sync runs; the new handle's sync
+    meets the lock of the old one's, held by this very process."""
+    with sync_lock(tmp_path):
+        with pytest.raises(SyncLockBusy) as excinfo:
+            with sync_lock(tmp_path):
+                pytest.fail("acquired a lock this process is holding")
+    msg = str(excinfo.value)
+    assert msg.startswith("Another sync of this index") and "process" not in msg.split(".")[0]
+    assert f"PID {os.getpid()}" in msg, msg
 
 
 def test_holder_writes_its_pid_and_start_time_while_held(holder):
@@ -193,6 +206,40 @@ def test_a_second_lock_object_in_this_process_conflicts_too(db_path):
                 pass
 
 
+def test_is_held_reports_a_holder_without_taking_the_lock(db_path):
+    lock_file = db_path / LOCK_FILENAME
+    assert not is_held(db_path)
+    assert not lock_file.exists()  # asking creates nothing
+
+    with sync_lock(db_path):
+        holder_info = lock_file.read_bytes()
+        assert is_held(db_path)
+        assert is_held(db_path)
+        assert lock_file.read_bytes() == holder_info
+
+    assert not is_held(db_path)
+    with sync_lock(db_path):  # asking left no lock behind
+        pass
+
+
+def test_is_held_sees_a_holder_in_another_process(holder):
+    assert is_held(holder.db_path)
+    holder.stop()
+    assert not is_held(holder.db_path)
+
+
+def test_two_askers_do_not_see_each_other_as_a_holder(db_path):
+    """Writers ask at the same time; one asking must not read as a sync to the other."""
+    with sync_lock(db_path):
+        pass
+    fd = os.open(db_path / LOCK_FILENAME, os.O_RDONLY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)  # another is_held, mid-question
+        assert not is_held(db_path)
+    finally:
+        os.close(fd)
+
+
 @pytest.mark.parametrize(
     "contents",
     ["", "   \n", "not json at all", "[1, 2, 3]", "{}", '{"pid": "not-a-number"}', "null"],
@@ -211,7 +258,7 @@ def test_unreadable_holder_info_degrades_to_a_generic_message(held, contents):
             pass
 
     msg = str(excinfo.value)
-    assert "Another minirag-mcp process is syncing this index" in msg, msg
+    assert "Another sync of this index is running" in msg, msg
     assert "different DB_PATH" in msg, msg
     assert "PID" not in msg, msg  # no pid invented for one we could not read
     assert excinfo.value.pid is None
@@ -226,8 +273,8 @@ def test_message_reports_how_long_the_holder_has_been_running(held):
             pass
 
     assert (
-        str(excinfo.value) == "Another minirag-mcp process (PID 12345) has been syncing "
-        "this index for 4m12s. Wait for it to finish, or use a different DB_PATH."
+        str(excinfo.value) == "Another sync of this index (minirag-mcp PID 12345) has been "
+        "running for 4m12s. Wait for it to finish, or use a different DB_PATH."
     )
 
 
@@ -252,7 +299,7 @@ def test_an_unparseable_start_time_still_names_the_holder(held):
     with pytest.raises(SyncLockBusy) as excinfo:
         with sync_lock(held.path.parent):
             pass
-    assert "(PID 4242) is syncing this index" in str(excinfo.value)
+    assert "(minirag-mcp PID 4242) is running" in str(excinfo.value)
     assert excinfo.value.pid == 4242
 
 
@@ -260,7 +307,7 @@ def test_a_start_time_in_the_future_does_not_render_a_duration(held):
     """Clock skew between two machines sharing a mount, or a stamp from the future."""
     ahead = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
     held.path.write_text(json.dumps({"pid": 7, "startedAt": ahead}))
-    with pytest.raises(SyncLockBusy, match=r"\(PID 7\) is syncing this index"):
+    with pytest.raises(SyncLockBusy, match=r"\(minirag-mcp PID 7\) is running"):
         with sync_lock(held.path.parent):
             pass
 
@@ -342,7 +389,7 @@ def test_a_lock_that_cannot_be_established_warns_instead_of_raising(
     tmp_path, not_root, shape, expected_errno
 ):
     """Regression: these escaped acquire() as raw OSErrors and killed the sync."""
-    db_path = tmp_path / ".minirag" / "lancedb"
+    db_path = tmp_path / ".minirag" / "v2"
     shape(db_path)
     try:
         lock = SyncLock(db_path)

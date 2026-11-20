@@ -253,7 +253,12 @@ async def test_a_pdf_read_with_ocr_is_kept_by_an_install_without_ocr(
     flags = ["--base-dir", env["BASE_DIR"], "--db-path", env["DB_PATH"]]
     monkeypatch.setattr(ocr, "available", lambda: True)
     monkeypatch.setattr(
-        ocr, "ocr_pdf", lambda path, config, todo: {i: f"Recognized page {i}" for i in todo}
+        ocr,
+        "ocr_pdf",
+        lambda path, config, todo: (
+            {i: f"Recognized page {i}" for i in todo},
+            ocr.ENGINE_TESSERACT,
+        ),
     )
     code, out = run_cli(["sync", "--json", *flags], capsys)
     assert code == 0 and json.loads(out)["counts"]["ingested"] == 2

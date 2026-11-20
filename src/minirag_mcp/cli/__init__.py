@@ -1,4 +1,9 @@
-"""CLI over the same core as the MCP server. Flags beat env vars."""
+"""CLI over the same core as the MCP server. Flags beat env vars.
+
+A command uses the index the environment variables configure, or with `--index NAME` that
+index of indexes.toml. `--index NAME` without a command serves that index alone on stdio;
+`serve` serves every index of indexes.toml over HTTP.
+"""
 
 from __future__ import annotations
 
@@ -6,40 +11,45 @@ import json as jsonlib
 import os
 import sys
 from collections.abc import Callable
+from contextvars import ContextVar
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated
 
 from cyclopts import App, Parameter
 
 from minirag_mcp import __version__
-from minirag_mcp.chunker import SCHEME_VERSION, join_document
+from minirag_mcp.chunker import join_document
 from minirag_mcp.config import Config, ConfigError, load_config
-from minirag_mcp.embedder import Embedder, EmbedderUnavailableError, UnknownModelError
-from minirag_mcp.ingest.ignore import IGNORE_FILE, IgnoredFileError, excluded_by
+from minirag_mcp.embedder import EmbedderUnavailableError
+from minirag_mcp.handle import OpenIndex, make_embedder
+from minirag_mcp.identity import REASON_SEPARATOR, EmbeddingScheme
+from minirag_mcp.indexes import default_config_path
+from minirag_mcp.ingest.ignore import IGNORE_FILE, excluded_by
 from minirag_mcp.ingest.pipeline import IngestResult, Pipeline
 from minirag_mcp.ingest.scanner import scan_roots
-from minirag_mcp.labels import LabelerSource
-from minirag_mcp.labels.model import default_model_factory
-from minirag_mcp.lock import SyncLockBusy
+from minirag_mcp.registry import (
+    SINGLE_INDEX_NAME,
+    UNRESTRICTED,
+    Connection,
+    IndexEntry,
+    IndexRefused,
+    IndexRegistry,
+    Use,
+)
 from minirag_mcp.results import (
     DEFAULT_FIND_LIMIT,
     QueryError,
-    fts_status,
-    ignore_status,
     ingest_reply,
-    labels_status,
+    list_indexes_payload,
     list_payload,
-    ocr_status,
-    pages_status,
+    registry_status,
     result_dict,
     run_find,
     run_query,
-    scheme_status,
-    signature_status,
+    with_index,
 )
-from minirag_mcp.security import SecurityError, resolve_in_roots
-from minirag_mcp.store import DimensionMismatchError, IndexOpenError, Store
-from minirag_mcp.sync import run_sync
+from minirag_mcp.security import SecurityError
 
 app = App(name="minirag-mcp", version=__version__)
 
@@ -61,8 +71,8 @@ ModelNameOpt = Annotated[
 ]
 
 
-def _make_embedder(cfg: Config) -> Embedder:
-    return Embedder(cfg.model_name, cfg.cache_dir)  # patched in tests
+def _make_embedder(cfg: Config) -> object | None:
+    return None  # patched in tests; None builds through make_embedder
 
 
 def _make_model_factory() -> Callable | None:
@@ -96,13 +106,114 @@ def _parse_labels(flags: list[str] | None) -> dict[str, str | list[str]] | None:
     return {k: v[0] if len(v) == 1 else v for k, v in out.items()}
 
 
-def _label_source(cfg: Config) -> LabelerSource:
-    return LabelerSource(cfg.roots, cfg.cache_dir, _make_model_factory() or default_model_factory)
-
-
 def _fail(msg: str) -> None:
     print(f"error: {msg}", file=sys.stderr)
     raise SystemExit(1)
+
+
+@dataclass(frozen=True)
+class Selection:
+    """The options read before or after the command: an index of indexes.toml, and which
+    indexes.toml."""
+
+    index: str | None = None
+    config: str | None = None
+
+
+_NOTHING_SELECTED = Selection()
+_SELECTION: ContextVar[Selection] = ContextVar("minirag_selection", default=_NOTHING_SELECTED)
+
+ENV_FLAGS_WITH_INDEX = (
+    "--index reads indexes.toml; --base-dir, --db-path, --cache-dir and --model-name "
+    "configure the environment-variable index and cannot be combined with it. Set them in "
+    "the index's [index.NAME] table."
+)
+CONFIG_WITHOUT_INDEX = (
+    "--config names the indexes.toml that --index reads; without --index this command uses "
+    "the index the environment variables configure"
+)
+
+# The `--` before a `find` term that starts with a dash is the command's to read, so the
+# options around the command are given a delimiter no argument equals: NUL, which argv
+# cannot hold. Not "": cyclopts compares every token to it and would drop an empty
+# argument. --index and --config are therefore read anywhere, even after `--`:
+# `find foo -- --index beta` searches beta for foo.
+app.meta.end_of_options_delimiter = "\0"
+
+
+@app.meta.default
+def main(
+    *tokens: Annotated[str, Parameter(show=False, allow_leading_hyphen=True)],
+    index: Annotated[
+        str | None,
+        Parameter(
+            name="--index",
+            help="An index of indexes.toml, which the command uses in place of the index the "
+            "environment variables configure. Without a command, serve that index alone over "
+            "MCP on stdio.",
+        ),
+    ] = None,
+    config: Annotated[
+        str | None,
+        Parameter(
+            name="--config",
+            help="The indexes.toml to read. Overrides MINIRAG_CONFIG and the default "
+            "~/.config/minirag/indexes.toml.",
+        ),
+    ] = None,
+) -> object:
+    selected = _SELECTION.set(Selection(index, config))
+    try:
+        if tokens:
+            return app(tokens)
+        if index is not None:
+            return _serve(index)
+        _fail("nothing to do: give a command, or --index NAME to serve that index on stdio")
+    finally:
+        _SELECTION.reset(selected)
+
+
+def _config_path() -> Path:
+    """--config, else MINIRAG_CONFIG, else where this platform keeps indexes.toml."""
+    config = _SELECTION.get().config
+    if config is not None:
+        return Path(config).expanduser().absolute()
+    try:
+        return default_config_path(os.environ)
+    except ConfigError as e:
+        _fail(str(e))
+        raise AssertionError from e  # unreachable
+
+
+def _file_registry() -> IndexRegistry:
+    """The indexes of indexes.toml; exit 1 naming the file when it does not load."""
+    path, models = _config_path(), _make_model_factory()
+    try:
+        registry = IndexRegistry.from_file(path, os.environ, model_factory=models)
+        # As in `_single`, only a test's stand-in is handed in: the handles build and own
+        # every real embedder, so both shells refuse an index alike.
+        if any(_make_embedder(entry.config) is not None for entry in registry.entries):
+            registry = IndexRegistry.from_file(
+                path, os.environ, embedder_factory=_cli_embedder, model_factory=models
+            )
+    except ConfigError as e:
+        _fail(str(e))
+        raise AssertionError from e  # unreachable
+    return registry
+
+
+def _serve(name: str) -> None:
+    """The MCP server on stdio for index `name` of indexes.toml alone: what one entry of a
+    client's configuration starts. A file that does not load, or names no such index,
+    fails before it serves."""
+    from minirag_mcp.server import create_app  # fastmcp loads in a serving process only
+
+    registry = _file_registry()
+    try:
+        registry.resolve(UNRESTRICTED, name)
+    except IndexRefused as e:
+        _fail(str(e))
+    create_app(registry, connection=Connection.only(name), env=os.environ).run()
 
 
 def _load_cfg(
@@ -111,6 +222,8 @@ def _load_cfg(
     cache_dir: str | None,
     model_name: str | None,
 ) -> Config:
+    if _SELECTION.get().config is not None:
+        _fail(CONFIG_WITHOUT_INDEX)
     return load_config(
         os.environ,
         base_dir_flags=base_dir or (),
@@ -120,24 +233,64 @@ def _load_cfg(
     )
 
 
-def _load(
+def _cli_embedder(cfg: Config, scheme: EmbeddingScheme) -> object:
+    # Looked up on every call, so that a test's patch of _make_embedder applies.
+    emb = _make_embedder(cfg)
+    return emb if emb is not None else make_embedder(cfg, scheme)
+
+
+def _single(cfg: Config) -> IndexRegistry:
+    # Without a stand-in the handle builds its own embedders, as the server's does, so both
+    # shells refuse an index alike and the handle closes what it built.
+    factory = _cli_embedder if _make_embedder(cfg) is not None else None
+    return IndexRegistry.single(cfg, embedder_factory=factory, model_factory=_make_model_factory())
+
+
+# Reaches every index. Without --index its default is the environment's, named default;
+# with it, --index names the index of indexes.toml a command uses.
+_CONNECTION = Connection(SINGLE_INDEX_NAME, None)
+
+
+def _registry(
     base_dir: list[str] | None,
     db_path: str | None,
     cache_dir: str | None,
     model_name: str | None,
-) -> tuple[Config, Store, Pipeline]:
+) -> IndexRegistry:
+    if _SELECTION.get().index is not None:
+        if any(flag is not None for flag in (base_dir, db_path, cache_dir, model_name)):
+            _fail(ENV_FLAGS_WITH_INDEX)
+        return _file_registry()
     try:
-        cfg = _load_cfg(base_dir, db_path, cache_dir, model_name)
-        emb = _make_embedder(cfg)
-        store = Store(cfg.db_path, dim=emb.dim, fts_language=cfg.fts_language)
-        return cfg, store, Pipeline(store, emb, cfg, labels=_label_source(cfg))
+        return _single(_load_cfg(base_dir, db_path, cache_dir, model_name))
     except ConfigError as e:
         _fail(str(e))
         raise AssertionError from e  # unreachable
-    except UnknownModelError as e:
-        _fail(f"{e} — see fastembed's supported models")
+
+
+def _open_in(registry: IndexRegistry, use: Use) -> tuple[IndexEntry, OpenIndex]:
+    try:
+        return registry.open(_CONNECTION, _SELECTION.get().index, use)
+    except IndexRefused as e:
+        _fail(str(e))
         raise AssertionError from e  # unreachable
-    except (DimensionMismatchError, IndexOpenError) as e:
+
+
+def _open(
+    use: Use,
+    base_dir: list[str] | None,
+    db_path: str | None,
+    cache_dir: str | None,
+    model_name: str | None,
+) -> tuple[IndexRegistry, IndexEntry, OpenIndex]:
+    registry = _registry(base_dir, db_path, cache_dir, model_name)
+    return (registry, *_open_in(registry, use))
+
+
+def _inside(registry: IndexRegistry, entry: IndexEntry, path: str) -> Path:
+    try:
+        return registry.in_roots(_CONNECTION, entry, path, require_absolute=False)
+    except (SecurityError, IndexRefused) as e:
         _fail(str(e))
         raise AssertionError from e  # unreachable
 
@@ -194,6 +347,12 @@ def _warn_filter(payload: dict) -> None:
         print(f"warn: {payload['filterNotice']}", file=sys.stderr)
 
 
+def _warn(notes: list[str]) -> None:
+    """A reply's `warnings`, which the JSON output carries in the reply itself."""
+    for note in notes:
+        print(f"warn: {note}", file=sys.stderr)
+
+
 def _warn_labelling(pipeline: Pipeline, problems: list[str]) -> None:
     """A job's labelling problems, in the shape `sync` reports them. Not failures."""
     taxonomy = pipeline.labels.path if pipeline.labels else ""
@@ -212,7 +371,8 @@ def ingest(
     json: JsonFlag = False,
 ):
     """Ingest files or directories (recursive)."""
-    cfg, store, pipeline = _load(base_dir, db_path, cache_dir, model_name)
+    registry, entry, opened = _open(Use.INGEST, base_dir, db_path, cache_dir, model_name)
+    cfg, pipeline = entry.config, opened.pipeline
     files: list[Path] = []
     # Already held to the rules by their scan; only files named directly are checked again.
     scanned: set[Path] = set()
@@ -220,13 +380,22 @@ def ingest(
     failures: list[dict] = []
     try:
         for raw in paths:
-            p = resolve_in_roots(raw, cfg.roots, require_absolute=False)
+            p = registry.in_roots(_CONNECTION, entry, raw, require_absolute=False)
             blind: list[tuple[Path, str | None]] = []
-            if p.is_dir() and (by := excluded_by(p, cfg.roots)) is not None:
+            if (
+                p.is_dir()
+                and (
+                    by := excluded_by(p, cfg.roots, cfg.exclude, exclude_source=cfg.exclude_source)
+                )
+                is not None
+            ):
                 failures.append({"source": str(p), "error": f"{p} is excluded by {by}"})
                 continue
             if p.is_dir():
-                candidates = [e.path for e in scan_roots([p], blind=blind, rule_roots=cfg.roots)]
+                candidates = [
+                    e.path
+                    for e in scan_roots([p], blind=blind, rule_roots=cfg.roots, exclude=cfg.exclude)
+                ]
                 scanned.update(candidates)
             else:
                 candidates = [p]
@@ -243,19 +412,23 @@ def ingest(
                 if resolved not in seen:
                     seen.add(resolved)
                     files.append(c)
-    except Exception as e:  # SecurityError or a scan-time filesystem error
-        _fail(str(e))
+    except Exception as e:  # a path outside the roots, or a scan-time filesystem error
+        _fail(registry.failure(entry, e))
     done: list[IngestResult] = []
     # One job, so the model is loaded once for the whole run, not once per file.
     with pipeline.job() as report:
         for f in files:
             try:
-                done.append(pipeline.ingest_file(f, rules_checked=f in scanned))
+                with registry.refusals(_CONNECTION, entry):
+                    done.append(pipeline.ingest_file(f, rules_checked=f in scanned))
             except Exception as e:  # per-file failures never abort the batch
-                failures.append({"source": str(f), "error": str(e)})
-    payload = {"ingested": [ingest_reply(r) for r in done], "failed": failures}
+                failures.append({"source": str(f), "error": registry.failure(entry, e)})
+    notes = entry.handle.notes()
+    payload = {"ingested": [ingest_reply(r, notes) for r in done], "failed": failures}
     human = "\n".join([f"ingested {len(done)} file(s):"] + [f"  {r.source}" for r in done])
-    _emit(payload, json, human)
+    _emit(with_index(payload, entry), json, human)
+    if done:
+        _warn(notes)
     for fail in failures:
         print(f"warn: {fail['source']}: {fail['error']}", file=sys.stderr)
     _warn_labelling(pipeline, report.problems)
@@ -276,13 +449,16 @@ def ingest_url(
     json: JsonFlag = False,
 ):
     """Fetch an http(s) URL and index it."""
-    _, _, pipeline = _load(base_dir, db_path, cache_dir, model_name)
+    registry, entry, opened = _open(Use.INGEST, base_dir, db_path, cache_dir, model_name)
+    pipeline = opened.pipeline
     try:
-        with pipeline.job() as report:
+        with pipeline.job() as report, registry.refusals(_CONNECTION, entry):
             r = pipeline.ingest_url(url, source=source, title=title)
     except Exception as e:
-        _fail(str(e))
-    _emit(ingest_reply(r), json, f"ingested {r.source} ({r.chunk_count} chunks)")
+        _fail(registry.failure(entry, e))
+    reply = ingest_reply(r, entry.handle.notes())
+    _emit(with_index(reply, entry), json, f"ingested {r.source} ({r.chunk_count} chunks)")
+    _warn(reply.get("warnings", []))
     _warn_labelling(pipeline, report.problems)
 
 
@@ -298,29 +474,30 @@ def sync(
 ):
     """Reconcile the index with the document roots (synchronous).
 
-    Refuses to start if another process is already syncing this index.
+    Refuses to start if another process is already syncing this index. An index whose
+    configuration changed since it was built ("rebuild pending" in status) is rebuilt by a
+    sync without a path, and a sync with one is refused.
     """
-    cfg, store, pipeline = _load(base_dir, db_path, cache_dir, model_name)
-    scope = None
-    if path is not None:
-        try:
-            scope = resolve_in_roots(path, cfg.roots, require_absolute=False)
-        except SecurityError as e:
-            _fail(str(e))
+    registry, entry, _ = _open(Use.SYNC, base_dir, db_path, cache_dir, model_name)
+    scope = None if path is None else _inside(registry, entry, path)
     try:
-        counts, errors = run_sync(
-            pipeline,
-            store,
-            cfg.roots,
-            cfg.max_file_size,
-            scope=scope,
-            on_event=lambda m: print(m, file=sys.stderr),
+        with registry.refusals(_CONNECTION, entry):
+            lock = entry.handle.admit_sync(scope)
+        counts, errors, rebuilt = entry.handle.run_admitted(
+            scope, lock, on_event=lambda m: print(m, file=sys.stderr)
         )
-    except (SyncLockBusy, IgnoredFileError) as e:
+    except Exception as e:  # a refusal, a busy lock, a rebuild that stopped before its swap
         _fail(str(e))
         raise AssertionError from e  # unreachable
     human = ", ".join(f"{k}: {v}" for k, v in counts.items())
-    _emit({"counts": counts, "errors": errors}, json, human)
+    if rebuilt is not None:
+        human += f"; rebuilt ({rebuilt.kind}): {REASON_SEPARATOR.join(rebuilt.reasons)}"
+    payload = {
+        "counts": counts,
+        "errors": errors,
+        "rebuild": rebuilt.to_dict() if rebuilt is not None else None,
+    }
+    _emit(with_index(payload, entry), json, human)
     for err in errors:
         print(f"warn: {err['source']}: {err['error']}", file=sys.stderr)
     if counts["failed"] > 0:
@@ -349,11 +526,12 @@ def query(
     if top_k < 1:
         _fail(f"--top-k must be at least 1, got {top_k}")
     labels = _parse_labels(label)
-    cfg, store, pipeline = _load(base_dir, db_path, cache_dir, model_name)
+    registry, entry, opened = _open(Use.READ, base_dir, db_path, cache_dir, model_name)
+    cfg = entry.config
     try:
         payload = run_query(
-            store,
-            pipeline.embedder,
+            opened.store,
+            opened.embedder,
             cfg,
             text,
             top_k=top_k,
@@ -361,10 +539,11 @@ def query(
             labels=labels,
             date_from=date_from,
             date_to=date_to,
-            label_source=pipeline.labels,
+            label_source=opened.labels,
+            reranker=opened.reranker,
         )
     except (QueryError, EmbedderUnavailableError) as e:
-        _fail(str(e))
+        _fail(registry.failure(entry, e))
         raise AssertionError from e  # unreachable
     if payload["results"]:
         human = "\n".join(_result_line(r) for r in payload["results"])
@@ -378,7 +557,8 @@ def query(
         human += "\n\nSources:\n" + "\n".join(lines)
     else:
         human = "no results" + (f" — {payload['notice']}" if "notice" in payload else "")
-    _emit(payload, json, human)
+    _emit(with_index(payload, entry), json, human)
+    _warn(payload.get("warnings", []))
     _warn_filter(payload)
 
 
@@ -436,10 +616,11 @@ def find(
     starts with a dash goes after `--`, and every option before it.
     """
     labels = _parse_labels(label)
-    cfg, store, pipeline = _load(base_dir, db_path, cache_dir, model_name)
+    registry, entry, opened = _open(Use.READ, base_dir, db_path, cache_dir, model_name)
+    cfg = entry.config
     try:
         payload = run_find(
-            store,
+            opened.store,
             cfg.roots,
             terms,
             match="any" if any_ else "all",
@@ -449,12 +630,12 @@ def find(
             date_to=date_to,
             limit=limit,
             offset=offset,
-            label_source=pipeline.labels,
+            label_source=opened.labels,
         )
     except QueryError as e:
-        _fail(str(e))
+        _fail(registry.failure(entry, e))
         raise AssertionError from e  # unreachable
-    _emit(payload, json, _find_human(payload))
+    _emit(with_index(payload, entry), json, _find_human(payload))
     _warn_filter(payload)
 
 
@@ -473,17 +654,14 @@ def read_neighbors(
     json: JsonFlag = False,
 ):
     """Read chunks around a given chunk index."""
-    cfg, store, _ = _load(base_dir, db_path, cache_dir, model_name)
+    registry, entry, opened = _open(Use.READ, base_dir, db_path, cache_dir, model_name)
     if file_path is not None:
-        try:
-            key = str(resolve_in_roots(file_path, cfg.roots, require_absolute=False))
-        except SecurityError as e:
-            _fail(str(e))
+        key = str(_inside(registry, entry, file_path))
     elif source is not None:
         key = source
     else:
         _fail("provide --file-path or --source")
-    chunks = store.neighbors(key, chunk_index, before=before, after=after)
+    chunks = opened.store.neighbors(key, chunk_index, before=before, after=after)
     payload = {"chunks": [result_dict(r) for r in chunks]}
     human = (
         "\n\n".join(
@@ -492,7 +670,7 @@ def read_neighbors(
         )
         or "no chunks"
     )
-    _emit(payload, json, human)
+    _emit(with_index(payload, entry), json, human)
 
 
 @app.command
@@ -512,20 +690,17 @@ def read(
     chunk repeats to carry it into its own vector is emitted once, where the document
     had it.
     """
-    cfg, store, _ = _load(base_dir, db_path, cache_dir, model_name)
+    registry, entry, opened = _open(Use.READ, base_dir, db_path, cache_dir, model_name)
     if path is not None:
-        try:
-            key = str(resolve_in_roots(path, cfg.roots, require_absolute=False))
-        except SecurityError as e:
-            _fail(str(e))
+        key = str(_inside(registry, entry, path))
     elif source is not None:
         key = source
     else:
         _fail("provide a path or --source")
-    chunks = store.all_chunks(key)
+    chunks = opened.store.all_chunks(key)
     if not chunks:
         _fail(f"source not found in index: {key}")
-    info = store.get_source(key)
+    info = opened.store.get_source(key)
     text = join_document(chunks)
     payload = {
         "source": key,
@@ -534,7 +709,7 @@ def read(
         "chunkCount": len(chunks),
         "text": text,
     }
-    _emit(payload, json, text)
+    _emit(with_index(payload, entry), json, text)
 
 
 @app.command(name="list")
@@ -565,20 +740,23 @@ def list_cmd(
     named in a warning on stderr and in unlistedFolders with --json.
     """
     labels = _parse_labels(label)
-    cfg, store, pipeline = _load(base_dir, db_path, cache_dir, model_name)
+    registry, entry, opened = _open(Use.READ, base_dir, db_path, cache_dir, model_name)
+    cfg = entry.config
     try:
         payload = list_payload(
-            store,
+            opened.store,
             cfg.roots,
             tuple(scope or ()),
+            exclude=cfg.exclude,
+            exclude_source=cfg.exclude_source,
             labels=labels,
             date_from=date_from,
             date_to=date_to,
             sort=sort,
-            label_source=pipeline.labels,
+            label_source=opened.labels,
         )
     except QueryError as e:
-        _fail(str(e))
+        _fail(registry.failure(entry, e))
         raise AssertionError from e  # unreachable
     human = "\n".join(
         f"[{f['state']}] {f['source']} ({f['chunkCount']} chunks)"
@@ -586,11 +764,14 @@ def list_cmd(
         + _document_suffix(f)
         for f in payload["files"]
     )
-    _emit(payload, json, human or "no files found")
+    _emit(with_index(payload, entry), json, human or "no files found")
     for folder in payload["unlistedFolders"]:
         print(f"warn: {folder['path']}: {folder['message']}", file=sys.stderr)
     if n := payload.get("ignored"):
-        print(f"note: {n} file(s) and folder(s) excluded by {IGNORE_FILE}", file=sys.stderr)
+        print(
+            f"note: {n} file(s) and folder(s) excluded by {IGNORE_FILE} or {cfg.exclude_source}",
+            file=sys.stderr,
+        )
     _warn_filter(payload)
 
 
@@ -604,41 +785,82 @@ def status(
     json: JsonFlag = False,
 ):
     """Show index and configuration status."""
+    selection = _SELECTION.get()
     # Degraded mode, matching the server's `status` tool: a broken configuration is
     # exactly what you run `status` to diagnose, so it reports the error and exits 0.
-    # Every other command still fails loudly on the same ConfigError.
+    # Every other command still fails loudly on the same ConfigError. An indexes.toml that
+    # does not load fails it too: no configuration loaded before it to report beside it.
+    if selection.index is not None:
+        registry = _registry(base_dir, db_path, cache_dir, model_name)
+    else:
+        try:
+            registry = _single(_load_cfg(base_dir, db_path, cache_dir, model_name))
+        except ConfigError as e:
+            registry = IndexRegistry.single(None, error=str(e))
     try:
-        _load_cfg(base_dir, db_path, cache_dir, model_name)
-    except ConfigError as e:
-        payload = {"version": __version__, "configError": str(e)}
-        _emit(payload, json, "\n".join(f"{k}: {v}" for k, v in payload.items()))
-        return
-    cfg = _load_cfg(base_dir, db_path, cache_dir, model_name)
-    payload = {
-        "version": __version__,
-        "roots": [str(r) for r in cfg.roots],
-        "dbPath": str(cfg.db_path),
-        "model": cfg.model_name,
-        "hybridWeight": cfg.hybrid_weight,
-        "chunkScheme": SCHEME_VERSION,
-        **ocr_status(),
-        **ignore_status(cfg.roots),
-    }
-    # An index that cannot be opened is reported, not raised: the server's `status` does
-    # the same, and both are what a broken setup is diagnosed with.
-    try:
-        store = Store(cfg.db_path, dim=_make_embedder(cfg).dim, fts_language=cfg.fts_language)
-        payload["chunkCount"] = store.chunk_count()
-        payload["sourceCount"] = store.source_count()
-        payload.update(scheme_status(store))
-        payload.update(fts_status(store))
-        payload.update(signature_status(store))
-        payload.update(pages_status(store))
-        payload.update(labels_status(_label_source(cfg), store))
-    except Exception as e:
-        payload["indexError"] = str(e)
+        payload = registry_status(registry, _CONNECTION, selection.index)
+    except IndexRefused as e:
+        _fail(str(e))
+        raise AssertionError from e  # unreachable
     human = "\n".join(f"{k}: {v}" for k, v in payload.items())
     _emit(payload, json, human)
+
+
+def _index_line(row: dict) -> str:
+    """One `indexes` row; an unavailable index says why in place of its counts."""
+    if "documentCount" in row:
+        found = f"{row['documentCount']} documents, {row['chunkCount']} chunks"
+    else:
+        found = row["stateReason"]
+    line = f"{row['name']} [{row['state']}] {found}, {row['model']}, {row['language']}"
+    return line + (f" — {row['description']}" if row["description"] else "")
+
+
+@app.command
+def indexes(*, json: JsonFlag = False) -> None:
+    """List the indexes of indexes.toml, as the MCP list_indexes tool does.
+
+    Each is opened to be reported, which may load its embedding model. A row is
+    "name [state] counts, model, language — description"; an index that cannot be opened
+    gives why in place of its counts, and --json also the reason a syncing or "rebuild
+    pending" index is not ready.
+    """
+    if _SELECTION.get().index is not None:
+        _fail(
+            "`indexes` lists every index of indexes.toml; --index selects the one another "
+            "command uses and cannot be combined with it"
+        )
+    payload = list_indexes_payload(_file_registry(), UNRESTRICTED)
+    _emit(payload, json, "\n".join(_index_line(row) for row in payload["indexes"]))
+
+
+@app.command
+def serve() -> None:
+    """Serve every index of indexes.toml over streamable HTTP on this machine.
+
+    A client connects to `http://127.0.0.1:8765/mcp/<index>`, which makes `<index>` its
+    default; `?allow=a,b` lets it name a and b too, and `/mcp` has no default. Every request
+    sends the token that the first start writes next to indexes.toml (or to [server]
+    token_file) as `Authorization: Bearer <token>`. SIGHUP reads indexes.toml again;
+    [server] changes take a restart.
+    """
+    if _SELECTION.get().index is not None:
+        _fail(
+            "`serve` serves every index of indexes.toml; --index selects the one another "
+            "command uses and cannot be combined with it"
+        )
+    from minirag_mcp.http_server import serve as serve_http  # fastmcp loads in a server only
+
+    path = _config_path()
+    if not path.exists():
+        _fail(
+            f"no indexes.toml at {path}; create one "
+            "(docs/launchd/local.minirag-mcp.plist shows how to run it)"
+        )
+    try:
+        serve_http(path, os.environ)
+    except ConfigError as e:
+        _fail(str(e))
 
 
 @app.command
@@ -653,20 +875,26 @@ def delete(
     json: JsonFlag = False,
 ):
     """Delete an indexed file (by path) or data/url item (by --source)."""
-    cfg, store, _ = _load(base_dir, db_path, cache_dir, model_name)
+    registry, entry, opened = _open(Use.READ, base_dir, db_path, cache_dir, model_name)
     if path is not None:
-        try:
-            key = str(resolve_in_roots(path, cfg.roots, require_absolute=False))
-        except SecurityError as e:
-            _fail(str(e))
+        key = str(_inside(registry, entry, path))
     elif source is not None:
         key = source
     else:
         _fail("provide a path or --source")
-    deleted = store.delete_source(key)
+    try:
+        with registry.refusals(_CONNECTION, entry):
+            deleted = opened.store.delete_source(key)
+    except IndexRefused as e:  # a rebuild runs, or swapped another index in meanwhile
+        _fail(str(e))
+        raise AssertionError from e  # unreachable
     if deleted == 0:
         _fail(f"source not found in index: {key}")
-    _emit({"source": key, "deletedChunks": deleted}, json, f"deleted {deleted} chunk(s) of {key}")
+    _emit(
+        with_index({"source": key, "deletedChunks": deleted}, entry),
+        json,
+        f"deleted {deleted} chunk(s) of {key}",
+    )
 
 
 classify_app = App(name="classify", help="Inspect how documents would be labelled.")
@@ -687,9 +915,10 @@ def classify_try(
 
     Nothing is embedded or stored.
     """
-    cfg, _, pipeline = _load(base_dir, db_path, cache_dir, model_name)
+    registry, entry, opened = _open(Use.READ, base_dir, db_path, cache_dir, model_name)
+    pipeline = opened.pipeline
     try:
-        target = resolve_in_roots(path, cfg.roots, require_absolute=False)
+        target = registry.in_roots(_CONNECTION, entry, path, require_absolute=False)
         preview = pipeline.preview_labels(target)
     except Exception as e:  # labels off, a path outside the roots, a file it cannot read
         _fail(str(e))
@@ -728,7 +957,7 @@ def classify_try(
     lines.append(
         f"date: {doc.date.value or 'none'}" + (f" [{doc.date.source}]" if doc.date.value else "")
     )
-    _emit(payload, json, "\n".join(lines))
+    _emit(with_index(payload, entry), json, "\n".join(lines))
     _warn_labelling(pipeline, preview.problems)
     # The preview exists to show the model's answers; one it could not give is a failure.
     if doc.unanswered:

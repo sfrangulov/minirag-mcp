@@ -47,7 +47,8 @@ jobs:
           /tmp/smoke/bin/minirag-mcp status --base-dir .
 
   slow:
-    # Downloads a ~220 MB embedding model: never on push or pull_request.
+    # Downloads the embedding models, ~2.5 GB (e5-large and MiniLM): never on push or
+    # pull_request.
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     runs-on: ubuntu-latest
     env:
@@ -60,6 +61,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/.model-cache
-          key: fastembed-${{ runner.os }}-${{ hashFiles('src/minirag_mcp/config.py') }}
-      - run: uv sync
+          key: fastembed-${{ runner.os }}-${{ hashFiles('src/minirag_mcp/config.py', 'src/minirag_mcp/probes.json') }}
+      # The fast job stays without the extra; this is where the real Tesseract runs.
+      - run: uv sync --extra ocr
       - run: uv run pytest -q -m slow

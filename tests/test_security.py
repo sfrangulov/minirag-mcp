@@ -234,3 +234,55 @@ def test_resolution_cannot_hang_forever(monkeypatch):
 def test_url_without_a_host_rejected():
     with pytest.raises(SecurityError, match="host"):
         check_url("http:///etc/passwd")
+
+
+@pytest.mark.parametrize(
+    "value, name",
+    [
+        ("[::1]:8765", "::1"),
+        ("[::1]", "::1"),
+        ("::1", "::1"),
+        ("LOCALHOST:1", "localhost"),
+        ("127.0.0.1:8765", "127.0.0.1"),
+        ("Example.COM", "example.com"),
+        ("::ffff:127.0.0.1", "::ffff:127.0.0.1"),
+    ],
+)
+def test_host_name_drops_the_port_and_brackets_and_ignores_case(value, name):
+    assert security.host_name(value) == name
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "[::1]evil.example",
+        "[::1].evil.example:80",
+        "[::1]:80x",
+        "[::1]:",
+        "[::1",
+        "localhost:evil",
+        "localhost:",
+        "127.0.0.1:8765x",
+    ],
+)
+def test_host_name_reads_no_host_when_anything_but_a_port_follows_it(value):
+    assert security.host_name(value) == ""
+    assert not security.is_loopback_name(value)
+
+
+@pytest.mark.parametrize(
+    "value, loopback",
+    [
+        ("127.0.0.1", True),
+        ("localhost:8765", True),
+        ("[::1]:8765", True),
+        ("::1", True),
+        ("127.0.0.2", False),
+        ("0.0.0.0", False),
+        ("::ffff:127.0.0.1", False),
+        ("localhost.example.com", False),
+        ("", False),
+    ],
+)
+def test_only_the_three_loopback_names_are_loopback(value, loopback):
+    assert security.is_loopback_name(value) is loopback

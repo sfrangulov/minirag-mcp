@@ -9,6 +9,7 @@ import pytest
 import minirag_mcp.cli as cli
 from minirag_mcp import ocr
 from minirag_mcp.chunker import SCHEME_VERSION
+from minirag_mcp.config import DEFAULT_MODEL
 from minirag_mcp.labels.model import INSTALL_HINT, ModelError
 from minirag_mcp.lock import sync_lock
 from minirag_mcp.store import MAX_TOP_K, Store
@@ -84,7 +85,7 @@ def test_cli_read_reconstructs_a_multi_chunk_table_like_the_server(corpus, capsy
     delimiter = "| --- | --- | --- |"
     rows = [
         f"| {i} | Показатель номер {i} по форме статистической отчетности | месяц |"
-        for i in range(30)
+        for i in range(50)
     ]
     doc = corpus / "table.md"
     doc.write_text(
@@ -141,7 +142,9 @@ def test_list_reports_the_ocr_engine_in_json_and_in_the_human_listing(corpus, ca
     from minirag_mcp import ocr
 
     monkeypatch.setattr(ocr, "available", lambda: True)
-    monkeypatch.setattr(ocr, "ocr_image", lambda path, config: "recognized invoice text")
+    monkeypatch.setattr(
+        ocr, "ocr_image", lambda path, config: ("recognized invoice text", ocr.ENGINE_TESSERACT)
+    )
     scan = corpus / "scan.png"
     scan.write_bytes(b"png bytes irrelevant, ocr is faked")
     run(["ingest", str(scan), "--base-dir", str(corpus)])
@@ -149,7 +152,7 @@ def test_list_reports_the_ocr_engine_in_json_and_in_the_human_listing(corpus, ca
 
     run(["list", "--base-dir", str(corpus), "--json"])
     by_source = {f["source"]: f for f in json.loads(capsys.readouterr().out)["files"]}
-    assert by_source[str(scan)]["ocrEngine"] == "rapidocr"
+    assert by_source[str(scan)]["ocrEngine"] == "tesseract"
     assert by_source[str(corpus / "a.md")]["ocrEngine"] == ""
 
     run(["list", "--base-dir", str(corpus)])
@@ -158,7 +161,7 @@ def test_list_reports_the_ocr_engine_in_json_and_in_the_human_listing(corpus, ca
         for ln in capsys.readouterr().out.split("\n")
         if "] " in ln
     }
-    assert lines[str(scan)].endswith(" [ocr:rapidocr]")
+    assert lines[str(scan)].endswith(" [ocr:tesseract]")
     assert "[ocr:" not in lines[str(corpus / "a.md")]
 
 
@@ -166,7 +169,9 @@ def test_list_reports_an_indexed_source_this_install_cannot_read(corpus, capsys,
     """The CLI half of the same fact the MCP `list_files` state reports
     (tests/test_server.py): a retained source the install cannot scan is still listed."""
     monkeypatch.setattr(ocr, "available", lambda: True)
-    monkeypatch.setattr(ocr, "ocr_image", lambda path, config: "recognized invoice text")
+    monkeypatch.setattr(
+        ocr, "ocr_image", lambda path, config: ("recognized invoice text", ocr.ENGINE_TESSERACT)
+    )
     scan = corpus / "scan.png"
     scan.write_bytes(b"png bytes irrelevant, ocr is faked")
     run(["ingest", str(scan), "--base-dir", str(corpus)])
@@ -205,12 +210,12 @@ def test_sync_refuses_while_another_process_holds_the_lock(corpus, capsys):
     one (flock keys on the open file description). See tests/test_lock.py for the
     genuinely cross-process coverage.
     """
-    with sync_lock(corpus / ".minirag" / "lancedb"):
+    with sync_lock(corpus / ".minirag" / "v2"):
         with pytest.raises(SystemExit) as exc:
             run(["sync", "--base-dir", str(corpus)])
     assert exc.value.code == 1
     captured = capsys.readouterr()
-    assert "syncing this index" in captured.err and "DB_PATH" in captured.err
+    assert "Another sync of this index" in captured.err and "DB_PATH" in captured.err
     assert "Traceback" not in captured.err
     assert captured.out == ""  # no counts printed for a run that never happened
 
@@ -248,11 +253,12 @@ def test_sync_completes_and_exits_zero_when_the_lock_file_cannot_be_opened(corpu
     sniffing, so both are faked: the fake magika reports a non-"ok" status,
     which sends markitdown down its normal extension-based fallback path for
     a plain .md file — the ingest is still real, just not routed through a
-    model.
+    model. The fake fastembed keeps one thing of the real one: its registry
+    lists the configured model, whose width the index handle reads from it.
     """
     if os.geteuid() == 0:  # pragma: no cover - the suite is not meant to run as root
         pytest.skip("running as root: chmod 000 denies nothing")
-    lock_file = corpus / ".minirag" / "lancedb" / ".sync.lock"
+    lock_file = corpus / ".minirag" / "v2" / ".sync.lock"
     lock_file.parent.mkdir(parents=True)
     lock_file.write_text("")
     lock_file.chmod(0o000)
@@ -260,7 +266,11 @@ def test_sync_completes_and_exits_zero_when_the_lock_file_cannot_be_opened(corpu
     script = (
         "import sys, types\n"
         "fake_fastembed = types.ModuleType('fastembed')\n"
-        "fake_fastembed.TextEmbedding = object\n"
+        "fake_fastembed.TextEmbedding = type('TextEmbedding', (), {\n"
+        "    'list_supported_models': staticmethod(\n"
+        f"        lambda: [{{'model': {DEFAULT_MODEL!r}, 'dim': 1024}}]\n"
+        "    ),\n"
+        "})\n"
         "sys.modules['fastembed'] = fake_fastembed\n"
         "fake_magika = types.ModuleType('magika')\n"
         "fake_magika.Magika = type('Magika', (), {\n"
@@ -274,7 +284,8 @@ def test_sync_completes_and_exits_zero_when_the_lock_file_cannot_be_opened(corpu
         "cli._make_embedder = lambda cfg: FakeEmbedder()\n"
         f"cli.app(['sync', '--base-dir', {str(corpus)!r}, '--json'])\n"
     )
-    env = {k: v for k, v in os.environ.items() if k not in ("BASE_DIR", "BASE_DIRS", "DB_PATH")}
+    unset = ("BASE_DIR", "BASE_DIRS", "DB_PATH", "MODEL_NAME")
+    env = {k: v for k, v in os.environ.items() if k not in unset}
     try:
         proc = subprocess.run(
             [sys.executable, "-c", script], capture_output=True, text=True, timeout=180, env=env
@@ -294,7 +305,7 @@ def test_sync_completes_and_exits_zero_when_the_lock_file_cannot_be_opened(corpu
 
 def test_ingest_is_not_blocked_by_a_held_sync_lock(corpus, capsys):
     """The lock is scoped to sync: single-file ingests stay unblocked."""
-    with sync_lock(corpus / ".minirag" / "lancedb"):
+    with sync_lock(corpus / ".minirag" / "v2"):
         run(["ingest", str(corpus / "a.md"), "--base-dir", str(corpus), "--json"])
     assert json.loads(capsys.readouterr().out)["ingested"]
 
@@ -493,7 +504,7 @@ def test_cli_status_names_the_ocr_engine_when_the_extra_is_installed(corpus, cap
     monkeypatch.setattr(ocr, "available", lambda: True)
     run(["status", "--base-dir", str(corpus), "--json"])
     payload = json.loads(capsys.readouterr().out)
-    assert payload["ocr"] == ocr.ENGINE_RAPIDOCR
+    assert payload["ocr"] == ocr.ENGINE_TESSERACT
     assert "ocrHint" not in payload
 
 
@@ -552,7 +563,7 @@ def test_classify_try_prints_the_distribution_and_writes_nothing(
 
     assert out["labels"]["type"]["value"] == "minutes"
     assert out["distribution"]["type"] == {"minutes": 0.8, "report": 0.2}
-    assert Store(corpus / ".minirag" / "lancedb", dim=fake_embedder.dim).chunk_count() == 0
+    assert Store(corpus / ".minirag" / "v2", dim=fake_embedder.dim).chunk_count() == 0
     run(["classify", "try", str(corpus / "m.md"), "--base-dir", str(corpus)])
     human = capsys.readouterr().out
     assert "type: minutes" in human and "report" in human

@@ -1,10 +1,8 @@
-import asyncio
-import time
-
 import pytest
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
+from conftest import await_sync, stamp_identity
 from minirag_mcp import ocr
 from minirag_mcp.chunker import SCHEME_VERSION
 from minirag_mcp.config import load_config
@@ -13,35 +11,6 @@ from minirag_mcp.server import create_app
 from minirag_mcp.store import MAX_TOP_K, ChunkRecord, Store
 
 # pytest-asyncio runs in auto mode (see pyproject) — bare `async def` tests are collected as-is.
-
-SYNC_TIMEOUT_SECONDS = 30.0
-SYNC_POLL_SECONDS = 0.02
-
-
-async def await_sync(client: Client, job_id: str) -> dict:
-    """Poll `sync_status` until the job reaches a terminal state, and return it.
-
-    Bounded by wall-clock time rather than by an attempt count: sync runs on a
-    background thread, so how many polls fit before it finishes is a property of
-    the machine, not of the job. A fixed number of no-wait iterations passes on a
-    fast laptop and races on a loaded CI runner — a bigger number would only move
-    the threshold, not remove it. Yielding between polls also lets the event loop
-    run, so this finishes as soon as the job does and costs one poll interval
-    locally.
-    """
-    deadline = time.monotonic() + SYNC_TIMEOUT_SECONDS
-    st: dict | None = None
-    while True:
-        st = (await client.call_tool("sync_status", {"jobId": job_id})).data
-        if st["state"] in ("succeeded", "failed"):
-            return st
-        if time.monotonic() >= deadline:
-            raise AssertionError(
-                f"sync job {job_id} did not finish within {SYNC_TIMEOUT_SECONDS:g}s; "
-                f"last state={st['state']!r} counts={st['counts']} "
-                f"errors={st['errors']} error={st['error']!r}"
-            )
-        await asyncio.sleep(SYNC_POLL_SECONDS)
 
 
 @pytest.fixture
@@ -59,7 +28,7 @@ def app(tmp_path, fake_embedder):
     return create_app(cfg, embedder=fake_embedder), root
 
 
-async def test_all_twelve_tools_listed(app):
+async def test_all_thirteen_tools_listed(app):
     mcp, _ = app
     async with Client(mcp) as c:
         names = {t.name for t in await c.list_tools()}
@@ -76,6 +45,7 @@ async def test_all_twelve_tools_listed(app):
         "list_files",
         "delete_file",
         "status",
+        "list_indexes",
     }
 
 
@@ -145,8 +115,8 @@ async def test_sync_start_is_a_tool_error_while_another_process_syncs(app):
     """
     mcp, root = app
     async with Client(mcp) as c:
-        with sync_lock(root / ".minirag" / "lancedb"):
-            with pytest.raises(ToolError, match="syncing this index") as excinfo:
+        with sync_lock(root / ".minirag" / "v2"):
+            with pytest.raises(ToolError, match="Another sync of this index") as excinfo:
                 await c.call_tool("sync_start", {})
             assert "DB_PATH" in str(excinfo.value)
 
@@ -159,7 +129,7 @@ async def test_ingest_file_and_query_are_not_blocked_by_a_held_sync_lock(app):
     """The lock is scoped to sync: single-file ingest and search stay unblocked."""
     mcp, root = app
     async with Client(mcp) as c:
-        with sync_lock(root / ".minirag" / "lancedb"):
+        with sync_lock(root / ".minirag" / "v2"):
             r = (await c.call_tool("ingest_file", {"filePath": str(root / "auth.md")})).data
             assert r["chunkCount"] >= 1
             res = (await c.call_tool("query_documents", {"query": "OAuth2 token"})).data
@@ -193,13 +163,45 @@ async def test_ingest_data_and_url(app, monkeypatch, public_dns):
             await c.call_tool("ingest_url", {"url": "file:///etc/passwd"})
 
 
+async def test_every_result_names_its_index(app, monkeypatch, public_dns):
+    import minirag_mcp.ingest.pipeline as pmod
+    from minirag_mcp.ingest.parser import ParsedDoc
+
+    monkeypatch.setattr(pmod, "parse_url", lambda url, **kw: ParsedDoc("# R\n\nRemote body.", "R"))
+    mcp, root = app
+    auth = str(root / "auth.md")
+    async with Client(mcp) as c:
+
+        async def call(tool: str, args: dict) -> dict:
+            return (await c.call_tool(tool, args)).data
+
+        job = await call("sync_start", {})
+        payloads = [job, await await_sync(c, job["jobId"])]
+        payloads += [
+            await call("ingest_file", {"filePath": auth}),
+            await call("ingest_data", {"data": "# Note\n\nSaved note.", "source": "note-1"}),
+            await call("ingest_url", {"url": "https://example.com/x"}),
+            await call("query_documents", {"query": "OAuth2 token"}),
+            await call("find_mentions", {"terms": "oauth2"}),
+            await call("read_chunk_neighbors", {"filePath": auth, "chunkIndex": 0}),
+            await call("read_file", {"filePath": auth}),
+            await call("list_files", {}),
+            await call("delete_file", {"source": "note-1"}),
+            await call("status", {}),
+        ]
+    assert len(payloads) == 12
+    assert [p["index"] for p in payloads] == ["default"] * 12
+
+
 async def test_list_files_reports_the_ocr_engine(app, monkeypatch):
     """The MCP half of the same user-visible fact the CLI prints as `[ocr:<engine>]`
     (tests/test_cli.py): how a document entered the index."""
     from minirag_mcp import ocr
 
     monkeypatch.setattr(ocr, "available", lambda: True)
-    monkeypatch.setattr(ocr, "ocr_image", lambda path, config: "recognized invoice text")
+    monkeypatch.setattr(
+        ocr, "ocr_image", lambda path, config: ("recognized invoice text", ocr.ENGINE_TESSERACT)
+    )
     mcp, root = app
     scan = root / "scan.png"
     scan.write_bytes(b"png bytes irrelevant, ocr is faked")
@@ -207,7 +209,7 @@ async def test_list_files_reports_the_ocr_engine(app, monkeypatch):
         await c.call_tool("ingest_file", {"filePath": str(scan)})
         await c.call_tool("ingest_file", {"filePath": str(root / "auth.md")})
         by_source = {f["source"]: f for f in (await c.call_tool("list_files", {})).data["files"]}
-    assert by_source[str(scan)]["ocrEngine"] == "rapidocr"
+    assert by_source[str(scan)]["ocrEngine"] == "tesseract"
     assert by_source[str(root / "auth.md")]["ocrEngine"] == ""
 
 
@@ -215,7 +217,9 @@ async def test_list_files_reports_an_indexed_source_this_install_cannot_read(app
     """An image indexed by an install with the extra, listed from one without it: sync
     keeps it and `status` still counts its chunks, so the listing has to show it too."""
     monkeypatch.setattr(ocr, "available", lambda: True)
-    monkeypatch.setattr(ocr, "ocr_image", lambda path, config: "recognized invoice text")
+    monkeypatch.setattr(
+        ocr, "ocr_image", lambda path, config: ("recognized invoice text", ocr.ENGINE_TESSERACT)
+    )
     mcp, root = app
     scan = root / "scan.png"
     scan.write_bytes(b"png bytes irrelevant, ocr is faked")
@@ -344,7 +348,7 @@ async def test_read_file_reconstructs_the_document_rather_than_concatenating_chu
     delimiter = "| --- | --- | --- |"
     rows = [
         f"| {i} | Показатель номер {i} по форме статистической отчетности | месяц |"
-        for i in range(30)
+        for i in range(50)
     ]
     doc = root / "table.md"
     doc.write_text(
@@ -373,7 +377,7 @@ async def test_status_names_the_ocr_engine_when_the_extra_is_installed(app, monk
     monkeypatch.setattr(ocr, "available", lambda: True)
     async with Client(mcp) as c:
         st = (await c.call_tool("status", {})).data
-    assert st["ocr"] == ocr.ENGINE_RAPIDOCR
+    assert st["ocr"] == ocr.ENGINE_TESSERACT
     assert "ocrHint" not in st
 
 
@@ -452,6 +456,7 @@ async def test_status_tells_the_user_to_re_sync_a_stale_index(tmp_path, fake_emb
     root = tmp_path / "docs"
     root.mkdir()
     cfg = load_config({"BASE_DIR": str(root)}, cwd=root)
+    stamp_identity(cfg, fake_embedder)
     store = Store(cfg.db_path, dim=fake_embedder.dim)
     store.replace_source(
         "/old.md",

@@ -28,11 +28,8 @@ from pathlib import Path
 from items import CORPUS, ITEMS_FILE, existing_index, load_items, select
 
 from minirag_mcp.config import load_config
-from minirag_mcp.embedder import Embedder
-from minirag_mcp.ingest.pipeline import Pipeline
+from minirag_mcp.handle import IndexHandle
 from minirag_mcp.results import run_query
-from minirag_mcp.store import Store
-from minirag_mcp.sync import run_sync
 
 
 def main() -> int:
@@ -49,18 +46,18 @@ def main() -> int:
     else:
         db = Path(tempfile.mkdtemp(prefix="minirag-check-items-")) / "db"
     cfg = load_config({"BASE_DIR": str(args.base_dir), "DB_PATH": str(db)})
-    emb = Embedder(cfg.model_name, cfg.cache_dir)
-    store = Store(cfg.db_path, dim=emb.dim)
-    pipeline = Pipeline(store, emb, cfg)
+    handle = IndexHandle(cfg)
+    index = handle.get()
+    emb, store = index.embedder, index.store
     if not args.db:
-        counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+        counts, errors, _ = handle.run_sync(None)
         print(f"indexed: {counts}  chunks: {store.chunk_count()}")
         if errors:
             print(f"sync errors: {errors}")
             return 1
 
     def search(q: str):
-        payload = run_query(store, emb, cfg, q, top_k=args.top_k)
+        payload = run_query(store, emb, cfg, q, top_k=args.top_k, reranker=index.reranker)
         # Filenames a macOS app wrote are stored decomposed; items typed by hand are not.
         return payload, [unicodedata.normalize("NFC", s["displayPath"]) for s in payload["sources"]]
 

@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent for minirag-mcp serve: one HTTP server for every index in indexes.toml.
+
+  Setup
+  1. Replace the placeholders: __UVX__ (absolute path to uvx), __PYTHON__ (absolute path
+     to a Python interpreter), __VERSION__ (the minirag-mcp release to run) and __HOME__
+     (your home directory). launchd expands neither ~ nor $HOME, so every path must be
+     absolute.
+  2. Copy this file to ~/Library/LaunchAgents/
+  3. Start it:
+       launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.minirag-mcp.plist
+  4. Reload indexes.toml after editing it (host, port and token need a restart instead):
+       launchctl kill HUP gui/$(id -u)/local.minirag-mcp
+  5. Stop it:
+       launchctl bootout gui/$(id -u)/local.minirag-mcp
+
+  The token is in ~/.config/minirag/token. Logs go to ~/Library/Logs/minirag-mcp.log.
+
+  The [ocr] extra reads scanned PDFs and images; without it a sync fails each of them.
+  On macOS it also installs Apple Vision's bindings, the second reader of unsure pages.
+
+  Why the interpreter is pinned: macOS privacy (TCC) grants access to Documents,
+  Desktop and similar folders per binary, and a LaunchAgent cannot ask for it. Point
+  __PYTHON__ at the interpreter that has been granted access to the folders you index,
+  otherwise the sync sees them as empty or unreadable. A background process also cannot
+  trigger the download of online-only files in cloud-synced folders (it fails with
+  errno 11), so keep those folders set to "Always Keep on This Device". After the first
+  start, run a real sync and verify that the counts are above zero and that no root is
+  reported as held.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>local.minirag-mcp</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__UVX__</string>
+    <string>--python</string>
+    <string>__PYTHON__</string>
+    <string>--from</string>
+    <string>minirag-mcp[ocr]==__VERSION__</string>
+    <string>minirag-mcp</string>
+    <string>serve</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Logs/minirag-mcp.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/minirag-mcp.log</string>
+</dict>
+</plist>

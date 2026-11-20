@@ -641,3 +641,14 @@ def test_a_failed_load_is_forgotten_once_the_model_file_appears(root, model_fact
     assert labeler.model_problem() == "bad magic"
     path.write_bytes(b"a whole model")
     assert labeler.model_problem() is None
+
+
+def test_a_served_model_needs_no_classify_extra(root, model_factory, monkeypatch):
+    monkeypatch.setattr(model, "available", lambda: False)
+    write_taxonomy(root)
+    served = LabelerSource([root], root.parent / "cache", model_factory, needs_extra=False)
+    assert served.get()[0].model_status() == ("on demand", None)
+    assert served.backend == "endpoint"
+    local = LabelerSource([root], root.parent / "cache", model_factory)
+    assert local.get()[0].model_status()[0] == "unavailable"
+    assert local.backend == "in-process"

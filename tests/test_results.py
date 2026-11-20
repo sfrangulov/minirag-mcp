@@ -19,26 +19,33 @@ from __future__ import annotations
 
 import re
 import warnings
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import pytest
 
-from conftest import FakeModelFactory
+import minirag_mcp.embedder as embedder_mod
+from conftest import FakeEmbedder, FakeModelFactory
 from label_helpers import L, record
 from minirag_mcp.config import Config
+from minirag_mcp.embedder import E5_LARGE, Embedder
+from minirag_mcp.endpoints import EmbeddingEndpoint, Endpoint, RerankEndpoint
+from minirag_mcp.ingest.ignore import EXCLUDE_VAR
 from minirag_mcp.labels import LabelerSource
 from minirag_mcp.results import (
     QueryError,
     aggregate_sources,
     display_path,
+    documents_status,
     labels_status,
     list_payload,
+    rerank_status,
     run_query,
 )
 from minirag_mcp.store import LABEL_COLUMNS, SearchResult, Store
 from store_helpers import _older_table, _raise_commit_conflict, _row
 
-ROOT = "/Users/x/Documents/solidcore_data"
+ROOT = "/Users/x/Documents/corpus"
 
 #: A real relative path from the indexed corpus: a numbered directory, a space in the
 #: directory name, an underscore-and-space filename, Cyrillic, and a `.docx` extension —
@@ -292,7 +299,7 @@ def test_an_unfiltered_query_has_exactly_the_old_keys(
             "budget review",
             label_source=source,
         )
-        assert set(payload) == {"results", "sources", "parents"}
+        assert set(payload) == {"results", "sources", "parents", "embeddingBackend", "reranked"}
     # Labels were stored, so the source row shows them; the shell keys stay unchanged.
     assert "labels" in payload["sources"][0]
 
@@ -321,7 +328,7 @@ def test_list_sorted_by_date_puts_undated_last(tmp_path, root, store, fake_embed
     index(store, fake_embedder, root, "c_new.md", {}, "2026-10-20")
     index(store, fake_embedder, root, "d_tie.md", {}, "2026-10-01")
 
-    payload = list_payload(store, [root], sort="date")
+    payload = list_payload(store, [root], sort="date", exclude=(), exclude_source=EXCLUDE_VAR)
 
     assert [Path(f["source"]).name for f in payload["files"]] == [
         "c_new.md",
@@ -330,7 +337,7 @@ def test_list_sorted_by_date_puts_undated_last(tmp_path, root, store, fake_embed
         "a_undated.md",
     ]
     with pytest.raises(QueryError, match="sort"):
-        list_payload(store, [root], sort="size")
+        list_payload(store, [root], sort="size", exclude=(), exclude_source=EXCLUDE_VAR)
 
 
 def test_a_filtered_listing_keeps_matches_and_counts_unread_files_as_unlabelled(
@@ -343,7 +350,14 @@ def test_a_filtered_listing_keeps_matches_and_counts_unread_files_as_unlabelled(
     index(store, fake_embedder, root, "pilot/d.md", {}, create=True)
     (root / "new.md").write_text("never ingested")
 
-    payload = list_payload(store, [root], labels={"type": "minutes"}, label_source=label_source)
+    payload = list_payload(
+        store,
+        [root],
+        labels={"type": "minutes"},
+        label_source=label_source,
+        exclude=(),
+        exclude_source=EXCLUDE_VAR,
+    )
 
     assert [f["source"] for f in payload["files"]] == [a]
     assert payload["files"][0]["labels"]["type"]["value"] == "minutes"
@@ -352,9 +366,69 @@ def test_a_filtered_listing_keeps_matches_and_counts_unread_files_as_unlabelled(
     assert "filterNotice" not in payload
 
 
+def test_a_query_names_its_embedding_backend_and_warns_on_a_fallback(
+    tmp_path, root, store, fake_embedder
+):
+    index(store, fake_embedder, root, "a.md", {})
+    payload = run_query(store, fake_embedder, make_config(root, tmp_path), "budget review")
+    assert payload["embeddingBackend"] == "in-process" and "warnings" not in payload
+    fallen = FakeEmbedder()
+    fallen.backend = "in-process (endpoint unreachable)"
+    fallen.warning = "W"
+    payload = run_query(store, fallen, make_config(root, tmp_path), "budget review")
+    assert payload["embeddingBackend"] == "in-process (endpoint unreachable)"
+    assert payload["warnings"] == ["W"]
+
+
+def test_a_query_reads_the_backend_after_embedding(tmp_path, root, store, fake_embedder):
+    """The query's own embedding is what falls back, so the flag must describe it."""
+
+    class FallsBack(FakeEmbedder):
+        def embed_query(self, text):
+            self.backend, self.warning = "in-process (endpoint unreachable)", "W"
+            return super().embed_query(text)
+
+    payload = run_query(store, FallsBack(), make_config(root, tmp_path), "budget review")
+    assert payload["embeddingBackend"] == "in-process (endpoint unreachable)"
+    assert payload["warnings"] == ["W"]
+
+
+def test_only_the_reply_to_a_query_embedded_in_process_says_so(
+    tmp_path, root, fake_llama, stub_text_embedding, tokenizer_file, monkeypatch
+):
+    """Per reply, not from the shared embedder: another query may run meanwhile."""
+    monkeypatch.setattr(embedder_mod, "QUERY_TIMEOUT", 0.2)
+    fake_llama.dim = 1024
+    url = fake_llama.url("/v1/embeddings")
+    embedder = Embedder(E5_LARGE, tmp_path, endpoint=EmbeddingEndpoint(Endpoint(url, "e5")))
+    store = Store(tmp_path / "db", dim=1024)
+    index(store, embedder, root, "a.md", {})
+    config = make_config(root, tmp_path)
+    fake_llama.delay = 1.0
+    slow = run_query(store, embedder, config, "budget review")
+    fake_llama.delay = 0.0
+    fast = run_query(store, embedder, config, "budget review")
+    assert slow["embeddingBackend"] == "in-process (endpoint timed out)"
+    [note] = slow["warnings"]
+    assert url in note and "in-process" in note
+    assert slow["results"] and slow["results"][0]["source"] == fast["results"][0]["source"]
+    assert fast["embeddingBackend"] == "endpoint" and "warnings" not in fast
+
+
+def test_an_embedder_without_backend_flags_reads_as_in_process(tmp_path, root, store):
+    class Bare:
+        dim = 8
+
+        def embed_query(self, text):
+            return FakeEmbedder().embed_query(text)
+
+    payload = run_query(store, Bare(), make_config(root, tmp_path), "budget review")
+    assert payload["embeddingBackend"] == "in-process" and "warnings" not in payload
+
+
 def test_a_listing_without_a_filter_has_exactly_the_old_keys(tmp_path, root, store, fake_embedder):
     index(store, fake_embedder, root, "a.md", {})
-    payload = list_payload(store, [root])
+    payload = list_payload(store, [root], exclude=(), exclude_source=EXCLUDE_VAR)
     assert set(payload) == {"files", "unlistedFolders"}
     assert set(payload["files"][0]) == {
         "source",
@@ -386,7 +460,14 @@ def test_a_filter_on_an_index_without_label_columns_is_refused(
             label_source=label_source,
         )
     with pytest.raises(QueryError, match="write access"):
-        list_payload(old, [root], date_from="2026-10-01", label_source=label_source)
+        list_payload(
+            old,
+            [root],
+            date_from="2026-10-01",
+            label_source=label_source,
+            exclude=(),
+            exclude_source=EXCLUDE_VAR,
+        )
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         assert run_query(old, fake_embedder, make_config(root, tmp_path), "x")["results"]
@@ -479,3 +560,194 @@ def test_status_and_a_filter_name_a_model_file_that_is_not_there(
         label_source=source,
     )
     assert got["filterNotice"].endswith(f"which cannot run here: {reason}")
+
+
+def test_status_counts_sources_without_a_document_row(tmp_path, root, store, fake_embedder):
+    index(store, fake_embedder, root, "a.md", {})
+    assert documents_status(store) == {}
+
+    path = root / "b.md"
+    path.write_text("budget review")
+    store._table.add([asdict(record(str(path), {}, "", "", text="budget review"))])
+    status = documents_status(store)
+    assert status["undocumentedSourceCount"] == 1
+    assert "sync" in status["documentsWarning"]
+
+    store.backfill_documents()
+    assert documents_status(store) == {}
+
+
+class _Fixed:
+    """Embeds every query as the same vector, so the keyword-free ranking is known."""
+
+    dim = 8
+
+    def embed_query(self, text):
+        return [0.0, 1.0] + [0.0] * 6
+
+
+def test_a_query_ranks_with_the_configured_document_weight(tmp_path, root, store):
+    """/a.md holds both query terms only as a whole document; /b.md's chunk is nearest."""
+    near, apart = [0.0, 1.0] + [0.0] * 6, [1.0, 0.0] + [0.0] * 6
+    for name, texts, vector in (
+        ("b.md", ["gamma delta"], near),
+        ("a.md", ["alpha", "beta"], apart),
+    ):
+        source = str(root / name)
+        store.replace_source(
+            source,
+            [
+                replace(
+                    record(source, {}, "", "", text=text, vector=vector),
+                    id=f"{source}#{i}",
+                    chunk_index=i,
+                )
+                for i, text in enumerate(texts)
+            ],
+        )
+
+    def first(document_weight):
+        config = replace(
+            make_config(root, tmp_path), hybrid_weight=0.0, document_weight=document_weight
+        )
+        payload = run_query(store, _Fixed(), config, "alpha beta")
+        return Path(payload["sources"][0]["source"]).name
+
+    assert first(0.0) == "b.md"
+    assert first(0.5) == "a.md"
+
+
+def _two_chunks(store, embedder, root):
+    path = root / "r.md"
+    path.write_text("x")
+    texts = ["budget alpha", "budget review plan"]
+    store.replace_source(
+        str(path),
+        [
+            replace(
+                record(
+                    str(path),
+                    {},
+                    text=t,
+                    vector=embedder.embed_documents([t])[0],
+                    mtime=path.stat().st_mtime,
+                ),
+                id=f"{path}#{i}",
+                chunk_index=i,
+            )
+            for i, t in enumerate(texts)
+        ],
+    )
+
+
+def test_a_served_reranker_reorders_and_says_so(tmp_path, root, store, fake_embedder, fake_llama):
+    _two_chunks(store, fake_embedder, root)
+    rr = RerankEndpoint(Endpoint(fake_llama.url("/v1/rerank"), "rr"))
+    cfg = make_config(root, tmp_path)
+    plain = run_query(store, fake_embedder, cfg, "review plan")
+    payload = run_query(store, fake_embedder, cfg, "review plan", reranker=rr)
+    assert payload["reranked"] is True and "warnings" not in payload
+    assert payload["results"][0]["text"] == "budget review plan"
+    assert payload["results"][0]["rerankScore"] == 0.0  # fake: 2 shared words - 2.0
+    assert payload["results"][0]["score"] == next(
+        r["score"] for r in plain["results"] if r["text"] == "budget review plan"
+    )
+    assert all("rerankScore" not in r for r in plain["results"])
+
+
+def test_an_unreachable_reranker_is_flagged_in_the_result_and_in_status(
+    tmp_path, root, store, fake_embedder, dead_url
+):
+    _two_chunks(store, fake_embedder, root)
+    rr = RerankEndpoint(Endpoint(dead_url + "/v1/rerank", "rr"))
+    payload = run_query(
+        store, fake_embedder, make_config(root, tmp_path), "review plan", reranker=rr
+    )
+    assert payload["reranked"] is False and payload["results"]
+    assert payload["warnings"][0].startswith("Reranking was skipped")
+    assert rerank_status(rr) == {"reranker": "unreachable", "rerankWarning": rr.last_error}
+
+
+def test_without_a_reranker_reranked_is_false(tmp_path, root, store, fake_embedder):
+    _two_chunks(store, fake_embedder, root)
+    payload = run_query(store, fake_embedder, make_config(root, tmp_path), "review plan")
+    assert payload["reranked"] is False and "warnings" not in payload
+    assert rerank_status(None) == {"reranker": "off"}
+
+
+def test_an_oversize_passage_is_capped_in_the_request_and_reranking_succeeds(
+    tmp_path, root, store, fake_embedder, fake_llama
+):
+    path = root / "big.md"
+    path.write_text("x")
+    text = "review " * 3000
+    store.replace_source(
+        str(path),
+        [
+            record(
+                str(path),
+                {},
+                text=text,
+                vector=fake_embedder.embed_documents([text])[0],
+                mtime=path.stat().st_mtime,
+            )
+        ],
+    )
+    rr = RerankEndpoint(Endpoint(fake_llama.url("/v1/rerank"), "rr"))
+    payload = run_query(store, fake_embedder, make_config(root, tmp_path), "review", reranker=rr)
+    (sent,) = [r for r in fake_llama.requests if r.path == "/v1/rerank"]
+    assert all(len(d) <= 4000 for d in sent.body["documents"])
+    assert payload["reranked"] is True and payload["results"][0]["text"] == text
+
+
+def test_a_wrong_score_count_is_flagged_not_silent(tmp_path, root, store, fake_embedder):
+    _two_chunks(store, fake_embedder, root)
+
+    class Short:
+        last_error = None
+
+        def scores(self, query, passages):
+            return [1.0]
+
+    payload = run_query(
+        store, fake_embedder, make_config(root, tmp_path), "review", reranker=Short()
+    )
+    assert payload["reranked"] is False
+    assert payload["warnings"][0].startswith("Reranking was skipped")
+
+
+def test_a_hung_reranker_costs_one_short_wait_then_is_not_called_until_the_window_passes(
+    tmp_path, root, store, fake_embedder, fake_llama, monkeypatch
+):
+    import time
+
+    import minirag_mcp.endpoints as endpoints
+
+    _two_chunks(store, fake_embedder, root)
+    monkeypatch.setattr(endpoints, "RERANK_TIMEOUT", 0.3)
+    now = [1000.0]
+    monkeypatch.setattr(endpoints.time, "monotonic", lambda: now[0])
+    rr = RerankEndpoint(Endpoint(fake_llama.url("/v1/rerank"), "rr"))  # default 120 s
+    cfg = make_config(root, tmp_path)
+    fake_llama.delay = 1.5
+
+    started = time.perf_counter()
+    first = run_query(store, fake_embedder, cfg, "review plan", reranker=rr)
+    assert time.perf_counter() - started < 1.2
+    assert first["reranked"] is False and first["results"]
+    assert first["warnings"][0].startswith("Reranking was skipped")
+    assert "not retried for 60 s" in first["warnings"][0]
+    calls = len(fake_llama.requests)
+
+    fake_llama.delay = 0.0
+    now[0] += 30
+    second = run_query(store, fake_embedder, cfg, "review plan", reranker=rr)
+    assert len(fake_llama.requests) == calls
+    assert second["reranked"] is False
+    assert "not retried for another 30 s" in second["warnings"][0]
+    assert rr.last_error and "30 s" not in rr.last_error
+
+    now[0] += 31
+    third = run_query(store, fake_embedder, cfg, "review plan", reranker=rr)
+    assert len(fake_llama.requests) == calls + 1
+    assert third["reranked"] is True and "warnings" not in third

@@ -10,17 +10,18 @@ from pathlib import Path
 
 import pytest
 
-from conftest import FakeChoiceModel
+from conftest import FakeChoiceModel, stamp_identity
+from minirag_mcp.chunker import join_document
 from minirag_mcp.config import Config, load_config
+from minirag_mcp.handle import IndexHandle
 from minirag_mcp.ingest.pipeline import Pipeline, file_sha256
-from minirag_mcp.labels import Labeler, LabelerSource, model, taxonomy_path
+from minirag_mcp.labels import Labeler, model, taxonomy_path
 from minirag_mcp.labels.dates import DocDate
 from minirag_mcp.labels.filters import LabelFilterError
 from minirag_mcp.labels.model import ModelError, default_model_factory
 from minirag_mcp.labels.resolve import Label, decode_labels
 from minirag_mcp.labels.taxonomy import load_taxonomy
 from minirag_mcp.store import LABEL_COLUMNS, Store
-from minirag_mcp.sync import run_sync
 from store_helpers import _older_table, _raise_commit_conflict, _row
 
 TAXONOMY = """
@@ -68,6 +69,10 @@ class SaltedEmbedder:
     def embed_query(self, text: str):
         return self._inner.embed_query(text)
 
+    def __getattr__(self, name: str):
+        # The rest of what an index's embedder answers: its scheme, its probe.
+        return getattr(self._inner, name)
+
 
 @dataclass
 class Corpus:
@@ -76,6 +81,7 @@ class Corpus:
     store: Store
     embedder: SaltedEmbedder
     pipeline: Pipeline
+    handle: IndexHandle
 
     @property
     def taxonomy_file(self) -> Path:
@@ -101,9 +107,9 @@ class Corpus:
         return path
 
     def sync(self, scope: Path | None = None):
-        return run_sync(
-            self.pipeline, self.store, self.cfg.roots, self.cfg.max_file_size, scope=scope
-        )
+        counts, errors, rebuilt = self.handle.run_sync(scope)
+        assert rebuilt is None
+        return counts, errors
 
     def rows(self, source: str | None = None) -> list[dict]:
         q = self.store._table.search()
@@ -121,14 +127,23 @@ class Corpus:
         return load_taxonomy(self.taxonomy_file).hash
 
 
+def _cfg(root: Path, tmp_path: Path) -> Config:
+    env = {
+        "BASE_DIR": str(root),
+        "DB_PATH": str(tmp_path / "index"),
+        "CACHE_DIR": str(tmp_path / "cache"),
+    }
+    return load_config(env, cwd=root)
+
+
 def make_corpus(tmp_path: Path, embedder, factory) -> Corpus:
     root = tmp_path / "docs"
     root.mkdir()
-    cfg = load_config({"BASE_DIR": str(root)}, cwd=root)
-    store = Store(tmp_path / "index", dim=embedder.dim)
+    cfg = _cfg(root, tmp_path)
     salted = SaltedEmbedder(embedder)
-    source = LabelerSource(cfg.roots, tmp_path / "cache", factory)
-    return Corpus(cfg.roots[0], cfg, store, salted, Pipeline(store, salted, cfg, labels=source))
+    handle = IndexHandle(cfg, embedder_factory=lambda scheme: salted, model_factory=factory)
+    opened = handle.get()
+    return Corpus(cfg.roots[0], cfg, opened.store, salted, opened.pipeline, handle)
 
 
 @pytest.fixture
@@ -265,6 +280,25 @@ def test_documents_ingested_inside_one_job_share_one_model_and_one_taxonomy(corp
     assert corpus.store.get_source(str(b)).label_hash == first_hash
     corpus.pipeline.ingest_file(b)
     assert corpus.store.get_source(str(b)).label_hash == corpus.hash() != first_hash
+
+
+def test_a_reingest_keeps_its_stored_labels_and_makes_no_model(corpus, model_factory):
+    """A rebuild re-stores what it cannot read again from its stored text; it must not
+    label it again, which would load the classify model a second time."""
+    corpus.taxonomy()
+    model_factory.answers = {"Minutes of": {"minutes": 0.9, "report": 0.1}}
+    doc = corpus.doc("alpha/weekly.md", "Minutes of the weekly sync.", 3)
+    corpus.pipeline.ingest_file(doc)
+    before = corpus.store.get_source(str(doc))
+    model_factory.answers = {"Minutes of": {"report": 0.9, "minutes": 0.1}}
+    made = len(model_factory.created)
+
+    corpus.pipeline.reingest_stored(before, join_document(corpus.store.all_chunks(str(doc))))
+
+    after = corpus.store.get_source(str(doc))
+    assert [getattr(after, f) for f in FIELDS] == [getattr(before, f) for f in FIELDS]
+    assert corpus.labels(doc)["type"].value == "minutes"
+    assert len(model_factory.created) == made
 
 
 # --- sync --------------------------------------------------------------------------
@@ -509,24 +543,25 @@ def test_an_index_without_label_columns_is_one_error_and_not_a_failure(
 ):
     root = tmp_path / "docs"
     root.mkdir()
-    cfg = load_config({"BASE_DIR": str(root)}, cwd=root)
+    db_path = tmp_path / "old"
+    cfg = load_config({"BASE_DIR": str(root), "DB_PATH": str(db_path)}, cwd=root)
     rows = []
     for name in ("a.md", "b.md"):
         path = root / name
         path.write_text(f"# {name}\n\nQuarterly report.", encoding="utf-8")
         # The real hash, so the sync finds the files unchanged and keeps their rows.
         rows.append({**_row(str(path), 0, "Quarterly report."), "file_hash": file_sha256(path)})
-    db_path = tmp_path / "old"
     table = _older_table(db_path, set(LABEL_COLUMNS), rows)
+    stamp_identity(cfg, fake_embedder)
     monkeypatch.setattr(type(table), "add_columns", _raise_commit_conflict)
+    h = IndexHandle(cfg, embedder_factory=lambda scheme: fake_embedder, model_factory=model_factory)
     with pytest.warns(RuntimeWarning, match="labels_json"):
-        store = Store(db_path, dim=fake_embedder.dim)
-    source = LabelerSource(cfg.roots, tmp_path / "cache", model_factory)
-    pipeline = Pipeline(store, fake_embedder, cfg, labels=source)
-    source.path.parent.mkdir()
-    source.path.write_text(TAXONOMY, encoding="utf-8")
+        h.get()
+    taxonomy = taxonomy_path(cfg.roots)
+    taxonomy.parent.mkdir()
+    taxonomy.write_text(TAXONOMY, encoding="utf-8")
 
-    counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    counts, errors, _ = h.run_sync(None)
 
     assert counts["failed"] == 0 and counts["skipped"] == 2 and counts["relabelled"] == 0
     assert len(errors) == 1
@@ -719,9 +754,7 @@ def test_a_pipeline_without_a_label_source_labels_nothing(tmp_path, fake_embedde
     path.write_text(TAXONOMY, encoding="utf-8")
     (root / "a.md").write_text("# A\n\nQuarterly report A.", encoding="utf-8")
 
-    counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
-
-    assert errors == [] and counts["ingested"] == 1 and counts["relabelled"] == 0
+    assert pipeline.ingest_file(root / "a.md").label_problem is None
     assert store.get_source(str(root / "a.md")).label_hash == ""
     assert pipeline.relabel_stale() == (0, [])
 

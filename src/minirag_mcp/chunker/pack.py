@@ -19,10 +19,12 @@ says so.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, replace
+from itertools import pairwise
 from typing import NamedTuple
 
+from minirag_mcp.chunker import strike
 from minirag_mcp.chunker.sections import (
     SENTENCE_END,
     TABLE_DELIMITER,
@@ -72,13 +74,17 @@ class Atom:
 
     `header` is the table header rows repeated in front of every unit built from this
     atom, so a row chunk still says what its columns mean. `sep` is what joins this
-    atom to the one before it inside a unit.
+    atom to the one before it inside a unit. `struck` is how many struck-through runs
+    are open where the atom starts, and `marks` the paired `~~` in it: markers pair
+    across a whole paragraph, and a unit holds only some of its atoms.
     """
 
     text: str
     kind: str
     header: str = ""
     sep: str = " "
+    struck: int = 0
+    marks: tuple[strike.Mark, ...] = ()
 
 
 def _table_header(lines: Sequence[str]) -> int:
@@ -234,6 +240,59 @@ def _join(atoms: Sequence[Atom]) -> str:
     return atoms[0].text + "".join(a.sep + a.text for a in atoms[1:])
 
 
+def _starts(atoms: Sequence[Atom]) -> list[int]:
+    """Where each atom begins in `_join(atoms)`."""
+    starts: list[int] = []
+    at = 0
+    for i, atom in enumerate(atoms):
+        at += len(atom.sep) if i else 0
+        starts.append(at)
+        at += len(atom.text)
+    return starts
+
+
+def _marked(atoms: Sequence[Atom]) -> strike.Marked:
+    """The atoms' text joined, with their paired markers at their offsets in it."""
+    marks = tuple(
+        (start + offset, side)
+        for atom, start in zip(atoms, _starts(atoms), strict=True)
+        for offset, side in atom.marks
+    )
+    return strike.Marked(_join(atoms), atoms[0].struck, marks)
+
+
+def _paired(paragraph: Sequence[Atom]) -> list[Atom]:
+    text = _join(paragraph)
+    if paragraph[0].kind == CODE or strike.MARKER not in text:
+        return list(paragraph)
+    marks = strike.row_pairs(text) if paragraph[0].kind == ROW else strike.pairs(text)
+    out: list[Atom] = []
+    for atom, start in zip(paragraph, _starts(paragraph), strict=True):
+        end = start + len(atom.text)
+        out.append(
+            replace(
+                atom,
+                struck=sum(side for offset, side in marks if offset < start),
+                marks=tuple((at - start, side) for at, side in marks if start <= at < end),
+            )
+        )
+    return out
+
+
+def _locate_struck(atoms: Sequence[Atom]) -> list[Atom]:
+    """`atoms` with their struck-through runs located, pairing the markers of each
+    paragraph: a table row, or the text between two blank lines. Code is never paired."""
+    out: list[Atom] = []
+    i = 0
+    while i < len(atoms):
+        j = i + 1
+        while j < len(atoms) and atoms[i].kind == atoms[j].kind == TEXT and atoms[j].sep != "\n\n":
+            j += 1
+        out += _paired(atoms[i:j])
+        i = j
+    return out
+
+
 def _prefix_room(budget: int) -> int:
     """Tokens a prefix may occupy: the tighter of an absolute floor and a share.
 
@@ -252,39 +311,55 @@ def _choose_prefix(prefixes: Sequence[str], count_tokens: CountTokens, budget: i
     return ""
 
 
-def _greedy(pieces: Sequence[str], glue: str, wrap, count_tokens: CountTokens, budget: int):
-    """Pack `pieces` into the fewest `glue`-joined groups whose wrapped form fits."""
-    out: list[str] = []
-    current: list[str] = []
-    for piece in pieces:
-        trial = current + [piece]
-        if current and count_tokens(wrap(glue.join(trial))) > budget:
-            out.append(glue.join(current))
-            current = [piece]
+# A span of a text, as (start, end) offsets
+Span = tuple[int, int]
+# Whether the unit rendered for a span of a text fits the budget
+Fits = Callable[[int, int], bool]
+
+
+def _parts(text: str, sep: str) -> list[Span]:
+    """The span of every `sep`-separated part of `text`."""
+    spans: list[Span] = []
+    at = 0
+    for part in text.split(sep):
+        spans.append((at, at + len(part)))
+        at += len(part) + len(sep)
+    return spans
+
+
+def _greedy(spans: Sequence[Span], fits: Fits) -> list[Span]:
+    """Merge consecutive `spans` into the fewest groups that fit."""
+    out: list[Span] = []
+    for start, end in spans:
+        if out and fits(out[-1][0], end):
+            out[-1] = (out[-1][0], end)
         else:
-            current = trial
-    if current:
-        out.append(glue.join(current))
+            out.append((start, end))
     return out
 
 
-def _force_split(text: str, wrap, count_tokens: CountTokens, budget: int) -> list[tuple[str, bool]]:
-    """Last resort for one piece that does not fit: split at whitespace, then anywhere.
+def _force_split(
+    text: str, fits: Fits, uncuttable: frozenset[int] = frozenset()
+) -> list[tuple[int, int, bool]]:
+    """Last resort for one piece that does not fit: split at whitespace, then anywhere
+    but at `uncuttable` offsets.
 
     This is what a single table row longer than the whole budget goes through. The row
     is never cut for the *reader* — the parent section still holds it intact — but its
     retrieval units have to fit the encoder, and a truncated vector would drop the tail
     entirely rather than merely index it separately.
 
-    Each piece comes with whether it is whole words: one cut out of a word is not.
+    Each piece is a span of `text`, with whether it is whole words: one cut out of a
+    word is not.
     """
-    out: list[tuple[str, bool]] = []
-    for piece in _greedy(text.split(" "), " ", wrap, count_tokens, budget):
-        if count_tokens(wrap(piece)) <= budget and piece:
-            out.append((piece, True))
+    out: list[tuple[int, int, bool]] = []
+    for start, end in _greedy(_parts(text, " "), fits):
+        if start < end and fits(start, end):
+            out.append((start, end, True))
         else:
-            out += [(cut, False) for cut in _greedy(list(piece), "", wrap, count_tokens, budget)]
-    return [(p, whole) for p, whole in out if p.strip()]
+            cuts = [start, *(at for at in range(start + 1, end) if at not in uncuttable), end]
+            out += [(a, b, False) for a, b in _greedy(list(pairwise(cuts)), fits)]
+    return [(start, end, whole) for start, end, whole in out if text[start:end].strip()]
 
 
 def _split_fence(prefix: str, code: str, count_tokens: CountTokens, budget: int) -> list[Packed]:
@@ -300,12 +375,16 @@ def _split_fence(prefix: str, code: str, count_tokens: CountTokens, budget: int)
     def wrap(text: str) -> str:
         return _render(prefix, "", f"{FENCE_SPLIT_NOTE}\n{text}")
 
+    def fits_in(text: str) -> Fits:
+        return lambda start, end: count_tokens(wrap(text[start:end])) <= budget
+
     pieces: list[tuple[str, bool]] = []
-    for rough in _greedy(code.split("\n"), "\n", wrap, count_tokens, budget):
+    for start, end in _greedy(_parts(code, "\n"), fits_in(code)):
+        rough = code[start:end]
         if rough.strip() and count_tokens(wrap(rough)) <= budget:
             pieces.append((rough, True))
         else:
-            pieces += _force_split(rough, wrap, count_tokens, budget)
+            pieces += [(rough[a:b], whole) for a, b, whole in _force_split(rough, fits_in(rough))]
     return [_owning(wrap(piece), piece, whole) for piece, whole in pieces]
 
 
@@ -345,35 +424,43 @@ def pack_section(section: Section, count_tokens: CountTokens, budget: int) -> li
 
     The only unit that may exceed it is a closed fenced code block, which is atomic —
     and only up to `FENCE_BUDGET_MULTIPLE` budgets, past which even that is split.
+
+    A struck-through run (`~~...~~`) that a unit boundary cuts is closed at the end of
+    the one unit and re-opened at the start of the next, and the markers count against
+    the budget.
     """
     atoms = section_atoms(section.body)
     if not atoms:
         return []
     prefix = _choose_prefix(section.prefixes, count_tokens, budget)
-    atoms = _resolve_headers(atoms, prefix, count_tokens, budget)
+    atoms = _locate_struck(_resolve_headers(atoms, prefix, count_tokens, budget))
     units: list[Packed] = []
     run: list[Atom] = []
+
+    def packed(header: str, body: strike.Marked, start: int, end: int) -> Packed:
+        cut = body.cut(start, end)
+        return _owning(_render(prefix, header, cut.reopen + cut.own), cut.own, cut.verbatim)
+
+    def fits(header: str, body: strike.Marked) -> Fits:
+        return lambda start, end: count_tokens(packed(header, body, start, end).text) <= budget
 
     def flush() -> None:
         if not run:
             return
         header = run[0].header
-        body = _join(run)
-        rendered = _render(prefix, header, body)
+        body = _marked(run)
+        whole = packed(header, body, 0, len(body.text))
         if run[0].kind == CODE:
-            if count_tokens(rendered) <= budget * FENCE_BUDGET_MULTIPLE:
-                units.append(_owning(rendered, body))
+            if count_tokens(whole.text) <= budget * FENCE_BUDGET_MULTIPLE:
+                units.append(whole)
             else:
-                units.extend(_split_fence(prefix, body, count_tokens, budget))
-        elif count_tokens(rendered) <= budget:
-            units.append(_owning(rendered, body))
+                units.extend(_split_fence(prefix, body.text, count_tokens, budget))
+        elif count_tokens(whole.text) <= budget:
+            units.append(whole)
         else:
-            units.extend(
-                _owning(_render(prefix, header, piece), piece, whole)
-                for piece, whole in _force_split(
-                    body, lambda t: _render(prefix, header, t), count_tokens, budget
-                )
-            )
+            for start, end, words in _force_split(body.text, fits(header, body), body.uncuttable()):
+                piece = packed(header, body, start, end)
+                units.append(piece._replace(verbatim=piece.verbatim and words))
         run.clear()
 
     for atom in atoms:
@@ -384,8 +471,8 @@ def pack_section(section: Section, count_tokens: CountTokens, budget: int) -> li
             flush()
             continue
         if run:
-            trial = _render(prefix, run[0].header, _join(run + [atom]))
-            if count_tokens(trial) > budget:
+            trial = _marked(run + [atom])
+            if not fits(run[0].header, trial)(0, len(trial.text)):
                 flush()
         run.append(atom)
     flush()

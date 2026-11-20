@@ -8,8 +8,11 @@ The one race left is two writers indexing the same new file at once: both
 insert, and the next sync finds the doubled source and reads it again. What
 two simultaneous syncs would cost is wasted work (both walk and re-index the
 same corpus) and a user with no way to tell that it is happening. So
-single-file ingests and every read path stay unlocked; only the whole-corpus
-sync takes this.
+single-file ingests, deletes and every read path never take this; only the
+whole-corpus sync does. A write is refused while a rebuild runs, which a store
+tells from the rebuild's staging folder and this lock together
+(`identity.rebuild_running`), and it is ordered against a swap by the separate
+identity lock (`identity.writing`).
 
 The lock is an exclusive, non-blocking `flock` on `<db_path>/.sync.lock`. While
 held, the file contains the holder's PID and start time as JSON, so a contender
@@ -40,8 +43,9 @@ Known limitations:
   silently local to each client, or not work at all. Two machines syncing one
   `DB_PATH` on a share can therefore both win the lock. Local disks only.
 - **Advisory.** Nothing stops a process that does not ask for the lock from
-  writing to the index. That is deliberate: it is what keeps `ingest_file` and
-  queries unblocked.
+  writing to the index. That is deliberate: queries are never blocked, and a
+  single-file ingest or delete waits for no ordinary sync; it is refused only
+  while a rebuild runs, since the rebuilt index would replace what it wrote.
 """
 
 from __future__ import annotations
@@ -77,7 +81,7 @@ _CONTENTION_ERRNOS = frozenset({errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES})
 
 
 class SyncLockBusy(Exception):
-    """Another process holds the sync lock for this index.
+    """Another sync holds the sync lock for this index, in this process or another.
 
     `pid` and `started_at` describe the holder when it could be read from the
     lock file, and are None when it could not (see `_read_holder`). The message
@@ -97,6 +101,13 @@ class SyncLockBusy(Exception):
         self.pid = pid
         self.started_at = started_at
         self.path = path
+
+    def naming(self, setting: str) -> str:
+        """The message, with `setting` as what to change instead of DB_PATH: how an index
+        configured elsewhere than the environment names its index folder."""
+        if self.path is None:
+            return str(self)
+        return _busy_message(self.path, self.pid, self.started_at, setting)
 
 
 def _read_holder(path: Path) -> tuple[int | None, str | None]:
@@ -165,13 +176,16 @@ def _warn_unlocked(path: Path, e: OSError) -> None:
     )
 
 
-def _busy_message(path: Path, pid: int | None, started_at: str | None) -> str:
-    tail = "Wait for it to finish, or use a different DB_PATH."
+def _busy_message(
+    path: Path, pid: int | None, started_at: str | None, setting: str = "DB_PATH"
+) -> str:
+    tail = f"Wait for it to finish, or use a different {setting}."
     if pid is None:
-        return f"Another minirag-mcp process is syncing this index (lock: {path}). {tail}"
+        return f"Another sync of this index is running (lock: {path}). {tail}"
     elapsed = _elapsed(started_at)
-    doing = f"has been syncing this index for {elapsed}" if elapsed else "is syncing this index"
-    return f"Another minirag-mcp process (PID {pid}) {doing}. {tail}"
+    doing = f"has been running for {elapsed}" if elapsed else "is running"
+    # The holder may be this process: a reload replaces a handle whose sync still runs.
+    return f"Another sync of this index (minirag-mcp PID {pid}) {doing}. {tail}"
 
 
 class SyncLock:
@@ -274,12 +288,37 @@ class SyncLock:
             os.close(fd)
 
 
+def is_held(db_path: Path) -> bool:
+    """Whether anyone, this process included, holds the sync lock for `db_path`.
+
+    flock has no way to ask without trying, so this takes the lock for an instant and
+    drops it. It asks for a *shared* lock: that conflicts with a holder's exclusive one,
+    but not with another caller asking at the same moment, so two writers checking at
+    once never see each other as a sync. A sync starting in that instant is refused as
+    contended. A lock that cannot be asked about at all reads as not held, as `acquire`
+    proceeds unlocked in the same cases.
+    """
+    if fcntl is None:
+        return False
+    try:
+        fd = os.open(Path(db_path) / LOCK_FILENAME, os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except OSError as e:
+        return e.errno in _CONTENTION_ERRNOS
+    finally:
+        os.close(fd)
+    return False
+
+
 @contextmanager
 def sync_lock(db_path: Path) -> Iterator[SyncLock]:
     """Hold the sync lock for `db_path` for the duration of the block.
 
-    Raises SyncLockBusy immediately — never blocks — if another process is
-    already syncing this index.
+    Raises SyncLockBusy immediately — never blocks — if another sync of this index
+    holds it, in this process or another.
     """
     lock = SyncLock(db_path)
     lock.acquire()

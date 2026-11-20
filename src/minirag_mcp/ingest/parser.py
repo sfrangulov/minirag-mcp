@@ -6,13 +6,14 @@ from __future__ import annotations
 import io
 import logging
 import re
+import zipfile
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
-from markitdown import MarkItDown, StreamInfo
+from markitdown import DocumentConverterResult, MarkItDown, StreamInfo
 from requests.adapters import HTTPAdapter
 
 from minirag_mcp import ocr
@@ -433,6 +434,50 @@ def _utf8_hint(path: Path) -> StreamInfo | None:
     return StreamInfo(charset="utf-8")
 
 
+_DOUBLE_STRIKE = b"<w:dstrike"
+# An element written as a start and end tag needs both renamed: mammoth parses
+# `styles.xml`, `numbering.xml` and `comments.xml` with expat, which refuses a mismatch.
+_DOUBLE_STRIKE_END = b"</w:dstrike"
+
+
+def _docx_stream(path: Path) -> io.BytesIO | None:
+    """The `.docx` at `path` with double strikethrough rewritten as single, or None when
+    no part has any or the file is not a zip — markitdown then reads and reports on the
+    file as it always has.
+
+    mammoth reads `w:strike` and ignores `w:dstrike`, so double-struck text would reach
+    the index unmarked: deleted text that reads as current.
+    """
+    try:
+        with zipfile.ZipFile(path) as source:
+            parts = [
+                info.filename
+                for info in source.infolist()
+                if info.filename.startswith("word/") and info.filename.endswith(".xml")
+            ]
+            if not any(_DOUBLE_STRIKE in source.read(name) for name in parts):
+                return None
+            out = io.BytesIO()
+            with zipfile.ZipFile(out, "w") as copy:
+                for info in source.infolist():
+                    data = source.read(info)
+                    if info.filename in parts:
+                        data = data.replace(_DOUBLE_STRIKE, b"<w:strike")
+                        data = data.replace(_DOUBLE_STRIKE_END, b"</w:strike")
+                    copy.writestr(info, data)
+    except (zipfile.BadZipFile, OSError):
+        return None
+    out.seek(0)
+    return out
+
+
+def _convert_file(path: Path) -> DocumentConverterResult:
+    if path.suffix.lower() == ".docx" and (stream := _docx_stream(path)) is not None:
+        info = StreamInfo(extension=".docx", filename=path.name, local_path=str(path))
+        return _md().convert_stream(stream, stream_info=info)
+    return _md().convert(str(path), stream_info=_utf8_hint(path))
+
+
 def parse_file(path: Path, config: Config | None = None) -> ParsedDoc:
     if path.suffix.lower() == ".vtt":
         return _parse_vtt(path)
@@ -442,15 +487,15 @@ def parse_file(path: Path, config: Config | None = None) -> ParsedDoc:
         if config is None:
             raise ParserError(f"OCR for {path} needs a Config (internal error)")
         try:
-            text = ocr.ocr_image(path, config)
+            text, engine = ocr.ocr_image(path, config)
         except ocr.OcrError as e:
             raise ParserError(str(e)) from e
         # Not `_file_title`: it prefers an authored ATX heading to the filename, and a
         # recognized page has none — a `# ` line in OCR output is scanner noise.
         title = _stem_title(_strip_extension_suffix(path.stem))
-        return ParsedDoc(markdown=text, title=title, ocr_engine=ocr.ENGINE_RAPIDOCR)
+        return ParsedDoc(markdown=text, title=title, ocr_engine=engine)
     try:
-        result = _md().convert(str(path), stream_info=_utf8_hint(path))
+        result = _convert_file(path)
     except Exception as e:  # markitdown may raise lib-specific errors too
         raise ParserError(f"Failed to convert {path}: {e}") from e
     markdown = _converted_markdown(result)
@@ -508,7 +553,7 @@ def _pdf_with_ocr_fallback(
             )
         return markdown, "", starts  # partial text beats refusal
     try:
-        recognized = ocr.ocr_pdf(path, config, needs)
+        recognized, engine = ocr.ocr_pdf(path, config, needs)
     except ocr.OcrError as e:
         raise ParserError(str(e)) from e
     # markitdown's markdown does not reliably mark page boundaries to splice into: a
@@ -531,7 +576,7 @@ def _pdf_with_ocr_fallback(
     if converted := markdown.strip():
         parts.insert(0, (converted, pages.stripped(markdown, starts)))
     merged, merged_starts = pages.joined(parts)
-    return merged, ocr.ENGINE_RAPIDOCR, merged_starts
+    return merged, engine, merged_starts
 
 
 def parse_html(html: str, title: str | None = None) -> ParsedDoc:

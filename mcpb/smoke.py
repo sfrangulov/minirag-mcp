@@ -12,7 +12,7 @@ server answers `initialize`, lists exactly the tools the manifest declares, and
 reports through `status` the folder the user picked and the bundle's own version.
 
 --search also syncs a one-document folder and searches it, which loads the embedding
-model (a ~220 MB download on a machine that has never run minirag-mcp).
+model (a 2.24 GB download on a machine that has never run minirag-mcp).
 """
 
 from __future__ import annotations

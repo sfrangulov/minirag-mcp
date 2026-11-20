@@ -12,10 +12,13 @@ import unicodedata
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from minirag_mcp import literal, ocr
-from minirag_mcp.chunker import shared_lines
+from minirag_mcp import __version__, literal, ocr, ocr_vision
+from minirag_mcp.chunker import SCHEME_VERSION, shared_lines
 from minirag_mcp.config import Config
+from minirag_mcp.endpoints import RerankEndpoint
+from minirag_mcp.identity import REASON_SEPARATOR, IdentityError, IndexState, read_identity
 from minirag_mcp.ingest import ignore
 from minirag_mcp.ingest.pipeline import IngestResult
 from minirag_mcp.ingest.scanner import FileState, compute_states, scan_roots
@@ -37,10 +40,15 @@ from minirag_mcp.store import (
     LABEL_COLUMNS,
     MAX_TOP_K,
     RESYNC_HINT,
+    IndexOpenError,
     SearchResult,
     SourceInfo,
     Store,
 )
+
+if TYPE_CHECKING:
+    from minirag_mcp.handle import IndexHandle, OpenIndex
+    from minirag_mcp.registry import Connection, IndexEntry, IndexRegistry
 
 EMPTY_INDEX_NOTICE = (
     "Nothing is indexed yet, so no query can match. Index the document roots first: "
@@ -65,15 +73,62 @@ class QueryError(ValueError):
     """A query that cannot run as given."""
 
 
-def ingest_reply(r: IngestResult) -> dict:
+def embedding_status(embedder) -> dict:
+    """Which backend embeds, and while the endpoint is unreachable, why not it, and whether
+    the in-process model can stand in for it at all."""
+    out = {"embeddingBackend": getattr(embedder, "backend", "in-process")}
+    if warning := getattr(embedder, "warning", None):
+        out["embeddingWarning"] = warning
+        if not embedder.has_local_copy():
+            out["embeddingFallback"] = f"no local copy in {embedder.cache_dir}"
+    return out
+
+
+def embedder_notes(embedder) -> list[str]:
+    """The embedder's warning as a reply's `warnings`; empty while nothing is wrong."""
+    warning = getattr(embedder, "warning", None)
+    return [warning] if warning else []
+
+
+def rerank_status(reranker: RerankEndpoint | None) -> dict:
+    """Whether results are reranked, and while the endpoint is unreachable, why not."""
+    if reranker is None:
+        return {"reranker": "off"}
+    if reranker.last_error:
+        return {"reranker": "unreachable", "rerankWarning": reranker.last_error}
+    return {"reranker": "endpoint"}
+
+
+class _Recorder:
+    """One query's view of a shared reranker: what it failed with, kept per call so
+    concurrent queries share no state."""
+
+    def __init__(self, reranker: RerankEndpoint) -> None:
+        self._reranker = reranker
+        self.error: str | None = None
+
+    def __call__(self, query: str, passages: list[str]) -> list[float]:
+        try:
+            scores = self._reranker.scores(query, passages)
+            if len(scores) != len(passages):
+                raise ValueError(f"{len(scores)} scores for {len(passages)} passages")
+        except Exception as e:
+            self.error = str(e)
+            raise
+        return scores
+
+
+def ingest_reply(r: IngestResult, notes: Sequence[str] = ()) -> dict:
     """One ingested document as the ingest tools and commands report it.
 
-    `labelProblem` appears only when labels are missing, so a corpus without a
-    classify.toml sees the reply it always had.
+    `labelProblem` and `warnings` appear only when there is something to say, so a
+    corpus without a classify.toml sees the reply it always had.
     """
     out = {"source": r.source, "chunkCount": r.chunk_count, "title": r.title}
     if r.label_problem:
         out["labelProblem"] = r.label_problem
+    if notes:
+        out["warnings"] = list(notes)
     return out
 
 
@@ -97,6 +152,8 @@ def result_dict(r: SearchResult) -> dict:
         "distance": r.distance,
         "parentId": r.parent_id or None,
     }
+    if r.rerank_score is not None:
+        out["rerankScore"] = r.rerank_score
     if r.pages:
         out["pages"] = r.pages
     return out
@@ -142,6 +199,13 @@ def fts_status(store: Store) -> dict:
             f"RAG_FTS_LANGUAGE is {store.fts_language}, but the keyword index still stems "
             f"{store.fts_index_language}: it could not be rebuilt on open. Reopen the index "
             f"with write access and no concurrent writer to rebuild it."
+        )
+    if missing := store.missing_document_fts_indices:
+        columns = ", ".join(repr(c) for c in missing)
+        out["documentFtsWarning"] = (
+            f"The whole-document keyword index has no BM25 index on {columns}: it could not "
+            "be created. Search still works, but ranks documents as a whole without it. "
+            "Reopen the index with write access and no concurrent writer to create it."
         )
     return out
 
@@ -195,6 +259,24 @@ def signature_status(store: Store) -> dict:
     }
 
 
+def documents_status(store: Store) -> dict:
+    """The whole-document half of `status`, identical for the server and the CLI.
+
+    Absent when every indexed document has its row, so an index that is up to date sees
+    the status it always had.
+    """
+    undocumented = len(store.undocumented_sources())
+    if not undocumented:
+        return {}
+    return {
+        "undocumentedSourceCount": undocumented,
+        "documentsWarning": f"{undocumented} indexed document(s) have no row in the "
+        "whole-document keyword index, so search cannot rank them as whole documents. A "
+        "sync (sync_start, or `minirag-mcp sync`) builds them from the stored text, reading "
+        "and embedding nothing again.",
+    }
+
+
 def add_look_alikes(rows: Sequence[dict], store: Store, roots: Sequence[Path]) -> None:
     """Give each document row with look-alikes a `lookAlikes` list; leave the rest as is.
 
@@ -232,19 +314,194 @@ def ignore_status(roots: Sequence[Path]) -> dict:
     return {"ignoreFiles": files} if files else {}
 
 
-def ocr_status() -> dict:
+def ocr_status(config: Config) -> dict:
     """The OCR half of `status`, identical for the server and the CLI.
 
     Measured, not configured: the extra is either importable in this interpreter or it
-    is not, and the whole of the feature turns on that one answer. Nothing here reads
-    the index, so the server reports it alongside the fields that do not need one.
+    is not, and the whole of the feature turns on that one answer. The second reader is
+    the exception, since the owner can turn it off. Nothing here reads the index, so the
+    server reports it alongside the fields that do not need one.
     """
     if ocr.available():
-        return {"ocr": ocr.ENGINE_RAPIDOCR}
+        return {"ocr": ocr.ENGINE_TESSERACT, **_second_reader_status(config)}
     return {
         "ocr": "unavailable",
         "ocrHint": f"scanned PDFs and images cannot be indexed; {ocr.INSTALL_HINT}",
     }
+
+
+def _second_reader_status(config: Config) -> dict:
+    """Apple Vision, on the platform that has it: turned off, or whether its bindings
+    are installed."""
+    if not ocr_vision.supported():
+        return {}
+    if config.ocr_second_reader_below == 0:
+        return {"ocrSecondReader": "off"}
+    return {"ocrSecondReader": "vision" if ocr_vision.available() else "unavailable"}
+
+
+def identity_status(opened: OpenIndex, state: IndexState, why: str) -> dict:
+    """What the open index was built with, which its queries follow, and what a rebuild
+    would change while one is pending."""
+    recorded = opened.identity
+    out: dict = {
+        "indexGeneration": recorded.generation,
+        "embedding": {
+            "model": recorded.embedding.model,
+            "prefixes": recorded.embedding.prefixes,
+            "dim": recorded.embedding.dim,
+            "backend": getattr(opened.embedder, "backend", "in-process"),
+        },
+        "chunkBudget": recorded.chunking.token_budget,
+    }
+    if state is IndexState.REBUILD_PENDING:
+        out["rebuildReasons"] = why.split(REASON_SEPARATOR)
+    return out
+
+
+def status_payload(
+    config: Config, handle: IndexHandle, state: tuple[IndexState, str] | None = None
+) -> dict:
+    """`status` for a valid configuration, the same in both shells.
+
+    An index that cannot be opened is reported as `indexError`, with `indexState`
+    "unavailable", not raised: `status` is what a broken setup is diagnosed with.
+
+    `state` is the index's state and why, the handle's own when None. An `IndexEntry`
+    knows of a sync its handle does not run: one of the handle a reload replaced.
+    """
+    out: dict = {
+        "version": __version__,
+        "roots": [str(r) for r in config.roots],
+        "dbPath": str(config.db_path),
+        "model": config.model_name,
+        "hybridWeight": config.hybrid_weight,
+        "chunkScheme": SCHEME_VERSION,
+        **ocr_status(config),
+        **ignore_status(config.roots),
+    }
+    if config.exclude:
+        out["excludePatterns"] = len(config.exclude)
+    if config.max_table_rows is not None:
+        out["maxTableRows"] = config.max_table_rows
+    state, why = handle.state() if state is None else state
+    out["indexState"] = state.value
+    if state is IndexState.UNAVAILABLE:
+        out["indexError"] = why
+        return out
+    try:
+        opened = handle.get()
+        out.update(identity_status(opened, state, why))
+        out["chunkCount"] = opened.store.chunk_count()
+        out["sourceCount"] = opened.store.source_count()
+        out.update(embedding_status(opened.embedder))
+        out.update(rerank_status(opened.reranker))
+        out.update(scheme_status(opened.store))
+        out.update(fts_status(opened.store))
+        out.update(signature_status(opened.store))
+        out.update(documents_status(opened.store))
+        out.update(pages_status(opened.store))
+        out.update(labels_status(opened.labels, opened.store))
+    except Exception as e:
+        out["indexState"] = IndexState.UNAVAILABLE.value
+        out["indexError"] = str(e)
+    return out
+
+
+def with_index(payload: dict, entry: IndexEntry) -> dict:
+    """`payload` as a call into `entry` answers it: naming the index, and its state while
+    that is not ready."""
+    state, why = entry.state()
+    out = {"index": entry.name, **payload}
+    if state is not IndexState.READY:
+        out["indexState"] = state.value
+    if state is IndexState.REBUILD_PENDING:
+        out["indexWarning"] = (
+            f"Index {entry.name!r} differs from its configuration ({why}); it answers from "
+            "its existing vectors until an unscoped sync_start rebuilds it."
+        )
+    return out
+
+
+def index_status(entry: IndexEntry) -> dict:
+    """`status` of one index, the same in both shells."""
+    return {"index": entry.name, **status_payload(entry.config, entry.handle, entry.state())}
+
+
+def registry_status(registry: IndexRegistry, connection: Connection, requested: str | None) -> dict:
+    """`status` of the index a call names, or of its connection's default; IndexRefused
+    when the connection cannot use it. With no index to report on, the configuration's
+    error is the whole answer; a reload that failed is reported beside the indexes the
+    previous configuration still serves."""
+    if not registry.names:
+        return {
+            "version": __version__,
+            "configError": registry.config_error or "no configuration",
+        }
+    out = index_status(registry.resolve(connection, requested))
+    if registry.config_error:
+        out["configError"] = registry.config_error
+    return out
+
+
+# A syncing index has no reason of its own to report.
+SYNCING_REASON = "a sync of this index is running"
+
+
+def list_indexes_payload(registry: IndexRegistry, connection: Connection) -> dict:
+    """Every index the registry serves, in its configuration's order, and which of them
+    `connection` may use. Those it may use are opened to be reported; the others never.
+    No one index answers it, so it names the connection's `default`, not an `index`."""
+    out: dict = {
+        "default": connection.default,
+        "indexes": [_index_row(e, connection.reachable(e.name)) for e in registry.entries],
+    }
+    if registry.config_error:
+        out["configError"] = registry.config_error
+    return out
+
+
+def _recorded_model(config: Config) -> str:
+    """The model the index's vectors were made with, read without opening it; the
+    configured one while none is recorded or the record cannot be read."""
+    try:
+        recorded = read_identity(config.db_path)
+    except (IdentityError, IndexOpenError):
+        return config.model_name
+    return config.model_name if recorded is None else recorded.embedding.model
+
+
+def _index_row(entry: IndexEntry, reachable: bool) -> dict:
+    config = entry.config
+    row: dict = {
+        "name": entry.name,
+        "description": entry.description,
+        "model": _recorded_model(config),
+        "language": config.fts_language,
+        "reachable": reachable,
+    }
+    if not reachable:
+        return row
+    state, why = entry.state()
+    found: dict = {}
+    if state is not IndexState.UNAVAILABLE:
+        try:
+            opened = entry.handle.get()
+            found = {
+                "documentCount": opened.store.source_count(),
+                "chunkCount": opened.store.chunk_count(),
+                "embeddingBackend": getattr(opened.embedder, "backend", "in-process"),
+                "reranker": rerank_status(opened.reranker)["reranker"],
+                "classifyBackend": opened.labels.backend,
+            }
+        except Exception as e:
+            state, why = IndexState.UNAVAILABLE, str(e)
+    row["state"] = state.value
+    if state is IndexState.SYNCING:
+        row["stateReason"] = why or SYNCING_REASON
+    elif state is not IndexState.READY:
+        row["stateReason"] = why
+    return {**row, **found}
 
 
 def display_path(source: str, roots: Sequence[Path] = ()) -> str:
@@ -348,6 +605,7 @@ def run_query(
     date_from: str | None = None,
     date_to: str | None = None,
     label_source: LabelerSource | None = None,
+    reranker: RerankEndpoint | None = None,
 ) -> dict:
     """`query_documents` and `minirag-mcp query`, as one implementation.
 
@@ -361,22 +619,40 @@ def run_query(
         raise QueryError(f"topK must be at least 1, got {top_k}")
     scopes = tuple(scopes)
     label_filter, labeler = _parse_filter(store, labels, date_from, date_to, label_source)
+    recorder = _Recorder(reranker) if reranker is not None else None
+    # Per call: another query may share the embedder meanwhile.
+    embed = getattr(embedder, "embed_query_noted", None)
+    vector, embed_note = embed(query) if embed else (embedder.embed_query(query), None)
     results = store.search(
         query,
-        embedder.embed_query(query),
+        vector,
         top_k=min(top_k, MAX_TOP_K),
         hybrid_weight=config.hybrid_weight,
+        document_weight=config.document_weight,
         scopes=scopes,
         max_distance=config.max_distance,
         grouping=config.grouping,
         max_files=config.max_files,
         filter_sql=to_sql(label_filter) if label_filter else None,
+        reranker=recorder,
+        rerank_top=config.rerank_top,
     )
+    # Read after the query was embedded: that embedding is what may have fallen back.
+    backend = getattr(embedder, "backend", "in-process")
     payload = {
         "results": [result_dict(r) for r in results],
         "sources": aggregate_sources(results, config.roots),
         "parents": parent_map(results),
+        "embeddingBackend": "in-process (endpoint timed out)" if embed_note else backend,
+        "reranked": any(r.rerank_score is not None for r in results),
     }
+    notes = embedder_notes(embedder)
+    if embed_note:
+        notes.append(embed_note)
+    if recorder is not None and recorder.error:
+        notes.append(f"Reranking was skipped ({recorder.error}); results are in first-stage order.")
+    if notes:
+        payload["warnings"] = notes
     add_look_alikes(payload["sources"], store, config.roots)
     if label_filter is not None and labeler is not None:
         payload["filterCounts"] = filter_counts(
@@ -626,7 +902,7 @@ def _labels_status(source: LabelerSource, store: Store | None) -> dict:
     taxonomy = labeler.taxonomy
     infos = store.list_sources() if store is not None else []
     state, problem = labeler.model_status()
-    out: dict = {"file": str(source.path), "model": state}
+    out: dict = {"file": str(source.path), "model": state, "backend": source.backend}
     if state == "unavailable":
         out["modelHint"] = problem or INSTALL_HINT
     facets: dict = {}
@@ -682,6 +958,8 @@ def list_payload(
     date_to: str | None = None,
     sort: str | None = None,
     label_source: LabelerSource | None = None,
+    exclude: Sequence[str],
+    exclude_source: str,
 ) -> dict:
     """`list_files` and `minirag-mcp list`, as one implementation.
 
@@ -697,11 +975,12 @@ def list_payload(
         raise QueryError(f"sort must be 'date', got {sort!r}")
     label_filter, labeler = _parse_filter(store, labels, date_from, date_to, label_source)
     for scope in scopes:
-        if (by := ignore.scope_excluded_by(Path(scope), roots)) is not None:
+        by = ignore.scope_excluded_by(Path(scope), roots, exclude, exclude_source=exclude_source)
+        if by is not None:
             raise QueryError(f"{scope} is excluded by {by}; nothing under it is listed")
     blind: list[tuple[Path, str | None]] = []
     ignored: list[Path] = []
-    entries = scan_roots(roots, blind=blind, ignored=ignored)
+    entries = scan_roots(roots, blind=blind, ignored=ignored, exclude=exclude)
     if scopes:
         entries = [e for e in entries if any(is_under(str(e.path), p) for p in scopes)]
         ignored = [p for p in ignored if any(is_under(str(p), s) for s in scopes)]

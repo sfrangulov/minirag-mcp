@@ -9,6 +9,7 @@ import pytest
 from fastmcp import Client
 
 import minirag_mcp.cli as cli
+from conftest import stamp_identity
 from minirag_mcp.config import load_config
 from minirag_mcp.ingest.ignore import IGNORE_FILE
 from minirag_mcp.ingest.scanner import scan_roots
@@ -211,11 +212,14 @@ async def test_a_file_under_an_excluded_folder_stays_out_even_if_re_included(
     assert r.is_error and "is excluded by" in r.content[0].text
 
 
-def test_a_file_indexed_before_its_rule_goes_even_if_this_install_cannot_read_it(root, env, capsys):
+def test_a_file_indexed_before_its_rule_goes_even_if_this_install_cannot_read_it(
+    root, env, capsys, fake_embedder
+):
     from minirag_mcp.store import ChunkRecord, Store
 
     png = root / "scan.png"
     png.write_bytes(b"\x89PNG")
+    stamp_identity(load_config(env), fake_embedder)
     store = Store(Path(env["DB_PATH"]), dim=8)
     store.replace_source(
         str(png),

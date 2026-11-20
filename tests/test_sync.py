@@ -7,21 +7,40 @@ from dataclasses import asdict, replace
 
 import pytest
 
+import minirag_mcp.identity as identity_mod
 import minirag_mcp.sync as sync_mod
+from conftest import FakeEmbedder
 from minirag_mcp.chunker import SCHEME_VERSION
 from minirag_mcp.config import load_config
-from minirag_mcp.ingest.pipeline import Pipeline
+from minirag_mcp.handle import IndexHandle
+from minirag_mcp.identity import begin_staging
 from minirag_mcp.lock import SyncLock, SyncLockBusy, sync_lock
-from minirag_mcp.store import ChunkRecord, Store
-from minirag_mcp.sync import SyncBusyError, SyncManager, run_sync
+from minirag_mcp.store import DOCUMENT_TABLE, ChunkRecord, Store
+from minirag_mcp.sync import SyncBusyError
+
+
+def handle_for(cfg, embedder) -> IndexHandle:
+    """The path both shells sync through, every scheme embedded by `embedder`."""
+    return IndexHandle(cfg, embedder_factory=lambda scheme: embedder)
+
+
+def sync(h: IndexHandle, scope=None, on_event=None) -> tuple[dict[str, int], list[dict]]:
+    counts, errors, rebuilt = h.run_sync(scope, on_event)
+    assert rebuilt is None
+    return counts, errors
+
+
+def opened(cfg, embedder) -> tuple[IndexHandle, Store, object]:
+    h = handle_for(cfg, embedder)
+    index = h.get()
+    return h, index.store, index.pipeline
 
 
 @pytest.fixture
 def env(tmp_path, fake_embedder):
     cfg = load_config({"BASE_DIR": str(tmp_path)}, cwd=tmp_path)
-    store = Store(tmp_path / ".minirag" / "lancedb", dim=fake_embedder.dim)
-    pipeline = Pipeline(store, fake_embedder, cfg)
-    return cfg, store, pipeline, tmp_path
+    h, store, pipeline = opened(cfg, fake_embedder)
+    return cfg, store, pipeline, tmp_path, h
 
 
 def seed(root):
@@ -31,18 +50,18 @@ def seed(root):
 
 
 def test_run_sync_ingests_and_deletes(env):
-    cfg, store, pipeline, root = env
+    cfg, store, pipeline, root, h = env
     seed(root)
-    counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    counts, errors = sync(h)
     assert counts["ingested"] == 2 and counts["scanned"] == 2 and errors == []
     (root / "a.md").unlink()
-    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    counts, _ = sync(h)
     assert counts["deleted"] == 1 and counts["skipped"] == 1
     assert store.get_source(str(root / "a.md")) is None
 
 
 def test_run_sync_collects_per_file_errors(env, monkeypatch):
-    cfg, store, pipeline, root = env
+    cfg, store, pipeline, root, h = env
     seed(root)
 
     real = pipeline.ingest_file
@@ -53,15 +72,24 @@ def test_run_sync_collects_per_file_errors(env, monkeypatch):
         return real(path, **kw)
 
     monkeypatch.setattr(pipeline, "ingest_file", flaky)
-    counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    counts, errors = sync(h)
     assert counts["ingested"] == 1 and counts["failed"] == 1
     assert errors and "boom" in errors[0]["error"]
 
 
-def test_manager_lifecycle(env):
-    cfg, store, pipeline, root = env
+def test_an_embedding_fallback_is_reported_but_not_a_failure(env):
+    cfg, store, pipeline, root, h = env
     seed(root)
-    mgr = SyncManager(pipeline, store, cfg)
+    pipeline.embedder.warning = "W"
+    counts, errors = sync(h)
+    assert {"source": str(store.db_path), "error": "embedding: W"} in errors
+    assert counts["failed"] == 0 and counts["ingested"] == 2
+
+
+def test_manager_lifecycle(env):
+    cfg, store, pipeline, root, h = env
+    seed(root)
+    mgr = h.sync
     job_id = mgr.start()
     mgr.wait()
     job = mgr.status(job_id)
@@ -72,7 +100,7 @@ def test_manager_lifecycle(env):
 
 
 def test_manager_rejects_concurrent_and_forgets_old(env):
-    cfg, store, pipeline, root = env
+    cfg, store, pipeline, root, h = env
     seed(root)
     gate = threading.Event()
     real = pipeline.ingest_file
@@ -82,7 +110,7 @@ def test_manager_rejects_concurrent_and_forgets_old(env):
         return real(path, **kw)
 
     pipeline.ingest_file = slow
-    mgr = SyncManager(pipeline, store, cfg)
+    mgr = h.sync
     first = mgr.start()
     with pytest.raises(SyncBusyError):
         mgr.start()
@@ -96,8 +124,8 @@ def test_manager_rejects_concurrent_and_forgets_old(env):
 
 
 def test_unknown_job_id(env):
-    cfg, store, pipeline, _ = env
-    mgr = SyncManager(pipeline, store, cfg)
+    cfg, store, pipeline, _, h = env
+    mgr = h.sync
     with pytest.raises(KeyError):
         mgr.status("nope")
 
@@ -105,15 +133,17 @@ def test_unknown_job_id(env):
 def test_sync_ingests_images_via_ocr(env, monkeypatch):
     from minirag_mcp import ocr
 
-    cfg, store, pipeline, root = env
+    cfg, store, pipeline, root, h = env
     monkeypatch.setattr(ocr, "available", lambda: True)
-    monkeypatch.setattr(ocr, "ocr_image", lambda path, config: "scanned text body")
+    monkeypatch.setattr(
+        ocr, "ocr_image", lambda path, config: ("scanned text body", ocr.ENGINE_TESSERACT)
+    )
     (root / "note.md").write_text("# plain note\n\nbody")
     (root / "scan.jpg").write_bytes(b"...")
-    counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    counts, errors = sync(h)
     assert errors == []
     assert counts["ingested"] == 2
-    counts2, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    counts2, _ = sync(h)
     assert counts2["skipped"] == 2 and counts2["ingested"] == 0
 
 
@@ -125,16 +155,18 @@ def test_sync_keeps_indexed_images_when_the_ocr_extra_is_gone(env, monkeypatch):
     re-syncing from an install that has the extra."""
     from minirag_mcp import ocr
 
-    cfg, store, pipeline, root = env
+    cfg, store, pipeline, root, h = env
     monkeypatch.setattr(ocr, "available", lambda: True)
-    monkeypatch.setattr(ocr, "ocr_image", lambda path, config: "scanned text body")
+    monkeypatch.setattr(
+        ocr, "ocr_image", lambda path, config: ("scanned text body", ocr.ENGINE_TESSERACT)
+    )
     (root / "note.md").write_text("# plain note\n\nbody")
     (root / "scan.jpg").write_bytes(b"...")
-    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    counts, _ = sync(h)
     assert counts["ingested"] == 2
 
     monkeypatch.setattr(ocr, "available", lambda: False)
-    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    counts, _ = sync(h)
 
     assert counts["deleted"] == 0
     assert store.get_source(str(root / "scan.jpg")) is not None
@@ -146,15 +178,17 @@ def test_sync_reports_the_sources_it_kept_but_cannot_read(env, monkeypatch):
     told that part of the corpus is frozen, or which install would thaw it."""
     from minirag_mcp import ocr
 
-    cfg, store, pipeline, root = env
+    cfg, store, pipeline, root, h = env
     monkeypatch.setattr(ocr, "available", lambda: True)
-    monkeypatch.setattr(ocr, "ocr_image", lambda path, config: "scanned text body")
+    monkeypatch.setattr(
+        ocr, "ocr_image", lambda path, config: ("scanned text body", ocr.ENGINE_TESSERACT)
+    )
     (root / "note.md").write_text("# plain note\n\nbody")
     (root / "scan.jpg").write_bytes(b"...")
-    run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    sync(h)
 
     monkeypatch.setattr(ocr, "available", lambda: False)
-    counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    counts, errors = sync(h)
 
     assert counts["unreadable"] == 1
     assert counts["failed"] == 0  # a missing extra is not a failed run
@@ -168,16 +202,20 @@ def two_roots(tmp_path, fake_embedder):
     docs, more = tmp_path / "docs", tmp_path / "more"
     docs.mkdir()
     more.mkdir()
-    cfg = load_config({"BASE_DIRS": json.dumps([str(docs), str(more)])}, cwd=tmp_path)
-    store = Store(tmp_path / "index", dim=fake_embedder.dim)
+    cfg = _cfg(tmp_path, BASE_DIRS=json.dumps([str(docs), str(more)]))
+    h, store, pipeline = opened(cfg, fake_embedder)
     (docs / "sub").mkdir()
     (docs / "a.md").write_text("# A\n\nAlpha body text for the corpus.")
     (docs / "sub" / "b.md").write_text("# B\n\nBeta body text for the corpus.")
     (more / "c.md").write_text("# C\n\nGamma body text for the corpus.")
-    pipeline = Pipeline(store, fake_embedder, cfg)
-    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    counts, _ = sync(h)
     assert counts["ingested"] == 3
-    return cfg, store, pipeline, cfg.roots[0], cfg.roots[1]
+    return cfg, store, pipeline, cfg.roots[0], cfg.roots[1], h
+
+
+def _cfg(tmp_path, **env):
+    """A configuration whose index is `tmp_path / "index"`, outside every root."""
+    return load_config({**env, "DB_PATH": str(tmp_path / "index")}, cwd=tmp_path)
 
 
 def _indexed(store) -> list[str]:
@@ -191,11 +229,11 @@ def test_sync_keeps_what_is_indexed_under_a_folder_it_cannot_list(two_roots):
     os.walk skipped the folder without a word, so every indexed file under it looked
     deleted from disk, and sync deleted it from the index and reported success.
     """
-    cfg, store, pipeline, docs, more = two_roots
+    cfg, store, pipeline, docs, more, h = two_roots
     before = _indexed(store)
     os.chmod(docs / "sub", 0)
     try:
-        counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+        counts, errors = sync(h)
     finally:
         os.chmod(docs / "sub", 0o755)
 
@@ -211,12 +249,12 @@ def test_sync_keeps_what_is_indexed_under_a_root_that_is_gone(two_roots):
 
     The other root still syncs.
     """
-    cfg, store, pipeline, docs, more = two_roots
+    cfg, store, pipeline, docs, more, h = two_roots
     before = _indexed(store)
     docs.rename(docs.with_name("docs-elsewhere"))
     (more / "d.md").write_text("# D\n\nDelta body text for the corpus.")
 
-    counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    counts, errors = sync(h)
 
     assert _indexed(store) == sorted([*before, str(more / "d.md")])
     assert counts["deleted"] == 0 and counts["ingested"] == 1
@@ -227,12 +265,12 @@ def test_sync_keeps_what_is_indexed_under_a_root_that_is_gone(two_roots):
 
 def test_sync_keeps_what_is_indexed_under_a_root_that_lists_empty(two_roots):
     """An empty folder left where a volume was mounted lists without any error."""
-    cfg, store, pipeline, docs, more = two_roots
+    cfg, store, pipeline, docs, more, h = two_roots
     before = _indexed(store)
     shutil.rmtree(docs)
     docs.mkdir()
 
-    counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    counts, errors = sync(h)
 
     assert _indexed(store) == before
     assert counts["deleted"] == 0 and counts["failed"] == 1
@@ -243,11 +281,11 @@ def test_sync_keeps_what_is_indexed_under_a_root_that_lists_empty(two_roots):
 @pytest.mark.skipif(os.geteuid() == 0, reason="root reads a chmod 000 folder anyway")
 def test_an_unlistable_folder_with_nothing_indexed_is_reported_but_does_not_fail(two_roots):
     """Nothing in the index depends on it, and failing would fail every sync forever."""
-    cfg, store, pipeline, docs, more = two_roots
+    cfg, store, pipeline, docs, more, h = two_roots
     (more / "private").mkdir()
     os.chmod(more / "private", 0)
     try:
-        counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+        counts, errors = sync(h)
     finally:
         os.chmod(more / "private", 0o755)
 
@@ -256,11 +294,11 @@ def test_an_unlistable_folder_with_nothing_indexed_is_reported_but_does_not_fail
 
 
 def test_a_scoped_sync_is_not_failed_by_a_root_outside_its_scope(two_roots):
-    cfg, store, pipeline, docs, more = two_roots
+    cfg, store, pipeline, docs, more, h = two_roots
     shutil.rmtree(docs)
     (more / "d.md").write_text("# D\n\nDelta body text for the corpus.")
 
-    counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size, scope=more)
+    counts, errors = sync(h, scope=more)
 
     assert counts["failed"] == 0 and errors == []
     assert counts["ingested"] == 1
@@ -268,12 +306,12 @@ def test_a_scoped_sync_is_not_failed_by_a_root_outside_its_scope(two_roots):
 
 
 def test_sync_still_deletes_a_file_removed_beside_a_kept_folder(two_roots):
-    cfg, store, pipeline, docs, more = two_roots
+    cfg, store, pipeline, docs, more, h = two_roots
     shutil.rmtree(docs)
     (more / "d.md").write_text("# D\n\nDelta body text for the corpus.")
     (more / "c.md").unlink()
 
-    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    counts, _ = sync(h)
 
     assert counts["deleted"] == 1
     assert str(more / "c.md") not in _indexed(store)
@@ -285,11 +323,11 @@ def test_a_pending_job_reports_the_counter_shape_a_finished_one_does(env):
     counter only once the job finishes makes every earlier poll quietly incomplete."""
     from minirag_mcp.sync import SyncJob
 
-    cfg, store, pipeline, root = env
+    cfg, store, pipeline, root, h = env
     seed(root)
     pending = SyncJob(job_id="not-started")
 
-    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    counts, _ = sync(h)
 
     assert set(pending.to_dict()["counts"]) == set(counts)
 
@@ -298,29 +336,29 @@ def test_sync_counts_include_relabelled_from_the_first_poll(env):
     """With or without a classify.toml: the counter shape never depends on the corpus."""
     from minirag_mcp.sync import SyncJob
 
-    cfg, store, pipeline, root = env
+    cfg, store, pipeline, root, h = env
     seed(root)
 
-    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    counts, _ = sync(h)
 
     assert SyncJob(job_id="x").counts["relabelled"] == 0
     assert counts["relabelled"] == 0
 
 
 def test_run_sync_scope_single_file(env):
-    cfg, store, pipeline, root = env
+    cfg, store, pipeline, root, h = env
     seed(root)
-    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size, scope=root / "a.md")
+    counts, _ = sync(h, scope=root / "a.md")
     assert counts["ingested"] == 1
 
 
 def test_run_sync_scope_through_symlink(env, tmp_path):
     """Regression: an unresolved scope silently matched zero files (roots are resolved)."""
-    cfg, store, pipeline, root = env
+    cfg, store, pipeline, root, h = env
     seed(root)
     link = tmp_path / "link_root"
     link.symlink_to(root, target_is_directory=True)
-    counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size, scope=link / "sub")
+    counts, errors = sync(h, scope=link / "sub")
     assert counts["ingested"] == 1 and errors == []
 
 
@@ -331,7 +369,7 @@ def test_run_sync_never_indexes_symlink_escaping_the_root(env, tmp_path):
     target, so without a containment check any readable file — extension-less
     private keys included — lands in the index.
     """
-    cfg, store, pipeline, root = env
+    cfg, store, pipeline, root, h = env
     outside = tmp_path.parent / f"{tmp_path.name}_outside"  # sibling of the document root
     outside.mkdir()
     secret = outside / "id_rsa"
@@ -339,7 +377,7 @@ def test_run_sync_never_indexes_symlink_escaping_the_root(env, tmp_path):
     (root / "readme.md").symlink_to(secret)
     (root / "real.md").write_text("# Real\n\nOrdinary body text that belongs in the corpus.")
 
-    counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    counts, errors = sync(h)
 
     assert counts["ingested"] == 1 and errors == []
     assert store.get_source(str(root / "readme.md")) is None
@@ -350,7 +388,7 @@ def test_run_sync_never_indexes_symlink_escaping_the_root(env, tmp_path):
 
 def test_run_sync_purges_content_leaked_by_an_escaping_symlink(env, tmp_path):
     """An index written before the containment check is cleaned up by the next sync."""
-    cfg, store, pipeline, root = env
+    cfg, store, pipeline, root, h = env
     outside = tmp_path.parent / f"{tmp_path.name}_leak"
     outside.mkdir()
     secret = outside / "id_rsa"
@@ -360,7 +398,7 @@ def test_run_sync_purges_content_leaked_by_an_escaping_symlink(env, tmp_path):
     pipeline.ingest_file(link)  # simulate the pre-fix state: the target got indexed
     assert store.get_source(str(link)) is not None
 
-    run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    sync(h)
 
     assert store.get_source(str(link)) is None
     assert store.chunk_count() == 0
@@ -377,13 +415,13 @@ def test_run_sync_purges_content_leaked_by_an_escaping_symlink(env, tmp_path):
 
 
 def test_run_sync_refuses_while_another_process_syncs(env):
-    cfg, store, pipeline, root = env
+    cfg, store, pipeline, root, h = env
     seed(root)
     with sync_lock(store.db_path):
-        with pytest.raises(SyncLockBusy, match="syncing this index"):
-            run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+        with pytest.raises(SyncLockBusy, match="Another sync of this index"):
+            sync(h)
     # Once the rival is gone the very same call goes through.
-    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    counts, _ = sync(h)
     assert counts["ingested"] == 2
 
 
@@ -394,12 +432,12 @@ def test_manager_start_refuses_immediately_and_records_nothing(env):
     already doomed. It also must leave no trace: a half-registered 'pending' job
     would make every later start() raise SyncBusyError forever.
     """
-    cfg, store, pipeline, root = env
+    cfg, store, pipeline, root, h = env
     seed(root)
-    mgr = SyncManager(pipeline, store, cfg)
+    mgr = h.sync
 
     with sync_lock(store.db_path):
-        with pytest.raises(SyncLockBusy, match="syncing this index"):
+        with pytest.raises(SyncLockBusy, match="Another sync of this index"):
             mgr.start()
 
     job_id = mgr.start()  # not wedged by the refusal
@@ -408,7 +446,7 @@ def test_manager_start_refuses_immediately_and_records_nothing(env):
 
 
 def test_manager_holds_the_lock_for_the_job_and_releases_it_after(env):
-    cfg, store, pipeline, root = env
+    cfg, store, pipeline, root, h = env
     seed(root)
     gate = threading.Event()
     real = pipeline.ingest_file
@@ -418,7 +456,7 @@ def test_manager_holds_the_lock_for_the_job_and_releases_it_after(env):
         return real(path, **kw)
 
     pipeline.ingest_file = slow
-    mgr = SyncManager(pipeline, store, cfg)
+    mgr = h.sync
     mgr.start()
     rival = SyncLock(store.db_path)
     with pytest.raises(SyncLockBusy):
@@ -432,12 +470,12 @@ def test_manager_holds_the_lock_for_the_job_and_releases_it_after(env):
 
 def test_manager_releases_the_lock_when_the_job_fails(env, monkeypatch):
     """A catastrophic failure must not strand the lock for the process's lifetime."""
-    cfg, store, pipeline, root = env
+    cfg, store, pipeline, root, h = env
     seed(root)
     monkeypatch.setattr(
         sync_mod, "scan_roots", lambda roots: (_ for _ in ()).throw(RuntimeError("disk gone"))
     )
-    mgr = SyncManager(pipeline, store, cfg)
+    mgr = h.sync
     job_id = mgr.start()
     mgr.wait()
 
@@ -454,7 +492,7 @@ def test_in_process_guard_fires_before_the_cross_process_lock(env):
     has to reject a second job first. If the order were reversed, this would
     raise SyncLockBusy naming our own PID, or wedge.
     """
-    cfg, store, pipeline, root = env
+    cfg, store, pipeline, root, h = env
     seed(root)
     gate = threading.Event()
     real = pipeline.ingest_file
@@ -464,7 +502,7 @@ def test_in_process_guard_fires_before_the_cross_process_lock(env):
         return real(path, **kw)
 
     pipeline.ingest_file = slow
-    mgr = SyncManager(pipeline, store, cfg)
+    mgr = h.sync
     mgr.start()
     try:
         with pytest.raises(SyncBusyError) as excinfo:
@@ -500,7 +538,7 @@ def test_restarting_the_moment_a_job_reports_terminal_is_never_refused(env, monk
     the same ~5-in-1000 as an untouched interpreter. A test that flaky proves
     nothing when it passes.)
     """
-    cfg, store, pipeline, root = env
+    cfg, store, pipeline, root, h = env
     seed(root)
 
     class LingeringLock(SyncLock):
@@ -511,8 +549,8 @@ def test_restarting_the_moment_a_job_reports_terminal_is_never_refused(env, monk
                 time.sleep(0.05)
             super().release()
 
-    monkeypatch.setattr(sync_mod, "SyncLock", LingeringLock)
-    mgr = SyncManager(pipeline, store, cfg)
+    monkeypatch.setattr(identity_mod, "SyncLock", LingeringLock)
+    mgr = h.sync
 
     first = mgr.start()
     while mgr.status(first).state not in ("succeeded", "failed"):
@@ -528,9 +566,9 @@ def test_restarting_the_moment_a_job_reports_terminal_is_never_refused(env, monk
 
 
 def test_finished_at_set_when_state_terminal(env):
-    cfg, store, pipeline, root = env
+    cfg, store, pipeline, root, h = env
     seed(root)
-    mgr = SyncManager(pipeline, store, cfg)
+    mgr = h.sync
     job_id = mgr.start()
     mgr.wait()
     job = mgr.status(job_id)
@@ -546,13 +584,12 @@ def test_sync_re_ingests_a_source_whose_chunking_scheme_is_stale(tmp_path, fake_
     root.mkdir()
     doc = root / "spec.md"
     doc.write_text("# 1 Хранение\n\n" + "Правило про хранение запасов. " * 40, encoding="utf-8")
-    cfg = load_config({"BASE_DIR": str(root)}, cwd=root)
-    store = Store(tmp_path / "db", dim=fake_embedder.dim)
-    pipeline = Pipeline(store, fake_embedder, cfg)
+    cfg = _cfg(tmp_path, BASE_DIR=str(root))
+    h, store, pipeline = opened(cfg, fake_embedder)
 
-    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    counts, _ = sync(h)
     assert counts["ingested"] == 1
-    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    counts, _ = sync(h)
     assert counts == {**counts, "ingested": 0, "skipped": 1}
 
     # rewrite the source's chunks as an older scheme would have left them
@@ -563,7 +600,7 @@ def test_sync_re_ingests_a_source_whose_chunking_scheme_is_stale(tmp_path, fake_
     store.replace_source(str(doc), old)
     assert store.stale_chunk_count() == len(old)
 
-    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    counts, _ = sync(h)
     assert counts["ingested"] == 1 and counts["skipped"] == 0
     assert store.stale_chunk_count() == 0
 
@@ -598,13 +635,12 @@ def test_an_unlistable_folder_inside_two_overlapping_roots_is_reported_once(
     inner = outer / "inner"
     inner.mkdir(parents=True)
     (inner / "a.md").write_text("# A\n\nAlpha body text for the corpus.")
-    cfg = load_config({"BASE_DIRS": json.dumps([str(outer), str(inner)])}, cwd=tmp_path)
-    store = Store(tmp_path / "index", dim=fake_embedder.dim)
-    pipeline = Pipeline(store, fake_embedder, cfg)
-    run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    cfg = _cfg(tmp_path, BASE_DIRS=json.dumps([str(outer), str(inner)]))
+    h, store, pipeline = opened(cfg, fake_embedder)
+    sync(h)
     os.chmod(inner, 0)
     try:
-        counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+        counts, errors = sync(h)
     finally:
         os.chmod(inner, 0o755)
 
@@ -619,9 +655,8 @@ def test_an_unlistable_folder_inside_two_overlapping_roots_is_reported_once(
 def moving(tmp_path, fake_embedder):
     root = tmp_path / "docs"
     (root / "sub").mkdir(parents=True)
-    cfg = load_config({"BASE_DIR": str(root)}, cwd=root)
-    store = Store(tmp_path / "index", dim=fake_embedder.dim)
-    pipeline = Pipeline(store, fake_embedder, cfg)
+    cfg = _cfg(tmp_path, BASE_DIR=str(root))
+    h, store, pipeline = opened(cfg, fake_embedder)
     parsed: list[str] = []
     real = pipeline.ingest_file
 
@@ -630,7 +665,7 @@ def moving(tmp_path, fake_embedder):
         return real(path, **kw)
 
     pipeline.ingest_file = spy
-    return cfg, store, pipeline, cfg.roots[0], parsed
+    return cfg, store, pipeline, cfg.roots[0], parsed, h
 
 
 def _body(n: int, word: str) -> str:
@@ -640,14 +675,14 @@ def _body(n: int, word: str) -> str:
 def test_sync_follows_a_file_moved_by_hand_without_reading_it_again(moving):
     """Re-filing a document in Finder used to cost a full parse and embed, which for a
     scan is OCR all over again."""
-    cfg, store, pipeline, root, parsed = moving
+    cfg, store, pipeline, root, parsed, h = moving
     (root / "report.md").write_text("# Report\n\n" + _body(3, "alpha"))
-    run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    sync(h)
     chunks_before = len(store.all_chunks(str(root / "report.md")))
     parsed.clear()
 
     (root / "report.md").rename(root / "sub" / "report.md")
-    counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    counts, errors = sync(h)
 
     assert errors == []
     assert counts["moved"] == 1
@@ -655,7 +690,7 @@ def test_sync_follows_a_file_moved_by_hand_without_reading_it_again(moving):
     assert parsed == []
     assert [s.source for s in store.list_sources()] == [str(root / "sub" / "report.md")]
     assert len(store.all_chunks(str(root / "sub" / "report.md"))) == chunks_before
-    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    counts, _ = sync(h)
     assert counts["skipped"] == 1 and counts["moved"] == 0
 
 
@@ -663,14 +698,14 @@ def test_a_new_file_at_the_old_path_does_not_collide_with_the_moved_one(moving):
     """Chunk and section ids carry the source path. Left behind by a move, they are
     exactly the ids the next file at the old path gets, and its ingest would overwrite
     the moved document's rows or merge the two into one section."""
-    cfg, store, pipeline, root, parsed = moving
+    cfg, store, pipeline, root, parsed, h = moving
     (root / "notes.md").write_text("# Notes\n\n" + _body(2, "alpha"))
-    run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    sync(h)
     (root / "notes.md").rename(root / "sub" / "notes.md")
-    run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    sync(h)
 
     (root / "notes.md").write_text("# Notes\n\n" + _body(2, "omega"))
-    run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    sync(h)
 
     moved = store.all_chunks(str(root / "sub" / "notes.md"))
     fresh = store.all_chunks(str(root / "notes.md"))
@@ -684,12 +719,12 @@ def test_a_new_file_at_the_old_path_does_not_collide_with_the_moved_one(moving):
 
 
 def test_a_renamed_file_is_read_again_because_its_title_can_come_from_its_name(moving):
-    cfg, store, pipeline, root, parsed = moving
+    cfg, store, pipeline, root, parsed, h = moving
     (root / "draft_v1.md").write_text(_body(1, "alpha"))
-    run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    sync(h)
     (root / "draft_v1.md").rename(root / "sub" / "final_contract.md")
 
-    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    counts, _ = sync(h)
 
     assert counts["moved"] == 0
     assert counts["ingested"] == 1 and counts["deleted"] == 1
@@ -697,30 +732,30 @@ def test_a_renamed_file_is_read_again_because_its_title_can_come_from_its_name(m
 
 
 def test_a_moved_file_that_was_also_edited_is_read_again(moving):
-    cfg, store, pipeline, root, parsed = moving
+    cfg, store, pipeline, root, parsed, h = moving
     (root / "plan.md").write_text("# Plan\n\n" + _body(1, "alpha"))
-    run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    sync(h)
     (root / "plan.md").rename(root / "sub" / "plan.md")
     (root / "sub" / "plan.md").write_text("# Plan\n\n" + _body(1, "omega"))
 
-    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    counts, _ = sync(h)
 
     assert counts["moved"] == 0 and counts["ingested"] == 1 and counts["deleted"] == 1
     assert all("omega" in c.text for c in store.all_chunks(str(root / "sub" / "plan.md")))
 
 
 def test_one_vanished_file_moves_to_one_of_its_two_new_copies(moving):
-    cfg, store, pipeline, root, parsed = moving
+    cfg, store, pipeline, root, parsed, h = moving
     text = "# Memo\n\n" + _body(1, "alpha")
     (root / "memo.md").write_text(text)
-    run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    sync(h)
     (root / "memo.md").unlink()
     (root / "a").mkdir()
     (root / "b").mkdir()
     (root / "a" / "memo.md").write_text(text)
     (root / "b" / "memo.md").write_text(text)
 
-    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    counts, _ = sync(h)
 
     assert counts["moved"] == 1 and counts["ingested"] == 1 and counts["deleted"] == 0
     assert [s.source for s in store.list_sources()] == [
@@ -731,15 +766,15 @@ def test_one_vanished_file_moves_to_one_of_its_two_new_copies(moving):
 
 def test_a_moved_file_cut_by_an_older_scheme_is_read_again(moving):
     """Its chunks need re-cutting anyway; moving them would only delay that a sync."""
-    cfg, store, pipeline, root, parsed = moving
+    cfg, store, pipeline, root, parsed, h = moving
     doc = root / "old.md"
     doc.write_text("# Old\n\n" + _body(1, "alpha"))
-    run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    sync(h)
     stale = [replace(c, scheme_version=SCHEME_VERSION - 1) for c in _records_of(store, str(doc))]
     store.replace_source(str(doc), stale)
     doc.rename(root / "sub" / "old.md")
 
-    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    counts, _ = sync(h)
 
     assert counts["moved"] == 0 and counts["ingested"] == 1
     assert store.stale_chunk_count() == 0
@@ -747,14 +782,14 @@ def test_a_moved_file_cut_by_an_older_scheme_is_read_again(moving):
 
 def test_sync_repairs_a_source_a_racing_first_ingest_stored_twice(env):
     """Its bytes and mtime match the index, so nothing else would ever re-read it."""
-    cfg, store, pipeline, root = env
+    cfg, store, pipeline, root, h = env
     seed(root)
-    run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    sync(h)
     doc = str(root / "a.md")
     store._table.add([asdict(r) for r in _records_of(store, doc)])
     assert len(store.all_chunks(doc)) == 2 * len({c.chunk_index for c in store.all_chunks(doc)})
 
-    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    counts, _ = sync(h)
 
     assert counts["ingested"] == 1
     indexes = [c.chunk_index for c in store.all_chunks(doc)]
@@ -770,16 +805,15 @@ def test_files_moved_out_of_a_root_left_empty_are_followed_not_held(tmp_path, fa
     archive, inbox = tmp_path / "archive", tmp_path / "inbox"
     archive.mkdir()
     inbox.mkdir()
-    cfg = load_config({"BASE_DIRS": json.dumps([str(archive), str(inbox)])}, cwd=tmp_path)
-    store = Store(tmp_path / "index", dim=fake_embedder.dim)
-    pipeline = Pipeline(store, fake_embedder, cfg)
+    cfg = _cfg(tmp_path, BASE_DIRS=json.dumps([str(archive), str(inbox)]))
+    h, store, pipeline = opened(cfg, fake_embedder)
     for name in ("a.md", "b.md"):
         (inbox / name).write_text(f"# {name}\n\nBody of {name} for the corpus.")
-    run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    sync(h)
     for name in ("a.md", "b.md"):
         (inbox / name).rename(archive / name)
 
-    counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    counts, errors = sync(h)
 
     assert errors == []
     assert counts["moved"] == 2 and counts["ingested"] == 0 and counts["failed"] == 0
@@ -789,12 +823,12 @@ def test_files_moved_out_of_a_root_left_empty_are_followed_not_held(tmp_path, fa
 @pytest.mark.skipif(os.geteuid() == 0, reason="root reads a chmod 000 folder anyway")
 def test_syncing_exactly_a_folder_that_cannot_be_listed_fails(two_roots):
     """Nothing indexed is at stake, but nothing the user asked for was done either."""
-    cfg, store, pipeline, docs, more = two_roots
+    cfg, store, pipeline, docs, more, h = two_roots
     (docs / "new").mkdir()
     (docs / "new" / "n.md").write_text("# N\n\nNew body text for the corpus.")
     os.chmod(docs / "new", 0)
     try:
-        counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size, scope=docs / "new")
+        counts, errors = sync(h, scope=docs / "new")
     finally:
         os.chmod(docs / "new", 0o755)
 
@@ -804,10 +838,10 @@ def test_syncing_exactly_a_folder_that_cannot_be_listed_fails(two_roots):
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root reads a chmod 000 folder anyway")
 def test_a_scoped_sync_reports_an_unlistable_folder_inside_its_scope(two_roots):
-    cfg, store, pipeline, docs, more = two_roots
+    cfg, store, pipeline, docs, more, h = two_roots
     os.chmod(docs / "sub", 0)
     try:
-        counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size, scope=docs)
+        counts, errors = sync(h, scope=docs)
     finally:
         os.chmod(docs / "sub", 0o755)
 
@@ -817,11 +851,11 @@ def test_a_scoped_sync_reports_an_unlistable_folder_inside_its_scope(two_roots):
 
 
 def test_a_scoped_sync_inside_a_root_that_is_gone_keeps_it_and_fails(two_roots):
-    cfg, store, pipeline, docs, more = two_roots
+    cfg, store, pipeline, docs, more, h = two_roots
     before = _indexed(store)
     shutil.rmtree(docs)
 
-    counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size, scope=docs / "sub")
+    counts, errors = sync(h, scope=docs / "sub")
 
     assert _indexed(store) == before
     assert counts["failed"] == 1 and counts["deleted"] == 0
@@ -831,10 +865,10 @@ def test_a_scoped_sync_inside_a_root_that_is_gone_keeps_it_and_fails(two_roots):
 def test_a_root_that_is_gone_fails_the_sync_even_with_nothing_indexed(tmp_path, fake_embedder):
     """A configured root that does not exist is a typo or an unplugged drive, not a no-op."""
     docs = tmp_path / "docs"
-    cfg = load_config({"BASE_DIR": str(docs)}, cwd=tmp_path)
-    store = Store(tmp_path / "index", dim=fake_embedder.dim)
+    cfg = _cfg(tmp_path, BASE_DIR=str(docs))
+    h, _, _ = opened(cfg, fake_embedder)
 
-    counts, errors = run_sync(Pipeline(store, fake_embedder, cfg), store, cfg.roots, 10**9)
+    counts, errors = sync(h)
 
     assert counts["failed"] == 1
     assert [e["source"] for e in errors] == [str(cfg.roots[0])]
@@ -843,20 +877,20 @@ def test_a_root_that_is_gone_fails_the_sync_even_with_nothing_indexed(tmp_path, 
 def test_an_empty_root_with_nothing_indexed_is_simply_empty(tmp_path, fake_embedder):
     docs = tmp_path / "docs"
     docs.mkdir()
-    cfg = load_config({"BASE_DIR": str(docs)}, cwd=tmp_path)
-    store = Store(tmp_path / "index", dim=fake_embedder.dim)
+    cfg = _cfg(tmp_path, BASE_DIR=str(docs))
+    h, _, _ = opened(cfg, fake_embedder)
 
-    counts, errors = run_sync(Pipeline(store, fake_embedder, cfg), store, cfg.roots, 10**9)
+    counts, errors = sync(h)
 
     assert counts["failed"] == 0 and errors == []
 
 
 def test_removing_the_last_file_of_a_subfolder_still_deletes_it(two_roots):
     """Only an empty root is suspect; an emptied subfolder is just emptied."""
-    cfg, store, pipeline, docs, more = two_roots
+    cfg, store, pipeline, docs, more, h = two_roots
     (docs / "sub" / "b.md").unlink()
 
-    counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    counts, errors = sync(h)
 
     assert counts["deleted"] == 1 and counts["failed"] == 0 and errors == []
     assert str(docs / "sub" / "b.md") not in _indexed(store)
@@ -866,17 +900,16 @@ def test_a_root_that_is_gone_does_not_hold_a_sibling_whose_name_extends_it(tmp_p
     docs, archive = tmp_path / "docs", tmp_path / "docs-archive"
     docs.mkdir()
     archive.mkdir()
-    cfg = load_config({"BASE_DIRS": json.dumps([str(docs), str(archive)])}, cwd=tmp_path)
-    store = Store(tmp_path / "index", dim=fake_embedder.dim)
-    pipeline = Pipeline(store, fake_embedder, cfg)
+    cfg = _cfg(tmp_path, BASE_DIRS=json.dumps([str(docs), str(archive)]))
+    h, store, pipeline = opened(cfg, fake_embedder)
     (docs / "a.md").write_text("# A\n\nAlpha body text for the corpus.")
     (archive / "y.md").write_text("# Y\n\nYankee body text for the corpus.")
     (archive / "z.md").write_text("# Z\n\nZulu body text for the corpus.")
-    run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    sync(h)
     shutil.rmtree(docs)
     (archive / "z.md").unlink()
 
-    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    counts, _ = sync(h)
 
     assert counts["deleted"] == 1
     assert str(cfg.roots[1] / "z.md") not in _indexed(store)
@@ -885,13 +918,13 @@ def test_a_root_that_is_gone_does_not_hold_a_sibling_whose_name_extends_it(tmp_p
 
 def test_a_file_moved_over_an_indexed_file_of_the_same_name_replaces_it(moving):
     """The destination's own chunks must go: a re-path only removes the origin's."""
-    cfg, store, pipeline, root, parsed = moving
+    cfg, store, pipeline, root, parsed, h = moving
     (root / "x.md").write_text("# X\n\n" + _body(1, "alpha"))
     (root / "sub" / "x.md").write_text("# X\n\n" + _body(4, "omega"))
-    run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    sync(h)
     (root / "x.md").rename(root / "sub" / "x.md")
 
-    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    counts, _ = sync(h)
 
     assert counts["deleted"] == 1 and counts["moved"] == 0
     chunks = store.all_chunks(str(root / "sub" / "x.md"))
@@ -899,16 +932,16 @@ def test_a_file_moved_over_an_indexed_file_of_the_same_name_replaces_it(moving):
 
 
 def _paired_move(moving):
-    cfg, store, pipeline, root, parsed = moving
+    cfg, store, pipeline, root, parsed, h = moving
     (root / "r.md").write_text("# R\n\n" + _body(1, "alpha"))
-    run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    sync(h)
     (root / "r.md").rename(root / "sub" / "r.md")
-    return cfg, store, pipeline, root
+    return cfg, store, pipeline, root, h
 
 
 def test_a_move_whose_origin_vanished_meanwhile_is_read_instead(moving, monkeypatch):
     """delete_file takes no lock, so the origin can go between planning and re-pathing."""
-    cfg, store, pipeline, root = _paired_move(moving)
+    cfg, store, pipeline, root, h = _paired_move(moving)
     real = store.move_source
 
     def raced(old, new, *, mtime):
@@ -916,20 +949,20 @@ def test_a_move_whose_origin_vanished_meanwhile_is_read_instead(moving, monkeypa
         return real(old, new, mtime=mtime)
 
     monkeypatch.setattr(store, "move_source", raced)
-    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    counts, _ = sync(h)
 
     assert counts["moved"] == 0 and counts["ingested"] == 1 and counts["failed"] == 0
     assert _indexed(store) == [str(root / "sub" / "r.md")]
 
 
 def test_a_move_that_raises_is_read_instead_and_the_origin_goes(moving, monkeypatch):
-    cfg, store, pipeline, root = _paired_move(moving)
+    cfg, store, pipeline, root, h = _paired_move(moving)
 
     def broken(old, new, *, mtime):
         raise RuntimeError("commit conflict")
 
     monkeypatch.setattr(store, "move_source", broken)
-    counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    counts, errors = sync(h)
 
     assert counts["moved"] == 0 and counts["failed"] == 0
     assert counts["ingested"] == 1 and counts["deleted"] == 1
@@ -937,18 +970,18 @@ def test_a_move_that_raises_is_read_instead_and_the_origin_goes(moving, monkeypa
 
 
 def test_a_move_records_the_new_files_mtime(moving):
-    cfg, store, pipeline, root = _paired_move(moving)
-    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    cfg, store, pipeline, root, h = _paired_move(moving)
+    counts, _ = sync(h)
     new = root / "sub" / "r.md"
     assert counts["moved"] == 1 and counts["scanned"] == 1
     assert store.get_source(str(new)).mtime == new.stat().st_mtime
 
 
 def test_a_doubled_source_that_moved_is_read_again_rather_than_carried_over(moving):
-    cfg, store, pipeline, root = _paired_move(moving)
+    cfg, store, pipeline, root, h = _paired_move(moving)
     store._table.add([asdict(r) for r in _records_of(store, str(root / "r.md"))])
 
-    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    counts, _ = sync(h)
 
     assert counts["moved"] == 0 and counts["ingested"] == 1
     indexes = [c.chunk_index for c in store.all_chunks(str(root / "sub" / "r.md"))]
@@ -962,11 +995,11 @@ def test_a_copy_beside_a_folder_that_cannot_be_listed_does_not_take_its_entry(tw
     Re-pathing it to the copy dropped its own path from the index, and deleting the
     copy before access came back lost the document entirely.
     """
-    cfg, store, pipeline, docs, more = two_roots
+    cfg, store, pipeline, docs, more, h = two_roots
     (more / "b.md").write_bytes((docs / "sub" / "b.md").read_bytes())
     os.chmod(docs / "sub", 0)
     try:
-        counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+        counts, errors = sync(h)
     finally:
         os.chmod(docs / "sub", 0o755)
 
@@ -984,13 +1017,12 @@ def test_a_scoped_sync_reached_through_an_inner_root_is_not_failed_by_its_parent
     docs = tmp_path / "docs"
     inner = docs / "a" / "b"
     inner.mkdir(parents=True)
-    cfg = load_config({"BASE_DIRS": json.dumps([str(docs), str(inner)])}, cwd=tmp_path)
-    store = Store(tmp_path / "index", dim=fake_embedder.dim)
-    pipeline = Pipeline(store, fake_embedder, cfg)
+    cfg = _cfg(tmp_path, BASE_DIRS=json.dumps([str(docs), str(inner)]))
+    h, store, pipeline = opened(cfg, fake_embedder)
     (inner / "y.md").write_text("# Y\n\nYankee body text for the corpus.")
     os.chmod(docs / "a", 0o311)
     try:
-        counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size, scope=cfg.roots[1])
+        counts, _ = sync(h, scope=cfg.roots[1])
     finally:
         os.chmod(docs / "a", 0o755)
 
@@ -1001,35 +1033,32 @@ def _before_signatures(env):
     """An index synced by a version that predates look-alike signatures."""
     from lookalike_texts import MINUTES, REGULATION_V1, REGULATION_V2
 
-    cfg, store, pipeline, root = env
+    cfg, store, pipeline, root, h = env
     (root / "v1.md").write_text(REGULATION_V1)
     (root / "v2.md").write_text(REGULATION_V2)
     (root / "minutes.md").write_text(MINUTES)
-    counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    counts, errors = sync(h)
     assert counts["ingested"] >= 3 and errors == []
     store._db.drop_table("signatures")
-    return Store(store.db_path, dim=store.dim)
 
 
-class _NoEmbedder:
-    dim = 8
-
+class _NoEmbedder(FakeEmbedder):
     def embed_documents(self, texts):
         raise AssertionError("a backfill must not embed")
 
 
 def test_sync_signs_an_index_from_before_signatures_from_its_stored_text(env, monkeypatch):
-    cfg, _, _, root = env
-    store = _before_signatures(env)
+    cfg, _, _, root, _ = env
+    _before_signatures(env)
     monkeypatch.setattr(
         "minirag_mcp.ingest.pipeline.parse_file",
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("a backfill must not parse")),
     )
-    pipeline = Pipeline(store, _NoEmbedder(), cfg)
+    h, store, _ = opened(cfg, _NoEmbedder())
     assert len(store.unsigned_sources()) == 3
 
     events = []
-    counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size, on_event=events.append)
+    counts, errors = sync(h, on_event=events.append)
 
     assert errors == []
     assert counts["signed"] == 3 and counts["ingested"] == 0 and counts["skipped"] == 3
@@ -1038,34 +1067,34 @@ def test_sync_signs_an_index_from_before_signatures_from_its_stored_text(env, mo
     assert [n.source for n in store.look_alikes([str(root / "v1.md")])[str(root / "v1.md")]] == [
         str(root / "v2.md")
     ]
-    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    counts, _ = sync(h)
     assert counts["signed"] == 0
 
 
 def test_a_scoped_sync_signs_only_inside_its_scope(env):
-    cfg, _, _, root = env
+    cfg, _, _, root, _ = env
     (root / "sub").mkdir()
     (root / "sub" / "c.md").write_text("# C\n\nCharlie body text for the corpus.")
-    store = _before_signatures(env)
-    pipeline = Pipeline(store, _NoEmbedder(), cfg)
-    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size, scope=root / "sub")
+    _before_signatures(env)
+    h, store, _ = opened(cfg, _NoEmbedder())
+    counts, _ = sync(h, scope=root / "sub")
     assert counts["signed"] == 1
     assert len(store.unsigned_sources()) == 3
 
 
 def test_a_sync_that_ingests_signs_at_ingest_and_counts_no_backfill(env):
-    cfg, store, pipeline, root = env
+    cfg, store, pipeline, root, h = env
     seed(root)
-    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    counts, _ = sync(h)
     assert counts["ingested"] == 2 and counts["signed"] == 0
     assert store.unsigned_sources() == []
 
 
 def test_a_job_reports_the_same_count_keys_before_and_after_it_runs(env):
     """A counter that only appears once the job finishes changes every earlier poll's shape."""
-    cfg, store, pipeline, root = env
+    cfg, store, pipeline, root, h = env
     seed(root)
-    counts, _ = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    counts, _ = sync(h)
     assert set(sync_mod.SyncJob(job_id="x").counts) == set(counts)
 
 
@@ -1079,31 +1108,98 @@ def _unindexed(store):
 # LanceDB indexes only the rows present when an index is built; later rows are searched
 # by brute force, scored per data fragment and returned out of score order.
 def test_sync_leaves_no_row_outside_the_keyword_indexes(env):
-    cfg, store, pipeline, root = env
+    cfg, store, pipeline, root, h = env
     seed(root)
-    run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    sync(h)
     assert _unindexed(store) and set(_unindexed(store).values()) == {0}
 
 
 def test_a_sync_with_nothing_to_do_still_indexes_earlier_rows(env):
-    cfg, store, pipeline, root = env
+    cfg, store, pipeline, root, h = env
     seed(root)
     for path in (root / "a.md", root / "sub" / "b.md"):
         pipeline.ingest_file(path)
     assert set(_unindexed(store).values()) != {0}
-    counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    counts, errors = sync(h)
     assert counts["skipped"] == 2 and errors == []
     assert set(_unindexed(store).values()) == {0}
 
 
 def test_an_index_update_failure_is_reported_not_raised(env, monkeypatch):
-    cfg, store, pipeline, root = env
+    cfg, store, pipeline, root, h = env
     seed(root)
 
     def broken(*a, **kw):
         raise OSError("disk full")
 
     monkeypatch.setattr(type(store._table), "optimize", broken)
-    counts, errors = run_sync(pipeline, store, cfg.roots, cfg.max_file_size)
+    counts, errors = sync(h)
     assert counts["ingested"] == 2
     assert any("disk full" in e["error"] for e in errors)
+
+
+def _without_document_rows(env):
+    """An index whose chunks were written with no `documents` row beside them."""
+    cfg, store, pipeline, root, h = env
+    seed(root)
+    (root / "sub" / "c.md").write_text("# C\n\nCharlie body text for the corpus.")
+    counts, errors = sync(h)
+    assert counts["ingested"] == 3 and errors == []
+    store._db.open_table(DOCUMENT_TABLE).delete("true")
+
+
+def test_sync_builds_missing_document_rows(env, monkeypatch):
+    cfg, _, _, root, _ = env
+    _without_document_rows(env)
+    monkeypatch.setattr(
+        "minirag_mcp.ingest.pipeline.parse_file",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("a backfill must not parse")),
+    )
+    h, store, _ = opened(cfg, _NoEmbedder())
+    assert len(store.undocumented_sources()) == 3
+
+    events = []
+    counts, errors = sync(h, on_event=events.append)
+
+    assert errors == [] and counts["skipped"] == 3 and counts["ingested"] == 0
+    assert f"documented {root / 'a.md'}" in events
+    assert store.undocumented_sources() == []
+    documents = store._db.open_table(DOCUMENT_TABLE)
+    assert {
+        i.name: documents.index_stats(i.name).num_unindexed_rows for i in documents.list_indices()
+    } == {"text_idx": 0, "title_idx": 0}
+
+
+def test_a_scoped_sync_builds_document_rows_only_inside_its_scope(env):
+    cfg, _, _, root, _ = env
+    _without_document_rows(env)
+    h, store, _ = opened(cfg, _NoEmbedder())
+    sync(h, scope=root / "sub")
+    assert store.undocumented_sources() == [str(root / "a.md")]
+
+
+def test_a_document_backfill_failure_is_reported_not_raised(env, monkeypatch):
+    cfg, _, _, root, _ = env
+    _without_document_rows(env)
+    h, store, _ = opened(cfg, _NoEmbedder())
+
+    def conflict(*args, **kwargs):
+        raise RuntimeError("Retryable commit conflict for version 7")
+
+    monkeypatch.setattr(store, "_put_documents", conflict)
+    counts, errors = sync(h)
+    assert counts["failed"] == 0
+    [error] = errors
+    assert error["error"].startswith("documents: ") and "commit conflict" in error["error"]
+    assert len(store.undocumented_sources()) == 3
+
+
+def test_run_sync_deletes_the_staging_folder_a_stopped_rebuild_left(env):
+    """Left in place, with this sync's own lock held, it reads as a rebuild running and
+    every write of the sync is refused."""
+    cfg, store, pipeline, root, h = env
+    seed(root)
+    staging = begin_staging(store.db_path)
+    counts, errors = sync(h)
+    assert (counts["ingested"], counts["failed"], errors) == (2, 0, [])
+    assert not staging.exists()

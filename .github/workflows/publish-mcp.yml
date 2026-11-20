@@ -64,6 +64,24 @@ jobs:
           done
           echo "server.json versions: ${found[*]} — all match ${expected}"
 
+      # The registry's code ranks a non-semver version (2.0.0a1) below every semver one,
+      # but its versioning guide says such a version is always marked latest, and a semver
+      # pre-release (2.0.0-alpha.1) outranks 1.1.1 by semver itself. A registry version
+      # can never be withdrawn, so only vMAJOR.MINOR.PATCH is registered.
+      - name: Register final releases only
+        id: kind
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          version=${REF_NAME#v}
+          if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "final=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "final=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::${version} is not a final release; the MCP Registry entry is left as it is"
+            echo "${version} is not a final release: not registered with the MCP Registry." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       # The registry proves PyPI ownership by looking for `mcp-name: <name>` in
       # the package description, which is the README *as published to PyPI* —
       # and a PyPI description is immutable per version. So this must be true of
@@ -75,6 +93,7 @@ jobs:
       # Waiting turns that race into a wait, and a timeout into a re-runnable
       # failure with an actionable message instead of an opaque registry error.
       - name: Wait for the release on PyPI and check its ownership marker
+        if: steps.kind.outputs.final == 'true'
         env:
           REF_NAME: ${{ github.ref_name }}
         run: |
@@ -110,6 +129,7 @@ jobs:
       # does: the binary and the deployed registry are versioned together, and
       # an "invalid audience" error is what an outdated publisher looks like.
       - name: Install mcp-publisher
+        if: steps.kind.outputs.final == 'true'
         run: |
           curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
 
@@ -117,7 +137,9 @@ jobs:
       # workflow's own identity, so there is no secret in this repository to
       # leak and nothing to rotate.
       - name: Authenticate to the MCP Registry
+        if: steps.kind.outputs.final == 'true'
         run: ./mcp-publisher login github-oidc
 
       - name: Publish server.json to the MCP Registry
+        if: steps.kind.outputs.final == 'true'
         run: ./mcp-publisher publish

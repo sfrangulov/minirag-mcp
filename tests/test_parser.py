@@ -1,11 +1,15 @@
+import zipfile
+
 import pytest
 
 from conftest import SECRET_BODY
+from docx_builder import build_docx, para, run, styles, table
 from minirag_mcp.ingest.parser import (
     MAX_REDIRECTS,
     SUPPORTED_EXTENSIONS,
     ParsedDoc,
     ParserError,
+    _docx_stream,
     _is_boilerplate_heading,
     _is_informative_stem,
     _strip_extension_suffix,
@@ -380,13 +384,30 @@ def test_parse_file_image_routes_through_ocr(tmp_path, monkeypatch):
     from minirag_mcp.ingest import parser
 
     monkeypatch.setattr(ocr, "available", lambda: True)
-    monkeypatch.setattr(ocr, "ocr_image", lambda path, config: "recognized scan text")
+    monkeypatch.setattr(
+        ocr, "ocr_image", lambda path, config: ("recognized scan text", ocr.ENGINE_TESSERACT)
+    )
     img = tmp_path / "Договор_поставки_2026.png"
     img.write_bytes(b"png bytes irrelevant, ocr is faked")
     doc = parser.parse_file(img, load_config({}, cwd=tmp_path))
     assert doc.markdown == "recognized scan text"
-    assert doc.ocr_engine == "rapidocr"
+    assert doc.ocr_engine == "tesseract"
     assert doc.title == "Договор поставки 2026"
+
+
+def test_an_image_carries_the_engines_that_read_it(tmp_path, monkeypatch):
+    from minirag_mcp import ocr
+    from minirag_mcp.config import load_config
+    from minirag_mcp.ingest import parser
+
+    monkeypatch.setattr(ocr, "available", lambda: True)
+    monkeypatch.setattr(
+        ocr, "ocr_image", lambda path, config: ("spliced text", ocr.ENGINE_TESSERACT_VISION)
+    )
+    img = tmp_path / "scan.png"
+    img.write_bytes(b"png bytes irrelevant, ocr is faked")
+    doc = parser.parse_file(img, load_config({}, cwd=tmp_path))
+    assert (doc.markdown, doc.ocr_engine) == ("spliced text", "tesseract+vision")
 
 
 def test_parse_file_image_without_ocr_raises_hint(tmp_path, monkeypatch):
@@ -410,7 +431,7 @@ def test_parse_file_image_title_strips_leftover_extension(tmp_path, monkeypatch)
     from minirag_mcp.ingest import parser
 
     monkeypatch.setattr(ocr, "available", lambda: True)
-    monkeypatch.setattr(ocr, "ocr_image", lambda path, config: "text")
+    monkeypatch.setattr(ocr, "ocr_image", lambda path, config: ("text", ocr.ENGINE_TESSERACT))
     img = tmp_path / "scan.png.png"
     img.write_bytes(b"...")
     doc = parser.parse_file(img, load_config({}, cwd=tmp_path))
@@ -425,7 +446,7 @@ def test_parse_file_image_title_normalizes_underscores(tmp_path, monkeypatch):
     from minirag_mcp.ingest import parser
 
     monkeypatch.setattr(ocr, "available", lambda: True)
-    monkeypatch.setattr(ocr, "ocr_image", lambda path, config: "text")
+    monkeypatch.setattr(ocr, "ocr_image", lambda path, config: ("text", ocr.ENGINE_TESSERACT))
     img = tmp_path / "IMG_20260807_123456.png"
     img.write_bytes(b"...")
     doc = parser.parse_file(img, load_config({}, cwd=tmp_path))
@@ -467,14 +488,35 @@ def test_pdf_scanned_pages_get_ocr(tmp_path, monkeypatch):
 
     monkeypatch.setattr(ocr, "available", lambda: True)
     monkeypatch.setattr(
-        ocr, "ocr_pdf", lambda path, config, pages: {i: f"OCR PAGE {i}" for i in pages}
+        ocr,
+        "ocr_pdf",
+        lambda path, config, pages: ({i: f"OCR PAGE {i}" for i in pages}, ocr.ENGINE_TESSERACT),
     )
     doc = parser.parse_file(_pdf(tmp_path, [LONG, "", ""]), load_config({}, cwd=tmp_path))
-    assert doc.ocr_engine == "rapidocr"
+    assert doc.ocr_engine == "tesseract"
     # Recognized text follows the whole converted document, and the OCR'd pages keep
     # their order among themselves.
     body = doc.markdown
     assert body.index("long enough") < body.index("OCR PAGE 1") < body.index("OCR PAGE 2")
+
+
+def test_a_pdf_carries_the_engines_that_read_its_scanned_pages(tmp_path, monkeypatch):
+    from minirag_mcp import ocr
+    from minirag_mcp.config import load_config
+    from minirag_mcp.ingest import parser
+
+    monkeypatch.setattr(ocr, "available", lambda: True)
+    monkeypatch.setattr(
+        ocr,
+        "ocr_pdf",
+        lambda path, config, pages: (
+            {i: f"OCR PAGE {i}" for i in pages},
+            ocr.ENGINE_TESSERACT_VISION,
+        ),
+    )
+    doc = parser.parse_file(_pdf(tmp_path, [LONG, ""]), load_config({}, cwd=tmp_path))
+    assert doc.ocr_engine == "tesseract+vision"
+    assert "OCR PAGE 1" in doc.markdown
 
 
 def test_pdf_ocr_text_is_appended_after_the_converted_document(tmp_path, monkeypatch):
@@ -487,10 +529,12 @@ def test_pdf_ocr_text_is_appended_after_the_converted_document(tmp_path, monkeyp
 
     monkeypatch.setattr(ocr, "available", lambda: True)
     monkeypatch.setattr(
-        ocr, "ocr_pdf", lambda path, config, pages: {i: f"OCR PAGE {i}" for i in pages}
+        ocr,
+        "ocr_pdf",
+        lambda path, config, pages: ({i: f"OCR PAGE {i}" for i in pages}, ocr.ENGINE_TESSERACT),
     )
     doc = parser.parse_file(_pdf(tmp_path, ["", LONG]), load_config({}, cwd=tmp_path))
-    assert doc.ocr_engine == "rapidocr"
+    assert doc.ocr_engine == "tesseract"
     body = doc.markdown
     assert body.index("long enough") < body.index("OCR PAGE 0")
 
@@ -504,10 +548,12 @@ def test_pdf_page_with_a_short_text_layer_still_goes_to_ocr(tmp_path, monkeypatc
 
     monkeypatch.setattr(ocr, "available", lambda: True)
     monkeypatch.setattr(
-        ocr, "ocr_pdf", lambda path, config, pages: {i: f"OCR PAGE {i}" for i in pages}
+        ocr,
+        "ocr_pdf",
+        lambda path, config, pages: ({i: f"OCR PAGE {i}" for i in pages}, ocr.ENGINE_TESSERACT),
     )
     doc = parser.parse_file(_pdf(tmp_path, [LONG, SHORT]), load_config({}, cwd=tmp_path))
-    assert doc.ocr_engine == "rapidocr"
+    assert doc.ocr_engine == "tesseract"
     assert "OCR PAGE 1" in doc.markdown and "OCR PAGE 0" not in doc.markdown
 
 
@@ -594,26 +640,30 @@ def test_pdf_without_config_behaves_as_before(tmp_path):
 
 def test_pdf_fully_scanned_ocr_returns_nothing_raises(tmp_path, monkeypatch):
     """The blank-page guard: OCR ran over every page and still found nothing, which
-    must be a loud failure rather than an empty document tagged ocr_engine=rapidocr."""
+    must be a loud failure rather than an empty document tagged ocr_engine=tesseract."""
     from minirag_mcp import ocr
     from minirag_mcp.config import load_config
     from minirag_mcp.ingest import parser
 
     monkeypatch.setattr(ocr, "available", lambda: True)
-    monkeypatch.setattr(ocr, "ocr_pdf", lambda path, config, pages: {i: "" for i in pages})
+    monkeypatch.setattr(
+        ocr, "ocr_pdf", lambda path, config, pages: ({i: "" for i in pages}, ocr.ENGINE_TESSERACT)
+    )
     with pytest.raises(parser.ParserError, match=r"OCR produced no text"):
         parser.parse_file(_pdf(tmp_path, ["", ""]), load_config({}, cwd=tmp_path))
 
 
 def test_pdf_mixed_ocr_returns_nothing_keeps_text_page(tmp_path, monkeypatch):
     """OCR adding nothing must not erase a text page that already carried content,
-    and must not claim ocr_engine=rapidocr for a result OCR did not contribute to."""
+    and must not claim ocr_engine=tesseract for a result OCR did not contribute to."""
     from minirag_mcp import ocr
     from minirag_mcp.config import load_config
     from minirag_mcp.ingest import parser
 
     monkeypatch.setattr(ocr, "available", lambda: True)
-    monkeypatch.setattr(ocr, "ocr_pdf", lambda path, config, pages: {i: "" for i in pages})
+    monkeypatch.setattr(
+        ocr, "ocr_pdf", lambda path, config, pages: ({i: "" for i in pages}, ocr.ENGINE_TESSERACT)
+    )
     doc = parser.parse_file(_pdf(tmp_path, [LONG, ""]), load_config({}, cwd=tmp_path))
     assert doc.ocr_engine == ""
     assert "long enough" in doc.markdown
@@ -630,7 +680,9 @@ def test_pdf_markitdown_content_survives_when_pdfminer_diverges(tmp_path, monkey
 
     monkeypatch.setattr(ocr, "available", lambda: True)
     monkeypatch.setattr(ocr, "pdf_page_texts", lambda path: [""])
-    monkeypatch.setattr(ocr, "ocr_pdf", lambda path, config, pages: {i: "" for i in pages})
+    monkeypatch.setattr(
+        ocr, "ocr_pdf", lambda path, config, pages: ({i: "" for i in pages}, ocr.ENGINE_TESSERACT)
+    )
     doc = parser.parse_file(_pdf(tmp_path, [LONG]), load_config({}, cwd=tmp_path))
     assert "long enough" in doc.markdown
     assert doc.ocr_engine == ""
@@ -651,3 +703,72 @@ def test_cp1251_text_still_converts(tmp_path):
         "Приказ о командировке сотрудника отдела продаж в Казань.\n".encode("cp1251") * 20
     )
     assert "командировке" in parse_file(f).markdown
+
+
+# --- struck-through .docx text: kept, and marked `~~...~~` -------------------------
+
+
+def test_a_double_struck_docx_run_is_marked_like_a_single_struck_one(tmp_path):
+    """mammoth reads `w:strike` only; double-struck text is deleted text to its author,
+    and has to arrive marked like single strike."""
+    body = para(run("kept "), run("DOUBLESTRUCK", "<w:dstrike/>"), run(" tail"))
+    body += table((para(run("CELLDOUBLE", "<w:b/><w:dstrike/>")),))
+    md = parse_file(build_docx(tmp_path / "spec.docx", body)).markdown
+    assert "kept ~~DOUBLESTRUCK~~ tail" in md
+    assert "~~CELLDOUBLE~~" in md
+
+
+def test_a_double_strike_written_as_an_element_pair_still_converts(tmp_path):
+    """mammoth reads `styles.xml` with expat, which refuses a start tag the rewrite
+    renamed and an end tag it did not."""
+    body = para(run("kept "), run("STRUCK", "<w:strike/>"))
+    parts = {"word/styles.xml": styles('<w:dstrike w:val="1"></w:dstrike>')}
+    md = parse_file(build_docx(tmp_path / "spec.docx", body, parts)).markdown
+    assert "kept ~~STRUCK~~" in md
+
+
+def test_struck_docx_runs_keep_their_markers(tmp_path):
+    body = (
+        para(run("Keep this. "), run("OLDCLAUSE 4.2", "<w:strike/>"), run(" and the tail."))
+        + table((para(run("cell kept")), para(run("CELLSTRUCK", "<w:strike/>"))))
+        + para(run("WHOLEPARA", "<w:b/><w:strike/>"))
+    )
+    md = parse_file(build_docx(tmp_path / "spec.docx", body)).markdown
+    assert "Keep this. ~~OLDCLAUSE 4.2~~ and the tail." in md
+    assert "| cell kept | ~~CELLSTRUCK~~ |" in md
+    assert "~~WHOLEPARA~~" in md
+
+
+def test_docx_literal_tildes_and_switched_off_strikes_stay_unmarked(tmp_path):
+    body = para(run("Literal ~~tildes~~ stay")) + para(
+        run("off", '<w:strike w:val="0"/>'),
+        run(" false", '<w:strike w:val="false"/>'),
+        run(" doubleoff", '<w:dstrike w:val="0"/>'),
+        run(" doublefalse", '<w:dstrike w:val="false"/>'),
+    )
+    md = parse_file(build_docx(tmp_path / "spec.docx", body)).markdown
+    assert "Literal ~~tildes~~ stay" in md
+    assert "off false doubleoff doublefalse" in md
+
+
+def _truncated_docx(tmp_path):
+    whole = build_docx(tmp_path / "whole.docx", para(run("x", "<w:dstrike/>"))).read_bytes()
+    bad = tmp_path / "bad.docx"
+    bad.write_bytes(whole[: len(whole) // 2])
+    return bad
+
+
+def test_a_docx_that_is_not_a_zip_still_fails_to_convert(tmp_path):
+    with pytest.raises(ParserError, match=r"Failed to convert .*bad\.docx"):
+        parse_file(_truncated_docx(tmp_path))
+
+
+def test_only_a_docx_with_double_strike_is_rewritten(tmp_path):
+    plain = build_docx(tmp_path / "plain.docx", para(run("x", "<w:strike/>")))
+    assert _docx_stream(plain) is None
+    assert _docx_stream(_truncated_docx(tmp_path)) is None
+    double = build_docx(tmp_path / "double.docx", para(run("x", "<w:dstrike/>")))
+    with zipfile.ZipFile(double) as original, zipfile.ZipFile(_docx_stream(double)) as copy:
+        assert copy.namelist() == original.namelist()
+        xml = copy.read("word/document.xml")
+    assert b"<w:strike/>" in xml and b"dstrike" not in xml

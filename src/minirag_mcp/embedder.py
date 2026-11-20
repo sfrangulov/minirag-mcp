@@ -1,19 +1,73 @@
-"""fastembed wrapper: lazy model load, registry-based dim lookup, token counting."""
+"""fastembed wrapper and llama.cpp endpoint: prefixes, fallback, window cut, token counting."""
 
 from __future__ import annotations
 
+import json
 import math
+import threading
+import time
 import warnings
+import weakref
 from collections.abc import Callable, Sequence
+from importlib.resources import files
 from pathlib import Path
 
 from fastembed import TextEmbedding
+from huggingface_hub import hf_hub_download
 
 # fastembed already pulls this in — its tokenizers *are* `tokenizers.Tokenizer` objects —
 # but we construct one directly, so it is declared as a dependency of ours too.
 from tokenizers import Tokenizer
 
+from minirag_mcp.chunker import DEFAULT_TOKEN_BUDGET, MODEL_MAX_TOKENS
 from minirag_mcp.chunker.tokens import estimate_tokens
+from minirag_mcp.endpoints import EmbeddingEndpoint, EndpointError
+from minirag_mcp.identity import PROBE_COSINE, PROBE_TEXT
+
+MINILM = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+E5_LARGE = "intfloat/multilingual-e5-large"
+MODEL_WINDOWS: dict[str, int] = {E5_LARGE: 512, MINILM: 128}
+DEFAULT_BUDGETS: dict[str, int] = {E5_LARGE: 250, MINILM: 110}
+# Looser than PROBE_COSINE: a quantized GGUF is the same model with slightly other
+# vectors, and an unrelated model sits near 0.
+REFERENCE_PROBE_COSINE = 0.99
+PASSAGE_PREFIX = "passage: "
+QUERY_PREFIX = "query: "
+# Also how long a passing check of the endpoint stands: a router restarted with its preset
+# pointing at another model of the same width answers without ever failing.
+ENDPOINT_RETRY_SECONDS = 60.0
+# A query waits this long for the endpoint, then is embedded in-process alone; a document
+# batch waits the endpoint's own timeout.
+QUERY_TIMEOUT = 10.0
+
+
+def _load_reference_probes() -> dict[str, tuple[float, ...]]:
+    raw = json.loads(files("minirag_mcp").joinpath("probes.json").read_text(encoding="utf-8"))
+    return {model: tuple(vector) for model, vector in raw.items()}
+
+
+# PROBE_TEXT as the product embeds a document, made by fastembed in-process
+# (scripts/generate_probes.py; a slow test checks the file).
+REFERENCE_PROBES: dict[str, tuple[float, ...]] = _load_reference_probes()
+
+
+def known_model(model_name: str) -> bool:
+    return any(entry["model"] == model_name for entry in TextEmbedding.list_supported_models())
+
+
+def model_window(model_name: str) -> int:
+    return MODEL_WINDOWS.get(model_name, MODEL_MAX_TOKENS)
+
+
+def default_budget(model_name: str) -> int:
+    return DEFAULT_BUDGETS.get(model_name, DEFAULT_TOKEN_BUDGET)
+
+
+def prefix_rule(model_name: str) -> str:
+    lowered = model_name.lower()
+    if lowered.startswith("intfloat/") and "e5" in lowered.split("/", 1)[1]:
+        return "e5"
+    return "none"
 
 
 class UnknownModelError(Exception):
@@ -22,6 +76,10 @@ class UnknownModelError(Exception):
 
 class EmbedderUnavailableError(Exception):
     """The embedding model could not be loaded, so nothing can be searched or ingested."""
+
+
+class ProbeMismatchError(EmbedderUnavailableError):
+    """The live model's vector for the probe text is not the one recorded in the index."""
 
 
 def cosine(a: Sequence[float], b: Sequence[float]) -> float:
@@ -58,6 +116,47 @@ def _untruncated_counter(model: TextEmbedding) -> Callable[[str], int]:
     return lambda text: len(counting.encode(text).ids)
 
 
+class _LoadedModels:
+    """The fastembed models loaded in this process, shared by every embedder of one model,
+    cache folder and thread count: several indexes of one model hold it in memory once.
+    A model is let go with the last embedder holding it."""
+
+    def __init__(self) -> None:
+        self._models: weakref.WeakValueDictionary[tuple, TextEmbedding] = (
+            weakref.WeakValueDictionary()
+        )
+        self._loading: dict[tuple, threading.Lock] = {}
+        self._lock = threading.Lock()
+
+    def get(self, key: tuple) -> TextEmbedding | None:
+        return self._models.get(key)
+
+    def load(self, key: tuple, build: Callable[[], TextEmbedding]) -> TextEmbedding:
+        """The model loaded under `key`, built by `build` when none is. Two embedders asking
+        at once wait for one load; other models load meanwhile."""
+        with self._lock:
+            loading = self._loading.setdefault(key, threading.Lock())
+        with loading:
+            model = self._models.get(key)
+            if model is None:
+                model = build()
+                self._models[key] = model
+            return model
+
+    def clear(self) -> None:
+        with self._lock:
+            self._models.clear()
+            self._loading.clear()
+
+
+_LOADED = _LoadedModels()
+
+
+def clear_loaded_models() -> None:
+    """Forget every loaded model, so the next embedding loads its own (tests)."""
+    _LOADED.clear()
+
+
 def _unit(vector: list[float]) -> list[float]:
     """Scale to unit length so LanceDB's L2 ranking matches cosine similarity.
 
@@ -69,44 +168,300 @@ def _unit(vector: list[float]) -> list[float]:
 
 
 class Embedder:
-    def __init__(self, model_name: str, cache_dir: Path):
+    """One embedding model, run by an endpoint when one is given, else in-process.
+
+    Both backends see the same text: the model's prefixes, and for the endpoint a cut to
+    the window where fastembed would truncate. An unreachable endpoint falls back to the
+    in-process model, loudly, and is tried again every ENDPOINT_RETRY_SECONDS; a query it
+    does not answer within QUERY_TIMEOUT is embedded in-process alone. With a probe
+    expected, each backend is checked before its first embedding, and the endpoint again
+    once ENDPOINT_RETRY_SECONDS have passed since its last check.
+    """
+
+    # What a pickled copy carries. A loaded model, the tokenizers, the locks, the HTTP
+    # session and the fallback state belong to one process and are rebuilt lazily.
+    _CONFIG = (
+        "model_name",
+        "cache_dir",
+        "endpoint",
+        "prefixes",
+        "threads",
+        "allow_fallback",
+        "_expected",
+    )
+
+    def __init__(
+        self,
+        model_name: str,
+        cache_dir: Path,
+        *,
+        endpoint: EmbeddingEndpoint | None = None,
+        prefixes: str | None = None,
+        threads: int | None = None,
+        allow_fallback: bool = True,
+    ):
         self.model_name = model_name
         self.cache_dir = cache_dir
+        self.endpoint = endpoint
+        self.prefixes = prefixes if prefixes is not None else prefix_rule(model_name)
+        self.threads = threads
+        self.allow_fallback = allow_fallback
+        self._expected: tuple[float, ...] | None = None
+        self._reset()
+
+    def _reset(self) -> None:
         self._model: TextEmbedding | None = None
         self._dim: int | None = None
         self._count: Callable[[str], int] | None = None
         self._tokenizer_broken = False
+        self._file_tokenizers: tuple[Tokenizer, Tokenizer] | None = None
+        self._prefix_tokens: int | None = None
+        self._load_lock = threading.Lock()
+        # Apart from the model's lock: endpoint embeds must not wait out a fallback's load.
+        self._tokenizer_lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._warning: str | None = None
+        self._unreachable: str | None = None
+        self._failed_at = 0.0
+        # When each backend's probe last matched; the endpoint's is dropped when it falls back.
+        self._verified: dict[str, float] = {}
+        self._probe_errors: dict[str, str] = {}
+
+    def __getstate__(self) -> dict:
+        return {name: getattr(self, name) for name in self._CONFIG}
+
+    def __setstate__(self, state: dict) -> None:
+        self.__dict__.update(state)
+        self._reset()
 
     @property
     def dim(self) -> int:
         if self._dim is None:
-            for entry in TextEmbedding.list_supported_models():
-                if entry["model"] == self.model_name:
-                    self._dim = int(entry["dim"])
-                    break
-            else:
-                raise UnknownModelError(
-                    f"Model {self.model_name!r} is not in the fastembed registry. "
-                    "See TextEmbedding.list_supported_models() for valid names."
-                )
+            self._dim = int(self._registry_entry()["dim"])
         return self._dim
 
+    def _registry_entry(self) -> dict:
+        for entry in TextEmbedding.list_supported_models():
+            if entry["model"] == self.model_name:
+                return entry
+        raise UnknownModelError(
+            f"Model {self.model_name!r} is not in the fastembed registry. "
+            "See TextEmbedding.list_supported_models() for valid names."
+        )
+
+    @property
+    def max_tokens(self) -> int:
+        return model_window(self.model_name)
+
+    @property
+    def backend(self) -> str:
+        if self.endpoint is None:
+            return "in-process"
+        return "in-process (endpoint unreachable)" if self._warning else "endpoint"
+
+    @property
+    def warning(self) -> str | None:
+        return self._warning
+
+    @property
+    def probe_error(self) -> str | None:
+        """Why the backend that embeds now does not serve this model; None while it does, or
+        while nothing is expected. The other backend's mismatch is kept for when it embeds
+        again."""
+        with self._state_lock:
+            return self._probe_errors.get(self._live())
+
+    def _live(self) -> str:
+        """The backend an embedding goes to now; the caller holds `_state_lock`."""
+        return "endpoint" if self.endpoint is not None and self._warning is None else "in-process"
+
+    def expect_probe(self, probe: Sequence[float]) -> None:
+        """Check every backend against `probe` before its first embedding; empty disarms."""
+        self._expected = tuple(probe) or None
+        with self._state_lock:
+            self._verified.clear()
+            self._probe_errors.clear()
+
+    def probe_vector(self) -> list[float]:
+        """PROBE_TEXT embedded as a document, prefix included, by the live backend."""
+        return self._embed([self._probe_text()], query=False, check=False)[0][0]
+
+    def reference_error(self, vector: Sequence[float]) -> str | None:
+        """Why `vector`, this embedder's live probe, is not the model's reference probe;
+        None when it is, or when no reference ships for the model."""
+        reference = REFERENCE_PROBES.get(self.model_name)
+        if reference is None:
+            return None
+        c = cosine(vector, reference)
+        if c >= REFERENCE_PROBE_COSINE:
+            return None
+        served = self._served("endpoint" if self.backend == "endpoint" else "in-process")
+        return (
+            f"{served} does not serve {self.model_name}: its vector for the probe text is not "
+            f"the reference one for that model (cosine {c:.4f} < {REFERENCE_PROBE_COSINE}). "
+            f"Point it at {self.model_name}; until then nothing is written to this index."
+        )
+
+    def has_reference(self) -> bool:
+        return self.model_name in REFERENCE_PROBES
+
+    def verify(self, *, timeout: float | None = None) -> bool:
+        """Check a configured, reachable endpoint against the expected probe now. An
+        unreachable one falls back as an embed would, and the fallback checks itself; the
+        model is never loaded. True when a healthy endpoint did not answer within
+        `timeout`: that changes nothing, so it is checked again before its next use."""
+        if self.endpoint is None or self._expected is None or not self._endpoint_due():
+            return False
+        try:
+            self._check_endpoint(timeout)
+        except EndpointError as e:
+            if timeout is not None and e.timed_out and self._warning is None:
+                return True
+            if self.allow_fallback:
+                self._fall_back(e)
+        return False
+
+    def _probe_text(self) -> str:
+        return PASSAGE_PREFIX + PROBE_TEXT if self.prefixes == "e5" else PROBE_TEXT
+
+    def _served(self, backend: str) -> str:
+        if backend == "in-process":
+            return f"fastembed's {self.model_name}"
+        endpoint = self.endpoint.endpoint
+        return f"The endpoint {endpoint.url} (router model {endpoint.name!r})"
+
+    def _check_endpoint(self, timeout: float | None = None) -> None:
+        [vector] = self.endpoint.embed([self._fit_window(self._probe_text())], timeout=timeout)
+        self._check_width([vector])
+        with self._state_lock:
+            # It answered, so it is what embeds now, whatever its vector says.
+            self._warning = None
+        self._compare(vector, "endpoint")
+
+    def _checked(self, backend: str) -> bool:
+        with self._state_lock:
+            at = self._verified.get(backend)
+        if at is None:
+            return False
+        return backend == "in-process" or time.monotonic() - at < ENDPOINT_RETRY_SECONDS
+
+    def _check_local(self, model: TextEmbedding) -> None:
+        [vector] = model.embed([self._probe_text()])
+        self._compare(_unit([float(x) for x in vector]), "in-process")
+
+    def _compare(self, live: Sequence[float], backend: str) -> None:
+        c = cosine(live, self._expected)
+        if c >= PROBE_COSINE:
+            with self._state_lock:
+                self._probe_errors.pop(backend, None)
+                self._verified[backend] = time.monotonic()
+            return
+        message = (
+            f"{self._served(backend)} does not serve {self.model_name}: its vector for the "
+            "probe text differs from the one recorded when this index was built "
+            f"(cosine {c:.4f} < {PROBE_COSINE}). Point it at {self.model_name}; until "
+            "then this index is unavailable."
+        )
+        with self._state_lock:
+            self._probe_errors[backend] = message
+        raise ProbeMismatchError(message)
+
+    @property
+    def prefix_tokens(self) -> int:
+        """How many tokens the passage prefix adds to a chunk; the packer leaves room."""
+        if self.prefixes != "e5":
+            return 0
+        if self._prefix_tokens is None:
+            self._prefix_tokens = self.count_tokens(PASSAGE_PREFIX + "x") - self.count_tokens("x")
+        return self._prefix_tokens
+
+    def has_local_copy(self) -> bool:
+        """Whether the model runs in-process without a download: it is loaded in this
+        process, or the folder fastembed finds for it in cache_dir holds its model files.
+        Nothing is loaded.
+
+        fastembed's lookup alone is not that: it finds a folder holding only tokenizer.json,
+        which is what an endpoint leaves there, and building the model then fails.
+        """
+        if self._model is not None or _LOADED.get(self._loaded_key()) is not None:
+            return True
+        try:
+            found = self._fastembed(local_files_only=True, lazy_load=True).model
+            folder = Path(found._model_dir)
+            description = found.model_description
+            names = [description.model_file, *description.additional_files]
+        except Exception:
+            return False
+        return all((folder / name).is_file() for name in names)
+
+    def _fastembed(self, **options) -> TextEmbedding:
+        return TextEmbedding(
+            model_name=self.model_name,
+            cache_dir=str(self.cache_dir),
+            threads=self.threads,
+            **options,
+        )
+
+    def _loaded_key(self) -> tuple:
+        # Not the endpoint: whether this embedder may download decides only how a model
+        # missing from memory is loaded, never which model it is.
+        return (self.model_name, str(self.cache_dir), self.threads)
+
     def _load(self) -> TextEmbedding:
-        if self._model is None:
-            try:
-                self.cache_dir.mkdir(parents=True, exist_ok=True)
-                self._model = TextEmbedding(
-                    model_name=self.model_name, cache_dir=str(self.cache_dir)
-                )
-            except Exception as e:
-                raise EmbedderUnavailableError(
-                    f"The embedding model {self.model_name!r} could not be loaded ({e}). "
-                    "Every search and ingest needs it, so each one fails this way until it "
-                    "loads; this is not a problem with the query. It is downloaded once, "
-                    f"into {self.cache_dir}: the server needs to reach huggingface.co for "
-                    "that, or CACHE_DIR has to point at a folder that already holds it."
-                ) from e
-        return self._model
+        with self._load_lock:
+            if self._model is None:
+                self._model = _LOADED.load(self._loaded_key(), self._build)
+            return self._model
+
+    def _build(self) -> TextEmbedding:
+        try:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            # With an endpoint this model only stands in for it, behind one search or one
+            # sync, where a download of gigabytes must never start.
+            return self._fastembed(local_files_only=self.endpoint is not None)
+        except Exception as e:
+            raise EmbedderUnavailableError(
+                f"The embedding model {self.model_name!r} could not be loaded ({e}). "
+                "Every search and ingest needs it, so each one fails this way until "
+                "it loads; this is not a problem with the query. It is downloaded "
+                f"once, into {self.cache_dir}: the server needs to reach huggingface.co "
+                "for that, or CACHE_DIR has to point at a folder that already holds it."
+            ) from e
+
+    def _tokenizers(self) -> tuple[Tokenizer, Tokenizer]:
+        """The model's tokenizer.json, read without the ONNX model: a counter that never
+        truncates, and a cutter that truncates to the window as fastembed does."""
+        if (loaded := self._file_tokenizers) is not None:
+            return loaded
+        with self._tokenizer_lock:
+            if self._file_tokenizers is None:
+                repo = self._registry_entry()["sources"].get("hf")
+                try:
+                    if not repo:
+                        raise FileNotFoundError("the model has no Hugging Face source")
+                    counting = Tokenizer.from_file(self._tokenizer_path(repo))
+                except Exception as e:
+                    raise EmbedderUnavailableError(
+                        f"The tokenizer of {self.model_name!r} could not be read from "
+                        f"{repo or 'Hugging Face'} ({e}). It is needed to size chunks and to "
+                        "cut text to the model's window before the embedding endpoint sees "
+                        f"it. It is downloaded once, into {self.cache_dir}: the server needs "
+                        "to reach huggingface.co for that, or CACHE_DIR has to point at a "
+                        "folder that already holds it."
+                    ) from e
+                counting.no_truncation()
+                counting.no_padding()
+                cutting = Tokenizer.from_str(counting.to_str())
+                cutting.enable_truncation(max_length=self.max_tokens)
+                self._file_tokenizers = (counting, cutting)
+            return self._file_tokenizers
+
+    def _tokenizer_path(self, repo: str) -> str:
+        where = {"repo_id": repo, "filename": "tokenizer.json", "cache_dir": str(self.cache_dir)}
+        try:
+            return hf_hub_download(**where, local_files_only=True)
+        except Exception:
+            return hf_hub_download(**where)
 
     def count_tokens(self, text: str) -> int:
         """How many tokens this model would make of `text` — the chunker's budget unit.
@@ -115,23 +470,30 @@ class Embedder:
         is only a budget if the counter can report a number above it: with fastembed's
         own `token_count`, which saturates at that length, `count <= budget` is
         vacuously true for every text once the budget reaches the ceiling, and the
-        packer silently stops enforcing anything. So this counts with a copy of the
-        tokenizer that has truncation disabled (see `_untruncated_counter`), which is
-        also the only way the packer can be told how far over the ceiling a piece is.
+        packer silently stops enforcing anything. So this counts with a tokenizer that
+        has truncation disabled — a copy of the loaded model's (see
+        `_untruncated_counter`), or with an endpoint the model's tokenizer.json alone, so
+        the ONNX model is never loaded just to count.
 
-        The tokenizer is two attributes away from a third-party backend, and a chunker
-        that silently stops counting tokens would produce a corpus of truncated vectors
-        with nothing to show for it. So a failure degrades to the character estimate,
-        loudly and once. It degrades *there* and never to `token_count`: the estimate is
-        rough but monotonic, and a saturating counter is not a counter at all. A model
-        that does not load at all is not that case: it raises EmbedderUnavailableError.
+        The loaded model's tokenizer is two attributes away from a third-party backend,
+        and a chunker that silently stops counting tokens would produce a corpus of
+        truncated vectors with nothing to show for it. So a failure degrades to the
+        character estimate, loudly and once. It degrades *there* and never to
+        `token_count`: the estimate is rough but monotonic, and a saturating counter is
+        not a counter at all. A model or tokenizer file that does not load at all is not
+        that case: it raises EmbedderUnavailableError.
         """
         if self._tokenizer_broken:
             return estimate_tokens(text)
+        model = None
         if self._count is None:
             # Outside the fallback: a model that cannot load cannot embed what the
             # estimate would size, and the fallback, once taken, is never undone.
-            model = self._load()
+            if self.endpoint is not None:
+                counting, _ = self._tokenizers()
+                self._count = lambda t: len(counting.encode(t).ids)
+            else:
+                model = self._load()
         try:
             if self._count is None:
                 self._count = _untruncated_counter(model)
@@ -148,10 +510,142 @@ class Embedder:
             )
             return estimate_tokens(text)
 
+    def _fit_window(self, text: str) -> str:
+        counting, cutting = self._tokenizers()
+        encoding = cutting.encode(text)
+        if not encoding.overflowing:
+            return text
+        ends = [
+            end
+            for (_, end), special in zip(
+                encoding.offsets, encoding.special_tokens_mask, strict=True
+            )
+            if not special
+        ]
+        # A kept token's span can reach into the first dropped one (XLM-R's lone "▁" covers
+        # the next word's first character), and that character re-tokenizes on its own.
+        for end in reversed(ends):
+            if len(counting.encode(text[:end]).ids) <= self.max_tokens:
+                return text[:end]
+        return ""
+
     def embed_documents(self, texts: Sequence[str]) -> list[list[float]]:
         if not texts:
             return []
-        return [_unit([float(x) for x in v]) for v in self._load().embed(list(texts))]
+        if self.prefixes == "e5":
+            texts = [PASSAGE_PREFIX + t for t in texts]
+        return self._embed(list(texts), query=False)[0]
 
     def embed_query(self, text: str) -> list[float]:
-        return [_unit([float(x) for x in v]) for v in self._load().query_embed([text])][0]
+        return self.embed_query_noted(text)[0]
+
+    def embed_query_noted(self, text: str) -> tuple[list[float], str | None]:
+        """The query's vector, and a note when the endpoint did not answer within
+        QUERY_TIMEOUT, so that this query alone was embedded in-process."""
+        if self.prefixes == "e5":
+            text = QUERY_PREFIX + text
+        [vector], note = self._embed([text], query=True)
+        return vector, note
+
+    def _embed(
+        self, texts: list[str], *, query: bool, check: bool = True
+    ) -> tuple[list[list[float]], str | None]:
+        check = check and self._expected is not None
+        note = None
+        if self.endpoint is not None and self._endpoint_due():
+            fitted = [self._fit_window(t) for t in texts]
+            timeout = QUERY_TIMEOUT if query else None
+            try:
+                if check and not self._checked("endpoint"):
+                    self._check_endpoint(timeout)
+                vectors = self.endpoint.embed(fitted, timeout=timeout)
+            except EndpointError as e:
+                if not self.allow_fallback:
+                    raise
+                # This embedder also serves a sync's document batches, and a router busy
+                # with them answers a query late: a slow query must not move them in-process
+                # while the endpoint is healthy. A retry of one fallen back falls back again.
+                if query and e.timed_out and self._warning is None:
+                    note = (
+                        f"The embedding endpoint {self.endpoint.endpoint.url} did not answer "
+                        f"within {QUERY_TIMEOUT:g} s, so this query was embedded in-process "
+                        f"with {self.model_name}, the same model: same vectors, slower. The "
+                        "endpoint stays in use."
+                    )
+                else:
+                    self._fall_back(e)
+            else:
+                self._check_width(vectors)
+                with self._state_lock:
+                    self._warning = None
+                return vectors, None
+        if self.endpoint is not None and not self.has_local_copy():
+            raise EmbedderUnavailableError(self._no_local_copy(timed_out=note is not None))
+        try:
+            model = self._load()
+        except EmbedderUnavailableError as e:
+            if self.endpoint is None:
+                raise
+            raise EmbedderUnavailableError(
+                f"{self._not_used(timed_out=note is not None)}, so {self.model_name} was to "
+                f"run in-process, and that failed too. {e}"
+            ) from e
+        if check and not self._checked("in-process"):
+            self._check_local(model)
+        raw = model.query_embed(texts) if query else model.embed(texts)
+        return [_unit([float(x) for x in v]) for v in raw], note
+
+    def _endpoint_due(self) -> bool:
+        with self._state_lock:
+            return (
+                self._warning is None
+                or time.monotonic() - self._failed_at >= ENDPOINT_RETRY_SECONDS
+            )
+
+    def _not_used(self, *, timed_out: bool) -> str:
+        """Why the endpoint did not embed, as the start of a sentence."""
+        url = self.endpoint.endpoint.url
+        if timed_out:
+            return f"The embedding endpoint {url} did not answer within {QUERY_TIMEOUT:g} s"
+        return f"The embedding endpoint {url} is unreachable ({self._unreachable})"
+
+    def _no_local_copy(self, *, timed_out: bool) -> str:
+        return (
+            f"{self._not_used(timed_out=timed_out)}, and {self.model_name} has no local copy "
+            f"in {self.cache_dir} to run in-process instead. It was not downloaded: with an "
+            "endpoint configured, a download of the model never starts behind a search or a "
+            "sync. Nothing was embedded; this is not a problem with the query. Either bring "
+            f"the endpoint back, or download the model once into {self.cache_dir}, e.g. by "
+            "running minirag once with EMBED_URL and EMBED_ENDPOINT_MODEL unset."
+        )
+
+    def _fall_back(self, error: EndpointError) -> None:
+        url = self.endpoint.endpoint.url
+        message = (
+            f"The embedding endpoint {url} is unreachable ({error}). {self.model_name} runs "
+            "in-process meanwhile: same vectors, slower. The endpoint is tried again every "
+            f"{ENDPOINT_RETRY_SECONDS:g} s."
+        )
+        with self._state_lock:
+            first = self._warning is None
+            self._verified.pop("endpoint", None)
+            self._probe_errors.pop("endpoint", None)
+            self._warning = message
+            self._unreachable = str(error)
+            self._failed_at = time.monotonic()
+        # Python's default filter shows a given text once per process, so a long-running
+        # server may not repeat it; `warning`, status and every reply still carry it.
+        if first:
+            warnings.warn(message, RuntimeWarning, stacklevel=4)
+
+    def _check_width(self, vectors: list[list[float]]) -> None:
+        widths = sorted({len(v) for v in vectors} - {self.dim})
+        if widths:
+            endpoint = self.endpoint.endpoint
+            raise EmbedderUnavailableError(
+                f"The embedding endpoint {endpoint.url} (model {endpoint.name!r}) returned "
+                f"{widths[0]}-dimensional vectors, but {self.model_name} makes "
+                f"{self.dim}-dimensional ones: it serves another model. Nothing was "
+                "embedded; point the endpoint at the same model, or remove it to embed "
+                "in-process."
+            )

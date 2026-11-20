@@ -1,6 +1,10 @@
+import pickle
+from dataclasses import replace
+
 import pytest
 
 from conftest import FakeEmbedder
+from docx_builder import build_docx, para, run
 from minirag_mcp.config import load_config
 from minirag_mcp.ingest.parser import ParserError
 from minirag_mcp.ingest.pipeline import (
@@ -10,6 +14,7 @@ from minirag_mcp.ingest.pipeline import (
     UnsupportedFormatError,
     file_sha256,
 )
+from minirag_mcp.results import run_query
 from minirag_mcp.security import SecurityError
 from minirag_mcp.store import Store
 
@@ -17,7 +22,7 @@ from minirag_mcp.store import Store
 @pytest.fixture
 def pipe(tmp_path, fake_embedder):
     cfg = load_config({"BASE_DIR": str(tmp_path)}, cwd=tmp_path)
-    store = Store(tmp_path / ".minirag" / "lancedb", dim=fake_embedder.dim)
+    store = Store(tmp_path / ".minirag" / "v2", dim=fake_embedder.dim)
     return Pipeline(store, fake_embedder, cfg), store, tmp_path
 
 
@@ -31,6 +36,59 @@ def test_ingest_file_roundtrip(pipe):
     assert info.source_type == "file"
     assert info.file_hash == file_sha256(f)
     assert info.mtime == f.stat().st_mtime
+
+
+class _Untouchable:
+    def __getattr__(self, name):
+        raise AssertionError(f"preparing a document read .{name} of the label source")
+
+
+def test_prepare_file_needs_neither_a_store_nor_labels(tmp_path, fake_embedder):
+    cfg = load_config({"BASE_DIR": str(tmp_path)}, cwd=tmp_path)
+    f = tmp_path / "doc.md"
+    f.write_text("# T\n\n" + "Sentence about topic. " * 80, encoding="utf-8")
+    doc = Pipeline(None, fake_embedder, cfg, labels=_Untouchable()).prepare_file(f)
+    assert len(doc.chunks) == len(doc.vectors) == len(doc.pages) > 1
+    assert (doc.source, doc.source_type, doc.file_hash, doc.mtime) == (
+        str(f),
+        "file",
+        file_sha256(f),
+        f.stat().st_mtime,
+    )
+
+
+def test_a_prepared_document_survives_pickling(tmp_path, fake_embedder):
+    cfg = load_config({"BASE_DIR": str(tmp_path)}, cwd=tmp_path)
+    f = tmp_path / "doc.md"
+    f.write_text("# T\n\n" + "Sentence about topic. " * 80, encoding="utf-8")
+    doc = Pipeline(None, fake_embedder, cfg).prepare_file(f)
+    assert pickle.loads(pickle.dumps(doc)) == doc
+
+
+def test_ingest_file_stores_exactly_what_was_prepared(pipe):
+    p, store, root = pipe
+    f = root / "doc.md"
+    f.write_text("# T\n\n" + "Sentence about topic. " * 80, encoding="utf-8")
+    doc = p.prepare_file(f)
+    assert p.ingest_file(f).chunk_count == len(doc.chunks) > 1
+    rows = store._table.search().where(f"source = '{f}'").limit(10_000).to_list()
+    rows.sort(key=lambda r: r["chunk_index"])
+    assert [r["text"] for r in rows] == [c.text for c in doc.chunks]
+    assert [r["pages"] for r in rows] == list(doc.pages)
+    assert len(rows) == len(doc.vectors)
+    for row, vector in zip(rows, doc.vectors, strict=True):
+        assert list(row["vector"]) == pytest.approx(vector)
+
+
+def test_chunks_leave_room_for_the_passage_prefix(tmp_path):
+    class Prefixed(FakeEmbedder):
+        prefixes, prefix_tokens = "e5", 5
+
+    cfg = replace(load_config({"BASE_DIR": str(tmp_path)}, cwd=tmp_path), token_budget=40)
+    p = Pipeline(Store(tmp_path / "db", dim=8), Prefixed(), cfg)
+    p.ingest_data(" ".join(f"word{i}." for i in range(300)), source="s")
+    counts = [Prefixed().count_tokens(c.text) for c in p.store.all_chunks("s")]
+    assert len(counts) > 1 and max(counts) <= 35
 
 
 def test_reingest_replaces(pipe):
@@ -69,16 +127,16 @@ def test_ingest_file_carries_ocr_engine(pipe, monkeypatch):
         for i in range(20)
     )
     monkeypatch.setattr(ocr, "available", lambda: True)
-    monkeypatch.setattr(ocr, "ocr_image", lambda path, config: scanned)
+    monkeypatch.setattr(ocr, "ocr_image", lambda path, config: (scanned, ocr.ENGINE_TESSERACT))
     img = root / "scan.png"
     img.write_bytes(b"...")
     result = p.ingest_file(img)
     assert result.chunk_count >= 2
     info = store.get_source(str(img))
-    assert info.ocr_engine == ocr.ENGINE_RAPIDOCR
+    assert info.ocr_engine == ocr.ENGINE_TESSERACT
     rows = store._table.search().where(f"source = '{img}'").limit(10_000).to_list()
     assert len(rows) == result.chunk_count
-    assert [r["ocr_engine"] for r in rows] == [ocr.ENGINE_RAPIDOCR] * len(rows)
+    assert [r["ocr_engine"] for r in rows] == [ocr.ENGINE_TESSERACT] * len(rows)
 
 
 def test_ingest_file_image_without_ocr_names_the_missing_extra(pipe, monkeypatch):
@@ -458,7 +516,7 @@ def test_chunks_carry_a_parent_id_scoped_to_their_source(pipe):
     f = root / "spec.md"
     f.write_text(
         "# 1 Хранение\n\n"
-        + " ".join(f"Правило {i} про хранение запасов." for i in range(40))
+        + " ".join(f"Правило {i} про хранение запасов." for i in range(120))
         + "\n\n# 2 Выдача\n\nКоротко про выдачу.",
         encoding="utf-8",
     )
@@ -483,7 +541,7 @@ def test_the_stored_chunks_respect_the_token_budget(pipe):
     counter = FakeEmbedder().count_tokens
     chunks = store.all_chunks(str(f))
     assert len(chunks) > 1
-    assert all(counter(c.text) <= 110 for c in chunks)
+    assert all(counter(c.text) <= p.config.token_budget for c in chunks)
 
 
 def test_a_smaller_budget_produces_more_chunks(tmp_path, fake_embedder):
@@ -498,3 +556,37 @@ def test_a_smaller_budget_produces_more_chunks(tmp_path, fake_embedder):
         store = Store(tmp_path / f"db-{budget}", dim=fake_embedder.dim)
         counts.append(Pipeline(store, fake_embedder, cfg).ingest_file(f).chunk_count)
     assert counts[1] > counts[0]
+
+
+def test_the_store_hook_runs_before_every_write(tmp_path, fake_embedder):
+    cfg = load_config({"BASE_DIR": str(tmp_path)}, cwd=tmp_path)
+    store = Store(tmp_path / "db", dim=8)
+    held: list[list[str]] = []
+
+    def hook():
+        held.append([c.text for c in store.all_chunks("s")])
+
+    p = Pipeline(store, fake_embedder, cfg, before_store=hook)
+    p.ingest_data("one", source="s")
+    p.ingest_data("two", source="s")
+    assert held == [[], ["one"]] and p.before_store is hook
+
+
+def test_struck_docx_text_is_still_found_by_keyword_search(pipe):
+    """Struck-through text is kept, marked, because a deleted clause still records what
+    was removed."""
+    p, store, root = pipe
+    clauses = [f"Deleted clause {i} said the old rule." for i in range(60)]
+    clauses[30] = "Deleted clause OLDCLAUSE said the old rule."
+    struck = build_docx(
+        root / "spec.docx",
+        para(run("Current text stays. "), run(" ".join(clauses), "<w:strike/>")),
+    )
+    other = root / "other.md"
+    other.write_text("# Other\n\nNothing was deleted from this one.", encoding="utf-8")
+    p.ingest_file(struck)
+    p.ingest_file(other)
+    assert len(store.all_chunks(str(struck))) > 1, "the run has to be cut to prove anything"
+    payload = run_query(store, p.embedder, p.config, "OLDCLAUSE")
+    assert payload["sources"][0]["source"] == str(struck)
+    assert "OLDCLAUSE" in payload["results"][0]["text"]
