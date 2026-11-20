@@ -75,8 +75,9 @@ LAYOUT = {
     "document_table": True,
 }
 UNLOADABLE = (
-    "this index was built with {model}, which cannot be loaded here: no embedding endpoint "
-    "is configured for it and fastembed does not know it"
+    "this index was built with {model}, which cannot be loaded here: fastembed does not know "
+    "it, and an index is opened only with a model whose vector width fastembed knows, even "
+    "through an endpoint"
 )
 
 
@@ -547,7 +548,9 @@ def test_index_state_refuses_a_legacy_index_naming_the_v2_path(tmp_path, fake_em
     assert not (db / INDEX_FILE).exists()
 
 
-def test_index_state_needs_a_way_to_load_the_recorded_model(tmp_path, fake_embedder, registry_only):
+def test_index_state_needs_fastembed_to_know_the_recorded_model(
+    tmp_path, fake_embedder, registry_only
+):
     cfg = config(tmp_path)
     fresh = IndexIdentity.fresh(
         EmbeddingScheme("x/unknown", 8, "none"),
@@ -555,15 +558,11 @@ def test_index_state_needs_a_way_to_load_the_recorded_model(tmp_path, fake_embed
         cfg.fts_language,
     )
     write_identity(cfg.db_path, fresh)
-    assert index_state(cfg, fake_embedder) == (
-        IndexState.UNAVAILABLE,
-        UNLOADABLE.format(model="x/unknown"),
-    )
+    unloadable = (IndexState.UNAVAILABLE, UNLOADABLE.format(model="x/unknown"))
+    assert index_state(cfg, fake_embedder) == unloadable
+    # An endpoint does not help: opening the index reads the width from fastembed.
     routed = replace(cfg, embed_endpoints={"x/unknown": Endpoint("http://127.0.0.1:9", "x")})
-    assert index_state(routed, fake_embedder) == (
-        IndexState.REBUILD_PENDING,
-        "model x/unknown -> fake",
-    )
+    assert index_state(routed, fake_embedder) == unloadable
     write_identity(cfg.db_path, replace(fresh, embedding=EmbeddingScheme(MINILM, 384, "none")))
     assert index_state(cfg, fake_embedder) == (
         IndexState.REBUILD_PENDING,

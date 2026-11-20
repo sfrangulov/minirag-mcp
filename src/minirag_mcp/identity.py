@@ -510,14 +510,11 @@ def index_state(config: Config, embedder) -> tuple[IndexState, str]:
             return IndexState.UNAVAILABLE, str(legacy_error(db, config.roots))
         return IndexState.READY, ""
     model = recorded.embedding.model
-    if (
-        model != embedder.model_name
-        and model not in config.embed_endpoints
-        and not known_model(model)
-    ):
+    if model != embedder.model_name and not known_model(model):
         return IndexState.UNAVAILABLE, (
-            f"this index was built with {model}, which cannot be loaded here: no embedding "
-            "endpoint is configured for it and fastembed does not know it"
+            f"this index was built with {model}, which cannot be loaded here: fastembed does "
+            "not know it, and an index is opened only with a model whose vector width "
+            "fastembed knows, even through an endpoint"
         )
     found = differences(
         recorded,
