@@ -186,7 +186,9 @@ argument. With no `index`, the call uses the connection's default (or fails loud
 is none). One call always touches exactly one index. Every result carries `index`, so a
 follow-up `read_file` / `read_chunk_neighbors` can pass it back. New tool `list_indexes`:
 name, description, document and chunk counts, language, model, whether this connection may
-use it, and its state (`ready`, `syncing`, `needs rebuild`, `unavailable`). Writes
+use it, and its state (`ready`, `syncing`, ~~`needs rebuild`~~ `rebuild pending`,
+`unavailable`). **Superseded (2026-11-20, plan 3 ruling S15):** the states are `status`'s
+`indexState` values, so `status`, `list_indexes` and each result speak one vocabulary. Writes
 (`ingest_*`, `delete_file`, `sync_start`) follow the same rule as reads: allowed in any
 reachable index when named.
 
