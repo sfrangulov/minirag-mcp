@@ -12,7 +12,7 @@ from minirag_mcp.config import load_config
 from minirag_mcp.embedder import E5_LARGE, Embedder
 from minirag_mcp.endpoints import EmbeddingEndpoint, Endpoint, EndpointError
 from minirag_mcp.ingest.pipeline import Pipeline
-from minirag_mcp.store import Store
+from minirag_mcp.store import DOCUMENT_TABLE, SIGNATURE_TABLE, ChunkRecord, IndexBusyError, Store
 from parallel_helpers import SLOW_ROUTER, Preparer, Unloadable, broken_factory
 
 GiB = 2**30
@@ -200,3 +200,131 @@ def test_an_unreachable_endpoint_is_marked_as_an_endpoint_failure(dead_worker, d
     got = parallel.prepare_one(pipe, f)
     assert (got.path, got.document, got.endpoint_failed) == (f, None, True)
     assert dead_url in got.error
+
+
+@pytest.fixture
+def store(tmp_path):
+    return Store(tmp_path / "db", dim=8)
+
+
+def recs(source, n, text="t", stamp="2026-08-07T00:00:00+00:00"):
+    return [
+        ChunkRecord(
+            id=f"{source}#{i}",
+            source=source,
+            source_type="file",
+            title="T",
+            chunk_index=i,
+            text=f"{text} {i}",
+            vector=[0.1 * (i + 1)] * 8,
+            file_hash="h",
+            mtime=1.0,
+            ingested_at=stamp,
+        )
+        for i in range(n)
+    ]
+
+
+def written(store):
+    return (
+        store._table.to_arrow().sort_by("id").to_pylist(),
+        store._db.open_table(SIGNATURE_TABLE).to_arrow().sort_by("source").to_pylist(),
+        store._db.open_table(DOCUMENT_TABLE).to_arrow().sort_by("source").to_pylist(),
+    )
+
+
+def _fail_batches(store, monkeypatch):
+    def refuse(*args, **kwargs):
+        raise RuntimeError("batch refused")
+
+    monkeypatch.setattr(store, "replace_sources", refuse)
+
+
+def test_batch_writer_writes_when_the_batch_is_full_and_on_flush(store):
+    w = parallel.BatchWriter(store, indexed=set(), batch_rows=5)
+    assert w.add("/a.md", recs("/a.md", 3)) == [] and store.chunk_count() == 0
+    assert w.add("/b.md", recs("/b.md", 3)) == [("/a.md", None), ("/b.md", None)]
+    assert store.chunk_count() == 6
+    assert w.add("/c.md", recs("/c.md", 1)) == []
+    assert w.flush() == [("/c.md", None)] and store.chunk_count() == 7
+    assert w.flush() == []
+
+
+def test_batch_rows_defaults_to_the_constant_read_at_construction(store, monkeypatch):
+    monkeypatch.setattr(parallel, "BATCH_ROWS", 2)
+    w = parallel.BatchWriter(store, indexed=set())
+    assert w.add("/a.md", recs("/a.md", 2)) == [("/a.md", None)]
+
+
+def test_a_failed_batch_is_retried_source_by_source(store, monkeypatch):
+    _fail_batches(store, monkeypatch)
+    w = parallel.BatchWriter(store, indexed=set(), batch_rows=100)
+    w.add("/a.md", recs("/a.md", 2))
+    w.add("/b.md", recs("/b.md", 2))
+    assert w.flush() == [("/a.md", None), ("/b.md", None)]
+    assert sorted(s.source for s in store.list_sources()) == ["/a.md", "/b.md"]
+
+
+def test_a_source_that_cannot_be_written_fails_alone(store, monkeypatch):
+    _fail_batches(store, monkeypatch)
+    real = store.replace_source
+
+    def replace_source(source, records):
+        if source == "/b.md":
+            raise RuntimeError("disk full")
+        real(source, records)
+
+    monkeypatch.setattr(store, "replace_source", replace_source)
+    w = parallel.BatchWriter(store, indexed=set(), batch_rows=100)
+    w.add("/a.md", recs("/a.md", 1))
+    w.add("/b.md", recs("/b.md", 1))
+    assert w.flush() == [("/a.md", None), ("/b.md", "disk full")]
+    assert [s.source for s in store.list_sources()] == ["/a.md"]
+
+
+def test_a_batch_that_failed_half_way_is_completed_by_the_fallback(tmp_path, monkeypatch):
+    """The merge of the indexed source commits, then the append of the new one raises:
+    /a.md holds new chunks under its old document row and signature."""
+    old = recs("/a.md", 3, "old")
+    new_a = recs("/a.md", 2, "new", stamp="2026-09-01T00:00:00+00:00")
+    new_b = recs("/b.md", 2, "fresh", stamp="2026-09-01T00:00:00+00:00")
+    store, reference = Store(tmp_path / "db", dim=8), Store(tmp_path / "ref", dim=8)
+    for s in (store, reference):
+        s.replace_source("/a.md", old)
+    reference.replace_source("/a.md", new_a)
+    reference.replace_source("/b.md", new_b)
+
+    real_add, original = store._table.add, store.replace_sources
+
+    def refuse(*args, **kwargs):
+        raise RuntimeError("append refused")
+
+    def half_way(batch, *, indexed):
+        monkeypatch.setattr(store._table, "add", refuse)
+        try:
+            original(batch, indexed=indexed)
+        finally:
+            monkeypatch.setattr(store._table, "add", real_add)
+
+    monkeypatch.setattr(store, "replace_sources", half_way)
+    with pytest.raises(RuntimeError):
+        half_way([("/a.md", new_a), ("/b.md", new_b)], indexed={"/a.md"})
+    assert written(store) != written(reference)  # the failure left /a.md half written
+
+    w = parallel.BatchWriter(store, indexed={"/a.md"}, batch_rows=100)
+    w.add("/a.md", new_a)
+    w.add("/b.md", new_b)
+    assert w.flush() == [("/a.md", None), ("/b.md", None)]
+    assert written(store) == written(reference)
+    assert not store.get_source("/a.md").duplicated
+
+
+def test_a_rebuild_in_progress_is_not_turned_into_file_failures(store, monkeypatch):
+    def busy(*args, **kwargs):
+        raise IndexBusyError("rebuilding")
+
+    monkeypatch.setattr(store, "replace_sources", busy)
+    w = parallel.BatchWriter(store, indexed=set(), batch_rows=100)
+    w.add("/a.md", recs("/a.md", 1))
+    with pytest.raises(IndexBusyError):
+        w.flush()

@@ -9,7 +9,7 @@ import re
 import subprocess
 import sys
 from collections import deque
-from collections.abc import Callable, Generator, Iterator, Sequence
+from collections.abc import Callable, Container, Generator, Iterator, Sequence
 from concurrent.futures import Future, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
@@ -22,10 +22,16 @@ from minirag_mcp.endpoints import EndpointError
 if TYPE_CHECKING:
     from minirag_mcp.config import Config
     from minirag_mcp.ingest.pipeline import Pipeline, PreparedDocument
+    from minirag_mcp.store import ChunkRecord, Store
 
 FILES_PER_WORKER = 4
 # Interpreter and libraries per worker process, measured.
 WORKER_BASE_BYTES = 3 * 2**29
+# ~65 MB of 1024-dim vectors held as Python floats; ~200 commits per 400k rows.
+BATCH_ROWS = 2000
+
+# (source, error); error is None when the source was stored.
+Written = tuple[str, str | None]
 
 
 def _logical_cpus() -> int:
@@ -212,3 +218,52 @@ def prepare_files(
         while suspects:
             for path in (yield from _run(factory, suspects, 1, 1)):
                 yield Prepared(path, None, WORKER_DIED)
+
+
+class BatchWriter:
+    """Prepared documents held until `batch_rows` chunks are waiting, then written in one
+    `Store.replace_sources` call.
+
+    A batch the store refuses is written one source at a time with `replace_source`, so one
+    source's failure is that source's alone. The records keep their stamps, which makes the
+    retry safe over a batch that failed half-way: a source whose merge had committed is
+    matched row for row and updated, and its document row and signature are written again.
+    An IndexBusyError is never a file's failure and propagates.
+    """
+
+    def __init__(self, store: Store, *, indexed: Container[str], batch_rows: int | None = None):
+        self._store = store
+        self._indexed = indexed
+        self._batch_rows = BATCH_ROWS if batch_rows is None else batch_rows
+        self._batch: list[tuple[str, Sequence[ChunkRecord]]] = []
+        self._rows = 0
+
+    def add(self, source: str, records: Sequence[ChunkRecord]) -> list[Written]:
+        self._batch.append((source, records))
+        self._rows += len(records)
+        return self.flush() if self._rows >= self._batch_rows else []
+
+    def flush(self) -> list[Written]:
+        batch, self._batch, self._rows = self._batch, [], 0
+        if not batch:
+            return []
+        from minirag_mcp.store import IndexBusyError
+
+        try:
+            self._store.replace_sources(batch, indexed=self._indexed)
+        except IndexBusyError:
+            raise
+        except Exception:
+            return [self._write_one(source, records) for source, records in batch]
+        return [(source, None) for source, _ in batch]
+
+    def _write_one(self, source: str, records: Sequence[ChunkRecord]) -> Written:
+        from minirag_mcp.store import IndexBusyError
+
+        try:
+            self._store.replace_source(source, records)
+        except IndexBusyError:
+            raise
+        except Exception as e:
+            return source, str(e)
+        return source, None
