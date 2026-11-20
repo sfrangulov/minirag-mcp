@@ -59,7 +59,7 @@ from minirag_mcp.labels.labeler import ModelFactory
 from minirag_mcp.labels.model import default_model_factory
 from minirag_mcp.results import embedder_notes
 from minirag_mcp.store import IndexBusyError, IndexOpenError, Store
-from minirag_mcp.sync import OnRebuild, SyncJob, SyncManager, _run_sync_unlocked
+from minirag_mcp.sync import OnEvent, OnRebuild, SyncJob, SyncManager, _run_sync_unlocked
 
 EmbedderFactory = Callable[[EmbeddingScheme], object]
 
@@ -576,9 +576,9 @@ class IndexHandle:
         )
 
     def _run_held(
-        self, scope: Path | None, on_rebuild: OnRebuild
+        self, scope: Path | None, on_rebuild: OnRebuild, on_event: OnEvent
     ) -> tuple[dict[str, int], list[dict], RebuildInfo | None]:
-        return self._sync_held(scope, None, on_rebuild)
+        return self._sync_held(scope, on_event, on_rebuild)
 
     def _sync_held(
         self,

@@ -17,7 +17,8 @@ from __future__ import annotations
 import hashlib
 import sys
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
@@ -28,8 +29,9 @@ from minirag_mcp.handle import IndexHandle, IndexUnavailableError, OpenIndex, Re
 from minirag_mcp.identity import EmbeddingScheme, IdentityError, IndexState, read_identity
 from minirag_mcp.indexes import ServerConfig, load_server_config
 from minirag_mcp.labels.labeler import ModelFactory
+from minirag_mcp.lock import SyncLockBusy
 from minirag_mcp.store import IndexOpenError
-from minirag_mcp.sync import SyncJob
+from minirag_mcp.sync import SyncBusyError, SyncJob
 
 SINGLE_INDEX_NAME = "default"
 # Where `http_server` puts a request's `Connection` in its ASGI scope.
@@ -69,6 +71,10 @@ class IndexRefused(Exception):
 def _also(others: tuple[str, ...]) -> str:
     """The reachable indexes a refused call could use instead, as a closing sentence."""
     return f" Other reachable indexes: {', '.join(others)}." if others else ""
+
+
+def _refused(name: str, why: str, others: tuple[str, ...]) -> IndexRefused:
+    return IndexRefused(f"Index {name!r}: {why.rstrip('.')}.{_also(others)}")
 
 
 class IndexUnavailable(IndexRefused):
@@ -396,6 +402,11 @@ class IndexRegistry:
     def names(self) -> tuple[str, ...]:
         return tuple(self._snapshot())
 
+    @property
+    def entries(self) -> tuple[IndexEntry, ...]:
+        """Every configured index, in the file's order."""
+        return tuple(self._snapshot().values())
+
     def reachable(self, connection: Connection) -> tuple[str, ...]:
         return tuple(name for name in self._snapshot() if connection.reachable(name))
 
@@ -428,6 +439,11 @@ class IndexRegistry:
             )
         return entry
 
+    def _others(
+        self, entries: Mapping[str, IndexEntry], connection: Connection, name: str
+    ) -> tuple[str, ...]:
+        return tuple(n for n in entries if n != name and connection.reachable(n))
+
     def open(
         self, connection: Connection, requested: str | None, use: Use
     ) -> tuple[IndexEntry, OpenIndex]:
@@ -435,11 +451,11 @@ class IndexRegistry:
         and the open index returned for it carries the pipeline the handle admitted."""
         entries = self._snapshot()
         entry = self._resolve(entries, connection, requested)
-        others = tuple(n for n in entries if n != entry.name and connection.reachable(n))
+        others = self._others(entries, connection, entry.name)
         try:
             opened = _admitted(entry) if use is Use.INGEST else entry.handle.get()
         except RebuildPendingError as e:
-            raise IndexRefused(f"Index {entry.name!r}: {e}{_also(others)}") from e
+            raise _refused(entry.name, str(e), others) from e
         except Exception as e:
             raise IndexUnavailable(entry.name, _reason(e), others) from e
         if opened is None:
@@ -449,3 +465,19 @@ class IndexRegistry:
                 f"Retry it.{_also(others)}"
             )
         return entry, opened
+
+    @contextmanager
+    def refusals(self, connection: Connection, entry: IndexEntry) -> Iterator[None]:
+        """Refusals the handle of `entry` raises in the block, named as `open` names its
+        own: a sync it does not start, an index it cannot serve as it stands."""
+        try:
+            yield
+        except (RebuildPendingError, SyncBusyError, SyncLockBusy) as e:
+            others = self._others(self._snapshot(), connection, entry.name)
+            why = str(e)
+            if isinstance(e, SyncLockBusy) and self.path is not None:
+                why = e.naming(f"db in {self.path} [index.{entry.name}]")
+            raise _refused(entry.name, why, others) from e
+        except IndexUnavailableError as e:
+            others = self._others(self._snapshot(), connection, entry.name)
+            raise IndexUnavailable(entry.name, _reason(e), others) from e

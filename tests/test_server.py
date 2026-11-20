@@ -19,7 +19,7 @@ SYNC_TIMEOUT_SECONDS = 30.0
 SYNC_POLL_SECONDS = 0.02
 
 
-async def await_sync(client: Client, job_id: str) -> dict:
+async def await_sync(client: Client, job_id: str, index: str | None = None) -> dict:
     """Poll `sync_status` until the job reaches a terminal state, and return it.
 
     Bounded by wall-clock time rather than by an attempt count: sync runs on a
@@ -32,8 +32,9 @@ async def await_sync(client: Client, job_id: str) -> dict:
     """
     deadline = time.monotonic() + SYNC_TIMEOUT_SECONDS
     st: dict | None = None
+    args = {"jobId": job_id} if index is None else {"jobId": job_id, "index": index}
     while True:
-        st = (await client.call_tool("sync_status", {"jobId": job_id})).data
+        st = (await client.call_tool("sync_status", args)).data
         if st["state"] in ("succeeded", "failed"):
             return st
         if time.monotonic() >= deadline:
@@ -60,7 +61,7 @@ def app(tmp_path, fake_embedder):
     return create_app(cfg, embedder=fake_embedder), root
 
 
-async def test_all_twelve_tools_listed(app):
+async def test_all_thirteen_tools_listed(app):
     mcp, _ = app
     async with Client(mcp) as c:
         names = {t.name for t in await c.list_tools()}
@@ -77,6 +78,7 @@ async def test_all_twelve_tools_listed(app):
         "list_files",
         "delete_file",
         "status",
+        "list_indexes",
     }
 
 
@@ -192,6 +194,36 @@ async def test_ingest_data_and_url(app, monkeypatch, public_dns):
         assert r2["source"] == "https://example.com/x"
         with pytest.raises(Exception, match="http"):
             await c.call_tool("ingest_url", {"url": "file:///etc/passwd"})
+
+
+async def test_every_result_names_its_index(app, monkeypatch, public_dns):
+    import minirag_mcp.ingest.pipeline as pmod
+    from minirag_mcp.ingest.parser import ParsedDoc
+
+    monkeypatch.setattr(pmod, "parse_url", lambda url, **kw: ParsedDoc("# R\n\nRemote body.", "R"))
+    mcp, root = app
+    auth = str(root / "auth.md")
+    async with Client(mcp) as c:
+
+        async def call(tool: str, args: dict) -> dict:
+            return (await c.call_tool(tool, args)).data
+
+        job = await call("sync_start", {})
+        payloads = [job, await await_sync(c, job["jobId"])]
+        payloads += [
+            await call("ingest_file", {"filePath": auth}),
+            await call("ingest_data", {"data": "# Note\n\nSaved note.", "source": "note-1"}),
+            await call("ingest_url", {"url": "https://example.com/x"}),
+            await call("query_documents", {"query": "OAuth2 token"}),
+            await call("find_mentions", {"terms": "oauth2"}),
+            await call("read_chunk_neighbors", {"filePath": auth, "chunkIndex": 0}),
+            await call("read_file", {"filePath": auth}),
+            await call("list_files", {}),
+            await call("delete_file", {"source": "note-1"}),
+            await call("status", {}),
+        ]
+    assert len(payloads) == 12
+    assert [p["index"] for p in payloads] == ["default"] * 12
 
 
 async def test_list_files_reports_the_ocr_engine(app, monkeypatch):

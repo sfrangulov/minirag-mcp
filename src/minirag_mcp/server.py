@@ -1,4 +1,4 @@
-"""FastMCP server: 12 tools over the shared core."""
+"""FastMCP server: 13 tools over the shared core, each call answered by one index."""
 
 from __future__ import annotations
 
@@ -6,28 +6,48 @@ import os
 from collections.abc import Callable, Mapping
 from functools import wraps
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
+from fastmcp.server.dependencies import get_http_request
+from pydantic import Field
 
-from minirag_mcp import __version__
 from minirag_mcp.chunker import join_document
 from minirag_mcp.config import Config, ConfigError, load_config
 from minirag_mcp.handle import OpenIndex
 from minirag_mcp.ingest.ignore import scope_excluded_by
 from minirag_mcp.instructions import build_instructions
-from minirag_mcp.registry import SINGLE_INDEX_NAME, Connection, IndexEntry, IndexRegistry, Use
+from minirag_mcp.registry import (
+    CONNECTION_SCOPE_KEY,
+    SINGLE_INDEX_NAME,
+    UNRESTRICTED,
+    Connection,
+    IndexEntry,
+    IndexRegistry,
+    Use,
+)
 from minirag_mcp.results import (
     DEFAULT_FIND_LIMIT,
     ingest_reply,
+    list_indexes_payload,
     list_payload,
+    registry_status,
     result_dict,
     run_find,
     run_query,
-    status_payload,
+    with_index,
 )
 from minirag_mcp.security import resolve_in_roots
+
+INDEX_ARG_DOC = (
+    "Which index to use. Omit it for this connection's default; name another only when the "
+    "user names it or asks to look elsewhere. list_indexes lists them, and every result's "
+    "`index` says which one answered."
+)
+IndexArg = Annotated[str | None, Field(description=INDEX_ARG_DOC)]
+# What a request may use when the path middleware put no connection in its scope.
+_NO_CONNECTION = Connection(None, frozenset())
 
 
 def _scopes(scope: str | list[str] | None) -> tuple[str, ...]:
@@ -38,28 +58,57 @@ def _scopes(scope: str | list[str] | None) -> tuple[str, ...]:
     return tuple(scope)
 
 
+def current_connection(fallback: Connection) -> Connection:
+    """The connection of the HTTP request being answered; `fallback` outside one (stdio,
+    or the in-memory client)."""
+    try:
+        request = get_http_request()
+    except RuntimeError:
+        return fallback
+    return request.scope.get(CONNECTION_SCOPE_KEY, _NO_CONNECTION)
+
+
 def create_app(
-    config: Config | None,
+    source: Config | IndexRegistry | None,
     *,
     config_error: str | None = None,
     embedder: object | None = None,
     env: Mapping[str, str] | None = None,
     model_factory: Callable | None = None,
+    connection: Connection | None = None,
 ) -> FastMCP:
+    """The server over a registry's indexes, or over the one index the environment
+    configures (`source` None when its configuration did not load, `config_error` saying
+    why). `connection` is what a call outside an HTTP request may use: every index of a
+    registry unless given; the environment's index, named `default`."""
+    if isinstance(source, IndexRegistry):
+        if config_error is not None or embedder is not None or model_factory is not None:
+            raise ValueError(
+                "a registry builds its indexes from its own configuration; config_error, "
+                "embedder and model_factory configure the environment's index"
+            )
+        registry, fallback = source, connection or UNRESTRICTED
+    else:
+        if connection is not None:
+            raise ValueError(
+                "a connection chooses among a registry's indexes; the environment configures "
+                "one, named default, which every call uses"
+            )
+        registry = IndexRegistry.single(
+            source,
+            error=config_error,
+            embedder_factory=None if embedder is None else (lambda c, s: embedder),
+            model_factory=model_factory,
+        )
+        fallback = Connection(SINGLE_INDEX_NAME, None)
     # Instructions come from the environment directly rather than from Config, so a
     # server whose configuration failed to load still tells the client how to use it —
     # same reason `status` keeps answering.
     mcp = FastMCP("minirag-mcp", instructions=build_instructions(env))
-    registry = IndexRegistry.single(
-        config,
-        error=config_error,
-        embedder_factory=None if embedder is None else (lambda c, s: embedder),
-        model_factory=model_factory,
-    )
-    connection = Connection(SINGLE_INDEX_NAME, None)
 
-    def opened(use: Use) -> tuple[IndexEntry, OpenIndex]:
-        return registry.open(connection, None, use)
+    def opened(index: str | None, use: Use) -> tuple[IndexEntry, OpenIndex]:
+        registry.refresh()
+        return registry.open(current_connection(fallback), index, use)
 
     def guard(fn):
         @wraps(fn)
@@ -77,7 +126,7 @@ def create_app(
 
     @mcp.tool
     @guard
-    def sync_start(path: str | None = None) -> dict:
+    def sync_start(path: str | None = None, index: IndexArg = None) -> dict:
         """Reconcile the index with the document roots (or one path inside them).
 
         Returns a jobId immediately; poll sync_status until state is
@@ -101,8 +150,13 @@ def create_app(
         changed, the roots are ingested again when the chunking changed. The
         index answers from its existing vectors until the rebuilt one replaces
         it, and refuses writes meanwhile. A sync with a path is refused there.
+
+        The reply's `index` is where the job runs; pass it to sync_status when it is not
+        the default.
         """
-        entry, c = opened(Use.SYNC)
+        registry.refresh()
+        connection = current_connection(fallback)
+        entry, c = registry.open(connection, index, Use.SYNC)
         scope = None
         if path is not None:
             scope = resolve_in_roots(path, c.config.roots)
@@ -111,18 +165,25 @@ def create_app(
             )
             if by is not None:
                 raise ToolError(f"{scope} is excluded by {by}; nothing under it can be synced")
-        return {"jobId": entry.handle.start_sync(scope)}
+        with registry.refusals(connection, entry):
+            job_id = entry.handle.start_sync(scope)
+        return with_index({"jobId": job_id}, entry)
 
     @mcp.tool
     @guard
-    def sync_status(jobId: str) -> dict:
+    def sync_status(jobId: str, index: IndexArg = None) -> dict:
         """Poll a sync job started by sync_start.
 
         Returns state ('pending' | 'running' | 'succeeded' | 'failed'),
         counts (scanned/ingested/skipped/moved/deleted/relabelled/signed/
         ignored/unreadable/largeTables/failed), and any per-file errors. Only
         the latest job is retained — an old jobId, or any jobId from before a
-        server restart, raises an error.
+        server restart, raises an error. A job is polled in the index it runs
+        in: the `index` sync_start's reply named.
+
+        waiting is null unless the job waits for another index's sync in this
+        server to finish its worker processes (one sync's workers run at a
+        time); it then says so, and the job goes on by itself once they have.
 
         relabelled counts documents whose labels were rewritten from their
         stored text, with nothing re-embedded: classify.toml changed, a move
@@ -143,10 +204,11 @@ def create_app(
         one; a problem appears in errors prefixed "documents:" and is not a
         failure.
 
-        ignored counts the files and folders a .miniragignore rule or a
-        RAG_EXCLUDE pattern excluded from the
-        scan, a folder once; a file indexed before its rule was added is
-        deleted from the index and counted under deleted.
+        ignored counts the files and folders a .miniragignore rule or an
+        exclude pattern (the index's `exclude` in indexes.toml, or
+        RAG_EXCLUDE) left out of the scan, a folder once; a file indexed
+        before its rule was added is deleted from the index and counted under
+        deleted.
 
         unreadable counts indexed sources this installation cannot read
         because an optional extra is absent (images need [ocr], and so does
@@ -178,12 +240,19 @@ def create_app(
         read again — stored again from their indexed text, each file among
         them also in errors), which are null until then.
         """
-        entry, _ = opened(Use.READ)
-        return entry.sync_status(jobId).to_dict()
+        entry, _ = opened(index, Use.READ)
+        try:
+            job = entry.sync_status(jobId)
+        except KeyError as e:
+            raise ToolError(
+                f"{e.args[0]} in index {entry.name!r}; a job started in another index is "
+                "polled with that `index`."
+            ) from e
+        return with_index(job.to_dict(), entry)
 
     @mcp.tool
     @guard
-    def ingest_file(filePath: str) -> dict:
+    def ingest_file(filePath: str, index: IndexArg = None) -> dict:
         """Ingest or re-ingest one file, replacing any content already indexed for it.
 
         filePath must be an absolute path inside a configured document root.
@@ -198,13 +267,19 @@ def create_app(
         pending"), until an unscoped sync_start rebuilds it, and for a file
         above MAX_FILE_SIZE or a table above RAG_MAX_TABLE_ROWS data rows.
         """
-        entry, c = opened(Use.INGEST)
+        entry, c = opened(index, Use.INGEST)
         path = resolve_in_roots(filePath, c.config.roots)
-        return ingest_reply(c.pipeline.ingest_file(path), entry.handle.notes())
+        return with_index(ingest_reply(c.pipeline.ingest_file(path), entry.handle.notes()), entry)
 
     @mcp.tool
     @guard
-    def ingest_data(data: str, source: str, format: str = "text", title: str | None = None) -> dict:
+    def ingest_data(
+        data: str,
+        source: str,
+        format: str = "text",
+        title: str | None = None,
+        index: IndexArg = None,
+    ) -> dict:
         """Ingest text/markdown/html content the client holds, under a source id you choose.
 
         format is one of "text", "markdown", or "html" (default "text").
@@ -214,15 +289,18 @@ def create_app(
         `warnings` and the refusal while a rebuild is pending are as in
         ingest_file.
         """
-        entry, c = opened(Use.INGEST)
-        return ingest_reply(
+        entry, c = opened(index, Use.INGEST)
+        reply = ingest_reply(
             c.pipeline.ingest_data(data, source=source, fmt=format, title=title),
             entry.handle.notes(),
         )
+        return with_index(reply, entry)
 
     @mcp.tool
     @guard
-    def ingest_url(url: str, source: str | None = None, title: str | None = None) -> dict:
+    def ingest_url(
+        url: str, source: str | None = None, title: str | None = None, index: IndexArg = None
+    ) -> dict:
         """Fetch an http(s) URL, convert it to Markdown, and index it.
 
         Only http and https schemes are accepted, and the host must not be a
@@ -234,10 +312,11 @@ def create_app(
         `labelProblem`, `warnings` and the refusal while a rebuild is pending
         are as in ingest_file.
         """
-        entry, c = opened(Use.INGEST)
-        return ingest_reply(
+        entry, c = opened(index, Use.INGEST)
+        reply = ingest_reply(
             c.pipeline.ingest_url(url, source=source, title=title), entry.handle.notes()
         )
+        return with_index(reply, entry)
 
     @mcp.tool
     @guard
@@ -248,6 +327,7 @@ def create_app(
         labels: dict[str, str | list[str]] | None = None,
         dateFrom: str | None = None,
         dateTo: str | None = None,
+        index: IndexArg = None,
     ) -> dict:
         """Hybrid search: semantic similarity plus a keyword boost for exact terms
         and one for passages of documents that match the query as a whole.
@@ -317,8 +397,8 @@ def create_app(
         only for having no label or no date; each `sources` row carries its
         `labels` and `date`.
         """
-        _, c = opened(Use.READ)
-        return run_query(
+        entry, c = opened(index, Use.READ)
+        found = run_query(
             c.store,
             c.embedder,
             c.config,
@@ -331,6 +411,7 @@ def create_app(
             label_source=c.labels,
             reranker=c.reranker,
         )
+        return with_index(found, entry)
 
     @mcp.tool
     @guard
@@ -343,6 +424,7 @@ def create_app(
         dateTo: str | None = None,
         limit: int = DEFAULT_FIND_LIMIT,
         offset: int = 0,
+        index: IndexArg = None,
     ) -> dict:
         """List every indexed document that mentions a word or phrase, with counts.
 
@@ -380,8 +462,8 @@ def create_app(
         and dateTo filter as in query_documents, and citations follow its
         rule: each document's `displayPath`, verbatim.
         """
-        _, c = opened(Use.READ)
-        return run_find(
+        entry, c = opened(index, Use.READ)
+        found = run_find(
             c.store,
             c.config.roots,
             terms,
@@ -394,6 +476,7 @@ def create_app(
             offset=offset,
             label_source=c.labels,
         )
+        return with_index(found, entry)
 
     @mcp.tool
     @guard
@@ -403,6 +486,7 @@ def create_app(
         source: str | None = None,
         before: int = 1,
         after: int = 1,
+        index: IndexArg = None,
     ) -> dict:
         """Read the chunks immediately before and after a search result, for context.
 
@@ -412,7 +496,7 @@ def create_app(
         default to 1). A chunk of a PDF carries `pages` as in
         query_documents.
         """
-        _, c = opened(Use.READ)
+        entry, c = opened(index, Use.READ)
         if filePath is not None:
             key = str(resolve_in_roots(filePath, c.config.roots))
         elif source is not None:
@@ -420,11 +504,13 @@ def create_app(
         else:
             raise ToolError("Provide filePath or source")
         chunks = c.store.neighbors(key, chunkIndex, before=before, after=after)
-        return {"chunks": [result_dict(r) for r in chunks]}
+        return with_index({"chunks": [result_dict(r) for r in chunks]}, entry)
 
     @mcp.tool
     @guard
-    def read_file(filePath: str | None = None, source: str | None = None) -> dict:
+    def read_file(
+        filePath: str | None = None, source: str | None = None, index: IndexArg = None
+    ) -> dict:
         """Read a source's entire indexed content as Markdown.
 
         The document is reconstructed from its chunks, not concatenated
@@ -438,7 +524,7 @@ def create_app(
         responses — prefer read_chunk_neighbors when only the context
         around one chunk is needed.
         """
-        _, c = opened(Use.READ)
+        entry, c = opened(index, Use.READ)
         not_indexed_hint = ""
         if filePath is not None:
             key = str(resolve_in_roots(filePath, c.config.roots))
@@ -456,13 +542,14 @@ def create_app(
         if not chunks:
             raise ToolError(f"Source not found in index: {key}{not_indexed_hint}")
         info = c.store.get_source(key)
-        return {
+        document = {
             "source": key,
             "sourceType": info.source_type,
             "title": info.title,
             "chunkCount": len(chunks),
             "text": join_document(chunks),
         }
+        return with_index(document, entry)
 
     @mcp.tool
     @guard
@@ -472,6 +559,7 @@ def create_app(
         dateFrom: str | None = None,
         dateTo: str | None = None,
         sort: str | None = None,
+        index: IndexArg = None,
     ) -> dict:
         """List files found on disk under the document roots, plus indexed data/url sources.
 
@@ -495,15 +583,16 @@ def create_app(
         Indexed files under one are listed as "unlisted": still indexed and
         searchable, not checked against the disk.
 
-        `ignored`, present when a .miniragignore rule or a RAG_EXCLUDE
-        pattern excluded anything, counts the files and folders it left out, a folder once.
+        `ignored`, present when a .miniragignore rule or an exclude pattern
+        (the index's `exclude` in indexes.toml, or RAG_EXCLUDE) excluded
+        anything, counts the files and folders it left out, a folder once.
 
         `labels`, `dateFrom` and `dateTo` filter as in query_documents;
         sort="date" lists newest first, documents without a date last. Rows
         carry `labels` and `date` when present.
         """
-        _, c = opened(Use.READ)
-        return list_payload(
+        entry, c = opened(index, Use.READ)
+        listed = list_payload(
             c.store,
             c.config.roots,
             _scopes(scope),
@@ -515,10 +604,13 @@ def create_app(
             sort=sort,
             label_source=c.labels,
         )
+        return with_index(listed, entry)
 
     @mcp.tool
     @guard
-    def delete_file(filePath: str | None = None, source: str | None = None) -> dict:
+    def delete_file(
+        filePath: str | None = None, source: str | None = None, index: IndexArg = None
+    ) -> dict:
         """Delete an indexed file, data item, or url item from the index.
 
         Provide exactly one of filePath (absolute path inside a document
@@ -526,7 +618,7 @@ def create_app(
         index entry — a file left in place under a document root is
         re-ingested by a later sync_start.
         """
-        _, c = opened(Use.READ)
+        entry, c = opened(index, Use.READ)
         if filePath is not None:
             key = str(resolve_in_roots(filePath, c.config.roots))
         elif source is not None:
@@ -536,19 +628,22 @@ def create_app(
         deleted = c.store.delete_source(key)
         if deleted == 0:
             raise ToolError(f"Source not found in index: {key}")
-        return {"source": key, "deletedChunks": deleted}
+        return with_index({"source": key, "deletedChunks": deleted}, entry)
 
     @mcp.tool
-    def status() -> dict:
+    @guard
+    def status(index: IndexArg = None) -> dict:
         """Report configuration and index status. Works even when configuration is invalid.
 
         Always includes version. When configuration is valid, also includes
-        roots, dbPath, model, hybridWeight, and chunkCount/sourceCount (both
-        present on every call, 0 before anything is indexed) — or, if opening
-        the index itself fails, indexError instead of the counts. When
-        configuration is invalid, includes configError instead, and every
-        other tool raises an error referencing it until the configuration is
-        fixed.
+        index (the index reported on), roots, dbPath, model, hybridWeight, and
+        chunkCount/sourceCount (both present on every call, 0 before anything
+        is indexed) — or, if opening the index itself fails, indexError
+        instead of the counts. When configuration is invalid, includes
+        configError instead, and every other tool raises an error referencing
+        it until the configuration is fixed. When an edit of indexes.toml does
+        not load, configError says why beside the index's status: the indexes
+        it configured before keep answering.
 
         indexState is "ready", "rebuild pending", "syncing" or "unavailable".
         indexGeneration, embedding (model, prefixes, dim, backend) and
@@ -593,8 +688,8 @@ def create_app(
         ignoreFiles, present when a root has a .miniragignore: each file with
         its number of rules, or the error that stops scanning under its root.
 
-        excludePatterns, present when RAG_EXCLUDE is set, is the number of
-        patterns it holds.
+        excludePatterns, present when the index has exclude patterns (its
+        `exclude` in indexes.toml, or RAG_EXCLUDE), is how many it has.
 
         maxTableRows, present only when RAG_MAX_TABLE_ROWS is set, is the
         number of data rows above which an .xlsx or .csv is not indexed.
@@ -612,13 +707,26 @@ def create_app(
         counts, and the model state, with modelHint saying why when it is
         "unavailable" — or the file's error.
         """
-        if not registry.names:
-            return {
-                "version": __version__,
-                "configError": registry.config_error or "no configuration",
-            }
-        entry = registry.resolve(connection, None)
-        return status_payload(entry.config, entry.handle)
+        registry.refresh()
+        return registry_status(registry, current_connection(fallback), index)
+
+    @mcp.tool
+    @guard
+    def list_indexes() -> dict:
+        """List the indexes this server hosts and which of them this connection may use.
+
+        Each row has name, description, model, language and reachable. A reachable row also has
+        documentCount, chunkCount, state ('ready', 'syncing', 'rebuild pending' or
+        'unavailable'), stateReason when not ready, and embeddingBackend, reranker and
+        classifyBackend: which backend computes embeddings ('endpoint', 'in-process', or
+        'in-process (endpoint unreachable)'), reranks ('endpoint', 'unreachable' or 'off') and
+        classifies. `default` names this connection's default index, or is null when its URL named
+        none. Pass a reachable name as `index` to another tool only when the user asks for that
+        index or asks to look elsewhere. Reporting an index opens it, which may load its
+        embedding model.
+        """
+        registry.refresh()
+        return list_indexes_payload(registry, current_connection(fallback))
 
     return mcp
 

@@ -12,7 +12,7 @@ from conftest import FakeEmbedder, stamp_identity
 from index_helpers import file_registry
 from minirag_mcp.config import ConfigError, load_config
 from minirag_mcp.embedder import E5_LARGE, MINILM, EmbedderUnavailableError
-from minirag_mcp.handle import IndexHandle
+from minirag_mcp.handle import IndexHandle, IndexUnavailableError
 from minirag_mcp.identity import PROBE_TEXT, IndexState, record_probe
 from minirag_mcp.lock import SyncLockBusy
 from minirag_mcp.registry import (
@@ -24,6 +24,7 @@ from minirag_mcp.registry import (
     IndexUnavailable,
     Use,
 )
+from minirag_mcp.sync import SyncBusyError
 
 
 def test_a_registry_opens_no_index_until_one_is_used(indexes_file, fake_embedder):
@@ -190,6 +191,30 @@ def test_an_unavailable_index_ends_its_reason_once_and_names_only_the_reachable_
     assert str(e.value) == (
         f"Index 'alpha' is unavailable: The endpoint serves another model.{others}"
     )
+
+
+@pytest.mark.parametrize(
+    "raised, refusal",
+    [
+        (
+            SyncBusyError("A sync job is already running"),
+            "Index 'beta': A sync job is already running.",
+        ),
+        (
+            IndexUnavailableError("the endpoint serves another model"),
+            "Index 'beta' is unavailable: the endpoint serves another model.",
+        ),
+    ],
+)
+def test_a_refusal_the_handle_raises_names_the_index_and_the_reachable_ones(
+    indexes_file, fake_embedder, raised, refusal
+):
+    reg = file_registry(indexes_file, lambda c, s: fake_embedder)
+    connection = Connection("beta", frozenset({"alpha"}))
+    entry = reg.resolve(connection, None)
+    with pytest.raises(IndexRefused) as caught, reg.refusals(connection, entry):
+        raise raised
+    assert str(caught.value) == f"{refusal} Other reachable indexes: alpha."
 
 
 def test_an_unknown_model_names_where_the_known_ones_are_listed(tmp_path):

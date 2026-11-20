@@ -46,7 +46,8 @@
     { "name": "ingest_data", "description": "Index text supplied in the conversation" },
     { "name": "ingest_url", "description": "Fetch a web page and index it" },
     { "name": "delete_file", "description": "Remove a document from the index (the file itself is untouched)" },
-    { "name": "status", "description": "Report the configuration and the state of the index" }
+    { "name": "status", "description": "Report the configuration and the state of the index" },
+    { "name": "list_indexes", "description": "List the indexes this server hosts and which this connection may use" }
   ],
   "keywords": ["rag", "search", "documents", "local", "pdf", "knowledge base"],
   "license": "MIT AND Apache-2.0",

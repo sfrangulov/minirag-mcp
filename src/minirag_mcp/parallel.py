@@ -247,6 +247,7 @@ POOL_WAIT = (
     "waiting for another index's sync in this process to finish its workers; this sync's "
     "workers start then"
 )
+POOL_WAITED = "the workers this sync waited for have finished; its own start now"
 
 
 def prepare_files(
@@ -264,15 +265,19 @@ def prepare_files(
     worker fails, with WORKER_DIED; a fresh pool then takes the rest.
 
     While one call's pools run in this process, another call starts none until that call
-    has ended, and tells `on_event` it waits; closing an iterator ends its call.
+    has ended, and tells `on_event` when it starts and stops waiting; closing an iterator
+    ends its call.
     """
     factory = pickle.dumps(make_preparer)
     waiting = deque(paths)
-    if not _POOL_GATE.acquire(blocking=False):
+    waited = not _POOL_GATE.acquire(blocking=False)
+    if waited:
         if on_event is not None:
             on_event(POOL_WAIT)
         _POOL_GATE.acquire()
     try:
+        if waited and on_event is not None:
+            on_event(POOL_WAITED)
         while waiting:
             suspects = deque((yield from _run(factory, waiting, workers, 2 * workers)))
             while suspects:

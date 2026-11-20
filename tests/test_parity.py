@@ -236,6 +236,7 @@ async def test_both_shells_refuse_a_scoped_sync_of_a_pending_index_the_same_way(
 
     refusal = _last_error(err)
     assert code == 1 and out == "" and is_error and text.endswith(refusal)
+    assert refusal.startswith("Index 'default': ")
     assert "index needs a rebuild: run an unscoped sync" in refusal and a_md in refusal
     _, st = await call_mcp(env, "status", {}, fake_embedder)
     assert (st["indexState"], st["indexGeneration"]) == ("rebuild pending", 1)
@@ -897,7 +898,41 @@ async def test_an_ingest_without_labels_keeps_its_reply_shape(root, tmp_path, fa
     is_error, reply = await call_mcp(
         env, "ingest_file", {"filePath": str(root / "sub" / "a.md")}, fake_embedder
     )
-    assert not is_error and set(reply) == {"source", "chunkCount", "title"}
+    assert not is_error and set(reply) == {"index", "source", "chunkCount", "title"}
+
+
+async def test_every_json_payload_of_the_cli_names_its_index(
+    labelled_root, tmp_path, capsys, monkeypatch, fake_embedder, model_factory, public_dns
+):
+    import minirag_mcp.ingest.pipeline as pmod
+    from minirag_mcp.ingest.parser import ParsedDoc
+
+    monkeypatch.setattr(pmod, "parse_url", lambda url, **kw: ParsedDoc("# R\n\nNotes.", "R"))
+    monkeypatch.setattr(cli, "_make_embedder", lambda cfg: fake_embedder)
+    monkeypatch.setattr(cli, "_make_model_factory", lambda: model_factory)
+    model_factory.answers = {"Minutes of": {"minutes": 1.0}}
+    model_factory.default = {"report": 1.0}
+    env = {"BASE_DIR": str(labelled_root), "DB_PATH": str(tmp_path / "db")}
+    plan = str(labelled_root / "alpha" / "plan.md")
+    commands = [
+        ["sync"],
+        ["ingest", plan],
+        ["ingest-url", "https://example.com/q"],
+        ["query", "rollout"],
+        ["find", "rollout"],
+        ["read-neighbors", "--file-path", plan, "--chunk-index", "0"],
+        ["read", plan],
+        ["list"],
+        ["status"],
+        ["classify", "try", plan],
+        ["delete", "--source", "https://example.com/q"],
+    ]
+    named = []
+    for command in commands:
+        code, out, err = run_cli([*command, *_flags(env), "--json"], capsys)
+        assert code == 0, (command, err)
+        named.append(json.loads(out).get("index"))
+    assert named == ["default"] * len(commands)
 
 
 async def test_ingest_url_says_why_its_labels_are_missing_in_both_shells(

@@ -944,7 +944,7 @@ def _sync_job(h: IndexHandle) -> None:
         lambda h: h.run_sync(None),
         _sync_job,
         # What the job's thread runs, after a mismatch may have become known.
-        lambda h: h._run_held(None, None),
+        lambda h: h._run_held(None, None, None),
         lambda h: h.ensure_probe(),
     ],
     ids=["ingest", "sync", "sync-job", "sync-job-body", "before-store"],

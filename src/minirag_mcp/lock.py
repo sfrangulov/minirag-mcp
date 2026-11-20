@@ -102,6 +102,13 @@ class SyncLockBusy(Exception):
         self.started_at = started_at
         self.path = path
 
+    def naming(self, setting: str) -> str:
+        """The message, with `setting` as what to change instead of DB_PATH: how an index
+        configured elsewhere than the environment names its index folder."""
+        if self.path is None:
+            return str(self)
+        return _busy_message(self.path, self.pid, self.started_at, setting)
+
 
 def _read_holder(path: Path) -> tuple[int | None, str | None]:
     """Best-effort (pid, startedAt) of the holder. Never raises.
@@ -169,8 +176,10 @@ def _warn_unlocked(path: Path, e: OSError) -> None:
     )
 
 
-def _busy_message(path: Path, pid: int | None, started_at: str | None) -> str:
-    tail = "Wait for it to finish, or use a different DB_PATH."
+def _busy_message(
+    path: Path, pid: int | None, started_at: str | None, setting: str = "DB_PATH"
+) -> str:
+    tail = f"Wait for it to finish, or use a different {setting}."
     if pid is None:
         return f"Another sync of this index is running (lock: {path}). {tail}"
     elapsed = _elapsed(started_at)

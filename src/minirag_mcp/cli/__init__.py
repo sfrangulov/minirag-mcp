@@ -33,10 +33,11 @@ from minirag_mcp.results import (
     QueryError,
     ingest_reply,
     list_payload,
+    registry_status,
     result_dict,
     run_find,
     run_query,
-    status_payload,
+    with_index,
 )
 from minirag_mcp.security import SecurityError, resolve_in_roots
 from minirag_mcp.store import IndexBusyError
@@ -132,6 +133,27 @@ def _single(cfg: Config) -> IndexRegistry:
 _CONNECTION = Connection(SINGLE_INDEX_NAME, None)
 
 
+def _registry(
+    base_dir: list[str] | None,
+    db_path: str | None,
+    cache_dir: str | None,
+    model_name: str | None,
+) -> IndexRegistry:
+    try:
+        return _single(_load_cfg(base_dir, db_path, cache_dir, model_name))
+    except ConfigError as e:
+        _fail(str(e))
+        raise AssertionError from e  # unreachable
+
+
+def _open_in(registry: IndexRegistry, use: Use) -> tuple[IndexEntry, OpenIndex]:
+    try:
+        return registry.open(_CONNECTION, None, use)
+    except IndexRefused as e:
+        _fail(str(e))
+        raise AssertionError from e  # unreachable
+
+
 def _open(
     use: Use,
     base_dir: list[str] | None,
@@ -139,12 +161,7 @@ def _open(
     cache_dir: str | None,
     model_name: str | None,
 ) -> tuple[IndexEntry, OpenIndex]:
-    try:
-        cfg = _load_cfg(base_dir, db_path, cache_dir, model_name)
-        return _single(cfg).open(_CONNECTION, None, use)
-    except (ConfigError, IndexRefused) as e:
-        _fail(str(e))
-        raise AssertionError from e  # unreachable
+    return _open_in(_registry(base_dir, db_path, cache_dir, model_name), use)
 
 
 def _emit(payload: dict, as_json: bool, human: str) -> None:
@@ -277,7 +294,7 @@ def ingest(
     notes = entry.handle.notes()
     payload = {"ingested": [ingest_reply(r, notes) for r in done], "failed": failures}
     human = "\n".join([f"ingested {len(done)} file(s):"] + [f"  {r.source}" for r in done])
-    _emit(payload, json, human)
+    _emit(with_index(payload, entry), json, human)
     if done:
         _warn(notes)
     for fail in failures:
@@ -308,7 +325,7 @@ def ingest_url(
     except Exception as e:
         _fail(str(e))
     reply = ingest_reply(r, entry.handle.notes())
-    _emit(reply, json, f"ingested {r.source} ({r.chunk_count} chunks)")
+    _emit(with_index(reply, entry), json, f"ingested {r.source} ({r.chunk_count} chunks)")
     _warn(reply.get("warnings", []))
     _warn_labelling(pipeline, report.problems)
 
@@ -329,7 +346,8 @@ def sync(
     configuration changed since it was built ("rebuild pending" in status) is rebuilt by a
     sync without a path, and a sync with one is refused.
     """
-    entry, _ = _open(Use.SYNC, base_dir, db_path, cache_dir, model_name)
+    registry = _registry(base_dir, db_path, cache_dir, model_name)
+    entry, _ = _open_in(registry, Use.SYNC)
     scope = None
     if path is not None:
         try:
@@ -337,9 +355,10 @@ def sync(
         except SecurityError as e:
             _fail(str(e))
     try:
-        counts, errors, rebuilt = entry.handle.run_sync(
-            scope, on_event=lambda m: print(m, file=sys.stderr)
-        )
+        with registry.refusals(_CONNECTION, entry):
+            counts, errors, rebuilt = entry.handle.run_sync(
+                scope, on_event=lambda m: print(m, file=sys.stderr)
+            )
     except Exception as e:  # a refusal, a busy lock, a rebuild that stopped before its swap
         _fail(str(e))
         raise AssertionError from e  # unreachable
@@ -351,7 +370,7 @@ def sync(
         "errors": errors,
         "rebuild": rebuilt.to_dict() if rebuilt is not None else None,
     }
-    _emit(payload, json, human)
+    _emit(with_index(payload, entry), json, human)
     for err in errors:
         print(f"warn: {err['source']}: {err['error']}", file=sys.stderr)
     if counts["failed"] > 0:
@@ -411,7 +430,7 @@ def query(
         human += "\n\nSources:\n" + "\n".join(lines)
     else:
         human = "no results" + (f" — {payload['notice']}" if "notice" in payload else "")
-    _emit(payload, json, human)
+    _emit(with_index(payload, entry), json, human)
     _warn(payload.get("warnings", []))
     _warn_filter(payload)
 
@@ -489,7 +508,7 @@ def find(
     except QueryError as e:
         _fail(str(e))
         raise AssertionError from e  # unreachable
-    _emit(payload, json, _find_human(payload))
+    _emit(with_index(payload, entry), json, _find_human(payload))
     _warn_filter(payload)
 
 
@@ -528,7 +547,7 @@ def read_neighbors(
         )
         or "no chunks"
     )
-    _emit(payload, json, human)
+    _emit(with_index(payload, entry), json, human)
 
 
 @app.command
@@ -571,7 +590,7 @@ def read(
         "chunkCount": len(chunks),
         "text": text,
     }
-    _emit(payload, json, text)
+    _emit(with_index(payload, entry), json, text)
 
 
 @app.command(name="list")
@@ -626,7 +645,7 @@ def list_cmd(
         + _document_suffix(f)
         for f in payload["files"]
     )
-    _emit(payload, json, human or "no files found")
+    _emit(with_index(payload, entry), json, human or "no files found")
     for folder in payload["unlistedFolders"]:
         print(f"warn: {folder['path']}: {folder['message']}", file=sys.stderr)
     if n := payload.get("ignored"):
@@ -651,13 +670,14 @@ def status(
     # exactly what you run `status` to diagnose, so it reports the error and exits 0.
     # Every other command still fails loudly on the same ConfigError.
     try:
-        cfg = _load_cfg(base_dir, db_path, cache_dir, model_name)
+        registry = _single(_load_cfg(base_dir, db_path, cache_dir, model_name))
     except ConfigError as e:
-        payload = {"version": __version__, "configError": str(e)}
-        _emit(payload, json, "\n".join(f"{k}: {v}" for k, v in payload.items()))
-        return
-    entry = _single(cfg).resolve(_CONNECTION, None)
-    payload = status_payload(entry.config, entry.handle)
+        registry = IndexRegistry.single(None, error=str(e))
+    try:
+        payload = registry_status(registry, _CONNECTION, None)
+    except IndexRefused as e:
+        _fail(str(e))
+        raise AssertionError from e  # unreachable
     human = "\n".join(f"{k}: {v}" for k, v in payload.items())
     _emit(payload, json, human)
 
@@ -692,7 +712,11 @@ def delete(
         raise AssertionError from e  # unreachable
     if deleted == 0:
         _fail(f"source not found in index: {key}")
-    _emit({"source": key, "deletedChunks": deleted}, json, f"deleted {deleted} chunk(s) of {key}")
+    _emit(
+        with_index({"source": key, "deletedChunks": deleted}, entry),
+        json,
+        f"deleted {deleted} chunk(s) of {key}",
+    )
 
 
 classify_app = App(name="classify", help="Inspect how documents would be labelled.")
@@ -756,7 +780,7 @@ def classify_try(
     lines.append(
         f"date: {doc.date.value or 'none'}" + (f" [{doc.date.source}]" if doc.date.value else "")
     )
-    _emit(payload, json, "\n".join(lines))
+    _emit(with_index(payload, entry), json, "\n".join(lines))
     _warn_labelling(pipeline, preview.problems)
     # The preview exists to show the model's answers; one it could not give is a failure.
     if doc.unanswered:

@@ -25,9 +25,13 @@ ENDPOINT_FAILURES_TO_STOP = 3
 
 # Told what a rebuild rebuilds and why when it starts, before its counts are known.
 OnRebuild = Callable[[RebuildInfo], None]
+# Told each progress line a sync reports, as the CLI prints them.
+OnEvent = Callable[[str], None]
 # One sync of the index, or of `scope` inside it: its counts, its per-file errors, and the
 # rebuild it made, if any. Run with the sync lock already held.
-SyncRun = Callable[[Path | None, OnRebuild], tuple[dict[str, int], list[dict], RebuildInfo | None]]
+SyncRun = Callable[
+    [Path | None, OnRebuild, OnEvent], tuple[dict[str, int], list[dict], RebuildInfo | None]
+]
 
 
 class SyncBusyError(Exception):
@@ -67,6 +71,8 @@ class SyncJob:
     error: str | None = None
     # Set when a rebuild starts, its counts None until the job has finished.
     rebuild: RebuildInfo | None = None
+    # What the job waits for while it waits at the worker-pool gate of this process.
+    waiting: str | None = None
 
     @property
     def running(self) -> bool:
@@ -83,6 +89,7 @@ class SyncJob:
             "errors": list(self.errors),
             "error": self.error,
             "rebuild": self.rebuild.to_dict() if self.rebuild else None,
+            "waiting": self.waiting,
         }
 
 
@@ -458,8 +465,11 @@ class SyncManager:
             def rebuilding(info: RebuildInfo) -> None:
                 job.rebuild = info
 
+            def reported(event: str) -> None:
+                job.waiting = event if event == parallel.POOL_WAIT else None
+
             try:
-                counts, errors, rebuilt = self._run(scope, rebuilding)
+                counts, errors, rebuilt = self._run(scope, rebuilding, reported)
             except Exception as e:  # catastrophic failure (scan error, DB down, ...)
                 job.error = str(e)
             else:
@@ -467,6 +477,7 @@ class SyncManager:
                 terminal = "succeeded"
             finally:
                 job.finished_at = _now()
+                job.waiting = None
                 try:
                     # Released on the worker thread, not the one that acquired it.
                     # flock belongs to the open file description, so the handoff is

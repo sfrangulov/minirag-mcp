@@ -18,7 +18,7 @@ from minirag_mcp import __version__, literal, ocr, ocr_vision
 from minirag_mcp.chunker import SCHEME_VERSION, shared_lines
 from minirag_mcp.config import Config
 from minirag_mcp.endpoints import RerankEndpoint
-from minirag_mcp.identity import REASON_SEPARATOR, IndexState
+from minirag_mcp.identity import REASON_SEPARATOR, IdentityError, IndexState, read_identity
 from minirag_mcp.ingest import ignore
 from minirag_mcp.ingest.pipeline import IngestResult
 from minirag_mcp.ingest.scanner import FileState, compute_states, scan_roots
@@ -40,6 +40,7 @@ from minirag_mcp.store import (
     LABEL_COLUMNS,
     MAX_TOP_K,
     RESYNC_HINT,
+    IndexOpenError,
     SearchResult,
     SourceInfo,
     Store,
@@ -47,6 +48,7 @@ from minirag_mcp.store import (
 
 if TYPE_CHECKING:
     from minirag_mcp.handle import IndexHandle, OpenIndex
+    from minirag_mcp.registry import Connection, IndexEntry, IndexRegistry
 
 EMPTY_INDEX_NOTICE = (
     "Nothing is indexed yet, so no query can match. Index the document roots first: "
@@ -357,11 +359,16 @@ def identity_status(opened: OpenIndex, state: IndexState, why: str) -> dict:
     return out
 
 
-def status_payload(config: Config, handle: IndexHandle) -> dict:
+def status_payload(
+    config: Config, handle: IndexHandle, state: tuple[IndexState, str] | None = None
+) -> dict:
     """`status` for a valid configuration, the same in both shells.
 
     An index that cannot be opened is reported as `indexError`, with `indexState`
     "unavailable", not raised: `status` is what a broken setup is diagnosed with.
+
+    `state` is the index's state and why, the handle's own when None. An `IndexEntry`
+    knows of a sync its handle does not run: one of the handle a reload replaced.
     """
     out: dict = {
         "version": __version__,
@@ -377,7 +384,7 @@ def status_payload(config: Config, handle: IndexHandle) -> dict:
         out["excludePatterns"] = len(config.exclude)
     if config.max_table_rows is not None:
         out["maxTableRows"] = config.max_table_rows
-    state, why = handle.state()
+    state, why = handle.state() if state is None else state
     out["indexState"] = state.value
     if state is IndexState.UNAVAILABLE:
         out["indexError"] = why
@@ -399,6 +406,102 @@ def status_payload(config: Config, handle: IndexHandle) -> dict:
         out["indexState"] = IndexState.UNAVAILABLE.value
         out["indexError"] = str(e)
     return out
+
+
+def with_index(payload: dict, entry: IndexEntry) -> dict:
+    """`payload` as a call into `entry` answers it: naming the index, and its state while
+    that is not ready."""
+    state, why = entry.state()
+    out = {"index": entry.name, **payload}
+    if state is not IndexState.READY:
+        out["indexState"] = state.value
+    if state is IndexState.REBUILD_PENDING:
+        out["indexWarning"] = (
+            f"Index {entry.name!r} differs from its configuration ({why}); it answers from "
+            "its existing vectors until an unscoped sync_start rebuilds it."
+        )
+    return out
+
+
+def index_status(entry: IndexEntry) -> dict:
+    """`status` of one index, the same in both shells."""
+    return {"index": entry.name, **status_payload(entry.config, entry.handle, entry.state())}
+
+
+def registry_status(registry: IndexRegistry, connection: Connection, requested: str | None) -> dict:
+    """`status` of the index a call names, or of its connection's default; IndexRefused
+    when the connection cannot use it. With no index to report on, the configuration's
+    error is the whole answer; a reload that failed is reported beside the indexes the
+    previous configuration still serves."""
+    if not registry.names:
+        return {
+            "version": __version__,
+            "configError": registry.config_error or "no configuration",
+        }
+    out = index_status(registry.resolve(connection, requested))
+    if registry.config_error:
+        out["configError"] = registry.config_error
+    return out
+
+
+# A syncing index has no reason of its own to report.
+SYNCING_REASON = "a sync of this index is running"
+
+
+def list_indexes_payload(registry: IndexRegistry, connection: Connection) -> dict:
+    """Every index the registry serves, in its configuration's order, and which of them
+    `connection` may use. Those it may use are opened to be reported; the others never.
+    No one index answers it, so it names the connection's `default`, not an `index`."""
+    out: dict = {
+        "default": connection.default,
+        "indexes": [_index_row(e, connection.reachable(e.name)) for e in registry.entries],
+    }
+    if registry.config_error:
+        out["configError"] = registry.config_error
+    return out
+
+
+def _recorded_model(config: Config) -> str:
+    """The model the index's vectors were made with, read without opening it; the
+    configured one while none is recorded or the record cannot be read."""
+    try:
+        recorded = read_identity(config.db_path)
+    except (IdentityError, IndexOpenError):
+        return config.model_name
+    return config.model_name if recorded is None else recorded.embedding.model
+
+
+def _index_row(entry: IndexEntry, reachable: bool) -> dict:
+    config = entry.config
+    row: dict = {
+        "name": entry.name,
+        "description": entry.description,
+        "model": _recorded_model(config),
+        "language": config.fts_language,
+        "reachable": reachable,
+    }
+    if not reachable:
+        return row
+    state, why = entry.state()
+    found: dict = {}
+    if state is not IndexState.UNAVAILABLE:
+        try:
+            opened = entry.handle.get()
+            found = {
+                "documentCount": opened.store.source_count(),
+                "chunkCount": opened.store.chunk_count(),
+                "embeddingBackend": getattr(opened.embedder, "backend", "in-process"),
+                "reranker": rerank_status(opened.reranker)["reranker"],
+                "classifyBackend": opened.labels.backend,
+            }
+        except Exception as e:
+            state, why = IndexState.UNAVAILABLE, str(e)
+    row["state"] = state.value
+    if state is IndexState.SYNCING:
+        row["stateReason"] = why or SYNCING_REASON
+    elif state is not IndexState.READY:
+        row["stateReason"] = why
+    return {**row, **found}
 
 
 def display_path(source: str, roots: Sequence[Path] = ()) -> str:
