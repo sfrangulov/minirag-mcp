@@ -1519,6 +1519,20 @@ release simply sits there looking like a build that hung.
    uv run bump-my-version bump patch    # or: minor | major
    ```
 
+   A pre-release cycle uses the `pre_l` and `pre_n` parts:
+
+   ```bash
+   uv run bump-my-version bump --new-version 2.0.0a1   # start a pre-release cycle
+   uv run bump-my-version bump pre_n                   # 2.0.0a1 -> 2.0.0a2
+   uv run bump-my-version bump pre_l                   # a -> b -> rc -> final: 2.0.0rc1 -> 2.0.0
+   ```
+
+   `pre_n` and `pre_l` only make sense on a pre-release: on a final version they
+   produce an invalid version such as `1.1.1final2`, and the way back is
+   `git tag -d vX.Y.Z` plus `git reset --hard HEAD~1` before anything is pushed.
+   The tag must be the PEP 440 spelling (`v2.0.0a1`, not `v2.0.0-alpha.1`),
+   because `release.yml` compares it with the built wheel's version.
+
    This rewrites `version` in `pyproject.toml`, commits that as
    `chore: release vX.Y.Z`, and creates the `vX.Y.Z` tag — the spelling
    `release.yml`'s version check expects. It deliberately does not push:
@@ -1534,6 +1548,14 @@ release simply sits there looking like a build that hung.
 
 2. Push the commit and the tag: `git push && git push origin vX.Y.Z`.
 3. Publish a GitHub release for that tag.
+
+   For a pre-release, publish with
+   `gh release create vX --verify-tag --prerelease --notes-file <notes>`.
+   Marking it as a pre-release keeps GitHub's "Latest" on the last final release.
+
+**A 1.x patch.** Cut `release/1.x` from the `v1.1.1` tag, cherry-pick the fix,
+run `bump-my-version bump patch` there, and tag from that branch.
+`release.yml` is already on `main`, which is what GitHub requires.
 
 Publishing the release runs `release.yml`. It runs `ruff` and `pytest` first —
 `ci.yml` has no tag trigger, so a tag is the one ref CI never covers and this

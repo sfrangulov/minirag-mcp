@@ -108,6 +108,17 @@ sign_tags = false
 # A bump has to be the only thing in its commit; refuse to sweep up whatever
 # else happens to be in the tree.
 allow_dirty = false
+parse = '(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)(?:(?P<pre_l>a|b|rc)(?P<pre_n>\d+))?'
+serialize = ["{major}.{minor}.{patch}{pre_l}{pre_n}", "{major}.{minor}.{patch}"]
+
+[tool.bumpversion.parts.pre_l]
+values = ["a", "b", "rc", "final"]
+optional_value = "final"
+# major/minor/patch reset pre_l to its first value; "final" keeps `bump patch` a final release.
+first_value = "final"
+
+[tool.bumpversion.parts.pre_n]
+first_value = "1"
 
 # bump-my-version 1.5.1 also rewrites `project.version` unprompted, but that is
 # not documented configuration and a release now depends on that line being

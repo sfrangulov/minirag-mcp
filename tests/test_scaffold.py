@@ -1,6 +1,10 @@
 import json
+import subprocess
+import sys
 import tomllib
 from pathlib import Path
+
+import pytest
 
 import minirag_mcp
 
@@ -82,3 +86,43 @@ def test_readme_carries_the_registry_ownership_marker():
     """
     readme = (ROOT / _pyproject()["project"]["readme"]).read_text(encoding="utf-8")
     assert f"<!-- mcp-name: {SERVER_NAME} -->" in readme
+
+
+BUMP = Path(sys.executable).with_name("bump-my-version")
+
+
+@pytest.mark.parametrize(
+    ("current", "part", "expected"),
+    [
+        ("1.1.1", "patch", "1.1.2"),
+        ("1.1.1", "major", "2.0.0"),
+        ("2.0.0a1", "pre_n", "2.0.0a2"),
+        ("2.0.0a2", "pre_l", "2.0.0b1"),
+        ("2.0.0b1", "pre_l", "2.0.0rc1"),
+        ("2.0.0rc1", "pre_l", "2.0.0"),
+        ("2.0.0", "patch", "2.0.1"),
+    ],
+)
+def test_bump_walks_pre_releases_to_the_final_release(current, part, expected):
+    """release.yml compares the tag with the wheel filename, which carries the
+    normalized PEP 440 form, so the result is `2.0.0a1` and not `2.0.0-alpha.1`."""
+    proc = subprocess.run(
+        [
+            str(BUMP),
+            "show",
+            "--config-file",
+            str(PYPROJECT),
+            "--current-version",
+            current,
+            "--increment",
+            part,
+            "-f",
+            "json",
+            "new_version",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=ROOT,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout)["new_version"] == expected
