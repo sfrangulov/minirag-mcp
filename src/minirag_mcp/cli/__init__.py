@@ -754,6 +754,7 @@ def list_cmd(
             date_to=date_to,
             sort=sort,
             label_source=opened.labels,
+            db_path=cfg.db_path,
         )
     except QueryError as e:
         _fail(registry.failure(entry, e))
@@ -762,6 +763,7 @@ def list_cmd(
         f"[{f['state']}] {f['source']} ({f['chunkCount']} chunks)"
         + (f" [ocr:{f['ocrEngine']}]" if f["ocrEngine"] else "")
         + _document_suffix(f)
+        + (f"\n  ! {f['lastSyncError']}" if "lastSyncError" in f else "")
         for f in payload["files"]
     )
     _emit(with_index(payload, entry), json, human or "no files found")
@@ -802,8 +804,22 @@ def status(
     except IndexRefused as e:
         _fail(str(e))
         raise AssertionError from e  # unreachable
-    human = "\n".join(f"{k}: {v}" for k, v in payload.items())
+    human = "\n".join(
+        _last_sync_line(v) if k == "lastSync" else f"{k}: {v}" for k, v in payload.items()
+    )
+    if "dbPath" in payload and "lastSync" not in payload:
+        human += "\nlast sync: no report yet"
     _emit(payload, json, human)
+
+
+def _last_sync_line(last: dict) -> str:
+    if "unreadable" in last:
+        return f"last sync: report unreadable: {last['unreadable']}"
+    by = last["ranBy"] + (f", scope {last['scope']}" if last["scope"] else "")
+    return (
+        f"last sync: {last['finishedAt']} ({by}) {last['outcome']}, "
+        f"{last['failed']} failed, {last['largeTables']} large tables"
+    )
 
 
 def _index_line(row: dict) -> str:

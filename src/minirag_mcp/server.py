@@ -612,6 +612,7 @@ def create_app(
             date_to=dateTo,
             sort=sort,
             label_source=c.labels,
+            db_path=c.config.db_path,
         )
         return with_index(listed, entry)
 

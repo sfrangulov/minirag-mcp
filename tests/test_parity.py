@@ -1306,3 +1306,49 @@ async def test_a_refused_search_in_a_named_index_names_it_the_same_way_in_both(
         code, _, err = run_meta([*beta, *command], capsys)
         assert is_error and code == 1 and text == _last_error(err), tool
         assert text.startswith("Index 'beta': "), text
+
+
+async def test_last_sync_is_identical_in_mcp_and_cli(
+    root, tmp_path, capsys, monkeypatch, fake_embedder
+):
+    monkeypatch.setattr(cli, "_make_embedder", lambda cfg: fake_embedder)
+    env = {"BASE_DIR": str(root), "DB_PATH": str(tmp_path / "db")}
+    assert run_cli(["sync", *_flags(env)], capsys)[0] == 0
+    is_error, st = await call_mcp(env, "status", {}, fake_embedder)
+    code, out, _ = run_cli(["status", *_flags(env), "--json"], capsys)
+    assert not is_error and code == 0
+    assert st["lastSync"]["ranBy"] == "cli" and st["lastSync"]["outcome"] == "succeeded"
+    assert json.loads(out)["lastSync"] == st["lastSync"]
+    code, out, _ = run_cli(["status", *_flags(env)], capsys)
+    line = next(ln for ln in out.splitlines() if ln.startswith("last sync: "))
+    assert "(cli) succeeded, 0 failed, 0 large tables" in line
+
+
+async def test_last_sync_error_is_identical_in_mcp_and_cli(
+    root, tmp_path, capsys, monkeypatch, fake_embedder
+):
+    from minirag_mcp.sync_report import SyncRecord, record_sync
+
+    monkeypatch.setattr(cli, "_make_embedder", lambda cfg: fake_embedder)
+    env = {"BASE_DIR": str(root), "DB_PATH": str(tmp_path / "db")}
+    assert run_cli(["sync", *_flags(env)], capsys)[0] == 0
+    bad = str(root / "sub" / "a.md")
+    record = SyncRecord(
+        "2026-01-01T00:00:00+00:00",
+        "2026-01-01T00:00:05+00:00",
+        "cli",
+        None,
+        "succeeded",
+        None,
+        {"failed": 1},
+        [{"source": bad, "error": "conversion failed"}],
+        None,
+    )
+    assert record_sync(tmp_path / "db", record) is None
+    is_error, listed = await call_mcp(env, "list_files", {}, fake_embedder)
+    code, out, _ = run_cli(["list", *_flags(env), "--json"], capsys)
+    assert not is_error and code == 0
+    assert [f["lastSyncError"] for f in listed["files"]] == ["conversion failed"]
+    assert json.loads(out) == listed
+    _, human, _ = run_cli(["list", *_flags(env)], capsys)
+    assert f"{bad} (" in human and "  ! conversion failed" in human.splitlines()[1:2][0]
