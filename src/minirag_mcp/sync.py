@@ -38,6 +38,9 @@ class SyncBusyError(Exception):
     pass
 
 
+LARGE_TABLE_ERROR_PREFIX = "skipped: more than "
+
+
 def _now() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -257,7 +260,7 @@ def _run_sync_unlocked(
         errors.append(
             {
                 "source": str(path),
-                "error": f"skipped: more than {limit} data rows exceeds RAG_MAX_TABLE_ROWS "
+                "error": f"{LARGE_TABLE_ERROR_PREFIX}{limit} data rows exceeds RAG_MAX_TABLE_ROWS "
                 f"({limit})",
             }
         )
