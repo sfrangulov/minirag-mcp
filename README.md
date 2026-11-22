@@ -469,6 +469,59 @@ minirag-mcp --index client-a sync
 minirag-mcp query "termination notice" --index client-a
 ```
 
+### Dashboard
+
+`minirag-mcp serve` also serves a read-only page about its indexes at
+`http://127.0.0.1:8765/dashboard`. The overview lists every index with its state, and
+the reason when it is not ready, its documents, chunks and last sync; an index page adds
+the folders under its roots with their shares of the chunks, the kinds of documents, the
+files that failed or were skipped at the last sync and what the exclusion patterns kept
+out; a folder page lists its files. An index that is unavailable, waiting for a rebuild
+or syncing is shown with its state and reason, and the others are shown as usual. Each
+page reads `indexes.toml` as it is, as an MCP call does: an index an edit adds appears on
+the next load, and an edit that does not load is shown above the indexes it listed before,
+which keep serving. The pages load nothing from outside the machine and change nothing.
+
+```bash
+minirag-mcp dashboard              # open the page in your browser, signed in
+minirag-mcp dashboard --no-open    # print the signed-in URL instead
+```
+
+The command asks the running server for a one-time code with the token of its token
+file, and opens a link that spends it; the token itself is never printed or put in a
+URL. When no browser can be opened, it prints the link for you to open. With no server
+at the address of `indexes.toml`, it exits with 1 and says so (the
+[LaunchAgent](#running-the-server-at-login-macos) starts the server at login).
+
+The link sets a session cookie, `minirag_session`, with `HttpOnly`, `SameSite=Strict`
+and `Path=/dashboard`, so the browser sends it to the dashboard and nowhere else. A
+code works once and for 60 seconds. A session lasts at most 12 hours of wall-clock time,
+sleep included, and ends with the server process: after a restart or an expiry the page
+answers 401 and tells you to run `minirag-mcp dashboard` again. The cookie opens the
+dashboard's pages only; `/mcp` keeps requiring the token, and the cookie never
+authorizes it.
+
+Limits: browsers scope cookies by host, not by port, so another program serving on
+another port of `127.0.0.1` can read this cookie and could use it for the 12 hours it
+lasts. The cookie shows the dashboard's statistics and file names, nothing more; do not
+run untrusted services on your loopback address while a session is open.
+
+Every sync writes its outcome to `last-sync.json` in the index folder (the index's
+`db`), in two parts. `latest` is the most recent sync of any scope and outcome: when it
+ran, who ran it, the counts and, for a failed one, why. `coverage` is the most recent
+unscoped sync that finished, the only one that says what the index as a whole holds, and
+the only part that lists the files that did not get in: up to 1000 entries with what the
+sync said of each (the total beside them) and the sources skipped as large tables. The
+list can therefore be older than the last sync: a sync limited to one path, or one that
+failed, leaves it as it was. Its entries are failures and notices both, such as a folder
+the sync could not see into that holds nothing indexed; the page's failed figure is the
+sync's own count of failures, as in `status`, so a notice is listed but not counted.
+
+The index page, `minirag-mcp status` and `list` read the report. In `list`, every file
+row that `coverage` names carries `lastSyncError`. A report that is truncated or of an
+unknown format is reported as unreadable, and everything else carries on: `list` shows
+it as `lastSyncReport` (a `warn:` line in the CLI).
+
 ### Model endpoints
 
 Each of the three models minirag uses can be served by a llama.cpp server instead of
@@ -1471,7 +1524,7 @@ index, with `default` naming the connection's.
 | Tool | Purpose |
 |---|---|
 | `sync_start` | Reconcile the index with the document roots (or one path inside them). Returns a `jobId`; the work runs in a background thread. On a `rebuild pending` index, a sync without a path rebuilds it, and one with a path is refused. |
-| `sync_status` | Poll a sync job started by `sync_start`, in the index it runs in: its state, per-file errors and `counts` (`scanned`, `ingested`, `skipped`, `moved`, `deleted`, `relabelled`, `signed`, `ignored`, `unreadable`, `largeTables`, `failed`). `relabelled` counts documents whose [labels](#document-labels-optional) were rewritten from their stored text; it stays 0 without a `classify.toml`. `signed` counts documents given a [look-alike](#look-alike-documents) signature from their stored text, such as every document of an index built before signatures existed. `largeTables` counts the spreadsheets left out, each named in the errors, for holding more data rows than [`RAG_MAX_TABLE_ROWS`](#configuration) — not a failure. Every table the sync would read again is counted, and no other; an indexed one left out is deleted from the index. `waiting` is set while the job waits for another index's sync in the same server to finish its worker processes, and `rebuild` describes a rebuild the job runs (its kind, `reembed` or `reingest`, and why). |
+| `sync_status` | Poll a sync job started by `sync_start`, in the index it runs in: its state, per-file errors and `counts` (`scanned`, `ingested`, `skipped`, `moved`, `deleted`, `relabelled`, `signed`, `ignored`, `unreadable`, `largeTables`, `failed`). `relabelled` counts documents whose [labels](#document-labels-optional) were rewritten from their stored text; it stays 0 without a `classify.toml`. `signed` counts documents given a [look-alike](#look-alike-documents) signature from their stored text, such as every document of an index built before signatures existed. `largeTables` counts the spreadsheets left out, each named in the errors, for holding more data rows than [`RAG_MAX_TABLE_ROWS`](#configuration) — not a failure. Every table the sync would read again is counted, and no other; an indexed one left out is deleted from the index. `waiting` is set while the job waits for another index's sync in the same server to finish its worker processes, `warnings` (present only when there is something to say) names a last-sync report the job could not write, and `rebuild` describes a rebuild the job runs (its kind, `reembed` or `reingest`, and why). |
 | `ingest_file` | Ingest or re-ingest one file, replacing any content already indexed for it. |
 | `ingest_data` | Ingest text/markdown/html content the client holds, under a source id you choose. |
 | `ingest_url` | Fetch an http(s) URL, convert it to Markdown, and index it. |
@@ -1774,10 +1827,10 @@ searches the index `beta` for `foo`.
 | Option | Effect |
 |---|---|
 | `--index NAME` | Use that index of `indexes.toml` instead of the one the environment variables configure. |
-| `--config PATH` | The `indexes.toml` to read; overrides `MINIRAG_CONFIG` and the default path. Only with `--index`, `indexes` and `serve`. |
+| `--config PATH` | The `indexes.toml` to read; overrides `MINIRAG_CONFIG` and the default path. Only with `--index`, `indexes`, `serve` and `dashboard`. |
 
-Every subcommand but `serve` takes `--json` for machine-readable output. Without
-`--index`, those that use one index (all but `indexes` and `serve`) also accept
+Every subcommand but `serve` and `dashboard` takes `--json` for machine-readable output. Without
+`--index`, those that use one index (all but `indexes`, `serve` and `dashboard`) also accept
 the same option quartet, given **after** the subcommand; with `--index` the
 quartet is refused, since the index's table in `indexes.toml` sets those.
 
@@ -1839,12 +1892,13 @@ minirag-mcp classify try ~/docs/notes.md
 minirag-mcp indexes
 minirag-mcp --index client-a status
 
-# Serve every index of indexes.toml over HTTP
+# Serve every index of indexes.toml over HTTP, and open its dashboard
 minirag-mcp serve
+minirag-mcp dashboard
 ```
 
-The 13 subcommands: `ingest`, `ingest-url`, `sync`, `query`, `find`,
-`read-neighbors`, `read`, `list`, `status`, `indexes`, `serve`, `delete`,
+The 14 subcommands: `ingest`, `ingest-url`, `sync`, `query`, `find`,
+`read-neighbors`, `read`, `list`, `status`, `indexes`, `serve`, `dashboard`, `delete`,
 `classify try`.
 
 `sync` prints a line per file as it goes, to stderr. A sync that reads its files

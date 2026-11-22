@@ -754,6 +754,7 @@ def list_cmd(
             date_to=date_to,
             sort=sort,
             label_source=opened.labels,
+            db_path=cfg.db_path,
         )
     except QueryError as e:
         _fail(registry.failure(entry, e))
@@ -762,11 +763,14 @@ def list_cmd(
         f"[{f['state']}] {f['source']} ({f['chunkCount']} chunks)"
         + (f" [ocr:{f['ocrEngine']}]" if f["ocrEngine"] else "")
         + _document_suffix(f)
+        + (f"\n  ! {f['lastSyncError']}" if "lastSyncError" in f else "")
         for f in payload["files"]
     )
     _emit(with_index(payload, entry), json, human or "no files found")
     for folder in payload["unlistedFolders"]:
         print(f"warn: {folder['path']}: {folder['message']}", file=sys.stderr)
+    if report := payload.get("lastSyncReport"):
+        print(f"warn: last-sync report unreadable: {report['unreadable']}", file=sys.stderr)
     if n := payload.get("ignored"):
         print(
             f"note: {n} file(s) and folder(s) excluded by {IGNORE_FILE} or {cfg.exclude_source}",
@@ -802,8 +806,22 @@ def status(
     except IndexRefused as e:
         _fail(str(e))
         raise AssertionError from e  # unreachable
-    human = "\n".join(f"{k}: {v}" for k, v in payload.items())
+    human = "\n".join(
+        _last_sync_line(v) if k == "lastSync" else f"{k}: {v}" for k, v in payload.items()
+    )
+    if "dbPath" in payload and "lastSync" not in payload:
+        human += "\nlast sync: no report yet"
     _emit(payload, json, human)
+
+
+def _last_sync_line(last: dict) -> str:
+    if "unreadable" in last:
+        return f"last sync: report unreadable: {last['unreadable']}"
+    by = last["ranBy"] + (f", scope {last['scope']}" if last["scope"] else "")
+    return (
+        f"last sync: {last['finishedAt']} ({by}) {last['outcome']}, "
+        f"{last['failed']} failed, {last['largeTables']} large tables"
+    )
 
 
 def _index_line(row: dict) -> str:
@@ -861,6 +879,67 @@ def serve() -> None:
         serve_http(path, os.environ)
     except ConfigError as e:
         _fail(str(e))
+
+
+DASHBOARD_CODE_TIMEOUT_SECONDS = 5
+
+
+@app.command
+def dashboard(*, no_open: Annotated[bool, Parameter(name="--no-open")] = False) -> None:
+    """Open the dashboard of the running `serve` in the browser, already signed in.
+
+    Asks the server for a one-time code with the token of its token file, which is never
+    shown, and opens the page that spends the code. With --no-open, or when no browser
+    can be opened, print that URL instead.
+    """
+    if _SELECTION.get().index is not None:
+        _fail("`dashboard` shows every index of indexes.toml; --index cannot be combined with it")
+    import urllib.error
+    import urllib.request
+
+    from minirag_mcp.http_server import read_token
+    from minirag_mcp.indexes import load_server_config
+
+    path = _config_path()
+    try:
+        settings = load_server_config(path, os.environ)
+    except ConfigError as e:
+        _fail(str(e))
+        raise AssertionError from e  # unreachable
+    host = f"[{settings.host}]" if ":" in settings.host else settings.host
+    base = f"http://{host}:{settings.port}"
+    unanswered = f"No minirag server answers at {base}. Start it with: minirag-mcp serve"
+    if not settings.token_file.exists():
+        _fail(unanswered)
+    try:
+        token = read_token(settings.token_file)
+    except ConfigError as e:
+        _fail(str(e))
+        raise AssertionError from e  # unreachable
+    request = urllib.request.Request(
+        f"{base}/dashboard/code", method="POST", headers={"Authorization": f"Bearer {token}"}
+    )
+    # Never through a proxy: urllib sends a loopback address to the one http_proxy or the
+    # system settings name too, and this request carries the token.
+    direct = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with direct.open(request, timeout=DASHBOARD_CODE_TIMEOUT_SECONDS) as reply:
+            code = jsonlib.load(reply)["code"]
+    except urllib.error.HTTPError as e:
+        _fail(f"the server at {base} refused the request for a login code (HTTP {e.code})")
+    except (OSError, ValueError, KeyError, TypeError):
+        _fail(unanswered)
+    url = f"{base}/dashboard/login?code={code}"
+    if no_open:
+        print(url)
+        return
+    import webbrowser
+
+    if webbrowser.open(url):
+        print("Opened the minirag dashboard in your browser.")
+        return
+    print("Could not open a browser; open this address yourself.", file=sys.stderr)
+    print(url)
 
 
 @app.command

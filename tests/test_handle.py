@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import threading
 import time
@@ -46,6 +47,7 @@ from minirag_mcp.lock import sync_lock
 from minirag_mcp.results import run_query
 from minirag_mcp.store import ChunkRecord, IndexBusyError, IndexOpenError, Store
 from minirag_mcp.sync import SyncManager
+from minirag_mcp.sync_report import REPORT_FILE, read_report
 
 UNUSED_URL = "http://127.0.0.1:9/v1/embeddings"
 
@@ -944,7 +946,7 @@ def _sync_job(h: IndexHandle) -> None:
         lambda h: h.run_sync(None),
         _sync_job,
         # What the job's thread runs, after a mismatch may have become known.
-        lambda h: h._run_held(None, None, None),
+        lambda h: h._run_held(None, None, None, None),
         lambda h: h.ensure_probe(),
     ],
     ids=["ingest", "sync", "sync-job", "sync-job-body", "before-store"],
@@ -994,3 +996,68 @@ def test_a_budget_only_rebuild_embeds_with_the_serving_embedder(
 
     assert info.kind == "reingest" and built == [serving] and closed == []
     assert h.get().embedder is serving and h.get().identity.generation == 2
+
+
+def _synced_handle(tmp_path, fake_embedder, **env) -> IndexHandle:
+    (tmp_path / "docs").mkdir(exist_ok=True)
+    (tmp_path / "docs" / "a.md").write_text("# Alpha\n\nAlpha body text.\n")
+    return handle(tmp_path, fake_embedder, **env)
+
+
+def test_a_cli_sync_writes_the_report(tmp_path, fake_embedder):
+    h = _synced_handle(tmp_path, fake_embedder)
+    counts, _, _ = h.run_admitted(None, h.admit_sync(None))
+    latest = read_report(h.config.db_path)["latest"]
+    assert latest["ranBy"] == "cli" and latest["outcome"] == "succeeded"
+    assert latest["counts"] == counts
+
+
+def test_a_background_sync_writes_the_report(tmp_path, fake_embedder):
+    h = _synced_handle(tmp_path, fake_embedder)
+    _sync_job(h)
+    report = read_report(h.config.db_path)
+    assert report["latest"]["ranBy"] == "server"
+    assert report["coverage"]["ranBy"] == "server"
+
+
+def test_a_sync_that_raises_writes_a_failed_latest(tmp_path, fake_embedder, monkeypatch):
+    h = _synced_handle(tmp_path, fake_embedder)
+
+    def boom(*a, **k):
+        raise RuntimeError("scan exploded")
+
+    monkeypatch.setattr(handle_mod, "_run_sync_unlocked", boom)
+    with pytest.raises(RuntimeError, match="scan exploded"):
+        h.run_admitted(None, h.admit_sync(None))
+    latest = read_report(h.config.db_path)["latest"]
+    assert latest["outcome"] == "failed" and "scan exploded" in latest["error"]
+
+
+def test_a_rebuild_report_lands_in_the_live_folder(tmp_path, fake_embedder):
+    a = _synced_handle(tmp_path, fake_embedder)
+    a.run_sync(None)
+    bigger = a.config.token_budget + 90
+    b = handle(tmp_path, fake_embedder, CHUNK_TOKEN_BUDGET=str(bigger))
+    assert b.state()[0] is IndexState.REBUILD_PENDING
+    b.run_sync(None)
+    report = read_report(b.config.db_path)
+    assert report["latest"]["rebuild"]["kind"]
+    nxt = b.config.db_path.with_name(b.config.db_path.name + ".next")
+    assert not (nxt / REPORT_FILE).exists()
+
+
+def test_a_report_that_cannot_be_written_leaves_the_sync_result_unchanged(
+    tmp_path, fake_embedder, monkeypatch
+):
+    h = _synced_handle(tmp_path, fake_embedder)
+    expected = h.run_sync(None)
+    (h.config.db_path / REPORT_FILE).unlink()
+
+    def crash(*a, **k):
+        raise OSError("read-only")
+
+    monkeypatch.setattr(os, "replace", crash)
+    events: list[str] = []
+    again = h.run_sync(None, events.append)
+    assert again[0].keys() == expected[0].keys() and again[1] == expected[1]
+    assert any("last-sync report" in e and "read-only" in e for e in events)

@@ -27,15 +27,22 @@ ENDPOINT_FAILURES_TO_STOP = 3
 OnRebuild = Callable[[RebuildInfo], None]
 # Told each progress line a sync reports, as the CLI prints them.
 OnEvent = Callable[[str], None]
+# Told what went wrong beside the sync itself, which leaves its result unchanged: a
+# last-sync report that could not be written.
+OnWarning = Callable[[str], None]
 # One sync of the index, or of `scope` inside it: its counts, its per-file errors, and the
 # rebuild it made, if any. Run with the sync lock already held.
 SyncRun = Callable[
-    [Path | None, OnRebuild, OnEvent], tuple[dict[str, int], list[dict], RebuildInfo | None]
+    [Path | None, OnRebuild, OnEvent, OnWarning],
+    tuple[dict[str, int], list[dict], RebuildInfo | None],
 ]
 
 
 class SyncBusyError(Exception):
     pass
+
+
+LARGE_TABLE_ERROR_PREFIX = "skipped: more than "
 
 
 def _now() -> str:
@@ -69,6 +76,7 @@ class SyncJob:
     )
     errors: list[dict] = field(default_factory=list)
     error: str | None = None
+    warnings: list[str] = field(default_factory=list)
     # Set when a rebuild starts, its counts None until the job has finished.
     rebuild: RebuildInfo | None = None
     # What the job waits for while it waits at the worker-pool gate of this process.
@@ -88,6 +96,7 @@ class SyncJob:
             "counts": dict(self.counts),
             "errors": list(self.errors),
             "error": self.error,
+            **({"warnings": list(self.warnings)} if self.warnings else {}),
             "rebuild": self.rebuild.to_dict() if self.rebuild else None,
             "waiting": self.waiting,
         }
@@ -257,7 +266,7 @@ def _run_sync_unlocked(
         errors.append(
             {
                 "source": str(path),
-                "error": f"skipped: more than {limit} data rows exceeds RAG_MAX_TABLE_ROWS "
+                "error": f"{LARGE_TABLE_ERROR_PREFIX}{limit} data rows exceeds RAG_MAX_TABLE_ROWS "
                 f"({limit})",
             }
         )
@@ -469,7 +478,9 @@ class SyncManager:
                 job.waiting = event if event == parallel.POOL_WAIT else None
 
             try:
-                counts, errors, rebuilt = self._run(scope, rebuilding, reported)
+                counts, errors, rebuilt = self._run(
+                    scope, rebuilding, reported, job.warnings.append
+                )
             except Exception as e:  # catastrophic failure (scan error, DB down, ...)
                 job.error = str(e)
             else:

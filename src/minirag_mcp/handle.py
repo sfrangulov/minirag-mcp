@@ -60,7 +60,16 @@ from minirag_mcp.labels.model import default_model_factory
 from minirag_mcp.lock import SyncLock
 from minirag_mcp.results import embedder_notes
 from minirag_mcp.store import IndexBusyError, IndexOpenError, Store
-from minirag_mcp.sync import OnEvent, OnRebuild, SyncJob, SyncManager, _run_sync_unlocked
+from minirag_mcp.sync import (
+    OnEvent,
+    OnRebuild,
+    OnWarning,
+    SyncJob,
+    SyncManager,
+    _now,
+    _run_sync_unlocked,
+)
+from minirag_mcp.sync_report import SyncRecord, record_sync
 
 EmbedderFactory = Callable[[EmbeddingScheme], object]
 
@@ -561,11 +570,15 @@ class IndexHandle:
         return acquire_sync_lock(self.config.db_path)
 
     def run_admitted(
-        self, scope: Path | None, lock: SyncLock, on_event: Callable[[str], None] | None = None
+        self,
+        scope: Path | None,
+        lock: SyncLock,
+        on_event: Callable[[str], None] | None = None,
+        ran_by: str = "cli",
     ) -> tuple[dict[str, int], list[dict], RebuildInfo | None]:
         """`run_sync` for the sync `admit_sync` admitted, releasing its lock."""
         try:
-            return self._sync_held(scope, on_event, None)
+            return self._sync_reported(scope, on_event, None, ran_by, on_event)
         finally:
             lock.release()
 
@@ -594,9 +607,50 @@ class IndexHandle:
         )
 
     def _run_held(
-        self, scope: Path | None, on_rebuild: OnRebuild, on_event: OnEvent
+        self, scope: Path | None, on_rebuild: OnRebuild, on_event: OnEvent, on_warning: OnWarning
     ) -> tuple[dict[str, int], list[dict], RebuildInfo | None]:
-        return self._sync_held(scope, on_event, on_rebuild)
+        return self._sync_reported(scope, on_event, on_rebuild, "server", on_warning)
+
+    def _sync_reported(
+        self,
+        scope: Path | None,
+        on_event: Callable[[str], None] | None,
+        on_rebuild: OnRebuild | None,
+        ran_by: str,
+        on_warning: OnWarning | None,
+    ) -> tuple[dict[str, int], list[dict], RebuildInfo | None]:
+        """`_sync_held`, then the last-sync report, written in every outcome while the
+        sync lock is still held. A report that cannot be written is a warning to
+        `on_warning`; it never changes the sync's result."""
+        started_at = _now()
+        counts: dict[str, int] = {}
+        errors: list[dict] = []
+        rebuild: dict | None = None
+        error: str | None = None
+        try:
+            counts, errors, info = self._sync_held(scope, on_event, on_rebuild)
+            rebuild = info.to_dict() if info is not None else None
+            return counts, errors, info
+        except BaseException as e:
+            error = str(e) or type(e).__name__
+            raise
+        finally:
+            warning = record_sync(
+                self.config.db_path,
+                SyncRecord(
+                    started_at=started_at,
+                    finished_at=_now(),
+                    ran_by=ran_by,
+                    scope=str(scope) if scope is not None else None,
+                    outcome="failed" if error is not None else "succeeded",
+                    error=error,
+                    counts=counts,
+                    errors=errors,
+                    rebuild=rebuild,
+                ),
+            )
+            if warning is not None and on_warning is not None:
+                on_warning(warning)
 
     def _sync_held(
         self,

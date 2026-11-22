@@ -89,7 +89,7 @@ through both.
 
 ```
 src/minirag_mcp/
-  server.py      FastMCP app, 13 tools          cli/          13 subcommands
+  server.py      FastMCP app, 13 tools          cli/          14 subcommands
                           \                    /
                            pipeline / store / embedder        <- the core
   ingest/parser.py    markitdown: file, HTML, URL -> Markdown + title
@@ -104,6 +104,8 @@ src/minirag_mcp/
   literal.py          the single definition of "does this text mention that term"
   security.py         document-root containment, URL host rules
   sync.py             one background job, per-file failures never abort it
+  sync_report.py      last-sync.json in the index folder: written atomically, read tolerantly
+  dashboard/          read-only pages under /dashboard, session cookie, one-time login codes
   labels/             taxonomy, dates, facet resolution, in-process choice model, filters
   indexes.py          indexes.toml -> one Config per index
   registry.py         index registry over IndexHandles, connection rules, refusals, reload

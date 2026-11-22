@@ -1,3 +1,5 @@
+import os
+
 import pytest
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
@@ -9,6 +11,7 @@ from minirag_mcp.config import load_config
 from minirag_mcp.lock import sync_lock
 from minirag_mcp.server import create_app
 from minirag_mcp.store import MAX_TOP_K, ChunkRecord, Store
+from minirag_mcp.sync_report import REPORT_FILE
 
 # pytest-asyncio runs in auto mode (see pyproject) — bare `async def` tests are collected as-is.
 
@@ -47,6 +50,15 @@ async def test_all_thirteen_tools_listed(app):
         "status",
         "list_indexes",
     }
+
+
+async def test_status_and_list_files_describe_their_last_sync_fields(app):
+    mcp, _ = app
+    async with Client(mcp) as c:
+        described = {t.name: t.description for t in await c.list_tools()}
+    assert "lastSync" in described["status"]
+    assert "lastSyncError" in described["list_files"]
+    assert "lastSyncReport" in described["list_files"]
 
 
 async def test_sync_then_query_then_neighbors(app):
@@ -105,6 +117,29 @@ async def test_ingest_file_read_list_delete(app):
         assert d["deletedChunks"] >= 1
         with pytest.raises(Exception, match="not"):
             await c.call_tool("read_file", {"filePath": str(f)})
+
+
+async def test_a_report_a_server_sync_cannot_write_is_a_warning_of_its_job(app, monkeypatch):
+    mcp, _ = app
+    real = os.replace
+
+    def refused(src, dst, *a, **k):
+        if os.path.basename(dst) == REPORT_FILE:
+            raise OSError("read-only")
+        return real(src, dst, *a, **k)
+
+    async with Client(mcp) as c:
+        for _ in range(2):
+            job = (await c.call_tool("sync_start", {})).data
+            control = await await_sync(c, job["jobId"])
+        monkeypatch.setattr(os, "replace", refused)
+        job = (await c.call_tool("sync_start", {})).data
+        st = await await_sync(c, job["jobId"])
+    assert "warnings" not in control
+    assert st["state"] == "succeeded" and st["error"] is None
+    assert st["counts"] == control["counts"] and st["errors"] == control["errors"] == []
+    [warning] = st["warnings"]
+    assert warning.startswith("could not write the last-sync report ") and "read-only" in warning
 
 
 async def test_sync_start_is_a_tool_error_while_another_process_syncs(app):

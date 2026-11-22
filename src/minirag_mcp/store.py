@@ -164,6 +164,7 @@ class SourceInfo:
     # False when a chunk of this source was stored before page numbers were.
     pages_recorded: bool = True
     label_keys: str = ""
+    ingested_at: str = ""
 
 
 _META_COLS = [
@@ -181,6 +182,7 @@ _META_COLS = [
     "doc_date",
     "doc_date_source",
     "pages",
+    "ingested_at",
 ]
 
 
@@ -1681,6 +1683,7 @@ class Store:
                 duplicated=counts[src] > len(indexes[src]),
                 **_label_fields(row),
                 pages_recorded=src not in unpaged,
+                ingested_at=row.get("ingested_at") or "",
             )
             for src, row in sorted(by_source.items())
         ]
@@ -1827,6 +1830,10 @@ class Store:
 
     def chunk_count(self) -> int:
         return self._table.count_rows()
+
+    def table_version(self) -> int:
+        """The table's version: changes with every write, so equal versions mean equal rows."""
+        return self._table.version
 
     def source_count(self) -> int:
         return len({r["source"] for r in self._iter_meta()})

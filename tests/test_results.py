@@ -17,6 +17,7 @@ degraded to a bare filename or a re-cased one.
 
 from __future__ import annotations
 
+import json
 import re
 import warnings
 from dataclasses import asdict, replace
@@ -751,3 +752,103 @@ def test_a_hung_reranker_costs_one_short_wait_then_is_not_called_until_the_windo
     third = run_query(store, fake_embedder, cfg, "review plan", reranker=rr)
     assert len(fake_llama.requests) == calls + 1
     assert third["reranked"] is True and "warnings" not in third
+
+
+def _handle(root, tmp_path, fake_embedder):
+    from minirag_mcp.config import load_config
+    from minirag_mcp.handle import IndexHandle
+
+    config = load_config({"BASE_DIR": str(root), "DB_PATH": str(tmp_path / "db")})
+    return IndexHandle(config, embedder_factory=lambda s: fake_embedder)
+
+
+def test_status_has_last_sync_after_a_sync(root, tmp_path, fake_embedder):
+    from minirag_mcp.results import status_payload
+
+    h = _handle(root, tmp_path, fake_embedder)
+    h.run_admitted(None, h.admit_sync(None))
+    last = status_payload(h.config, h)["lastSync"]
+    assert set(last) == {"finishedAt", "ranBy", "scope", "outcome", "failed", "largeTables"}
+    assert (last["ranBy"], last["scope"], last["outcome"]) == ("cli", None, "succeeded")
+    assert (last["failed"], last["largeTables"]) == (0, 0)
+
+
+def test_status_has_no_last_sync_before_any_report(root, tmp_path, fake_embedder):
+    from minirag_mcp.results import status_payload
+
+    h = _handle(root, tmp_path, fake_embedder)
+    assert "lastSync" not in status_payload(h.config, h)
+
+
+def test_status_reports_an_unreadable_report(root, tmp_path, fake_embedder):
+    from minirag_mcp.results import status_payload
+
+    h = _handle(root, tmp_path, fake_embedder)
+    h.config.db_path.mkdir(parents=True, exist_ok=True)
+    (h.config.db_path / "last-sync.json").write_text("{truncated")
+    last = status_payload(h.config, h)["lastSync"]
+    assert list(last) == ["unreadable"] and "last-sync.json" in last["unreadable"]
+
+
+def test_list_marks_the_files_the_last_full_sync_failed(root, tmp_path, store, fake_embedder):
+    from minirag_mcp.sync_report import SyncRecord, record_sync
+
+    index(store, fake_embedder, root, "a.md", {})
+    index(store, fake_embedder, root, "b.md", {})
+    bad = str(root / "b.md")
+    record = SyncRecord(
+        "2026-01-01T00:00:00+00:00",
+        "2026-01-01T00:00:05+00:00",
+        "cli",
+        None,
+        "succeeded",
+        None,
+        {"failed": 1},
+        [{"source": bad, "error": "conversion failed"}],
+        None,
+    )
+    assert record_sync(tmp_path / "db", record) is None
+    payload = list_payload(
+        store, [root], exclude=(), exclude_source=EXCLUDE_VAR, db_path=tmp_path / "db"
+    )
+    marked = {f["source"]: f.get("lastSyncError") for f in payload["files"]}
+    assert marked[bad] == "conversion failed"
+    assert marked[str(root / "a.md")] is None
+    assert all("lastSyncError" not in f for f in payload["files"] if f["source"] != bad)
+
+
+def test_list_shows_the_error_a_real_sync_recorded_on_that_files_row(root, tmp_path, fake_embedder):
+    (root / "good.md").write_text("# Good\n\nGood body.")
+    (root / "empty.md").write_text("")
+    h = _handle(root, tmp_path, fake_embedder)
+    counts, *_ = h.run_admitted(None, h.admit_sync(None))
+    assert counts["failed"] == 1
+    payload = list_payload(
+        h.get().store, [root], exclude=(), exclude_source=EXCLUDE_VAR, db_path=h.config.db_path
+    )
+    marked = {f["source"] for f in payload["files"] if f.get("lastSyncError")}
+    assert marked == {str(root / "empty.md")}
+
+
+def test_list_says_when_the_report_is_unreadable_and_marks_no_row(root, tmp_path, store):
+    index(store, FakeEmbedder(), root, "a.md", {})
+    (tmp_path / "db").mkdir(exist_ok=True)
+    (tmp_path / "db" / "last-sync.json").write_text("{truncated")
+    payload = list_payload(
+        store, [root], exclude=(), exclude_source=EXCLUDE_VAR, db_path=tmp_path / "db"
+    )
+    assert "last-sync.json" in payload["lastSyncReport"]["unreadable"]
+    assert [f["source"] for f in payload["files"]] == [str(root / "a.md")]
+    assert all("lastSyncError" not in f for f in payload["files"])
+
+
+def test_list_survives_a_report_whose_coverage_has_the_wrong_shape(root, tmp_path, store):
+    index(store, FakeEmbedder(), root, "a.md", {})
+    (tmp_path / "db").mkdir(exist_ok=True)
+    body = {"format": 1, "latest": {}, "coverage": {"errors": [{"source": "x"}]}}
+    (tmp_path / "db" / "last-sync.json").write_text(json.dumps(body))
+    payload = list_payload(
+        store, [root], exclude=(), exclude_source=EXCLUDE_VAR, db_path=tmp_path / "db"
+    )
+    assert "unreadable" in payload["lastSyncReport"]
+    assert all("lastSyncError" not in f for f in payload["files"])

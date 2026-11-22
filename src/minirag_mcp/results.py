@@ -45,6 +45,7 @@ from minirag_mcp.store import (
     SourceInfo,
     Store,
 )
+from minirag_mcp.sync_report import read_report
 
 if TYPE_CHECKING:
     from minirag_mcp.handle import IndexHandle, OpenIndex
@@ -359,6 +360,23 @@ def identity_status(opened: OpenIndex, state: IndexState, why: str) -> dict:
     return out
 
 
+def last_sync_status(db_path: Path) -> dict | None:
+    """The `lastSync` of `status`: None before any sync has recorded a report."""
+    report = read_report(db_path)
+    if report is None or "unreadable" in report:
+        return report
+    latest = report["latest"]
+    counts = latest.get("counts") or {}
+    return {
+        "finishedAt": latest.get("finishedAt"),
+        "ranBy": latest.get("ranBy"),
+        "scope": latest.get("scope"),
+        "outcome": latest.get("outcome"),
+        "failed": counts.get("failed", 0),
+        "largeTables": counts.get("largeTables", 0),
+    }
+
+
 def status_payload(
     config: Config, handle: IndexHandle, state: tuple[IndexState, str] | None = None
 ) -> dict:
@@ -384,6 +402,8 @@ def status_payload(
         out["excludePatterns"] = len(config.exclude)
     if config.max_table_rows is not None:
         out["maxTableRows"] = config.max_table_rows
+    if (last := last_sync_status(config.db_path)) is not None:
+        out["lastSync"] = last
     state, why = handle.state() if state is None else state
     out["indexState"] = state.value
     if state is IndexState.UNAVAILABLE:
@@ -960,6 +980,7 @@ def list_payload(
     label_source: LabelerSource | None = None,
     exclude: Sequence[str],
     exclude_source: str,
+    db_path: Path | None = None,
 ) -> dict:
     """`list_files` and `minirag-mcp list`, as one implementation.
 
@@ -1007,6 +1028,7 @@ def list_payload(
                 "message": _unlisted_message(error, indexed),
             }
         )
+    failed, unreadable_report = _last_sync_errors(db_path)
     rows = [
         {
             "source": st.source,
@@ -1016,10 +1038,13 @@ def list_payload(
             "chunkCount": st.chunk_count,
             "ocrEngine": st.ocr_engine,
             **_fields_of(by_source.get(st.source)),
+            **({"lastSyncError": failed[st.source]} if st.source in failed else {}),
         }
         for st in states
     ]
     payload: dict = {"files": rows, "unlistedFolders": folders}
+    if unreadable_report is not None:
+        payload["lastSyncReport"] = unreadable_report
     if ignored:
         payload["ignored"] = len(ignored)
     if label_filter is not None and labeler is not None:
@@ -1050,6 +1075,21 @@ def list_payload(
         )
         # Stable under reverse=True, and "" sorts lowest, so undated rows come last.
     return payload
+
+
+def _last_sync_errors(db_path: Path | None) -> tuple[dict[str, str], dict | None]:
+    """Source -> error for the files the last full sync could not read, and the
+    `{"unreadable": why}` marker when the report cannot be read."""
+    if db_path is None:
+        return {}, None
+    report = read_report(db_path)
+    if report is None:
+        return {}, None
+    if "unreadable" in report:
+        return {}, report
+    if not report.get("coverage"):
+        return {}, None
+    return {e["source"]: e["error"] for e in report["coverage"]["errors"]}, None
 
 
 def _fields_of(info: SourceInfo | None) -> dict:
