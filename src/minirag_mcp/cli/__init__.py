@@ -918,8 +918,11 @@ def dashboard(*, no_open: Annotated[bool, Parameter(name="--no-open")] = False) 
     request = urllib.request.Request(
         f"{base}/dashboard/code", method="POST", headers={"Authorization": f"Bearer {token}"}
     )
+    # Never through a proxy: urllib sends a loopback address to the one http_proxy or the
+    # system settings name too, and this request carries the token.
+    direct = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with urllib.request.urlopen(request, timeout=DASHBOARD_CODE_TIMEOUT_SECONDS) as reply:
+        with direct.open(request, timeout=DASHBOARD_CODE_TIMEOUT_SECONDS) as reply:
             code = jsonlib.load(reply)["code"]
     except urllib.error.HTTPError as e:
         _fail(f"the server at {base} refused the request for a login code (HTTP {e.code})")

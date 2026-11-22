@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import asyncio
 import re
+import socket
+import threading
 import webbrowser
 
 import httpx
@@ -68,6 +70,55 @@ async def test_dashboard_opens_the_browser(served, indexes_file, capsys, monkeyp
     assert out.strip() == "Opened the minirag dashboard in your browser."
     assert len(opened) == 1 and opened[0].startswith(f"{base}/dashboard/login?code=")
     assert token not in out + err
+
+
+@pytest.fixture
+def proxy(monkeypatch):
+    """A listener configured as the HTTP proxy of every scheme, with no exemption: what it
+    was sent, connection by connection."""
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    listener.settimeout(0.05)
+    received: list[bytes] = []
+    stop = threading.Event()
+
+    def accept() -> None:
+        while not stop.is_set():
+            try:
+                conn, _ = listener.accept()
+            except TimeoutError:
+                continue
+            with conn:
+                conn.settimeout(2)
+                try:
+                    received.append(conn.recv(65536))
+                except OSError:
+                    received.append(b"")
+
+    thread = threading.Thread(target=accept, daemon=True)
+    thread.start()
+    url = f"http://127.0.0.1:{listener.getsockname()[1]}"
+    for name in ("http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY"):
+        monkeypatch.setenv(name, url)
+    for name in ("no_proxy", "NO_PROXY"):
+        monkeypatch.delenv(name, raising=False)
+    yield received
+    stop.set()
+    thread.join(5)
+    listener.close()
+
+
+async def test_dashboard_never_sends_the_token_to_a_proxy(served, indexes_file, capsys, proxy):
+    base, token = served
+    argv = ["--config", str(indexes_file.path), "dashboard", "--no-open"]
+    code, out, err = await asyncio.to_thread(run_meta, argv, capsys)
+    assert proxy == []
+    assert code == 0, err
+    url = out.strip()
+    assert url.startswith(f"{base}/dashboard/login?code=")
+    async with httpx.AsyncClient(follow_redirects=True, trust_env=False) as http:
+        assert (await http.get(url)).status_code == 200
 
 
 def test_dashboard_without_a_server_fails_in_one_line(indexes_file, capsys, monkeypatch):
