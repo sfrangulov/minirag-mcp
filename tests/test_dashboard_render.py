@@ -179,3 +179,19 @@ def test_a_malformed_timestamp_in_the_report_is_escaped():
     ):
         assert "<script>" not in page
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in render_index(view, **KW)
+
+
+def test_an_out_of_range_timestamp_in_the_report_is_shown_as_it_is():
+    # Valid ISO 8601, but a year 0 in any local time zone: astimezone cannot represent it.
+    stamp = "0001-01-01T00:00:00+23:59"
+    view = make_view(
+        latest=report(finishedAt=stamp, startedAt=stamp),
+        coverage={"startedAt": stamp, "finishedAt": stamp, "errors": [], "largeTables": []},
+    )
+    files = [FileRow("/a", "t", 1, {}, stamp)]
+    for page in (
+        render_overview([view], **KW),
+        render_index(view, **KW),
+        render_folder(view, "/a", files, **KW),
+    ):
+        assert stamp in page

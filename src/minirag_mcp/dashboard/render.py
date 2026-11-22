@@ -39,7 +39,7 @@ def _when(stamp: object, *, year: bool = False) -> str:
         return ""
     try:
         moment = datetime.fromisoformat(str(stamp)).astimezone()
-    except ValueError:
+    except (ValueError, OverflowError, OSError):
         return _e(stamp)
     return moment.strftime("%d.%m.%Y %H:%M" if year else "%d.%m %H:%M")
 

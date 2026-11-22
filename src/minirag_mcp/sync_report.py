@@ -79,6 +79,9 @@ def _check_shape(data: dict) -> None:
         for e in errors
     ):
         raise ValueError("coverage.errors is not a list of {source, error} strings")
+    total = coverage.get("errorsTotal", len(errors))
+    if type(total) is not int or total < 0:
+        raise ValueError("coverage.errorsTotal is not a count")
     large = coverage.get("largeTables", [])
     if not isinstance(large, list) or not all(isinstance(x, str) for x in large):
         raise ValueError("coverage.largeTables is not a list of strings")

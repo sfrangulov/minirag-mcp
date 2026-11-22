@@ -128,6 +128,11 @@ def _write(tmp_path, **changes):
         {"coverage__largeTables": "big.csv"},
         {"coverage__largeTables": [1]},
         {"latest__counts": [1]},
+        {"coverage__errorsTotal": "many"},
+        {"coverage__errorsTotal": None},
+        {"coverage__errorsTotal": 1.5},
+        {"coverage__errorsTotal": True},
+        {"coverage__errorsTotal": -1},
     ],
 )
 def test_a_report_of_the_wrong_shape_is_unreadable(tmp_path, changes):

@@ -10,6 +10,11 @@ token file.
 `/mcp/<index>` makes `<index>` the connection's default, `?allow=a,b` lets it name `a` and
 `b` besides, and `/mcp` has no default; the connection reaches each tool through the ASGI
 scope, under `CONNECTION_SCOPE_KEY`.
+
+With a registry, the guard also serves the dashboard under `/dashboard`, whose pages a
+browser opens with a session cookie in place of the token: `/dashboard/code` hands a
+one-time code to a holder of the token, and `/dashboard/login?code=` spends it for the
+cookie. The cookie opens the dashboard's pages and nothing else.
 """
 
 from __future__ import annotations
@@ -30,10 +35,20 @@ from fastmcp import FastMCP
 from starlette.applications import Starlette
 from starlette.datastructures import Headers
 from starlette.middleware import Middleware
-from starlette.responses import PlainTextResponse
+from starlette.requests import cookie_parser
+from starlette.responses import PlainTextResponse, RedirectResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from minirag_mcp.config import ConfigError
+from minirag_mcp.dashboard.app import (
+    CODE_PATH,
+    DASHBOARD_PATH,
+    LOGIN_PATH,
+    dashboard_app,
+    is_dashboard_path,
+    not_signed_in,
+)
+from minirag_mcp.dashboard.sessions import COOKIE, Sessions
 from minirag_mcp.registry import CONNECTION_SCOPE_KEY, Connection, IndexRegistry
 from minirag_mcp.security import LOOPBACK_NAMES, host_name
 from minirag_mcp.server import create_app
@@ -133,14 +148,34 @@ def _checked(token: str, allowed_hosts: Collection[str]) -> tuple[bytes, frozens
     return token.encode("utf-8"), hosts
 
 
+def _unauthorized() -> PlainTextResponse:
+    return PlainTextResponse(UNAUTHORIZED, status_code=401, headers={"WWW-Authenticate": "Bearer"})
+
+
 class LoopbackGuard:
     """Refuses an HTTP request from anywhere but this machine's own clients: one whose
     Host is not a loopback name, whose Origin is another site's or opaque, or that lacks
-    the token."""
+    the token.
 
-    def __init__(self, app: ASGIApp, *, token: str, allowed_hosts: Collection[str]) -> None:
+    With `dashboard` and its `sessions`, a request under `/dashboard` goes to `dashboard`
+    instead, and `/` is redirected there: its login needs only its code, its code needs
+    the token, and every other page a session. No other path accepts a session."""
+
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        token: str,
+        allowed_hosts: Collection[str],
+        dashboard: ASGIApp | None = None,
+        sessions: Sessions | None = None,
+    ) -> None:
+        if (dashboard is None) != (sessions is None):
+            raise ValueError("the dashboard and its sessions are given together or not at all")
         self.app = app
         self._token, self._hosts = _checked(token, allowed_hosts)
+        self._dashboard = dashboard
+        self._sessions = sessions
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "lifespan":
@@ -152,19 +187,33 @@ class LoopbackGuard:
             return
         if scope["type"] != "http":
             raise RuntimeError(f"minirag-mcp serve answers no {scope['type']!r} connection")
-        headers = Headers(scope=scope)
+        answer = self._answer(scope["path"], Headers(scope=scope))
+        await answer(scope, receive, send)
+
+    def _answer(self, path: str, headers: Headers) -> ASGIApp:
+        """What answers a request for `path`: a refusal, the dashboard or the app."""
         if host_name(headers.get("host", "")) not in self._hosts:
-            refusal = PlainTextResponse(MISDIRECTED, status_code=421)
-        elif "origin" in headers and _origin_host(headers["origin"]) not in self._hosts:
-            refusal = PlainTextResponse(FOREIGN_ORIGIN, status_code=403)
-        elif not self._authorized(headers.get("authorization", "")):
-            refusal = PlainTextResponse(
-                UNAUTHORIZED, status_code=401, headers={"WWW-Authenticate": "Bearer"}
-            )
-        else:
-            await self.app(scope, receive, send)
-            return
-        await refusal(scope, receive, send)
+            return PlainTextResponse(MISDIRECTED, status_code=421)
+        if "origin" in headers and _origin_host(headers["origin"]) not in self._hosts:
+            return PlainTextResponse(FOREIGN_ORIGIN, status_code=403)
+        if self._dashboard is not None:
+            if path == "/":
+                return RedirectResponse(DASHBOARD_PATH, status_code=303)
+            if is_dashboard_path(path):
+                return self._dashboard_answer(path, headers)
+        if not self._authorized(headers.get("authorization", "")):
+            return _unauthorized()
+        return self.app
+
+    def _dashboard_answer(self, path: str, headers: Headers) -> ASGIApp:
+        if path == LOGIN_PATH:
+            # Its code is the credential: one the token's holder asked for, spent here.
+            return self._dashboard
+        if path == CODE_PATH:
+            authorized = self._authorized(headers.get("authorization", ""))
+            return self._dashboard if authorized else _unauthorized()
+        cookies = cookie_parser("; ".join(headers.getlist("cookie")))
+        return self._dashboard if self._sessions.valid(cookies.get(COOKIE)) else not_signed_in()
 
     def _authorized(self, authorization: str) -> bool:
         scheme, _, credentials = authorization.partition(" ")
@@ -193,15 +242,26 @@ class IndexPathMiddleware:
         await self.app(routed, receive, send)
 
 
-def build_http_app(mcp: FastMCP, *, token: str, allowed_hosts: Collection[str]) -> Starlette:
-    """`mcp` over streamable HTTP, behind the guard and the path middleware. ValueError for
-    an empty token or allowed host, here rather than at the first request."""
+def build_http_app(
+    mcp: FastMCP,
+    *,
+    token: str,
+    allowed_hosts: Collection[str],
+    registry: IndexRegistry | None = None,
+) -> Starlette:
+    """`mcp` over streamable HTTP, behind the guard and the path middleware, and with a
+    `registry` the dashboard of its indexes beside it. ValueError for an empty token or
+    allowed host, here rather than at the first request."""
     _checked(token, allowed_hosts)
+    sessions = None if registry is None else Sessions()
+    dashboard = None if registry is None else dashboard_app(registry, sessions)
 
     # A closure, not Middleware(LoopbackGuard, token=...): Middleware's repr prints its
     # arguments, so the token would show wherever the app's middleware list is printed.
     def loopback_guard(app: ASGIApp) -> LoopbackGuard:
-        return LoopbackGuard(app, token=token, allowed_hosts=allowed_hosts)
+        return LoopbackGuard(
+            app, token=token, allowed_hosts=allowed_hosts, dashboard=dashboard, sessions=sessions
+        )
 
     return mcp.http_app(
         path=MCP_PATH,
@@ -229,7 +289,7 @@ def serve(config_path: Path, env: Mapping[str, str]) -> None:
     token = ensure_token(settings.token_file)
     allowed_hosts = {*LOOPBACK_NAMES, host_name(settings.host)}
     mcp = create_app(registry, connection=_CLOSED, env=env)
-    app = build_http_app(mcp, token=token, allowed_hosts=allowed_hosts)
+    app = build_http_app(mcp, token=token, allowed_hosts=allowed_hosts, registry=registry)
     host = f"[{settings.host}]" if ":" in settings.host else settings.host
     print(
         f"minirag-mcp serve: http://{host}:{settings.port}/mcp/<index> for "
