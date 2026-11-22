@@ -234,3 +234,41 @@ def test_the_report_is_attached_to_its_index(indexes_file, registry):
     assert "last-sync.json" in view.report_problem
     assert view.latest is None and view.coverage is None
     assert data.index("beta").report_problem is None
+
+
+def test_one_index_computing_never_blocks_the_others(indexes_file, registry, monkeypatch):
+    import threading
+
+    _ingest(registry, "alpha", indexes_file.roots["alpha"] / "alpha.md")
+    _ingest(registry, "beta", indexes_file.roots["beta"] / "beta.md")
+    data = DashboardData(registry)
+    data.index("alpha")  # cached
+    entered, release = threading.Event(), threading.Event()
+    beta_store = next(e for e in registry.entries if e.name == "beta").runtime().store
+    real = Store.list_sources
+
+    def stub(self, *a, **k):
+        if self is beta_store:
+            entered.set()
+            assert release.wait(30)
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(Store, "list_sources", stub)
+    slow = threading.Thread(target=data.index, args=("beta",))
+    slow.start()
+    try:
+        assert entered.wait(30)
+        done: dict = {}
+
+        def others():
+            done["hit"] = data.index("alpha")
+            done["fresh"] = data.index("gamma")
+
+        t = threading.Thread(target=others)
+        t.start()
+        t.join(10)
+        finished = not t.is_alive()
+    finally:
+        release.set()
+        slow.join(30)
+    assert finished and done["hit"].documents == 1 and done["fresh"].name == "gamma"

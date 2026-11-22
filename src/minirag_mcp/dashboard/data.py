@@ -146,8 +146,10 @@ def _report_mtime(db_path: Path) -> int | None:
 class DashboardData:
     def __init__(self, registry: IndexRegistry) -> None:
         self._registry = registry
+        # Guards the two dicts only; a computation holds its own index's lock, never this.
         self._lock = threading.Lock()
         self._stats: dict[str, _Stats] = {}
+        self._compute_locks: dict[str, threading.Lock] = {}
 
     def overview(self) -> list[IndexView]:
         return [self._view(entry) for entry in self._registry.entries]
@@ -225,10 +227,17 @@ class DashboardData:
             key = (store.table_version(), _report_mtime(entry.config.db_path), id(entry.config))
             with self._lock:
                 cached = self._stats.get(entry.name)
+                lock = self._compute_locks.setdefault(entry.name, threading.Lock())
+            if cached is not None and cached.key == key:
+                return cached, ""
+            with lock:
+                with self._lock:
+                    cached = self._stats.get(entry.name)
                 if cached is not None and cached.key == key:
                     return cached, ""
                 stats = self._compute(entry, key)
-                self._stats[entry.name] = stats
+                with self._lock:
+                    self._stats[entry.name] = stats
                 return stats, ""
         except Exception as e:
             return None, str(e)
