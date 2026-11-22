@@ -476,10 +476,9 @@ minirag-mcp query "termination notice" --index client-a
 the reason when it is not ready, its documents, chunks and last sync; an index page adds
 the folders under its roots with their shares of the chunks, the kinds of documents, the
 files that failed or were skipped at the last sync and what the exclusion patterns kept
-out; a folder page lists its files. An
-index that is unavailable, waiting for a rebuild or syncing is shown with its state and
-reason, and the others are shown as usual. The pages load nothing from outside the
-machine and change nothing.
+out; a folder page lists its files. An index that is unavailable, waiting for a rebuild
+or syncing is shown with its state and reason, and the others are shown as usual. The
+pages load nothing from outside the machine and change nothing.
 
 ```bash
 minirag-mcp dashboard              # open the page in your browser, signed in
@@ -504,10 +503,19 @@ another port of `127.0.0.1` can read this cookie and could use it for the 12 hou
 lasts. The cookie shows the dashboard's statistics and file names, nothing more; do not
 run untrusted services on your loopback address while a session is open.
 
-A sync writes its outcome to `last-sync.json` in the index folder (the index's `db`):
-when it ran, the counts, and up to 1000 failed files with their reasons, with the total
-beside them. The index page and `minirag-mcp status` read it; a file that is truncated
-or of an unknown format is reported as unreadable, and everything else carries on.
+Every sync writes its outcome to `last-sync.json` in the index folder (the index's
+`db`), in two parts. `latest` is the most recent sync of any scope and outcome: when it
+ran, who ran it, the counts and, for a failed one, why. `coverage` is the most recent
+unscoped sync that finished, the only one that says what the index as a whole holds, and
+the only part that lists the files that did not get in: up to 1000 failures with their
+reasons (the total beside them) and the sources skipped as large tables. The list can
+therefore be older than the last sync: a sync limited to one path, or one that failed,
+leaves it as it was.
+
+The index page, `minirag-mcp status` and `list` read the report. In `list`, every file
+row that `coverage` names carries `lastSyncError`. A report that is truncated or of an
+unknown format is reported as unreadable, and everything else carries on: `list` shows
+it as `lastSyncReport` (a `warn:` line in the CLI).
 
 ### Model endpoints
 
