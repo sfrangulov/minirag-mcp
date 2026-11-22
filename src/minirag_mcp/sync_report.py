@@ -53,7 +53,7 @@ def _load(path: Path) -> dict | None:
         return None
     try:
         data = json.loads(raw)
-    except ValueError as e:
+    except (ValueError, RecursionError) as e:
         raise ValueError(f"not valid JSON ({e})") from e
     if not isinstance(data, dict):
         raise ValueError("not a JSON object")
@@ -61,7 +61,27 @@ def _load(path: Path) -> dict | None:
         raise ValueError(f"unknown format {data.get('format')!r}")
     if not isinstance(data.get("latest"), dict):
         raise ValueError("no latest sync")
+    _check_shape(data)
     return data
+
+
+def _check_shape(data: dict) -> None:
+    if not isinstance(data["latest"].get("counts", {}), dict):
+        raise ValueError("latest.counts is not an object")
+    coverage = data.get("coverage")
+    if coverage is None:
+        return
+    if not isinstance(coverage, dict):
+        raise ValueError("coverage is not an object")
+    errors = coverage.get("errors", [])
+    if not isinstance(errors, list) or not all(
+        isinstance(e, dict) and isinstance(e.get("source"), str) and isinstance(e.get("error"), str)
+        for e in errors
+    ):
+        raise ValueError("coverage.errors is not a list of {source, error} strings")
+    large = coverage.get("largeTables", [])
+    if not isinstance(large, list) or not all(isinstance(x, str) for x in large):
+        raise ValueError("coverage.largeTables is not a list of strings")
 
 
 def read_report(db_path: Path) -> dict | None:

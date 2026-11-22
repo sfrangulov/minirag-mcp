@@ -1352,3 +1352,35 @@ async def test_last_sync_error_is_identical_in_mcp_and_cli(
     assert json.loads(out) == listed
     _, human, _ = run_cli(["list", *_flags(env)], capsys)
     assert f"{bad} (" in human and "  ! conversion failed" in human.splitlines()[1:2][0]
+
+
+async def test_a_real_sync_failure_is_listed_identically_in_mcp_and_cli(
+    root, tmp_path, capsys, monkeypatch, fake_embedder
+):
+    monkeypatch.setattr(cli, "_make_embedder", lambda cfg: fake_embedder)
+    env = {"BASE_DIR": str(root), "DB_PATH": str(tmp_path / "db")}
+    bad = root / "sub" / "empty.md"
+    bad.write_text("")
+    assert run_cli(["sync", *_flags(env)], capsys)[0] == 1  # a failed file fails the sync
+    is_error, listed = await call_mcp(env, "list_files", {}, fake_embedder)
+    code, out, _ = run_cli(["list", *_flags(env), "--json"], capsys)
+    assert not is_error and code == 0
+    assert [f["source"] for f in listed["files"] if "lastSyncError" in f] == [str(bad)]
+    assert json.loads(out) == listed
+
+
+async def test_an_unreadable_report_is_reported_identically_by_list_in_both(
+    root, tmp_path, capsys, monkeypatch, fake_embedder
+):
+    monkeypatch.setattr(cli, "_make_embedder", lambda cfg: fake_embedder)
+    env = {"BASE_DIR": str(root), "DB_PATH": str(tmp_path / "db")}
+    assert run_cli(["sync", *_flags(env)], capsys)[0] == 0
+    (tmp_path / "db" / "last-sync.json").write_text("{truncated")
+    is_error, listed = await call_mcp(env, "list_files", {}, fake_embedder)
+    code, out, err = run_cli(["list", *_flags(env), "--json"], capsys)
+    assert not is_error and code == 0
+    why = listed["lastSyncReport"]["unreadable"]
+    assert json.loads(out) == listed
+    assert all("lastSyncError" not in f for f in listed["files"])
+    _, _, err = run_cli(["list", *_flags(env)], capsys)
+    assert f"warn: last-sync report unreadable: {why}" in err

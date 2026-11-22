@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 
+import pytest
+
 from minirag_mcp import sync_report
 from minirag_mcp.sync import LARGE_TABLE_ERROR_PREFIX
 from minirag_mcp.sync_report import SyncRecord, read_report, record_sync
@@ -100,3 +102,40 @@ def test_an_unreadable_report_is_reported_not_raised(tmp_path):
 
 def test_a_missing_report_reads_as_none(tmp_path):
     assert read_report(tmp_path) is None
+
+
+def _write(tmp_path, **changes):
+    record_sync(tmp_path, make(errors=[{"source": "a", "error": "x"}]))
+    path = tmp_path / sync_report.REPORT_FILE
+    data = json.loads(path.read_text())
+    for key, value in changes.items():
+        section, _, field = key.partition("__")
+        if field:
+            data[section][field] = value
+        else:
+            data[section] = value
+    path.write_text(json.dumps(data))
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"coverage": "oops"},
+        {"coverage__errors": "oops"},
+        {"coverage__errors": ["oops"]},
+        {"coverage__errors": [{"source": "a"}]},
+        {"coverage__errors": [{"source": 1, "error": "x"}]},
+        {"coverage__largeTables": "big.csv"},
+        {"coverage__largeTables": [1]},
+        {"latest__counts": [1]},
+    ],
+)
+def test_a_report_of_the_wrong_shape_is_unreadable(tmp_path, changes):
+    _write(tmp_path, **changes)
+    assert "unreadable" in read_report(tmp_path)
+
+
+def test_a_deeply_nested_report_is_unreadable_not_a_crash(tmp_path):
+    (tmp_path / sync_report.REPORT_FILE).write_text("[" * 100000)
+    assert "unreadable" in read_report(tmp_path)
+    assert record_sync(tmp_path, make()) is None  # and a sync still rewrites it

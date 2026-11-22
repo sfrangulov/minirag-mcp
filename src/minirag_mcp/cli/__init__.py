@@ -769,6 +769,8 @@ def list_cmd(
     _emit(with_index(payload, entry), json, human or "no files found")
     for folder in payload["unlistedFolders"]:
         print(f"warn: {folder['path']}: {folder['message']}", file=sys.stderr)
+    if report := payload.get("lastSyncReport"):
+        print(f"warn: last-sync report unreadable: {report['unreadable']}", file=sys.stderr)
     if n := payload.get("ignored"):
         print(
             f"note: {n} file(s) and folder(s) excluded by {IGNORE_FILE} or {cfg.exclude_source}",

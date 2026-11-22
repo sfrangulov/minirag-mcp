@@ -1028,7 +1028,7 @@ def list_payload(
                 "message": _unlisted_message(error, indexed),
             }
         )
-    failed = _last_sync_errors(db_path)
+    failed, unreadable_report = _last_sync_errors(db_path)
     rows = [
         {
             "source": st.source,
@@ -1043,6 +1043,8 @@ def list_payload(
         for st in states
     ]
     payload: dict = {"files": rows, "unlistedFolders": folders}
+    if unreadable_report is not None:
+        payload["lastSyncReport"] = unreadable_report
     if ignored:
         payload["ignored"] = len(ignored)
     if label_filter is not None and labeler is not None:
@@ -1075,14 +1077,19 @@ def list_payload(
     return payload
 
 
-def _last_sync_errors(db_path: Path | None) -> dict[str, str]:
-    """Source -> error for the files the last full sync could not read."""
+def _last_sync_errors(db_path: Path | None) -> tuple[dict[str, str], dict | None]:
+    """Source -> error for the files the last full sync could not read, and the
+    `{"unreadable": why}` marker when the report cannot be read."""
     if db_path is None:
-        return {}
+        return {}, None
     report = read_report(db_path)
-    if report is None or "unreadable" in report or not report.get("coverage"):
-        return {}
-    return {e["source"]: e["error"] for e in report["coverage"]["errors"]}
+    if report is None:
+        return {}, None
+    if "unreadable" in report:
+        return {}, report
+    if not report.get("coverage"):
+        return {}, None
+    return {e["source"]: e["error"] for e in report["coverage"]["errors"]}, None
 
 
 def _fields_of(info: SourceInfo | None) -> dict:

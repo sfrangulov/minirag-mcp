@@ -17,6 +17,7 @@ degraded to a bare filename or a re-cased one.
 
 from __future__ import annotations
 
+import json
 import re
 import warnings
 from dataclasses import asdict, replace
@@ -814,3 +815,40 @@ def test_list_marks_the_files_the_last_full_sync_failed(root, tmp_path, store, f
     assert marked[bad] == "conversion failed"
     assert marked[str(root / "a.md")] is None
     assert all("lastSyncError" not in f for f in payload["files"] if f["source"] != bad)
+
+
+def test_list_shows_the_error_a_real_sync_recorded_on_that_files_row(root, tmp_path, fake_embedder):
+    (root / "good.md").write_text("# Good\n\nGood body.")
+    (root / "empty.md").write_text("")
+    h = _handle(root, tmp_path, fake_embedder)
+    counts, *_ = h.run_admitted(None, h.admit_sync(None))
+    assert counts["failed"] == 1
+    payload = list_payload(
+        h.get().store, [root], exclude=(), exclude_source=EXCLUDE_VAR, db_path=h.config.db_path
+    )
+    marked = {f["source"] for f in payload["files"] if f.get("lastSyncError")}
+    assert marked == {str(root / "empty.md")}
+
+
+def test_list_says_when_the_report_is_unreadable_and_marks_no_row(root, tmp_path, store):
+    index(store, FakeEmbedder(), root, "a.md", {})
+    (tmp_path / "db").mkdir(exist_ok=True)
+    (tmp_path / "db" / "last-sync.json").write_text("{truncated")
+    payload = list_payload(
+        store, [root], exclude=(), exclude_source=EXCLUDE_VAR, db_path=tmp_path / "db"
+    )
+    assert "last-sync.json" in payload["lastSyncReport"]["unreadable"]
+    assert [f["source"] for f in payload["files"]] == [str(root / "a.md")]
+    assert all("lastSyncError" not in f for f in payload["files"])
+
+
+def test_list_survives_a_report_whose_coverage_has_the_wrong_shape(root, tmp_path, store):
+    index(store, FakeEmbedder(), root, "a.md", {})
+    (tmp_path / "db").mkdir(exist_ok=True)
+    body = {"format": 1, "latest": {}, "coverage": {"errors": [{"source": "x"}]}}
+    (tmp_path / "db" / "last-sync.json").write_text(json.dumps(body))
+    payload = list_payload(
+        store, [root], exclude=(), exclude_source=EXCLUDE_VAR, db_path=tmp_path / "db"
+    )
+    assert "unreadable" in payload["lastSyncReport"]
+    assert all("lastSyncError" not in f for f in payload["files"])
