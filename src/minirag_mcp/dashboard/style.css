@@ -1,0 +1,81 @@
+:root{--navy:#002B49;--bright:#0085CA;--steel:#5E8AB4;--b60:#8CC8E7;--b30:#B2DAEF;--wash:#E8F2F9;--panel:#F2F6F9;
+--hair:#E5E9EE;--body:#3B3939;--source:#646464;--caption:#767171;--rule:#969696;--grid:#D9D9D9;--band:#F2F2F2;
+--good:#29702A;--bad:#9E2A2B;--amber:#CF7F00;color-scheme:light}
+*{box-sizing:border-box}
+html{font-family:Arial,Helvetica,sans-serif;color:var(--body);background:#fff;font-size:15px;line-height:1.45;
+-webkit-text-size-adjust:100%}
+body{margin:0}
+::selection{background:var(--b30);color:var(--navy)}
+a{color:var(--navy);text-decoration:none}
+a:hover{text-decoration:underline;text-decoration-color:var(--bright);text-underline-offset:4px;text-decoration-thickness:2px}
+td a{white-space:nowrap}
+a:focus-visible,summary:focus-visible{outline:2px solid var(--bright);outline-offset:2px}
+.wrap{max-width:1240px;margin:0 auto;padding:0 32px}
+header.top{background:var(--navy);color:#fff}
+header.top .wrap{display:flex;align-items:baseline;gap:24px;padding-top:18px;padding-bottom:18px;flex-wrap:wrap}
+.brand{font-weight:700;font-size:20px;letter-spacing:.04em;text-transform:uppercase;color:#fff}
+.meta{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:#B2DAEF}
+.meta b{color:#fff;font-weight:700}
+.ver{text-transform:none;letter-spacing:.04em}
+.crumbs{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:#B2DAEF}
+.crumbs a{color:#fff}
+h1{font-size:26px;line-height:1.15;margin:40px 0 6px;color:var(--navy);text-transform:uppercase;letter-spacing:.03em}
+h2{font-size:20px;line-height:1.2;margin:0;color:var(--navy);text-transform:uppercase;letter-spacing:.03em}
+h3{font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--navy);margin:28px 0 10px;display:flex;align-items:center;gap:8px}
+h3::before{content:'';width:8px;height:8px;background:var(--bright);flex:none}
+p.lead{color:var(--navy);font-size:15px;margin:0 0 28px;max-width:75ch}
+.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+.scroll{overflow-x:auto}
+table{border-collapse:collapse;width:100%;font-size:14px;color:var(--navy)}
+thead th{background:var(--navy);color:#fff;font-weight:700;font-size:11px;letter-spacing:.1em;text-transform:uppercase;
+text-align:left;padding:10px 10px;white-space:nowrap}
+thead th.num{text-align:right}
+tbody td{padding:9px 10px;border-bottom:.5px solid var(--rule);vertical-align:middle}
+tbody tr:nth-child(even) td{background:var(--band)}
+tfoot td{padding:9px 10px;font-weight:700;background:var(--band);border-bottom:.5px solid var(--rule)}
+.state{font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;white-space:nowrap}
+.state.ok{color:var(--navy)} .state.warn{color:var(--amber)} .state.bad{color:var(--bad)}
+.bad{color:var(--bad);font-weight:700} .good{color:var(--good);font-weight:700} .dim{color:var(--caption)}
+.idx{border-top:1px solid var(--navy);padding:26px 0 34px}
+.idx-head{display:flex;justify-content:space-between;gap:24px;align-items:baseline;flex-wrap:wrap}
+.idx-desc{max-width:75ch;margin:8px 0 0;color:var(--body);font-size:14px}
+.grid{display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:32px;margin-top:20px}
+.tiles{display:grid;grid-template-columns:1fr 1fr;border-top:.5px solid var(--rule)}
+.tile{padding:12px 0 12px;border-bottom:.5px solid var(--rule)}
+.tile .fig{font-size:26px;font-weight:700;color:var(--navy);font-variant-numeric:tabular-nums;line-height:1.1}
+.tile .cap{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--caption);margin-top:4px;font-weight:700}
+.bar{display:flex;height:10px;width:100%;background:var(--hair)}
+.bar span{display:block;height:100%}
+.share{display:flex;align-items:center;gap:10px}
+.share .bar{flex:1;min-width:60px;height:8px}
+.legend{display:flex;flex-wrap:wrap;gap:6px 16px;margin-top:10px;font-size:12px;color:var(--source)}
+.legend i{display:inline-block;width:9px;height:9px;margin-right:6px;vertical-align:-1px}
+.panelbar{background:var(--navy);color:#fff;font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;
+padding:8px 12px}
+.panel{background:var(--panel);padding:12px 12px 14px;margin-bottom:20px;font-size:13px;color:var(--navy)}
+dl{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;margin:0}
+dt{font-weight:700} dd{margin:0}
+.read{font-size:13px;margin:10px 0 0;color:var(--caption)} .read b{color:var(--navy)}
+details{border-bottom:.5px solid var(--rule)}
+details>summary{list-style:none;cursor:pointer;display:grid;grid-template-columns:18px minmax(0,1fr) 90px 110px 180px;gap:10px;
+align-items:center;padding:9px 10px;color:var(--navy);font-size:14px}
+details>summary::-webkit-details-marker{display:none}
+details>summary .tw{width:0;height:0;border-left:5px solid var(--bright);border-top:4px solid transparent;border-bottom:4px solid transparent;
+transition:transform .15s ease-out}
+details[open]>summary .tw{transform:rotate(90deg)}
+details>summary:hover{background:var(--wash)}
+.sub{display:grid;grid-template-columns:18px minmax(0,1fr) 90px 110px 180px;gap:10px;padding:6px 10px;font-size:13px;color:var(--body);
+border-top:.5px solid var(--hair)}
+.sub:nth-child(even){background:#FAFBFC}
+.thead{display:grid;grid-template-columns:18px minmax(0,1fr) 90px 110px 180px;gap:10px;background:var(--navy);color:#fff;
+font-weight:700;font-size:11px;letter-spacing:.1em;text-transform:uppercase;padding:10px 10px}
+.root{margin:22px 0 6px;font-size:13px;color:var(--navy);font-weight:700}
+.root .dim{font-weight:400}
+code{font-family:Menlo,Consolas,monospace;font-size:12.5px;color:var(--navy);background:var(--panel);padding:1px 5px}
+ul.pat{list-style:none;padding:0;margin:0}
+ul.pat li{padding:6px 0;border-bottom:.5px solid var(--hair);font-size:13px}
+footer{margin:48px 0 40px;font-size:12px;color:var(--source);border-top:.5px solid var(--rule);padding-top:12px}
+.note{border:1.5px solid var(--bright);background:var(--wash);padding:10px 14px;font-size:13px;color:var(--navy);margin:20px 0 0}
+@media (max-width:900px){.grid{grid-template-columns:minmax(0,1fr)}header.top .wrap{gap:6px 16px}.wrap{padding:0 16px}
+details>summary,.sub,.thead{grid-template-columns:14px minmax(0,1fr) 64px 84px}
+details>summary>:nth-child(5),.sub>:nth-child(5),.thead>:nth-child(5){display:none}}
