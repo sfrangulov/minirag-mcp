@@ -604,6 +604,14 @@ def create_app(
         `labels`, `dateFrom` and `dateTo` filter as in query_documents;
         sort="date" lists newest first, documents without a date last. Rows
         carry `labels` and `date` when present.
+
+        lastSyncError, on each row the last full sync listed (the most recent
+        sync without a path that succeeded), is what that sync said of the
+        file: why it failed, or a notice, such as a file type this
+        installation cannot read kept as indexed. lastSyncReport, present
+        only when the report that sync wrote (last-sync.json in the index
+        folder) cannot be read, is {"unreadable": why}, and no row then
+        carries lastSyncError.
         """
         entry, c = opened(index, Use.READ)
         listed = list_payload(
@@ -722,6 +730,13 @@ def create_app(
         value descriptions and document counts, unlabelled and uncertain
         counts, and the model state, with modelHint saying why when it is
         "unavailable" — or the file's error.
+
+        lastSync, present once a sync has written its report (last-sync.json
+        in the index folder), is the most recent sync of any path and outcome:
+        finishedAt, ranBy ("cli" or "server"), scope (the path it was limited
+        to, or null), outcome ("succeeded" or "failed"), and the failed and
+        largeTables it counted. A report that cannot be read is
+        {"unreadable": why} instead.
         """
         registry.refresh()
         return registry_status(registry, current_connection(fallback), index)

@@ -72,6 +72,19 @@ async def test_dashboard_opens_the_browser(served, indexes_file, capsys, monkeyp
     assert token not in out + err
 
 
+async def test_dashboard_without_a_browser_prints_the_address(
+    served, indexes_file, capsys, monkeypatch
+):
+    base, token = served
+    monkeypatch.setattr(webbrowser, "open", lambda url: False)
+    argv = ["--config", str(indexes_file.path), "dashboard"]
+    code, out, err = await asyncio.to_thread(run_meta, argv, capsys)
+    assert code == 0, err
+    assert re.fullmatch(rf"{re.escape(base)}/dashboard/login\?code=[\w-]+\n", out)
+    assert err == "Could not open a browser; open this address yourself.\n"
+    assert token not in out + err
+
+
 @pytest.fixture
 def proxy(monkeypatch):
     """A listener configured as the HTTP proxy of every scheme, with no exemption: what it

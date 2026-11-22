@@ -68,7 +68,13 @@ def _load(path: Path) -> dict | None:
 
 
 def _check_shape(data: dict) -> None:
-    if not isinstance(data["latest"].get("counts", {}), dict):
+    latest = data["latest"]
+    for key in ("startedAt", "finishedAt", "ranBy", "outcome"):
+        if not isinstance(latest.get(key), str):
+            raise ValueError(f"latest.{key} is not a string")
+    if not isinstance(latest.get("scope"), str | None):
+        raise ValueError("latest.scope is neither a string nor null")
+    if not isinstance(latest.get("counts", {}), dict):
         raise ValueError("latest.counts is not an object")
     coverage = data.get("coverage")
     if coverage is None:

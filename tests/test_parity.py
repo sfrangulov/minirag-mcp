@@ -1324,6 +1324,23 @@ async def test_last_sync_is_identical_in_mcp_and_cli(
     assert "(cli) succeeded, 0 failed, 0 large tables" in line
 
 
+async def test_a_latest_without_its_fields_is_unreadable_in_both(
+    root, tmp_path, capsys, monkeypatch, fake_embedder
+):
+    monkeypatch.setattr(cli, "_make_embedder", lambda cfg: fake_embedder)
+    env = {"BASE_DIR": str(root), "DB_PATH": str(tmp_path / "db")}
+    assert run_cli(["sync", *_flags(env)], capsys)[0] == 0
+    report = {"format": 1, "latest": {"outcome": "succeeded"}}
+    (tmp_path / "db" / "last-sync.json").write_text(json.dumps(report))
+    is_error, st = await call_mcp(env, "status", {}, fake_embedder)
+    code, out, _ = run_cli(["status", *_flags(env), "--json"], capsys)
+    assert not is_error and code == 0
+    assert list(st["lastSync"]) == ["unreadable"] and json.loads(out)["lastSync"] == st["lastSync"]
+    code, out, _ = run_cli(["status", *_flags(env)], capsys)
+    assert code == 0
+    assert f"last sync: report unreadable: {st['lastSync']['unreadable']}" in out.splitlines()
+
+
 async def test_last_sync_error_is_identical_in_mcp_and_cli(
     root, tmp_path, capsys, monkeypatch, fake_embedder
 ):

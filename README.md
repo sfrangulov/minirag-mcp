@@ -489,7 +489,8 @@ minirag-mcp dashboard --no-open    # print the signed-in URL instead
 
 The command asks the running server for a one-time code with the token of its token
 file, and opens a link that spends it; the token itself is never printed or put in a
-URL. With no server at the address of `indexes.toml`, it exits with 1 and says so (the
+URL. When no browser can be opened, it prints the link for you to open. With no server
+at the address of `indexes.toml`, it exits with 1 and says so (the
 [LaunchAgent](#running-the-server-at-login-macos) starts the server at login).
 
 The link sets a session cookie, `minirag_session`, with `HttpOnly`, `SameSite=Strict`

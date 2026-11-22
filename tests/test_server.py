@@ -52,6 +52,15 @@ async def test_all_thirteen_tools_listed(app):
     }
 
 
+async def test_status_and_list_files_describe_their_last_sync_fields(app):
+    mcp, _ = app
+    async with Client(mcp) as c:
+        described = {t.name: t.description for t in await c.list_tools()}
+    assert "lastSync" in described["status"]
+    assert "lastSyncError" in described["list_files"]
+    assert "lastSyncReport" in described["list_files"]
+
+
 async def test_sync_then_query_then_neighbors(app):
     mcp, root = app
     async with Client(mcp) as c:

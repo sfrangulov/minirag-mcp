@@ -8,7 +8,7 @@ body{margin:0}
 ::selection{background:var(--b30);color:var(--navy)}
 a{color:var(--navy);text-decoration:none}
 a:hover{text-decoration:underline;text-decoration-color:var(--bright);text-underline-offset:4px;text-decoration-thickness:2px}
-td a{white-space:nowrap}
+a.idx-name{white-space:nowrap}
 a:focus-visible,summary:focus-visible{outline:2px solid var(--bright);outline-offset:2px}
 .wrap{max-width:1240px;margin:0 auto;padding:0 32px}
 header.top{background:var(--navy);color:#fff}
@@ -34,7 +34,8 @@ tbody td{padding:9px 10px;border-bottom:.5px solid var(--rule);vertical-align:mi
 tbody tr:nth-child(even) td{background:var(--band)}
 tfoot td{padding:9px 10px;font-weight:700;background:var(--band);border-bottom:.5px solid var(--rule)}
 .state{font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;white-space:nowrap}
-.state.ok{color:var(--navy)} .state.warn{color:var(--amber)} .state.bad{color:var(--bad)}
+.state.ok{color:var(--navy)} .state.warn{color:var(--navy)} .state.bad{color:var(--bad)}
+.state.warn::before{content:'';display:inline-block;width:8px;height:8px;background:var(--amber);margin-right:8px}
 .bad{color:var(--bad);font-weight:700} .good{color:var(--good);font-weight:700} .dim{color:var(--caption)}
 .idx{border-top:1px solid var(--navy);padding:26px 0 34px}
 .idx-head{display:flex;justify-content:space-between;gap:24px;align-items:baseline;flex-wrap:wrap}

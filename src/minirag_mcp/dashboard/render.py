@@ -7,6 +7,7 @@ from datetime import datetime
 from functools import cache
 from html import escape
 from importlib import resources
+from pathlib import Path
 from urllib.parse import quote
 
 from minirag_mcp.dashboard.data import FileRow, FolderStats, IndexView, RootStats, Unloaded
@@ -27,6 +28,14 @@ def _css() -> str:
 
 def _e(value: object) -> str:
     return escape(str(value), quote=True)
+
+
+def _tilde(path: str) -> str:
+    """`path` with the home folder shown as `~`, for display only: a link keeps the path."""
+    home = str(Path.home()).rstrip("/")
+    if home and (path == home or path.startswith(home + "/")):
+        return "~" + path[len(home) :]
+    return path
 
 
 def _n(value: int) -> str:
@@ -67,6 +76,8 @@ def _page(title: str, head: str, body: str) -> str:
     return (
         '<!doctype html><html lang="en"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        # An icon of its own, or the browser asks for /favicon.ico and is refused.
+        '<link rel="icon" href="data:,">'
         f"<title>{_e(title)}</title><style>{_css()}</style></head><body>"
         f'<header class="top"><div class="wrap">{head}</div></header>'
         f'<main class="wrap">{body}</main></body></html>'
@@ -161,7 +172,7 @@ def _last_sync_line(view: IndexView) -> str:
 def _roots_table(view: IndexView, *, linked: bool = True) -> str:
     rows = []
     for root in view.roots:
-        path = _e(root.path)
+        path = _e(_tilde(root.path))
         label = f'<a href="{_e(_folder_href(view.name, root.path))}">{path}</a>' if linked else path
         rows.append(
             f'<tr><td>{label}</td><td class="num">{_n(root.documents)}</td>'
@@ -240,7 +251,7 @@ def _overview_row(view: IndexView) -> str:
     )
     large_cell = '<span class="dim">&ndash;</span>' if large is None else _n(large)
     return (
-        f'<tr><td><a href="{_e(_index_href(view.name))}">{_e(view.name)}</a></td>'
+        f'<tr><td><a class="idx-name" href="{_e(_index_href(view.name))}">{_e(view.name)}</a></td>'
         f"<td>{_state_cell(view)}</td>"
         f'<td class="num">{_n(view.documents)}</td><td class="num">{_n(view.chunks)}</td>'
         f'<td>{sync}</td><td class="num">{failed_cell}</td>'
@@ -331,7 +342,7 @@ def _folder_row(view: IndexView, folder: FolderStats) -> str:
 def _folders(view: IndexView) -> str:
     blocks = []
     for root in view.roots:
-        link = f'<a href="{_e(_folder_href(view.name, root.path))}">{_e(root.path)}</a>'
+        link = f'<a href="{_e(_folder_href(view.name, root.path))}">{_e(_tilde(root.path))}</a>'
         blocks.append(
             f'<div class="root">{link} <span class="dim">'
             f"&middot; {_plural(root.documents, 'document')}"
@@ -392,7 +403,7 @@ def _coverage(view: IndexView) -> str:
     out = [f"<h3>Did not get in at the last full sync &middot; {when}</h3>{later}"]
     if errors:
         rows = "".join(
-            f"<tr><td>{_e(e.get('source', ''))}</td><td>{_e(e.get('error', ''))}</td></tr>"
+            f"<tr><td>{_e(_tilde(e.get('source', '')))}</td><td>{_e(e.get('error', ''))}</td></tr>"
             for e in errors
         )
         cap = (
@@ -411,7 +422,7 @@ def _coverage(view: IndexView) -> str:
     large = cov.get("largeTables", [])
     out.append(f"<h3>Skipped as large tables ({_n(len(large))})</h3>")
     if large:
-        rows = "".join(f"<tr><td>{_e(s)}</td></tr>" for s in large)
+        rows = "".join(f"<tr><td>{_e(_tilde(s))}</td></tr>" for s in large)
         out.append(
             '<div class="scroll"><table><thead><tr><th>File</th></tr></thead>'
             f"<tbody>{rows}</tbody></table></div>"
@@ -470,7 +481,7 @@ def render_folder(
     )
     if files:
         rows = "".join(
-            f'<tr><td>{_e(f.title)}<br><span class="dim">{_e(f.source)}</span></td>'
+            f'<tr><td>{_e(f.title)}<br><span class="dim">{_e(_tilde(f.source))}</span></td>'
             f'<td class="num">{_n(f.chunks)}</td><td>{_e(f.labels.get(KIND_FACET, ""))}</td>'
             f"<td>{_when(f.ingested, year=True)}</td></tr>"
             for f in files
@@ -483,10 +494,11 @@ def render_folder(
         table = '<p class="dim">No indexed files under this folder.</p>'
     body = (
         f"<h1>{_e(view.name)}</h1>"
-        f'<p class="lead"><code>{_e(path)}</code> &middot; {_plural(len(files), "file")}</p>'
+        f'<p class="lead"><code>{_e(_tilde(path))}</code> &middot; '
+        f"{_plural(len(files), 'file')}</p>"
         f"{table}{_footer(version, generated)}"
     )
-    return _page(f"{path} - minirag dashboard", head, body)
+    return _page(f"{_tilde(path)} - minirag dashboard", head, body)
 
 
 def render_message(title: str, text: str) -> str:

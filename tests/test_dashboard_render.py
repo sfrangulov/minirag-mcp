@@ -1,8 +1,10 @@
 import re
 import time
+from urllib.parse import quote
 
 from minirag_mcp.dashboard.data import FileRow, FolderStats, IndexView, RootStats
 from minirag_mcp.dashboard.render import (
+    _css,
     render_folder,
     render_index,
     render_message,
@@ -11,6 +13,7 @@ from minirag_mcp.dashboard.render import (
 
 HOSTILE = "<script>alert(1)</script>\"'&"
 KW = {"version": "2.0.0a2", "generated": "22.11.2026 14:20"}
+ICON = '<link rel="icon" href="data:,">'
 
 
 def make_view(name="alpha", **over):
@@ -136,7 +139,7 @@ def test_a_failed_latest_is_shown_beside_the_coverage(monkeypatch):
 def test_the_css_is_inlined():
     page = render_message("t", "x")
     assert "<style>" in page and "--navy:#002B49" in page
-    assert "<link" not in page
+    assert re.findall(r"<link[^>]*>", page) == [ICON]
 
 
 def test_kinds_block_needs_a_type_facet_and_folds_the_tail():
@@ -219,3 +222,90 @@ def test_failed_is_the_count_of_the_sync_and_notices_are_still_listed():
     counted = dict(coverage, counts={"failed": 37})
     page = render_index(make_view(latest=report(), coverage=counted), **KW)
     assert '<div class="fig"><span class="bad">37</span></div>' in page
+
+
+def test_every_page_names_an_icon_so_the_browser_asks_for_none():
+    view = make_view()
+    for page in (
+        render_overview([view], **KW),
+        render_index(view, **KW),
+        render_folder(view, "/docs/a", [], **KW),
+        render_message("t", "x"),
+    ):
+        assert page.count(ICON) == 1 and page.index(ICON) < page.index("</head>")
+
+
+def test_paths_under_the_home_folder_are_shown_from_tilde(monkeypatch):
+    home = "/Users/someone"
+    monkeypatch.setenv("HOME", home)
+    root = f"{home}/Library/CloudStorage/OneDrive-Client/Strategy"
+    shown = "~/Library/CloudStorage/OneDrive-Client/Strategy"
+    view = make_view(
+        roots=(RootStats(root, 1, 1, (FolderStats("sub", f"{root}/sub", 1, 1),)),),
+        coverage={
+            "counts": {"failed": 1},
+            "errors": [{"source": f"{root}/bad.pdf", "error": "boom"}],
+            "largeTables": [f"{root}/big.xlsx"],
+        },
+    )
+    files = [FileRow(f"{root}/sub/a.md", "A", 1, {}, None)]
+    overview, index = render_overview([view], **KW), render_index(view, **KW)
+    folder = render_folder(view, f"{root}/sub", files, **KW)
+    for page in (overview, index, folder):
+        assert home not in page
+    assert f">{shown}</a>" in overview and f">{shown}</a>" in index
+    assert f"<td>{shown}/bad.pdf</td>" in index and f"<td>{shown}/big.xlsx</td>" in index
+    assert f"{shown}/sub/a.md</span>" in folder and f"<code>{shown}/sub</code>" in folder
+    assert f"<title>{shown}/sub - minirag dashboard</title>" in folder
+    assert f"path={quote(root, safe='')}" in overview
+    assert f"path={quote(f'{root}/sub', safe='')}" in index
+
+
+def test_only_the_home_folder_itself_becomes_tilde(monkeypatch):
+    monkeypatch.setenv("HOME", "/Users/someone")
+    roots = tuple(RootStats(p, 1, 1, ()) for p in ("/Users/someone", "/Users/someone-else/x"))
+    page = render_overview([make_view(roots=roots)], **KW)
+    assert ">~</a>" in page and ">/Users/someone-else/x</a>" in page
+
+
+def test_only_index_names_keep_to_one_line():
+    css = _css()
+    assert "td a{" not in css and "a.idx-name{white-space:nowrap}" in css
+    page = render_overview([make_view()], **KW)
+    assert '<td><a class="idx-name" href="/dashboard/index/alpha">alpha</a></td>' in page
+
+
+def _rules(css: str) -> dict[str, str]:
+    return {sel.strip(): body for sel, body in re.findall(r"([^{}]+)\{([^{}]*)\}", css)}
+
+
+def _colour(css: str, value: str) -> str:
+    if value.startswith("var("):
+        return re.search(rf"{re.escape(value[4:-1])}:(#[0-9A-Fa-f]{{6}})", css).group(1)
+    return value
+
+
+def _declarations(body: str) -> dict[str, str]:
+    return dict(d.split(":", 1) for d in body.split(";") if d)
+
+
+def _contrast_on_white(hex_colour: str) -> float:
+    def channel(c: int) -> float:
+        c = c / 255
+        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+
+    r, g, b = (int(hex_colour[i : i + 2], 16) for i in (1, 3, 5))
+    lum = 0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+    return 1.05 / (lum + 0.05)
+
+
+def test_state_text_is_readable_and_amber_marks_a_warn_state():
+    css = _css()
+    rules = _rules(css)
+    for state in (".state.ok", ".state.warn", ".state.bad"):
+        colour = _colour(css, _declarations(rules[state])["color"])
+        assert _contrast_on_white(colour) >= 4.5, (state, colour)
+    assert _colour(css, _declarations(rules[".state.bad"])["color"]) == "#9E2A2B"
+    marker = _declarations(rules[".state.warn::before"])
+    assert (marker["width"], marker["height"]) == ("8px", "8px")
+    assert _colour(css, marker["background"]) == "#CF7F00"

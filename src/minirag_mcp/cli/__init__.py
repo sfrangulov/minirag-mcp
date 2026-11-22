@@ -889,7 +889,8 @@ def dashboard(*, no_open: Annotated[bool, Parameter(name="--no-open")] = False) 
     """Open the dashboard of the running `serve` in the browser, already signed in.
 
     Asks the server for a one-time code with the token of its token file, which is never
-    shown, and opens the page that spends the code. With --no-open, print that URL alone.
+    shown, and opens the page that spends the code. With --no-open, or when no browser
+    can be opened, print that URL instead.
     """
     if _SELECTION.get().index is not None:
         _fail("`dashboard` shows every index of indexes.toml; --index cannot be combined with it")
@@ -934,8 +935,11 @@ def dashboard(*, no_open: Annotated[bool, Parameter(name="--no-open")] = False) 
         return
     import webbrowser
 
-    webbrowser.open(url)
-    print("Opened the minirag dashboard in your browser.")
+    if webbrowser.open(url):
+        print("Opened the minirag dashboard in your browser.")
+        return
+    print("Could not open a browser; open this address yourself.", file=sys.stderr)
+    print(url)
 
 
 @app.command
