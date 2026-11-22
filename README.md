@@ -477,8 +477,10 @@ the reason when it is not ready, its documents, chunks and last sync; an index p
 the folders under its roots with their shares of the chunks, the kinds of documents, the
 files that failed or were skipped at the last sync and what the exclusion patterns kept
 out; a folder page lists its files. An index that is unavailable, waiting for a rebuild
-or syncing is shown with its state and reason, and the others are shown as usual. The
-pages load nothing from outside the machine and change nothing.
+or syncing is shown with its state and reason, and the others are shown as usual. Each
+page reads `indexes.toml` as it is, as an MCP call does: an index an edit adds appears on
+the next load, and an edit that does not load is shown above the indexes it listed before,
+which keep serving. The pages load nothing from outside the machine and change nothing.
 
 ```bash
 minirag-mcp dashboard              # open the page in your browser, signed in
@@ -507,10 +509,12 @@ Every sync writes its outcome to `last-sync.json` in the index folder (the index
 `db`), in two parts. `latest` is the most recent sync of any scope and outcome: when it
 ran, who ran it, the counts and, for a failed one, why. `coverage` is the most recent
 unscoped sync that finished, the only one that says what the index as a whole holds, and
-the only part that lists the files that did not get in: up to 1000 failures with their
-reasons (the total beside them) and the sources skipped as large tables. The list can
-therefore be older than the last sync: a sync limited to one path, or one that failed,
-leaves it as it was.
+the only part that lists the files that did not get in: up to 1000 entries with what the
+sync said of each (the total beside them) and the sources skipped as large tables. The
+list can therefore be older than the last sync: a sync limited to one path, or one that
+failed, leaves it as it was. Its entries are failures and notices both, such as a folder
+the sync could not see into that holds nothing indexed; the page's failed figure is the
+sync's own count of failures, as in `status`, so a notice is listed but not counted.
 
 The index page, `minirag-mcp status` and `list` read the report. In `list`, every file
 row that `coverage` names carries `lastSyncError`. A report that is truncated or of an
@@ -1519,7 +1523,7 @@ index, with `default` naming the connection's.
 | Tool | Purpose |
 |---|---|
 | `sync_start` | Reconcile the index with the document roots (or one path inside them). Returns a `jobId`; the work runs in a background thread. On a `rebuild pending` index, a sync without a path rebuilds it, and one with a path is refused. |
-| `sync_status` | Poll a sync job started by `sync_start`, in the index it runs in: its state, per-file errors and `counts` (`scanned`, `ingested`, `skipped`, `moved`, `deleted`, `relabelled`, `signed`, `ignored`, `unreadable`, `largeTables`, `failed`). `relabelled` counts documents whose [labels](#document-labels-optional) were rewritten from their stored text; it stays 0 without a `classify.toml`. `signed` counts documents given a [look-alike](#look-alike-documents) signature from their stored text, such as every document of an index built before signatures existed. `largeTables` counts the spreadsheets left out, each named in the errors, for holding more data rows than [`RAG_MAX_TABLE_ROWS`](#configuration) — not a failure. Every table the sync would read again is counted, and no other; an indexed one left out is deleted from the index. `waiting` is set while the job waits for another index's sync in the same server to finish its worker processes, and `rebuild` describes a rebuild the job runs (its kind, `reembed` or `reingest`, and why). |
+| `sync_status` | Poll a sync job started by `sync_start`, in the index it runs in: its state, per-file errors and `counts` (`scanned`, `ingested`, `skipped`, `moved`, `deleted`, `relabelled`, `signed`, `ignored`, `unreadable`, `largeTables`, `failed`). `relabelled` counts documents whose [labels](#document-labels-optional) were rewritten from their stored text; it stays 0 without a `classify.toml`. `signed` counts documents given a [look-alike](#look-alike-documents) signature from their stored text, such as every document of an index built before signatures existed. `largeTables` counts the spreadsheets left out, each named in the errors, for holding more data rows than [`RAG_MAX_TABLE_ROWS`](#configuration) — not a failure. Every table the sync would read again is counted, and no other; an indexed one left out is deleted from the index. `waiting` is set while the job waits for another index's sync in the same server to finish its worker processes, `warnings` (present only when there is something to say) names a last-sync report the job could not write, and `rebuild` describes a rebuild the job runs (its kind, `reembed` or `reingest`, and why). |
 | `ingest_file` | Ingest or re-ingest one file, replacing any content already indexed for it. |
 | `ingest_data` | Ingest text/markdown/html content the client holds, under a source id you choose. |
 | `ingest_url` | Fetch an http(s) URL, convert it to Markdown, and index it. |

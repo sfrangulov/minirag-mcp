@@ -195,3 +195,27 @@ def test_an_out_of_range_timestamp_in_the_report_is_shown_as_it_is():
         render_folder(view, "/a", files, **KW),
     ):
         assert stamp in page
+
+
+def test_failed_is_the_count_of_the_sync_and_notices_are_still_listed():
+    notice = {"source": "/docs/a/locked", "error": "could not list this folder: permission denied"}
+    coverage = {
+        "startedAt": "2026-11-20T10:00:00+00:00",
+        "finishedAt": "2026-11-20T10:05:00+00:00",
+        "counts": {"ingested": 3, "failed": 0},
+        "errors": [notice],
+        "errorsTotal": 1,
+        "largeTables": [],
+    }
+    view = make_view(latest=report(), coverage=coverage)
+    overview, page = render_overview([view], **KW), render_index(view, **KW)
+    assert '<span class="bad">' not in overview + page
+    assert '<td class="num">0</td><td class="num">0</td><td class="num">1</td></tr></tbody>' in (
+        overview
+    )
+    assert '<div class="fig">0</div><div class="cap">failed</div>' in page
+    assert "<h3>Did not get in at the last full sync &middot; " in page
+    assert "/docs/a/locked" in page and "permission denied" in page
+    counted = dict(coverage, counts={"failed": 37})
+    page = render_index(make_view(latest=report(), coverage=counted), **KW)
+    assert '<div class="fig"><span class="bad">37</span></div>' in page

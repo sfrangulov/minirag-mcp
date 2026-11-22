@@ -60,7 +60,15 @@ from minirag_mcp.labels.model import default_model_factory
 from minirag_mcp.lock import SyncLock
 from minirag_mcp.results import embedder_notes
 from minirag_mcp.store import IndexBusyError, IndexOpenError, Store
-from minirag_mcp.sync import OnEvent, OnRebuild, SyncJob, SyncManager, _now, _run_sync_unlocked
+from minirag_mcp.sync import (
+    OnEvent,
+    OnRebuild,
+    OnWarning,
+    SyncJob,
+    SyncManager,
+    _now,
+    _run_sync_unlocked,
+)
 from minirag_mcp.sync_report import SyncRecord, record_sync
 
 EmbedderFactory = Callable[[EmbeddingScheme], object]
@@ -570,7 +578,7 @@ class IndexHandle:
     ) -> tuple[dict[str, int], list[dict], RebuildInfo | None]:
         """`run_sync` for the sync `admit_sync` admitted, releasing its lock."""
         try:
-            return self._sync_reported(scope, on_event, None, ran_by)
+            return self._sync_reported(scope, on_event, None, ran_by, on_event)
         finally:
             lock.release()
 
@@ -599,9 +607,9 @@ class IndexHandle:
         )
 
     def _run_held(
-        self, scope: Path | None, on_rebuild: OnRebuild, on_event: OnEvent
+        self, scope: Path | None, on_rebuild: OnRebuild, on_event: OnEvent, on_warning: OnWarning
     ) -> tuple[dict[str, int], list[dict], RebuildInfo | None]:
-        return self._sync_reported(scope, on_event, on_rebuild, "server")
+        return self._sync_reported(scope, on_event, on_rebuild, "server", on_warning)
 
     def _sync_reported(
         self,
@@ -609,10 +617,11 @@ class IndexHandle:
         on_event: Callable[[str], None] | None,
         on_rebuild: OnRebuild | None,
         ran_by: str,
+        on_warning: OnWarning | None,
     ) -> tuple[dict[str, int], list[dict], RebuildInfo | None]:
         """`_sync_held`, then the last-sync report, written in every outcome while the
         sync lock is still held. A report that cannot be written is a warning to
-        `on_event`; it never changes the sync's result."""
+        `on_warning`; it never changes the sync's result."""
         started_at = _now()
         counts: dict[str, int] = {}
         errors: list[dict] = []
@@ -640,8 +649,8 @@ class IndexHandle:
                     rebuild=rebuild,
                 ),
             )
-            if warning is not None and on_event is not None:
-                on_event(warning)
+            if warning is not None and on_warning is not None:
+                on_warning(warning)
 
     def _sync_held(
         self,

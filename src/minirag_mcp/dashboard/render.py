@@ -9,7 +9,7 @@ from html import escape
 from importlib import resources
 from urllib.parse import quote
 
-from minirag_mcp.dashboard.data import FileRow, FolderStats, IndexView, RootStats
+from minirag_mcp.dashboard.data import FileRow, FolderStats, IndexView, RootStats, Unloaded
 
 KIND_FACET = "type"
 KIND_COLORS = ("#002B49", "#5E8AB4", "#0085CA", "#8CC8E7", "#B2DAEF")
@@ -101,10 +101,11 @@ def _state_cell(view: IndexView) -> str:
 
 
 def _failures(view: IndexView) -> int | None:
+    """What the last full sync counted as failed. Its list holds notices too, which it
+    did not count: a folder it could not see into that holds nothing indexed, say."""
     if view.coverage is None:
         return None
-    errors = view.coverage.get("errors", [])
-    return int(view.coverage.get("errorsTotal", len(errors)))
+    return (view.coverage.get("counts") or {}).get("failed", 0)
 
 
 def _large(view: IndexView) -> int | None:
@@ -208,6 +209,21 @@ def _kinds(view: IndexView) -> str:
     )
 
 
+def _stats_error(view: IndexView) -> str:
+    if view.stats_error is None:
+        return ""
+    return f'<div class="note">Statistics could not be computed: {_e(view.stats_error)}</div>'
+
+
+def _unloaded(unloaded: Unloaded | None) -> str:
+    if unloaded is None:
+        return ""
+    return (
+        f'<div class="note"><b>{_e(unloaded.file)} did not load:</b> '
+        f"{_e(unloaded.error.rstrip('.'))}; the indexes it listed before are still served.</div>"
+    )
+
+
 def _overview_row(view: IndexView) -> str:
     latest = view.latest
     if view.report_problem:
@@ -240,14 +256,16 @@ def _indexes(n: int) -> str:
     return f"{_n(n)} {'index' if n == 1 else 'indexes'}"
 
 
-def render_overview(views: list[IndexView], *, version: str, generated: str) -> str:
+def render_overview(
+    views: list[IndexView], *, version: str, generated: str, unloaded: Unloaded | None = None
+) -> str:
     documents = sum(v.documents for v in views)
     chunks = sum(v.chunks for v in views)
     failed = sum(_failures(v) or 0 for v in views)
     large = sum(_large(v) or 0 for v in views)
     exclusions = sum(len(v.exclude) for v in views)
     summary = (
-        "<h1>What the indexes hold</h1>"
+        f"{_unloaded(unloaded)}<h1>What the indexes hold</h1>"
         f'<p class="lead">{_indexes(len(views))}, '
         f"{_plural(documents, 'document')} in {_plural(chunks, 'chunk')}. "
         "Counts come from the indexes themselves.</p>"
@@ -267,7 +285,7 @@ def render_overview(views: list[IndexView], *, version: str, generated: str) -> 
         sections.append(
             '<section class="idx"><div class="idx-head">'
             f'<h2><a href="{_e(_index_href(v.name))}">{_e(v.name)}</a></h2>{_state(v)}</div>'
-            f'{desc}<div class="grid"><div>{_roots_table(v)}{_kinds(v)}</div>'
+            f'{desc}{_stats_error(v)}<div class="grid"><div>{_roots_table(v)}{_kinds(v)}</div>'
             f"<div>{_tiles(v)}{_last_sync_line(v)}</div></div></section>"
         )
     head = _brand_head(version, generated, f"<b>{_indexes(len(views))}</b>")
@@ -371,23 +389,25 @@ def _coverage(view: IndexView) -> str:
         )
     errors = cov.get("errors", [])
     total = int(cov.get("errorsTotal", len(errors)))
-    out = [f"<h3>Failed at the last full sync &middot; {when}</h3>{later}"]
+    out = [f"<h3>Did not get in at the last full sync &middot; {when}</h3>{later}"]
     if errors:
         rows = "".join(
             f"<tr><td>{_e(e.get('source', ''))}</td><td>{_e(e.get('error', ''))}</td></tr>"
             for e in errors
         )
         cap = (
-            f'<p class="read">Showing {_n(len(errors))} of {_n(total)} failures.</p>'
+            f'<p class="read">Showing {_n(len(errors))} of {_n(total)} entries.</p>'
             if total > len(errors)
             else ""
         )
         out.append(
-            '<div class="scroll"><table><thead><tr><th>File</th><th>Error</th></tr></thead>'
-            f"<tbody>{rows}</tbody></table></div>{cap}"
+            '<div class="scroll"><table><thead><tr><th>File</th><th>What the sync said</th>'
+            f"</tr></thead><tbody>{rows}</tbody></table></div>{cap}"
+            f'<p class="read">Failures and notices both; the sync counted '
+            f"{_plural(_failures(view) or 0, 'failure')}.</p>"
         )
     else:
-        out.append('<p class="good">Nothing failed.</p>')
+        out.append('<p class="good">Nothing failed and nothing was noted.</p>')
     large = cov.get("largeTables", [])
     out.append(f"<h3>Skipped as large tables ({_n(len(large))})</h3>")
     if large:
@@ -431,7 +451,7 @@ def render_index(view: IndexView, *, version: str, generated: str) -> str:
     desc = f'<p class="idx-desc">{_e(view.description)}</p>' if view.description else ""
     body = (
         f'<div class="idx-head"><h1>{_e(view.name)}</h1>{_state(view)}</div>{desc}'
-        f'<div class="grid"><div><h3>Folders</h3>{_folders(view)}{_kinds(view)}'
+        f'{_stats_error(view)}<div class="grid"><div><h3>Folders</h3>{_folders(view)}{_kinds(view)}'
         f"{_coverage(view)}{_exclusions(view)}</div>"
         f"<div>{_tiles(view)}{_last_sync_panel(view)}{_index_panel(view)}</div></div>"
         f"{_footer(version, generated)}"

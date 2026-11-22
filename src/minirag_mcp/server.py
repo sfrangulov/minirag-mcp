@@ -195,6 +195,11 @@ def create_app(
         server to finish its worker processes (one sync's workers run at a
         time); it then says so, and the job goes on by itself once they have.
 
+        warnings, present only when there is something to say, lists what went
+        wrong beside the sync without changing its result: a last-sync report
+        (last-sync.json in the index folder) that could not be written, so
+        status's lastSync and the dashboard still show an earlier sync.
+
         relabelled counts documents whose labels were rewritten from their
         stored text, with nothing re-embedded: classify.toml changed, a move
         put a file under other path rules, or the model answered after a model

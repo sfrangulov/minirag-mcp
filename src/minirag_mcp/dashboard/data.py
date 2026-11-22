@@ -8,6 +8,7 @@ configuration changes.
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
 import unicodedata
@@ -16,7 +17,7 @@ from pathlib import Path
 
 from minirag_mcp.identity import IndexState
 from minirag_mcp.labels.resolve import decode_labels
-from minirag_mcp.registry import IndexEntry, IndexRegistry
+from minirag_mcp.registry import IndexEntry, IndexRegistry, IndexUnavailable
 from minirag_mcp.results import labels_status
 from minirag_mcp.scope import SEP, is_under
 from minirag_mcp.store import SourceInfo
@@ -24,6 +25,8 @@ from minirag_mcp.sync_report import REPORT_FILE, read_report
 
 ROOT_FILES = "(files at the root)"
 FOLDER_FILES = "(files in this folder)"
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -61,6 +64,17 @@ class IndexView:
     model: str
     fts_language: str | None
     reranker: str | None
+    # Why the dashboard could not compute the statistics of an index it can open: a defect
+    # of its own, which leaves the index's state as it is.
+    stats_error: str | None = None
+
+
+@dataclass(frozen=True)
+class Unloaded:
+    """An edit of the indexes file that did not load: the file's name, and why."""
+
+    file: str
+    error: str
 
 
 @dataclass(frozen=True)
@@ -154,6 +168,12 @@ class DashboardData:
     def overview(self) -> list[IndexView]:
         return [self._view(entry) for entry in self._registry.entries]
 
+    def unloaded(self) -> Unloaded | None:
+        """The last edit of the indexes file when it did not load, while the indexes it
+        listed before keep serving."""
+        error, path = self._registry.config_error, self._registry.path
+        return None if error is None or path is None else Unloaded(path.name, error)
+
     def index(self, name: str) -> IndexView | None:
         entry = self._entry(name)
         return None if entry is None else self._view(entry)
@@ -164,7 +184,7 @@ class DashboardData:
         entry = self._entry(name)
         if entry is None:
             return None
-        stats, _ = self._stats_of(entry)
+        stats, _, _ = self._stats_of(entry)
         if stats is None:
             return None
         wanted = _nfc(path).rstrip(SEP)
@@ -192,9 +212,9 @@ class DashboardData:
         return next((e for e in self._registry.entries if e.name == name), None)
 
     def _view(self, entry: IndexEntry) -> IndexView:
-        stats, problem = self._stats_of(entry)
+        stats, problem, failure = self._stats_of(entry)
         state, why = entry.state()
-        if stats is None:
+        if stats is None and failure is None:
             state, why = IndexState.UNAVAILABLE, problem or why
         config = entry.config
         endpoint = config.rerank_endpoint
@@ -215,13 +235,15 @@ class DashboardData:
             model=config.model_name,
             fts_language=config.fts_language,
             reranker=None if endpoint is None else endpoint.name,
+            stats_error=failure,
         )
 
-    def _stats_of(self, entry: IndexEntry) -> tuple[_Stats | None, str]:
-        """The statistics of `entry`, or None with why it has none."""
+    def _stats_of(self, entry: IndexEntry) -> tuple[_Stats | None, str, str | None]:
+        """The statistics of `entry`; else None, and why the index is unavailable or, when it
+        is not, the error that stopped the computation, logged with its traceback."""
         state, why = entry.state()
         if state is IndexState.UNAVAILABLE:
-            return None, why
+            return None, why, None
         try:
             store = entry.runtime().store
             key = (store.table_version(), _report_mtime(entry.config.db_path), id(entry.config))
@@ -229,18 +251,23 @@ class DashboardData:
                 cached = self._stats.get(entry.name)
                 lock = self._compute_locks.setdefault(entry.name, threading.Lock())
             if cached is not None and cached.key == key:
-                return cached, ""
+                return cached, "", None
             with lock:
                 with self._lock:
                     cached = self._stats.get(entry.name)
                 if cached is not None and cached.key == key:
-                    return cached, ""
+                    return cached, "", None
                 stats = self._compute(entry, key)
                 with self._lock:
                     self._stats[entry.name] = stats
-                return stats, ""
+                return stats, "", None
+        except IndexUnavailable as e:
+            return None, str(e), None
         except Exception as e:
-            return None, str(e)
+            logger.exception(
+                "minirag dashboard: the statistics of index %r could not be computed", entry.name
+            )
+            return None, "", f"{type(e).__name__}: {e}"
 
     @staticmethod
     def _compute(entry: IndexEntry, key: tuple) -> _Stats:

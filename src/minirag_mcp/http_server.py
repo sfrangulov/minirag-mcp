@@ -45,6 +45,7 @@ from minirag_mcp.dashboard.app import (
     DASHBOARD_PATH,
     LOGIN_PATH,
     dashboard_app,
+    dashboard_headers,
     is_dashboard_path,
     not_signed_in,
 )
@@ -187,7 +188,11 @@ class LoopbackGuard:
             return
         if scope["type"] != "http":
             raise RuntimeError(f"minirag-mcp serve answers no {scope['type']!r} connection")
-        answer = self._answer(scope["path"], Headers(scope=scope))
+        path = scope["path"]
+        answer = self._answer(path, Headers(scope=scope))
+        if self._dashboard is not None and (path == "/" or is_dashboard_path(path)):
+            # Here and not in the dashboard app: its refusals are answered here.
+            answer = dashboard_headers(answer)
         await answer(scope, receive, send)
 
     def _answer(self, path: str, headers: Headers) -> ASGIApp:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import unicodedata
 from pathlib import Path
@@ -8,12 +9,14 @@ import pytest
 
 from index_helpers import file_registry
 from minirag_mcp.dashboard.data import DashboardData
+from minirag_mcp.dashboard.render import render_index, render_overview
 from minirag_mcp.identity import IndexState
 from minirag_mcp.store import Store
 from minirag_mcp.sync_report import REPORT_FILE, SyncRecord, record_sync
 
 ROOT_FILES = "(files at the root)"
 FOLDER_FILES = "(files in this folder)"
+KW = {"version": "2.0.0a2", "generated": "22.11.2026 14:20"}
 
 
 def _write(root: Path, rel: str, words: int = 3) -> Path:
@@ -272,3 +275,54 @@ def test_one_index_computing_never_blocks_the_others(indexes_file, registry, mon
         release.set()
         slow.join(30)
     assert finished and done["hit"].documents == 1 and done["fresh"].name == "gamma"
+
+
+def test_a_folder_the_sync_could_not_see_into_is_listed_but_not_counted_failed(
+    indexes_file, registry
+):
+    root = indexes_file.roots["alpha"]
+    locked = root / "locked"
+    _write(locked, "hidden.md")
+    entry = registry.entries[0]
+    locked.chmod(0)
+    try:
+        counts, errors, _ = entry.handle.run_sync(None)
+    finally:
+        locked.chmod(0o700)
+    assert counts["failed"] == 0 and [e["source"] for e in errors] == [str(locked.resolve())]
+
+    view = DashboardData(registry).index("alpha")
+
+    assert view.coverage["counts"]["failed"] == 0
+    overview, page = render_overview([view], **KW), render_index(view, **KW)
+    assert '<td class="num">0</td>' in overview and '<span class="bad">1</span>' not in overview
+    assert '<div class="fig">0</div><div class="cap">failed</div>' in page
+    assert "Did not get in at the last full sync" in page and str(locked.resolve()) in page
+
+
+def test_a_defect_computing_statistics_keeps_the_state_and_is_logged(
+    indexes_file, registry, monkeypatch, caplog
+):
+    _ingest(registry, "alpha", indexes_file.roots["alpha"] / "alpha.md")
+    alpha_store = registry.entries[0].runtime().store
+    real = Store.list_sources
+
+    def broken(self, *a, **k):
+        if self is alpha_store:
+            raise KeyError("type")
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(Store, "list_sources", broken)
+    caplog.set_level(logging.ERROR)
+
+    views = {v.name: v for v in DashboardData(registry).overview()}
+
+    alpha = views["alpha"]
+    assert alpha.state == "ready" and alpha.why == ""
+    assert alpha.stats_error == "KeyError: 'type'"
+    assert views["beta"].stats_error is None and views["beta"].state == "ready"
+    [record] = [r for r in caplog.records if r.exc_info]
+    assert record.exc_info[0] is KeyError and "alpha" in record.getMessage()
+    for page in (render_overview(list(views.values()), **KW), render_index(alpha, **KW)):
+        assert "Statistics could not be computed: KeyError: &#x27;type&#x27;" in page
+        assert '<span class="state ok">ready</span>' in page

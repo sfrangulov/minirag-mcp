@@ -34,15 +34,17 @@ class SyncRecord:
 
 
 def split_large_tables(errors: list[dict]) -> tuple[list[dict], list[str]]:
-    """The failures among `errors`, and the sources skipped as large tables."""
-    failures: list[dict] = []
+    """The entries of `errors` other than large tables, and the sources skipped as large
+    tables. The entries are failures and notices both: `counts["failed"]` alone says how
+    many failed."""
+    listed: list[dict] = []
     large: list[str] = []
     for entry in errors:
         if str(entry.get("error", "")).startswith(LARGE_TABLE_ERROR_PREFIX):
             large.append(entry["source"])
         else:
-            failures.append(entry)
-    return failures, large
+            listed.append(entry)
+    return listed, large
 
 
 def _load(path: Path) -> dict | None:
@@ -73,6 +75,12 @@ def _check_shape(data: dict) -> None:
         return
     if not isinstance(coverage, dict):
         raise ValueError("coverage is not an object")
+    counts = coverage.get("counts", {})
+    if not isinstance(counts, dict):
+        raise ValueError("coverage.counts is not an object")
+    failed = counts.get("failed", 0)
+    if type(failed) is not int or failed < 0:
+        raise ValueError("coverage.counts.failed is not a count")
     errors = coverage.get("errors", [])
     if not isinstance(errors, list) or not all(
         isinstance(e, dict) and isinstance(e.get("source"), str) and isinstance(e.get("error"), str)
@@ -118,15 +126,15 @@ def record_sync(db_path: Path, record: SyncRecord) -> str | None:
         }
         coverage = previous.get("coverage") if previous else None
         if record.scope is None and record.outcome == "succeeded":
-            failures, large = split_large_tables(record.errors)
+            listed, large = split_large_tables(record.errors)
             coverage = {
                 "startedAt": record.started_at,
                 "finishedAt": record.finished_at,
                 "ranBy": record.ran_by,
                 "version": __version__,
                 "counts": record.counts,
-                "errors": failures[:ERRORS_CAP],
-                "errorsTotal": len(failures),
+                "errors": listed[:ERRORS_CAP],
+                "errorsTotal": len(listed),
                 "largeTables": large,
             }
         body = json.dumps({"format": FORMAT, "latest": latest, "coverage": coverage})

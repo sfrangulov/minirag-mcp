@@ -11,6 +11,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
+from html import escape
 from urllib.parse import quote
 
 import httpx
@@ -395,6 +396,114 @@ async def test_a_malformed_report_is_shown_never_a_500(dashboard, report, shown)
         ]
     for page in pages:
         assert page.status_code == 200 and shown in page.text
+
+
+DELTA = '\n[index.delta]\ndescription = "Delta documents"\nroots = ["~/corpora/delta"]\n'
+
+
+async def test_the_overview_follows_an_edit_of_the_indexes_file(dashboard, indexes_file):
+    (indexes_file.roots["alpha"].parent / "delta").mkdir()
+    async with httpx.AsyncClient() as http:
+        await _sign_in(http, dashboard)
+        before = await http.get(f"{dashboard.base}/dashboard")
+        indexes_file.write(indexes_file.text + DELTA)
+        after = await http.get(f"{dashboard.base}/dashboard")
+        page = await http.get(f"{dashboard.base}/dashboard/index/delta")
+    assert before.status_code == 200 and "/dashboard/index/delta" not in before.text
+    assert after.status_code == 200 and "4 indexes" in after.text
+    assert 'href="/dashboard/index/delta"' in after.text and "Delta documents" in after.text
+    assert page.status_code == 200 and "Delta documents" in page.text
+
+
+async def test_an_edit_that_does_not_load_is_shown_beside_the_indexes_still_served(
+    dashboard, indexes_file
+):
+    async with httpx.AsyncClient() as http:
+        await _sign_in(http, dashboard)
+        assert "did not load" not in (await http.get(f"{dashboard.base}/dashboard")).text
+        indexes_file.write(indexes_file.text + "\n[index.delta]\nroots = 5\n")
+        page = await http.get(f"{dashboard.base}/dashboard")
+    error = dashboard.registry.config_error
+    assert error is not None and "delta" in error
+    assert page.status_code == 200
+    banner = f"<b>indexes.toml did not load:</b> {escape(error.rstrip('.'))}; the indexes it"
+    assert f'<div class="note">{banner}' in page.text
+    assert "3 indexes" in page.text
+    for name in ("alpha", "beta", "gamma"):
+        assert f'href="/dashboard/index/{name}"' in page.text
+
+
+CSP = (
+    "default-src 'none'; style-src 'unsafe-inline'; img-src data:; form-action 'none'; "
+    "frame-ancestors 'none'; base-uri 'none'"
+)
+
+
+async def test_every_dashboard_response_is_kept_out_of_caches_and_locked_down(
+    dashboard, monkeypatch
+):
+    _ingest(dashboard, "alpha")
+    base, root = dashboard.base, quote(dashboard.root("alpha"), safe="")
+    answered: dict[str, httpx.Response] = {}
+    async with httpx.AsyncClient() as http:
+        answered["root redirect"] = await http.get(f"{base}/")
+        answered["not signed in"] = await http.get(f"{base}/dashboard")
+        answered["code without the token"] = await http.post(f"{base}/dashboard/code")
+        answered["foreign origin"] = await http.get(
+            f"{base}/dashboard", headers={"Origin": "http://evil.example"}
+        )
+        answered["foreign host"] = await http.get(
+            f"{base}/dashboard", headers={"Host": "evil.example"}
+        )
+        answered["code"] = await http.post(f"{base}/dashboard/code", headers=AUTH)
+        code = answered["code"].json()["code"]
+        answered["refused code"] = await http.get(
+            f"{base}/dashboard/login", params={"code": "made-up"}
+        )
+        answered["login redirect"] = await http.get(
+            f"{base}/dashboard/login", params={"code": code}
+        )
+        answered["overview"] = await http.get(f"{base}/dashboard")
+        answered["index page"] = await http.get(f"{base}/dashboard/index/alpha")
+        answered["folder page"] = await http.get(f"{base}/dashboard/index/alpha/folder?path={root}")
+        answered["no such index"] = await http.get(f"{base}/dashboard/index/nope")
+        answered["no such page"] = await http.get(f"{base}/dashboard/anything")
+
+        def broken(*args, **kwargs):
+            raise RuntimeError("page failed")
+
+        monkeypatch.setattr(dashboard_mod, "render_overview", broken)
+        answered["page that failed"] = await http.get(f"{base}/dashboard")
+    assert {k: r.status_code for k, r in answered.items()} == {
+        "root redirect": 303,
+        "not signed in": 401,
+        "code without the token": 401,
+        "foreign origin": 403,
+        "foreign host": 421,
+        "code": 200,
+        "refused code": 401,
+        "login redirect": 303,
+        "overview": 200,
+        "index page": 200,
+        "folder page": 200,
+        "no such index": 404,
+        "no such page": 404,
+        "page that failed": 500,
+    }
+    for kind, r in answered.items():
+        assert r.headers.get_list("cache-control") == ["no-store"], kind
+        assert r.headers.get_list("content-security-policy") == [CSP], kind
+
+
+async def test_mcp_responses_keep_their_headers(dashboard):
+    async with httpx.AsyncClient() as http:
+        r = await http.post(
+            f"{dashboard.base}/mcp/alpha", json=INITIALIZE, headers={**MCP_HEADERS, **AUTH}
+        )
+        refused = await http.post(f"{dashboard.base}/mcp/alpha", json=INITIALIZE)
+    assert r.status_code == 200 and refused.status_code == 401
+    for answer in (r, refused):
+        assert "content-security-policy" not in answer.headers
 
 
 @pytest.fixture
