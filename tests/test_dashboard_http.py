@@ -5,9 +5,11 @@ had before."""
 from __future__ import annotations
 
 import functools
+import inspect
 import json
 import logging
 import threading
+import time
 from dataclasses import dataclass
 from urllib.parse import quote
 
@@ -166,6 +168,11 @@ async def test_an_expired_session_is_told_how_to_sign_in(dashboard):
         r = await http.get(f"{dashboard.base}/dashboard")
     assert r.status_code == 401
     assert NOT_SIGNED_IN in r.text and "Traceback" not in r.text
+
+
+def test_sessions_count_wall_clock_time_sleep_included():
+    # A monotonic clock stops while macOS sleeps, so a leaked cookie would outlive 12 h.
+    assert inspect.signature(Sessions).parameters["clock"].default is time.time
 
 
 async def test_the_cookie_is_scoped_to_dashboard(dashboard):

@@ -20,7 +20,9 @@ SESSION_TTL = 43200.0
 
 
 class Sessions:
-    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+    # Wall-clock time, not monotonic: macOS's monotonic clock stops while the machine
+    # sleeps, and a leaked cookie must age through the night all the same.
+    def __init__(self, clock: Callable[[], float] = time.time) -> None:
         self._clock = clock
         self._lock = threading.Lock()
         # Each live secret, with the time it was issued.
