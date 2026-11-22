@@ -881,6 +881,60 @@ def serve() -> None:
         _fail(str(e))
 
 
+DASHBOARD_CODE_TIMEOUT_SECONDS = 5
+
+
+@app.command
+def dashboard(*, no_open: Annotated[bool, Parameter(name="--no-open")] = False) -> None:
+    """Open the dashboard of the running `serve` in the browser, already signed in.
+
+    Asks the server for a one-time code with the token of its token file, which is never
+    shown, and opens the page that spends the code. With --no-open, print that URL alone.
+    """
+    if _SELECTION.get().index is not None:
+        _fail("`dashboard` shows every index of indexes.toml; --index cannot be combined with it")
+    import urllib.error
+    import urllib.request
+
+    from minirag_mcp.http_server import read_token
+    from minirag_mcp.indexes import load_server_config
+
+    path = _config_path()
+    try:
+        settings = load_server_config(path, os.environ)
+    except ConfigError as e:
+        _fail(str(e))
+        raise AssertionError from e  # unreachable
+    host = f"[{settings.host}]" if ":" in settings.host else settings.host
+    base = f"http://{host}:{settings.port}"
+    unanswered = f"No minirag server answers at {base}. Start it with: minirag-mcp serve"
+    if not settings.token_file.exists():
+        _fail(unanswered)
+    try:
+        token = read_token(settings.token_file)
+    except ConfigError as e:
+        _fail(str(e))
+        raise AssertionError from e  # unreachable
+    request = urllib.request.Request(
+        f"{base}/dashboard/code", method="POST", headers={"Authorization": f"Bearer {token}"}
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=DASHBOARD_CODE_TIMEOUT_SECONDS) as reply:
+            code = jsonlib.load(reply)["code"]
+    except urllib.error.HTTPError as e:
+        _fail(f"the server at {base} refused the request for a login code (HTTP {e.code})")
+    except (OSError, ValueError, KeyError, TypeError):
+        _fail(unanswered)
+    url = f"{base}/dashboard/login?code={code}"
+    if no_open:
+        print(url)
+        return
+    import webbrowser
+
+    webbrowser.open(url)
+    print("Opened the minirag dashboard in your browser.")
+
+
 @app.command
 def delete(
     path: str | None = None,

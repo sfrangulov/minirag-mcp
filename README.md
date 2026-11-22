@@ -469,6 +469,46 @@ minirag-mcp --index client-a sync
 minirag-mcp query "termination notice" --index client-a
 ```
 
+### Dashboard
+
+`minirag-mcp serve` also serves a read-only page about its indexes at
+`http://127.0.0.1:8765/dashboard`. The overview lists every index with its state, and
+the reason when it is not ready, its documents, chunks and last sync; an index page adds
+the folders under its roots with their shares of the chunks, the kinds of documents, the
+files that failed or were skipped at the last sync and what the exclusion patterns kept
+out; a folder page lists its files. An
+index that is unavailable, waiting for a rebuild or syncing is shown with its state and
+reason, and the others are shown as usual. The pages load nothing from outside the
+machine and change nothing.
+
+```bash
+minirag-mcp dashboard              # open the page in your browser, signed in
+minirag-mcp dashboard --no-open    # print the signed-in URL instead
+```
+
+The command asks the running server for a one-time code with the token of its token
+file, and opens a link that spends it; the token itself is never printed or put in a
+URL. With no server at the address of `indexes.toml`, it exits with 1 and says so (the
+[LaunchAgent](#running-the-server-at-login-macos) starts the server at login).
+
+The link sets a session cookie, `minirag_session`, with `HttpOnly`, `SameSite=Strict`
+and `Path=/dashboard`, so the browser sends it to the dashboard and nowhere else. A
+code works once and for 60 seconds. A session lasts at most 12 hours of wall-clock time,
+sleep included, and ends with the server process: after a restart or an expiry the page
+answers 401 and tells you to run `minirag-mcp dashboard` again. The cookie opens the
+dashboard's pages only; `/mcp` keeps requiring the token, and the cookie never
+authorizes it.
+
+Limits: browsers scope cookies by host, not by port, so another program serving on
+another port of `127.0.0.1` can read this cookie and could use it for the 12 hours it
+lasts. The cookie shows the dashboard's statistics and file names, nothing more; do not
+run untrusted services on your loopback address while a session is open.
+
+A sync writes its outcome to `last-sync.json` in the index folder (the index's `db`):
+when it ran, the counts, and up to 1000 failed files with their reasons, with the total
+beside them. The index page and `minirag-mcp status` read it; a file that is truncated
+or of an unknown format is reported as unreadable, and everything else carries on.
+
 ### Model endpoints
 
 Each of the three models minirag uses can be served by a llama.cpp server instead of
@@ -1774,10 +1814,10 @@ searches the index `beta` for `foo`.
 | Option | Effect |
 |---|---|
 | `--index NAME` | Use that index of `indexes.toml` instead of the one the environment variables configure. |
-| `--config PATH` | The `indexes.toml` to read; overrides `MINIRAG_CONFIG` and the default path. Only with `--index`, `indexes` and `serve`. |
+| `--config PATH` | The `indexes.toml` to read; overrides `MINIRAG_CONFIG` and the default path. Only with `--index`, `indexes`, `serve` and `dashboard`. |
 
-Every subcommand but `serve` takes `--json` for machine-readable output. Without
-`--index`, those that use one index (all but `indexes` and `serve`) also accept
+Every subcommand but `serve` and `dashboard` takes `--json` for machine-readable output. Without
+`--index`, those that use one index (all but `indexes`, `serve` and `dashboard`) also accept
 the same option quartet, given **after** the subcommand; with `--index` the
 quartet is refused, since the index's table in `indexes.toml` sets those.
 
@@ -1839,12 +1879,13 @@ minirag-mcp classify try ~/docs/notes.md
 minirag-mcp indexes
 minirag-mcp --index client-a status
 
-# Serve every index of indexes.toml over HTTP
+# Serve every index of indexes.toml over HTTP, and open its dashboard
 minirag-mcp serve
+minirag-mcp dashboard
 ```
 
-The 13 subcommands: `ingest`, `ingest-url`, `sync`, `query`, `find`,
-`read-neighbors`, `read`, `list`, `status`, `indexes`, `serve`, `delete`,
+The 14 subcommands: `ingest`, `ingest-url`, `sync`, `query`, `find`,
+`read-neighbors`, `read`, `list`, `status`, `indexes`, `serve`, `dashboard`, `delete`,
 `classify try`.
 
 `sync` prints a line per file as it goes, to stderr. A sync that reads its files
