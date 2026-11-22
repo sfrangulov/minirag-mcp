@@ -4,6 +4,7 @@ request off the machine. Every value that comes from an index is escaped here, o
 from __future__ import annotations
 
 from datetime import datetime
+from functools import cache
 from html import escape
 from importlib import resources
 from urllib.parse import quote
@@ -19,6 +20,7 @@ NO_REPORT = '<span class="dim">no report yet</span>'
 _STATE_CLASS = {"ready": "ok", "rebuild pending": "warn", "syncing": "warn", "unavailable": "bad"}
 
 
+@cache
 def _css() -> str:
     return resources.files("minirag_mcp.dashboard").joinpath("style.css").read_text("utf-8")
 
@@ -31,14 +33,22 @@ def _n(value: int) -> str:
     return f"{value:,}".replace(",", " ")
 
 
-def _when(stamp: str | None, *, year: bool = False) -> str:
+def _when(stamp: object, *, year: bool = False) -> str:
+    """`stamp` as escaped text: a report value that is not a timestamp is shown as it is."""
     if not stamp:
         return ""
     try:
-        moment = datetime.fromisoformat(stamp).astimezone()
+        moment = datetime.fromisoformat(str(stamp)).astimezone()
     except ValueError:
-        return str(stamp)
+        return _e(stamp)
     return moment.strftime("%d.%m.%Y %H:%M" if year else "%d.%m %H:%M")
+
+
+def _sync_summary(latest: dict) -> str:
+    text = f"{_when(latest.get('finishedAt'))} &middot; {_e(latest.get('ranBy', ''))}"
+    if latest.get("outcome") == "failed":
+        text += ' &middot; <span class="bad">failed</span>'
+    return text
 
 
 def _index_href(name: str) -> str:
@@ -144,10 +154,7 @@ def _last_sync_line(view: IndexView) -> str:
     latest = view.latest
     if latest is None:
         return f'<p class="read"><b>Last sync:</b> {NO_REPORT}</p>'
-    text = f"{_when(latest.get('finishedAt'))} &middot; {_e(latest.get('ranBy', ''))}"
-    if latest.get("outcome") == "failed":
-        text += ' &middot; <span class="bad">failed</span>'
-    return f'<p class="read"><b>Last sync:</b> {text}</p>'
+    return f'<p class="read"><b>Last sync:</b> {_sync_summary(latest)}</p>'
 
 
 def _roots_table(view: IndexView, *, linked: bool = True) -> str:
@@ -208,9 +215,7 @@ def _overview_row(view: IndexView) -> str:
     elif latest is None:
         sync = NO_REPORT
     else:
-        sync = f"{_when(latest.get('finishedAt'))} &middot; {_e(latest.get('ranBy', ''))}"
-        if latest.get("outcome") == "failed":
-            sync += ' &middot; <span class="bad">failed</span>'
+        sync = _sync_summary(latest)
     failed, large = _failures(view), _large(view)
     failed_cell = (
         '<span class="dim">&ndash;</span>'
@@ -366,7 +371,7 @@ def _coverage(view: IndexView) -> str:
         )
     errors = cov.get("errors", [])
     total = int(cov.get("errorsTotal", len(errors)))
-    out = [f"<h3>Failed at the last full sync &middot; {_e(when)}</h3>{later}"]
+    out = [f"<h3>Failed at the last full sync &middot; {when}</h3>{later}"]
     if errors:
         rows = "".join(
             f"<tr><td>{_e(e.get('source', ''))}</td><td>{_e(e.get('error', ''))}</td></tr>"
@@ -447,7 +452,7 @@ def render_folder(
         rows = "".join(
             f'<tr><td>{_e(f.title)}<br><span class="dim">{_e(f.source)}</span></td>'
             f'<td class="num">{_n(f.chunks)}</td><td>{_e(f.labels.get(KIND_FACET, ""))}</td>'
-            f"<td>{_e(_when(f.ingested, year=True))}</td></tr>"
+            f"<td>{_when(f.ingested, year=True)}</td></tr>"
             for f in files
         )
         table = (

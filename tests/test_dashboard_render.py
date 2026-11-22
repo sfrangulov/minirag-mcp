@@ -163,3 +163,19 @@ def test_folder_links_are_urlencoded_and_capped():
 
 def teardown_module():
     time.tzset()
+
+
+def test_a_malformed_timestamp_in_the_report_is_escaped():
+    bad = "<script>alert(1)</script>"
+    view = make_view(
+        latest=report(finishedAt=bad, startedAt=bad),
+        coverage={"startedAt": "x", "finishedAt": bad, "errors": [], "largeTables": []},
+    )
+    files = [FileRow("/a", "t", 1, {}, bad)]
+    for page in (
+        render_overview([view], **KW),
+        render_index(view, **KW),
+        render_folder(view, "/a", files, **KW),
+    ):
+        assert "<script>" not in page
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in render_index(view, **KW)
