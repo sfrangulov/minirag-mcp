@@ -554,6 +554,17 @@ def test_a_cut_is_never_longer_than_the_window(tmp_path, fake_llama, tokenizer_f
     assert inputs(fake_llama) == [["w w"]]
 
 
+def _e5_repo() -> str:
+    """The repository fastembed's own registry names for e5: the tokenizer file is fetched from
+    there, and fastembed has changed its spelling between releases (qdrant/ -> Qdrant/)."""
+    entry = next(
+        m
+        for m in embedder_mod.TextEmbedding.list_supported_models()
+        if m["model"] == "intfloat/multilingual-e5-large"
+    )
+    return entry["sources"]["hf"]
+
+
 def test_the_endpoint_backend_counts_with_the_tokenizer_file_only(
     tmp_path, fake_llama, tokenizer_file, monkeypatch
 ):
@@ -570,7 +581,7 @@ def test_the_endpoint_backend_counts_with_the_tokenizer_file_only(
     assert emb.count_tokens("a b c") == 5  # 3 + 2 specials, prefix not counted
     assert emb.count_tokens(" ".join(["w"] * 2000)) == 2002  # not truncated at the window
     assert [(c["repo_id"], c["filename"]) for c in tokenizer_file.calls] == [
-        ("qdrant/multilingual-e5-large-onnx", "tokenizer.json")
+        (_e5_repo(), "tokenizer.json")
     ]
     assert tokenizer_file.calls[0]["cache_dir"] == str(tmp_path)
     assert tokenizer_file.calls[0]["local_files_only"] is True  # a warm cache asks no one
@@ -605,7 +616,7 @@ def test_a_missing_tokenizer_file_is_loud(tmp_path, fake_llama, monkeypatch):
     with pytest.raises(EmbedderUnavailableError) as raised:
         emb.count_tokens("a b c")
     message = str(raised.value)
-    assert "qdrant/multilingual-e5-large-onnx" in message and str(tmp_path) in message
+    assert _e5_repo() in message and str(tmp_path) in message
     assert "needed to size chunks" in message and "offline" in message
     with pytest.raises(EmbedderUnavailableError):
         emb.embed_query("a")
