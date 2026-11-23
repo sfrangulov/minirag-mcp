@@ -305,16 +305,19 @@ version. Next to 1.1.1 it brings:
 Install it once as a command, with the extras you need:
 
 ```bash
-uv tool install 'minirag-mcp[ocr,classify]==2.0.0a2'   # an exact pre-release
+uv tool install 'minirag-mcp[ocr,classify]>=2.0.0a2'
 minirag-mcp --version
 ```
 
 The installed version stays until you upgrade it: the command, the [server](#running-the-server-at-login-macos)
 and every script that calls `minirag-mcp` run that one install, so no version is written
-anywhere else. To upgrade, `uv tool upgrade minirag-mcp --prerelease allow` while v2 is
-in pre-release (`uv tool upgrade minirag-mcp` once it is final); to go back, install the
-earlier version again with `uv tool install`. A running server keeps the old version until
-it is restarted.
+anywhere else. `uv tool upgrade minirag-mcp` moves it to the newest release the recorded
+requirement allows: `>=2.0.0a2` names a pre-release, so later pre-releases of minirag-mcp
+count, while its dependencies stay on final releases. Installing an exact version
+(`==2.0.0a2`) instead holds it there: `uv tool upgrade` then finds nothing newer. To go
+back, `uv tool install 'minirag-mcp[ocr,classify]==<older version>'` replaces the
+installed one (and holds it there until you install the range again). A running server
+keeps the old version until it is restarted.
 
 A version specifier that names a pre-release gets one; without one, `uv tool install
 minirag-mcp`, `uvx minirag-mcp` and `pip install minirag-mcp` install 1.1.1. Such a
@@ -611,7 +614,7 @@ From a clone of this repository:
 
 ```bash
 PY=/absolute/path/to/python3        # the interpreter with access, below
-uv tool install --python "$PY" 'minirag-mcp[ocr]==2.0.0a2'
+uv tool install --python "$PY" 'minirag-mcp[ocr]>=2.0.0a2'
 sed -e "s|__MINIRAG__|$(command -v minirag-mcp)|" -e "s|__HOME__|$HOME|" \
     docs/launchd/local.minirag-mcp.plist > ~/Library/LaunchAgents/local.minirag-mcp.plist
 plutil -lint ~/Library/LaunchAgents/local.minirag-mcp.plist
@@ -637,8 +640,8 @@ and check that its counts are above zero and that no root is reported as held.
 - Logs go to `~/Library/Logs/minirag-mcp.log`; the token is in
   `~/.config/minirag/token`.
 - `launchctl kill HUP gui/$(id -u)/local.minirag-mcp` reads `indexes.toml` again.
-- To upgrade: `uv tool upgrade minirag-mcp --prerelease allow`, then `launchctl kickstart
-  -k gui/$(id -u)/local.minirag-mcp`. The first start after an install or upgrade can
+- To upgrade: `uv tool upgrade minirag-mcp`, then `launchctl kickstart -k
+  gui/$(id -u)/local.minirag-mcp`. The first start after an install or upgrade can
   take up to a minute while Python compiles the new files; the port opens after that.
 - To stop it: `launchctl bootout gui/$(id -u)/local.minirag-mcp`.
 
