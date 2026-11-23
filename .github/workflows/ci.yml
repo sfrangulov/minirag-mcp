@@ -6,7 +6,7 @@ on:
   pull_request:
   workflow_dispatch:
   schedule:
-    - cron: "17 5 * * 1" # Mondays, for the slow job only
+    - cron: "17 5 * * 1" # Mondays, for the slow and latest-deps jobs only
 
 jobs:
   test:
@@ -45,6 +45,26 @@ jobs:
           uv venv /tmp/smoke
           VIRTUAL_ENV=/tmp/smoke uv pip install dist/*.whl
           /tmp/smoke/bin/minirag-mcp status --base-dir .
+
+  latest-deps:
+    # `uv tool install minirag-mcp` resolves the newest releases its dependency ranges
+    # allow, not uv.lock: this run tests that set, so a dependency that breaks a user's
+    # install turns this red before a user meets it. Weekly and by hand only.
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13"
+      - run: uv lock --upgrade
+      - run: uv sync
+      - run: uv pip list
+      - run: uv run pytest -q
 
   slow:
     # Downloads the embedding models, ~2.5 GB (e5-large and MiniLM): never on push or
