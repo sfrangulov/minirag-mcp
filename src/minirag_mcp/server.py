@@ -6,7 +6,7 @@ import os
 from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
 from contextvars import ContextVar
-from functools import wraps
+from functools import partial, wraps
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -15,6 +15,7 @@ from fastmcp.exceptions import ToolError
 from fastmcp.server.dependencies import get_http_request
 from pydantic import Field
 
+from minirag_mcp.abandon import run_abandonable
 from minirag_mcp.chunker import join_document
 from minirag_mcp.config import Config, ConfigError, load_config
 from minirag_mcp.handle import OpenIndex
@@ -122,7 +123,6 @@ def create_app(
         return registry.in_roots(current_connection(fallback), entry, path)
 
     def guard(fn):
-        @wraps(fn)
         def inner(*args, **kwargs):
             answering = _ANSWERING.set(None)
             try:
@@ -134,7 +134,11 @@ def create_app(
             finally:
                 _ANSWERING.reset(answering)
 
-        return inner
+        @wraps(fn)
+        async def outer(*args, **kwargs):
+            return await run_abandonable(partial(inner, *args, **kwargs))
+
+        return outer
 
     @mcp.tool
     @guard
