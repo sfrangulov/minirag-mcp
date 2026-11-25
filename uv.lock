@@ -1403,7 +1403,7 @@ wheels = [
 
 [[package]]
 name = "minirag-mcp"
-version = "2.0.0a2"
+version = "2.0.0a3"
 source = { editable = "." }
 dependencies = [
     { name = "anyio" },
