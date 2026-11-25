@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from minirag_mcp import __version__, literal, ocr, ocr_vision
+from minirag_mcp.abandon import checkpoint
 from minirag_mcp.chunker import SCHEME_VERSION, shared_lines
 from minirag_mcp.config import Config
 from minirag_mcp.endpoints import RerankEndpoint
@@ -109,6 +110,7 @@ class _Recorder:
         self.error: str | None = None
 
     def __call__(self, query: str, passages: list[str]) -> list[float]:
+        checkpoint()
         try:
             scores = self._reranker.scores(query, passages)
             if len(scores) != len(passages):
@@ -643,6 +645,7 @@ def run_query(
     # Per call: another query may share the embedder meanwhile.
     embed = getattr(embedder, "embed_query_noted", None)
     vector, embed_note = embed(query) if embed else (embedder.embed_query(query), None)
+    checkpoint()
     results = store.search(
         query,
         vector,
@@ -657,6 +660,7 @@ def run_query(
         reranker=recorder,
         rerank_top=config.rerank_top,
     )
+    checkpoint()
     # Read after the query was embedded: that embedding is what may have fallen back.
     backend = getattr(embedder, "backend", "in-process")
     payload = {
@@ -787,6 +791,7 @@ def run_find(
     docs: dict[str, _Mentions] = {}
     previous: tuple[str, int, list[str]] | None = None
     for chunk in store.literal_candidates(parsed, scopes=scopes, filter_sql=filter_sql):
+        checkpoint()
         doc = docs.get(chunk.source)
         if doc is None:
             doc = docs[chunk.source] = _Mentions(chunk, in_title=False)
