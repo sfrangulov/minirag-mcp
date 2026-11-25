@@ -20,8 +20,12 @@ client sends `notifications/cancelled`, the SDK answers "Request cancelled" at o
 cancels the handler's scope. But the handler only notices when the thread returns, and
 then it answers a second time, which trips the assert in `mcp/shared/session.py`. If the
 handler raises the cancellation instead, the SDK suppresses the duplicate on its own
-(`mcp/server/lowlevel/server.py`, the `get_cancelled_exc_class()` branch). When the
-transport closes, the session's task group cancels the handler the same way.
+(`mcp/server/lowlevel/server.py`, the `get_cancelled_exc_class()` branch).
+
+The signal is `notifications/cancelled`. mcp ≥ 2 clients, Skach's 2.3 among them, send it
+when they abandon a call (`cancel_on_abandon`). A client that only closes its session sends
+nothing the server acts on: the handler is not cancelled, and the work runs to the end.
+That case is follow-up minirag-mcp-m32, not this change.
 
 ## Goals
 
