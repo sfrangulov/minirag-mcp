@@ -9,8 +9,17 @@ import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
+import httpx
 import uvicorn
-from mcp.types import LATEST_PROTOCOL_VERSION
+from mcp import ClientSession
+from mcp.client.streamable_http import streamable_http_client
+from mcp.types import (
+    LATEST_PROTOCOL_VERSION,
+    CancelledNotification,
+    CancelledNotificationParams,
+    ClientNotification,
+)
+from sse_starlette.sse import AppStatus
 
 TOKEN = "test-token-0123456789abcdefghijklmnopqrstuvwxyz"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
@@ -54,3 +63,43 @@ async def serving(app) -> AsyncIterator[str]:
         server.should_exit = True
         await task
         sock.close()
+        # sse_starlette latches this process-wide when a server shuts down while a response
+        # stream is open; every later stream in the process would then end at once.
+        AppStatus.should_exit = False
+
+
+@asynccontextmanager
+async def _session(base: str, index: str) -> AsyncIterator[ClientSession]:
+    async with httpx.AsyncClient(headers=AUTH) as http:
+        async with streamable_http_client(f"{base}/mcp/{index}", http_client=http) as (r, w, _):
+            async with ClientSession(r, w) as session:
+                await session.initialize()
+                yield session
+
+
+async def call_tool(base: str, index: str, tool: str, args: dict):
+    """One ordinary call, awaited to its answer."""
+    async with _session(base, index) as session:
+        return await session.call_tool(tool, args)
+
+
+async def abandon_call(base: str, index: str, tool: str, args: dict, after_s: float) -> None:
+    """Call `tool`, then, `after_s` seconds in, cancel it and leave the session without
+    waiting for the answer, as a client with a timeout does."""
+    async with _session(base, index) as session:
+        # mcp >= 2 clients send this frame when they abandon a request; 1.29 does not.
+        # `_request_id` is this call's id only because `call_tool` below is the next
+        # request the session sends after it is read.
+        request_id = session._request_id
+        call = asyncio.create_task(session.call_tool(tool, args))
+        await asyncio.sleep(after_s)
+        await session.send_notification(
+            ClientNotification(
+                CancelledNotification(
+                    method="notifications/cancelled",
+                    params=CancelledNotificationParams(requestId=request_id),
+                )
+            )
+        )
+        call.cancel()
+        await asyncio.gather(call, return_exceptions=True)

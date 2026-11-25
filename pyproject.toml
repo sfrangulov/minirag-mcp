@@ -44,6 +44,9 @@ dependencies = [
     # computed and compared as arrays. The bound is lancedb's own floor, so declaring it
     # can never move the resolution.
     "numpy>=1.24",
+    # fastmcp already pulls this in, but we import it directly: a call runs in a worker
+    # thread that the cancellation of its request abandons.
+    "anyio>=4.5",
 ]
 
 [project.scripts]

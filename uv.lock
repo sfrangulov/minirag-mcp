@@ -1406,6 +1406,7 @@ name = "minirag-mcp"
 version = "2.0.0a2"
 source = { editable = "." }
 dependencies = [
+    { name = "anyio" },
     { name = "charset-normalizer" },
     { name = "cyclopts" },
     { name = "fastembed" },
@@ -1449,6 +1450,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "anyio", specifier = ">=4.5" },
     { name = "charset-normalizer", specifier = ">=3.0" },
     { name = "cyclopts", specifier = ">=4.0" },
     { name = "fastembed", specifier = ">=0.8" },
