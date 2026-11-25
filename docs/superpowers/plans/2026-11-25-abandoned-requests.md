@@ -162,7 +162,8 @@ and does nothing outside a server call.
       to". Keep this assertion only if it goes red on the unfixed code; otherwise delete
       it and say so in the commit message.
   - `test_an_abandoned_query_does_not_search_after_embedding`:
-    - Wrap the `FakeEmbedder` of the `site` registry so that `embed_query` sleeps 1.0 s.
+    - Monkeypatch the `fake_embedder` fixture's `embed_query`, the same instance the
+      `site` registry uses, so that it sleeps 1.0 s first.
     - Monkeypatch `Store.search` to record that it was called.
     - Call `abandon_call(..., "query_documents", {"query": "apricot"}, after_s=0.3)`,
       then `await asyncio.sleep(1.5)`.
