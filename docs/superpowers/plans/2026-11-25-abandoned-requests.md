@@ -35,6 +35,9 @@ and does nothing outside a server call.
    `notifications/cancelled`.** This is exactly what Skach does. The handler is cancelled
    by the session's task group, not by a responder. Covered by the HTTP tests in Task 2,
    which abandon that way.
+   *Erratum:* the real client (mcp >= 2) sends `notifications/cancelled` before it leaves,
+   and `abandon_call` reproduces that frame; only that frame stops a read. Leaving the
+   session silently does not (follow-up minirag-mcp-m32).
 2. **Two concurrent calls on one index, one abandoned.** The other must finish normally.
    Each call has its own event, created per call, never module-global. Pinned by
    `test_a_concurrent_call_is_not_stopped_by_another_abandoned_one` in Task 1.
@@ -144,6 +147,8 @@ and does nothing outside a server call.
   - It leaves the session when `asyncio.timeout(after_s)` fires and swallows that
     `TimeoutError`.
   - It never sends `notifications/cancelled`.
+    *Erratum:* as built, it does send it, as the real client (mcp >= 2) does; a silent
+    leave is follow-up minirag-mcp-m32.
 
 - [ ] **Step 1: Write the failing tests** in `tests/test_abandoned_calls.py`, over the
   `site` fixture. Each test first ingests its corpus through a normal call to the

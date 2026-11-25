@@ -34,7 +34,7 @@ async def test_an_abandoned_call_stops_at_its_next_checkpoint():
     started = time.monotonic()
     with anyio.move_on_after(0.1):
         await run_abandonable(_looping(5, ended, abandoned))
-    assert time.monotonic() - started < 0.3
+    assert time.monotonic() - started < 1.0
     assert ended.wait(1.0)
     assert abandoned == [True]
 

@@ -88,6 +88,8 @@ async def abandon_call(base: str, index: str, tool: str, args: dict, after_s: fl
     waiting for the answer, as a client with a timeout does."""
     async with _session(base, index) as session:
         # mcp >= 2 clients send this frame when they abandon a request; 1.29 does not.
+        # `_request_id` is this call's id only because `call_tool` below is the next
+        # request the session sends after it is read.
         request_id = session._request_id
         call = asyncio.create_task(session.call_tool(tool, args))
         await asyncio.sleep(after_s)

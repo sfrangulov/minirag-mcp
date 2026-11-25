@@ -1,4 +1,4 @@
-"""A client that leaves its session mid-call stops the read it started, over real HTTP."""
+"""A client that cancels a call mid-flight stops the read it started, over real HTTP."""
 
 from __future__ import annotations
 
@@ -57,6 +57,20 @@ async def test_an_abandoned_find_mentions_stops_scanning(site, indexes_file, mon
     assert len(calls) < len(full)
 
 
+async def test_a_cancelled_call_gets_one_answer_and_the_session_lives(
+    site, indexes_file, monkeypatch, caplog
+):
+    path = _corpus(indexes_file.roots["alpha"])
+    await call_tool(site, "alpha", "ingest_file", {"filePath": path})
+    _slow_matches(monkeypatch, [], 0.05)
+
+    await abandon_call(site, "alpha", "find_mentions", {"terms": ["apricot"]}, after_s=0.3)
+    await asyncio.sleep(3.0)
+
+    assert "Request already responded to" not in caplog.text
+    assert "crashed" not in caplog.text
+
+
 async def test_an_abandoned_query_does_not_search_after_embedding(
     site, indexes_file, fake_embedder, monkeypatch
 ):
@@ -100,5 +114,7 @@ async def test_an_abandoned_ingest_still_completes(site, indexes_file, monkeypat
     await asyncio.sleep(2.0)
 
     listed = await call_tool(site, "alpha", "list_files", {})
-    assert "fruit.md" in str(listed.structuredContent)
-    assert "ingested" in str(listed.structuredContent)
+    rows = [f for f in listed.structuredContent["files"] if f["source"].endswith("/fruit.md")]
+    assert len(rows) == 1
+    assert rows[0]["state"] == "ingested"
+    assert rows[0]["chunkCount"] > 0

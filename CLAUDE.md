@@ -102,7 +102,7 @@ src/minirag_mcp/
   store.py            LanceDB: vectors + BM25 FTS over text and title, hybrid search
   scope.py            the single definition of "is this path inside that prefix"
   literal.py          the single definition of "does this text mention that term"
-  abandon.py          a call its client gave up on stops at the next checkpoint
+  abandon.py          a call its client cancelled stops at the next checkpoint
   security.py         document-root containment, URL host rules
   sync.py             one background job, per-file failures never abort it
   sync_report.py      last-sync.json in the index folder: written atomically, read tolerantly

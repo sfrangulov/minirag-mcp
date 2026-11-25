@@ -1,4 +1,4 @@
-"""Stop work for a call whose client gave up on it.
+"""Stop work for a call its client cancelled.
 
 `Abandoned` derives from `BaseException` on purpose: the core's fallback handlers catch
 `Exception` and turn a failure into a degraded answer, which would swallow the stop and
@@ -21,7 +21,7 @@ _STOP: ContextVar[threading.Event | None] = ContextVar("minirag_stop", default=N
 
 
 class Abandoned(BaseException):
-    """The client of the current call is gone."""
+    """The client of the current call cancelled it."""
 
 
 def checkpoint() -> None:
@@ -31,6 +31,9 @@ def checkpoint() -> None:
 
 
 async def run_abandonable(fn: Callable[[], T]) -> T:
+    # anyio frees its thread-limiter slot on cancel while the thread keeps running, so
+    # abandoned work stops counting against the limit of 40. Reads stop at their next
+    # checkpoint; writes, a single LanceDB query and a single endpoint call run to the end.
     stop = threading.Event()
     token = _STOP.set(stop)
     try:
